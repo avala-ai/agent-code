@@ -30,20 +30,15 @@ pub struct LlmClient {
 }
 
 /// Configuration for thinking/reasoning behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ThinkingMode {
     /// Let the model decide when to think.
+    #[default]
     Adaptive,
     /// Always enable extended thinking with a token budget.
     Enabled { budget_tokens: u32 },
     /// Disable extended thinking.
     Disabled,
-}
-
-impl Default for ThinkingMode {
-    fn default() -> Self {
-        Self::Adaptive
-    }
 }
 
 /// Controls how the model selects tools.
@@ -330,12 +325,10 @@ impl LlmClient {
                             Ok(raw) => {
                                 let events = parser.process(raw);
                                 for event in events {
-                                    if !first_token {
-                                        if matches!(event, StreamEvent::TextDelta(_)) {
-                                            first_token = true;
-                                            let ttft = start.elapsed().as_millis() as u64;
-                                            let _ = tx.send(StreamEvent::Ttft(ttft)).await;
-                                        }
+                                    if !first_token && matches!(event, StreamEvent::TextDelta(_)) {
+                                        first_token = true;
+                                        let ttft = start.elapsed().as_millis() as u64;
+                                        let _ = tx.send(StreamEvent::Ttft(ttft)).await;
                                     }
                                     if tx.send(event).await.is_err() {
                                         return;
@@ -370,14 +363,13 @@ fn extract_sse_data(event_text: &str) -> Option<&str> {
 
 /// Try to parse a retry-after value from an error response.
 fn parse_retry_after(body: &str) -> u64 {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(retry) = v
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(retry) = v
             .get("error")
             .and_then(|e| e.get("retry_after"))
             .and_then(|r| r.as_f64())
-        {
-            return (retry * 1000.0) as u64;
-        }
+    {
+        return (retry * 1000.0) as u64;
     }
     1000
 }

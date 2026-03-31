@@ -18,6 +18,7 @@ pub struct McpTransportConnection {
     next_id: Mutex<u64>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TransportInner {
     Stdio {
         child: Mutex<Child>,

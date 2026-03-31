@@ -70,20 +70,20 @@ impl MemoryContext {
     pub fn to_system_prompt_section(&self) -> String {
         let mut section = String::new();
 
-        if let Some(ref project) = self.project_context {
-            if !project.is_empty() {
-                section.push_str("# Project Context\n\n");
-                section.push_str(project);
-                section.push_str("\n\n");
-            }
+        if let Some(ref project) = self.project_context
+            && !project.is_empty()
+        {
+            section.push_str("# Project Context\n\n");
+            section.push_str(project);
+            section.push_str("\n\n");
         }
 
-        if let Some(ref memory) = self.user_memory {
-            if !memory.is_empty() {
-                section.push_str("# User Memory\n\n");
-                section.push_str(memory);
-                section.push_str("\n\n");
-            }
+        if let Some(ref memory) = self.user_memory
+            && !memory.is_empty()
+        {
+            section.push_str("# User Memory\n\n");
+            section.push_str(memory);
+            section.push_str("\n\n");
         }
 
         for file in &self.memory_files {

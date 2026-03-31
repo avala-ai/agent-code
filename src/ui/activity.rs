@@ -56,7 +56,7 @@ impl ActivityIndicator {
 
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 frame += 1;
-                if frame % (DOT_FRAMES.len() * 2) == 0 {
+                if frame.is_multiple_of(DOT_FRAMES.len() * 2) {
                     phrase_idx += 1;
                 }
             }

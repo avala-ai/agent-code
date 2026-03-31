@@ -67,11 +67,11 @@ pub fn estimate_context_tokens(messages: &[Message]) -> u64 {
     // Find the most recent assistant message with usage data.
     let mut last_usage_idx = None;
     for (i, msg) in messages.iter().enumerate().rev() {
-        if let Message::Assistant(a) = msg {
-            if a.usage.is_some() {
-                last_usage_idx = Some(i);
-                break;
-            }
+        if let Message::Assistant(a) = msg
+            && a.usage.is_some()
+        {
+            last_usage_idx = Some(i);
+            break;
         }
     }
 
@@ -108,18 +108,13 @@ pub fn context_window_for_model(model: &str) -> u64 {
         return 1_000_000;
     }
 
-    if lower.contains("opus") {
-        200_000
-    } else if lower.contains("sonnet") {
-        200_000
-    } else if lower.contains("haiku") {
+    if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
         200_000
     } else if lower.contains("gpt-4") {
         128_000
     } else if lower.contains("gpt-3.5") {
         16_384
     } else {
-        // Conservative default.
         128_000
     }
 }

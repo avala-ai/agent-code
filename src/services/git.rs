@@ -147,10 +147,10 @@ pub fn parse_diff(diff_text: &str) -> Vec<DiffFile> {
                 hunks: Vec::new(),
             });
         } else if line.starts_with("@@") {
-            if let Some(ref mut file) = current_file {
-                if let Some(hunk) = current_hunk.take() {
-                    file.hunks.push(hunk);
-                }
+            if let Some(ref mut file) = current_file
+                && let Some(hunk) = current_hunk.take()
+            {
+                file.hunks.push(hunk);
             }
             current_hunk = Some(DiffHunk {
                 header: line.to_string(),

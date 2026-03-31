@@ -70,17 +70,17 @@ impl KeybindingRegistry {
         );
 
         // Load user overrides.
-        if let Some(path) = keybindings_path() {
-            if path.exists() {
-                match load_keybindings_file(&path) {
-                    Ok(user_bindings) => {
-                        for binding in user_bindings {
-                            registry.bindings.insert(binding.key.clone(), binding);
-                        }
+        if let Some(path) = keybindings_path()
+            && path.exists()
+        {
+            match load_keybindings_file(&path) {
+                Ok(user_bindings) => {
+                    for binding in user_bindings {
+                        registry.bindings.insert(binding.key.clone(), binding);
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to load keybindings: {e}");
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load keybindings: {e}");
                 }
             }
         }

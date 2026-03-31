@@ -54,7 +54,7 @@ impl AppState {
         self.total_usage.merge(usage);
         self.model_usage
             .entry(model.to_string())
-            .or_insert_with(Usage::default)
+            .or_default()
             .merge(usage);
         self.total_cost_usd += estimate_cost(usage, model);
     }

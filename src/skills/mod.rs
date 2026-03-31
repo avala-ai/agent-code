@@ -82,10 +82,10 @@ impl SkillRegistry {
         }
 
         // Load from user-level skills directory.
-        if let Some(dir) = user_skills_dir() {
-            if dir.is_dir() {
-                registry.load_from_dir(&dir);
-            }
+        if let Some(dir) = user_skills_dir()
+            && dir.is_dir()
+        {
+            registry.load_from_dir(&dir);
         }
 
         debug!("Loaded {} skills", registry.skills.len());

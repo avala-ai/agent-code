@@ -341,17 +341,16 @@ impl QueryEngine {
                     .iter()
                     .any(|b| matches!(b, ContentBlock::Text { .. }))
                     && error_text.contains("max_tokens")
+                    && max_output_recovery_count < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
                 {
-                    if max_output_recovery_count < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT {
-                        max_output_recovery_count += 1;
-                        info!(
-                            "Max output tokens recovery attempt {}/{}",
-                            max_output_recovery_count, MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
-                        );
-                        let recovery_msg = compact::max_output_recovery_message();
-                        self.state.push_message(recovery_msg);
-                        continue;
-                    }
+                    max_output_recovery_count += 1;
+                    info!(
+                        "Max output tokens recovery attempt {}/{}",
+                        max_output_recovery_count, MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
+                    );
+                    let recovery_msg = compact::max_output_recovery_message();
+                    self.state.push_message(recovery_msg);
+                    continue;
                 }
             }
 

@@ -95,37 +95,39 @@ fn render_inline(line: &str) -> String {
 
     while i < chars.len() {
         // Inline code: `code`
-        if chars[i] == '`' {
-            if let Some(end) = find_closing(&chars, i + 1, '`') {
-                let code: String = chars[i + 1..end].iter().collect();
-                result.push_str(&format!("\x1b[36m{code}\x1b[0m")); // cyan
-                i = end + 1;
-                continue;
-            }
+        if chars[i] == '`'
+            && let Some(end) = find_closing(&chars, i + 1, '`')
+        {
+            let code: String = chars[i + 1..end].iter().collect();
+            result.push_str(&format!("\x1b[36m{code}\x1b[0m")); // cyan
+            i = end + 1;
+            continue;
         }
 
         // Bold: **text** or __text__
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_double_closing(&chars, i + 2, '*') {
-                let text: String = chars[i + 2..end].iter().collect();
-                result.push_str(&format!("\x1b[1m{text}\x1b[0m")); // bold
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < chars.len()
+            && chars[i] == '*'
+            && chars[i + 1] == '*'
+            && let Some(end) = find_double_closing(&chars, i + 2, '*')
+        {
+            let text: String = chars[i + 2..end].iter().collect();
+            result.push_str(&format!("\x1b[1m{text}\x1b[0m")); // bold
+            i = end + 2;
+            continue;
         }
 
         // Italic: *text* or _text_
         if chars[i] == '*' || chars[i] == '_' {
             let marker = chars[i];
-            if i + 1 < chars.len() && chars[i + 1] != ' ' {
-                if let Some(end) = find_closing(&chars, i + 1, marker) {
-                    if end > i + 1 {
-                        let text: String = chars[i + 1..end].iter().collect();
-                        result.push_str(&format!("\x1b[3m{text}\x1b[0m")); // italic
-                        i = end + 1;
-                        continue;
-                    }
-                }
+            if i + 1 < chars.len()
+                && chars[i + 1] != ' '
+                && let Some(end) = find_closing(&chars, i + 1, marker)
+                && end > i + 1
+            {
+                let text: String = chars[i + 1..end].iter().collect();
+                result.push_str(&format!("\x1b[3m{text}\x1b[0m")); // italic
+                i = end + 1;
+                continue;
             }
         }
 
@@ -153,21 +155,11 @@ fn render_inline(line: &str) -> String {
 }
 
 fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len()).find(|&i| chars[i] == marker)
 }
 
 fn find_double_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    for i in start..chars.len().saturating_sub(1) {
-        if chars[i] == marker && chars[i + 1] == marker {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len().saturating_sub(1)).find(|&i| chars[i] == marker && chars[i + 1] == marker)
 }
 
 #[cfg(test)]

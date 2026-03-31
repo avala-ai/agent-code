@@ -52,14 +52,10 @@ pub fn collapse_to_budget(messages: &[Message], max_tokens: u64) -> Option<Colla
     let mut freed = 0u64;
     let mut snip_end = 1; // Start snipping after the first group.
 
-    for group_idx in 1..groups.len().saturating_sub(1) {
-        let group = &groups[group_idx];
-        let group_tokens: u64 = group
-            .iter()
-            .map(|m| tokens::estimate_message_tokens(m))
-            .sum();
+    for (group_idx, group) in groups[1..groups.len().saturating_sub(1)].iter().enumerate() {
+        let group_tokens: u64 = group.iter().map(tokens::estimate_message_tokens).sum();
         freed += group_tokens;
-        snip_end = group_idx + 1;
+        snip_end = group_idx + 2; // +1 for skipping first group, +1 for exclusive end
 
         if freed >= overshoot {
             break;

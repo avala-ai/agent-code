@@ -5,7 +5,7 @@
 //! the user when complete.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -53,7 +53,7 @@ impl TaskManager {
         &self,
         command: &str,
         description: &str,
-        cwd: &PathBuf,
+        cwd: &Path,
     ) -> Result<TaskId, String> {
         let id = self.allocate_id("b").await;
         let output_file = task_output_path(&id);
@@ -78,7 +78,7 @@ impl TaskManager {
         let task_id = id.clone();
         let tasks = self.tasks.clone();
         let command = command.to_string();
-        let cwd = cwd.clone();
+        let cwd = cwd.to_path_buf();
 
         tokio::spawn(async move {
             let result = tokio::process::Command::new("bash")

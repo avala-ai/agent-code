@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub api: ApiConfig,
     pub permissions: PermissionsConfig,
@@ -12,17 +13,6 @@ pub struct Config {
     /// MCP server configurations.
     #[serde(default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerEntry>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            api: ApiConfig::default(),
-            permissions: PermissionsConfig::default(),
-            ui: UiConfig::default(),
-            mcp_servers: std::collections::HashMap::new(),
-        }
-    }
 }
 
 /// Entry for a configured MCP server.

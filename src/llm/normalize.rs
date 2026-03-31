@@ -105,10 +105,10 @@ pub fn merge_consecutive_user_messages(messages: &mut Vec<Message>) {
 
         if both_user {
             // Merge content from i+1 into i.
-            if let Message::User(next) = messages.remove(i + 1) {
-                if let Message::User(ref mut current) = messages[i] {
-                    current.content.extend(next.content);
-                }
+            if let Message::User(next) = messages.remove(i + 1)
+                && let Message::User(ref mut current) = messages[i]
+            {
+                current.content.extend(next.content);
             }
         } else {
             i += 1;

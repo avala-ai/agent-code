@@ -22,13 +22,13 @@ impl Config {
         let mut config = Config::default();
 
         // Layer 1: User-level config.
-        if let Some(path) = user_config_path() {
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| ConfigError::FileError(format!("{path:?}: {e}")))?;
-                let user_config: Config = toml::from_str(&content)?;
-                config.merge(user_config);
-            }
+        if let Some(path) = user_config_path()
+            && path.exists()
+        {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| ConfigError::FileError(format!("{path:?}: {e}")))?;
+            let user_config: Config = toml::from_str(&content)?;
+            config.merge(user_config);
         }
 
         // Layer 2: Project-level config (walk up from cwd).

@@ -119,6 +119,7 @@ pub enum RawContentBlock {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::enum_variant_names)]
 pub enum RawDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
@@ -193,7 +194,7 @@ impl StreamParser {
                     self.blocks.push(PartialBlock::Text(String::new()));
                 }
 
-                let events = match content_block {
+                match content_block {
                     RawContentBlock::Text { text } => {
                         self.blocks[index] = PartialBlock::Text(text.unwrap_or_default());
                         vec![]
@@ -220,8 +221,7 @@ impl StreamParser {
                         };
                         vec![]
                     }
-                };
-                events
+                }
             }
 
             RawSseEvent::ContentBlockDelta { index, delta } => {

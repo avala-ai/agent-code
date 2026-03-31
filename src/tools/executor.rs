@@ -130,7 +130,7 @@ pub async fn execute_tool_calls(
                                     verbose: ctx_verbose,
                                     plan_mode: ctx_plan_mode,
                                 },
-                                &*perm_checker,
+                                &perm_checker,
                             )
                             .await
                         }));

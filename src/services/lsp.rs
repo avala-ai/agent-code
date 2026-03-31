@@ -4,7 +4,7 @@
 //! symbol information, and code intelligence. Communicates via JSON-RPC
 //! over stdio, similar to the MCP transport.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ impl LspClient {
         name: &str,
         command: &str,
         args: &[String],
-        root_path: &PathBuf,
+        root_path: &Path,
     ) -> Result<Self, String> {
         let mut child = tokio::process::Command::new(command)
             .args(args)
@@ -135,7 +135,7 @@ impl LspClient {
 
         // Read response (Content-Length header + body).
         let mut stdout = self.stdout.lock().await;
-        let content_length = read_content_length(&mut *stdout).await?;
+        let content_length = read_content_length(&mut stdout).await?;
 
         let mut buf = vec![0u8; content_length];
         tokio::io::AsyncReadExt::read_exact(&mut *stdout, &mut buf)
@@ -247,7 +247,7 @@ async fn read_content_length(
 }
 
 /// Detect language ID from file extension.
-fn detect_language(path: &PathBuf) -> &str {
+fn detect_language(path: &Path) -> &str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
         Some("py") => "python",

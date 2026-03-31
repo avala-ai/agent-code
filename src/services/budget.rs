@@ -42,44 +42,44 @@ pub fn check_budget(
     config: &BudgetConfig,
 ) -> BudgetDecision {
     // Check cost budget.
-    if let Some(max_cost) = config.max_cost_usd {
-        if max_cost > 0.0 {
-            let ratio = current_cost_usd / max_cost;
-            if ratio >= 1.0 {
-                return BudgetDecision::Stop {
-                    message: format!(
-                        "Cost budget exhausted: ${:.4} / ${:.4}",
-                        current_cost_usd, max_cost
-                    ),
-                };
-            }
-            if ratio >= config.warning_threshold {
-                return BudgetDecision::ContinueWithWarning {
-                    percent_used: ratio * 100.0,
-                    message: format!("Cost at {:.0}% of ${:.4} budget", ratio * 100.0, max_cost),
-                };
-            }
+    if let Some(max_cost) = config.max_cost_usd
+        && max_cost > 0.0
+    {
+        let ratio = current_cost_usd / max_cost;
+        if ratio >= 1.0 {
+            return BudgetDecision::Stop {
+                message: format!(
+                    "Cost budget exhausted: ${:.4} / ${:.4}",
+                    current_cost_usd, max_cost
+                ),
+            };
+        }
+        if ratio >= config.warning_threshold {
+            return BudgetDecision::ContinueWithWarning {
+                percent_used: ratio * 100.0,
+                message: format!("Cost at {:.0}% of ${:.4} budget", ratio * 100.0, max_cost),
+            };
         }
     }
 
     // Check token budget.
-    if let Some(max_tokens) = config.max_tokens {
-        if max_tokens > 0 {
-            let ratio = current_tokens as f64 / max_tokens as f64;
-            if ratio >= 1.0 {
-                return BudgetDecision::Stop {
-                    message: format!(
-                        "Token budget exhausted: {} / {} tokens",
-                        current_tokens, max_tokens
-                    ),
-                };
-            }
-            if ratio >= config.warning_threshold {
-                return BudgetDecision::ContinueWithWarning {
-                    percent_used: ratio * 100.0,
-                    message: format!("Tokens at {:.0}% of {} budget", ratio * 100.0, max_tokens),
-                };
-            }
+    if let Some(max_tokens) = config.max_tokens
+        && max_tokens > 0
+    {
+        let ratio = current_tokens as f64 / max_tokens as f64;
+        if ratio >= 1.0 {
+            return BudgetDecision::Stop {
+                message: format!(
+                    "Token budget exhausted: {} / {} tokens",
+                    current_tokens, max_tokens
+                ),
+            };
+        }
+        if ratio >= config.warning_threshold {
+            return BudgetDecision::ContinueWithWarning {
+                percent_used: ratio * 100.0,
+                message: format!("Tokens at {:.0}% of {} budget", ratio * 100.0, max_tokens),
+            };
         }
     }
 

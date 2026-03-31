@@ -38,14 +38,12 @@ impl FileCache {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
         // Check if cached entry is still valid.
-        if let Some(cached) = self.entries.get(&canonical) {
-            if let Ok(meta) = std::fs::metadata(&canonical) {
-                if let Ok(modified) = meta.modified() {
-                    if modified == cached.modified {
-                        return Ok(cached.content.clone());
-                    }
-                }
-            }
+        if let Some(cached) = self.entries.get(&canonical)
+            && let Ok(meta) = std::fs::metadata(&canonical)
+            && let Ok(modified) = meta.modified()
+            && modified == cached.modified
+        {
+            return Ok(cached.content.clone());
         }
 
         // Read fresh.
@@ -60,10 +58,10 @@ impl FileCache {
         // Evict if over budget.
         while self.total_bytes + size > MAX_CACHE_BYTES && !self.entries.is_empty() {
             // Remove the first entry (arbitrary eviction).
-            if let Some(key) = self.entries.keys().next().cloned() {
-                if let Some(evicted) = self.entries.remove(&key) {
-                    self.total_bytes -= evicted.size;
-                }
+            if let Some(key) = self.entries.keys().next().cloned()
+                && let Some(evicted) = self.entries.remove(&key)
+            {
+                self.total_bytes -= evicted.size;
             }
         }
 

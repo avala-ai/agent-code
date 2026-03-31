@@ -387,10 +387,10 @@ fn content_blocks_to_api(blocks: &[ContentBlock]) -> serde_json::Value {
         .collect();
 
     // If there's only one text block, use the simple string format.
-    if api_blocks.len() == 1 {
-        if let Some(text) = blocks[0].as_text() {
-            return serde_json::Value::String(text.to_string());
-        }
+    if api_blocks.len() == 1
+        && let Some(text) = blocks[0].as_text()
+    {
+        return serde_json::Value::String(text.to_string());
     }
 
     serde_json::Value::Array(api_blocks)

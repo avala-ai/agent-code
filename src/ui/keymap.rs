@@ -35,10 +35,10 @@ impl InputMode {
 impl Default for InputMode {
     fn default() -> Self {
         // Check EDITOR env var for vim preference.
-        if let Ok(editor) = std::env::var("EDITOR") {
-            if editor.contains("vi") {
-                return Self::Vi;
-            }
+        if let Ok(editor) = std::env::var("EDITOR")
+            && editor.contains("vi")
+        {
+            return Self::Vi;
         }
         Self::Emacs
     }

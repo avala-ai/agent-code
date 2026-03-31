@@ -142,19 +142,18 @@ pub fn microcompact(messages: &mut [Message], keep_recent: usize) -> u64 {
     let mut freed_tokens = 0u64;
 
     for &(msg_idx, block_idx) in to_clear {
-        if let Message::User(ref mut u) = messages[msg_idx] {
-            if let ContentBlock::ToolResult {
+        if let Message::User(ref mut u) = messages[msg_idx]
+            && let ContentBlock::ToolResult {
                 ref mut content,
                 tool_use_id: _,
                 is_error: _,
             } = u.content[block_idx]
-            {
-                let old_tokens = tokens::estimate_tokens(content);
-                let placeholder = "[Old tool result cleared]".to_string();
-                let new_tokens = tokens::estimate_tokens(&placeholder);
-                *content = placeholder;
-                freed_tokens += old_tokens.saturating_sub(new_tokens);
-            }
+        {
+            let old_tokens = tokens::estimate_tokens(content);
+            let placeholder = "[Old tool result cleared]".to_string();
+            let new_tokens = tokens::estimate_tokens(&placeholder);
+            *content = placeholder;
+            freed_tokens += old_tokens.saturating_sub(new_tokens);
         }
     }
 
@@ -166,12 +165,12 @@ fn is_compactable_tool_result(messages: &[Message], tool_use_id: &str) -> bool {
     for msg in messages {
         if let Message::Assistant(a) = msg {
             for block in &a.content {
-                if let ContentBlock::ToolUse { id, name, .. } = block {
-                    if id == tool_use_id {
-                        return COMPACTABLE_TOOLS
-                            .iter()
-                            .any(|t| t.eq_ignore_ascii_case(name));
-                    }
+                if let ContentBlock::ToolUse { id, name, .. } = block
+                    && id == tool_use_id
+                {
+                    return COMPACTABLE_TOOLS
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(name));
                 }
             }
         }

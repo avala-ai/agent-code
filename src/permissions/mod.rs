@@ -59,10 +59,10 @@ impl PermissionChecker {
                 continue;
             }
 
-            if let Some(ref pattern) = rule.pattern {
-                if !matches_input_pattern(pattern, input) {
-                    continue;
-                }
+            if let Some(ref pattern) = rule.pattern
+                && !matches_input_pattern(pattern, input)
+            {
+                continue;
             }
 
             return mode_to_decision(rule.action, tool_name);
@@ -79,10 +79,10 @@ impl PermissionChecker {
             if !matches_tool(&rule.tool, tool_name) {
                 continue;
             }
-            if let Some(ref pattern) = rule.pattern {
-                if !matches_input_pattern(pattern, input) {
-                    continue;
-                }
+            if let Some(ref pattern) = rule.pattern
+                && !matches_input_pattern(pattern, input)
+            {
+                continue;
             }
             if matches!(rule.action, PermissionMode::Deny) {
                 return PermissionDecision::Deny(format!("Denied by rule for {tool_name}"));
