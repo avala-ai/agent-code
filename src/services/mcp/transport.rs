@@ -24,7 +24,10 @@ enum TransportInner {
         stdin: Mutex<tokio::process::ChildStdin>,
         stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
     },
-    // SSE transport can be added later.
+    Sse {
+        base_url: String,
+        http: reqwest::Client,
+    },
 }
 
 impl McpTransportConnection {
@@ -63,6 +66,36 @@ impl McpTransportConnection {
                 child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
                 stdout: Mutex::new(BufReader::new(stdout)),
+            },
+            next_id: Mutex::new(1),
+        })
+    }
+
+    /// Connect to an MCP server via HTTP/SSE.
+    pub async fn connect_sse(base_url: &str) -> Result<Self, String> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+
+        // Verify the server is reachable.
+        let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+        match http.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!("MCP SSE server reachable at {base_url}");
+            }
+            Ok(resp) => {
+                debug!("MCP SSE server returned {}, proceeding anyway", resp.status());
+            }
+            Err(e) => {
+                warn!("MCP SSE server health check failed: {e}, proceeding anyway");
+            }
+        }
+
+        Ok(Self {
+            inner: TransportInner::Sse {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                http,
             },
             next_id: Mutex::new(1),
         })
@@ -134,6 +167,37 @@ impl McpTransportConnection {
                     .result
                     .ok_or_else(|| "MCP response missing 'result'".to_string())
             }
+            TransportInner::Sse { base_url, http } => {
+                let url = format!("{base_url}/jsonrpc");
+                let resp = http
+                    .post(&url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| format!("SSE request failed: {e}"))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("SSE error ({status}): {body}"));
+                }
+
+                let response: JsonRpcResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("SSE response parse error: {e}"))?;
+
+                if let Some(error) = response.error {
+                    return Err(format!(
+                        "MCP error ({}): {}",
+                        error.code, error.message
+                    ));
+                }
+
+                response
+                    .result
+                    .ok_or_else(|| "MCP response missing 'result'".to_string())
+            }
         }
     }
 
@@ -165,6 +229,10 @@ impl McpTransportConnection {
                     .map_err(|e| format!("Failed to write newline: {e}"))?;
                 stdin.flush().await.map_err(|e| format!("Flush failed: {e}"))?;
             }
+            TransportInner::Sse { base_url, http } => {
+                let url = format!("{base_url}/jsonrpc");
+                let _ = http.post(&url).json(&notification).send().await;
+            }
         }
 
         Ok(())
@@ -176,6 +244,9 @@ impl McpTransportConnection {
             TransportInner::Stdio { child, .. } => {
                 let mut child = child.lock().await;
                 let _ = child.kill().await;
+            }
+            TransportInner::Sse { .. } => {
+                // HTTP connections are stateless; nothing to shut down.
             }
         }
     }

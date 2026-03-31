@@ -64,8 +64,7 @@ impl McpClient {
                 McpTransportConnection::connect_stdio(command, args, &self.config.env).await?
             }
             McpTransport::Sse { url } => {
-                self.status = McpConnectionStatus::Error("SSE not yet implemented".into());
-                return Err("SSE transport not yet implemented".into());
+                McpTransportConnection::connect_sse(url).await?
             }
         };
 
