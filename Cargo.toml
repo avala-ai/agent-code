@@ -45,7 +45,7 @@ async-trait = "0.1"
 # Terminal UI
 rustyline = { version = "18", features = ["derive"] }
 crossterm = "0.29"
-termimad = "0.30"
+termimad = "0.34"
 syntect = "5"
 indicatif = "0.18"
 
