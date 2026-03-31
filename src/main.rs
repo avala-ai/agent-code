@@ -117,6 +117,41 @@ async fn main() -> anyhow::Result<()> {
     let permission_checker = PermissionChecker::from_config(&config.permissions);
     let app_state = AppState::new(config.clone());
 
+    // Connect configured MCP servers.
+    if !config.mcp_servers.is_empty() {
+        for (name, entry) in &config.mcp_servers {
+            let transport = if let Some(ref cmd) = entry.command {
+                services::mcp::McpTransport::Stdio {
+                    command: cmd.clone(),
+                    args: entry.args.clone(),
+                }
+            } else if let Some(ref url) = entry.url {
+                services::mcp::McpTransport::Sse { url: url.clone() }
+            } else {
+                tracing::warn!("MCP server '{name}' has no command or url, skipping");
+                continue;
+            };
+
+            let mcp_config = services::mcp::McpServerConfig {
+                transport,
+                name: name.clone(),
+                env: entry.env.clone(),
+            };
+
+            let mut client = services::mcp::McpClient::new(mcp_config);
+            match client.connect().await {
+                Ok(()) => {
+                    let tool_count = client.tools().len();
+                    tracing::info!("MCP server '{name}' connected ({tool_count} tools)");
+                }
+                Err(e) => {
+                    tracing::warn!("MCP server '{name}' failed to connect: {e}");
+                }
+            }
+            // TODO: register MCP tools into the tool registry
+        }
+    }
+
     if cli.dump_system_prompt {
         let prompt = query::build_system_prompt(&tool_registry, &app_state);
         println!("{prompt}");
