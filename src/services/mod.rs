@@ -16,6 +16,7 @@ pub mod git;
 pub mod history;
 pub mod lsp;
 pub mod mcp;
+pub mod output_store;
 pub mod plugins;
 pub mod session;
 pub mod session_env;

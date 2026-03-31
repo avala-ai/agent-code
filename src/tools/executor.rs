@@ -226,7 +226,14 @@ async fn execute_single_tool(
     // Execute.
     match tool.call(call.input.clone(), ctx).await {
         Ok(mut result) => {
-            // Truncate if needed.
+            // Persist large outputs to disk, replace with truncated + path reference.
+            result.content = crate::services::output_store::persist_if_large(
+                &result.content,
+                tool.name(),
+                &call.id,
+            );
+
+            // Additional truncation if still over the tool's limit.
             let max = tool.max_result_size_chars();
             if result.content.len() > max {
                 result.content.truncate(max);

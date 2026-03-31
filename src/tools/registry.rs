@@ -31,7 +31,9 @@ impl ToolRegistry {
         registry.register(Arc::new(super::mcp_resources::ReadMcpResourceTool));
         registry.register(Arc::new(super::plan_mode::EnterPlanModeTool));
         registry.register(Arc::new(super::plan_mode::ExitPlanModeTool));
+        registry.register(Arc::new(super::repl_tool::ReplTool));
         registry.register(Arc::new(super::send_message::SendMessageTool));
+        registry.register(Arc::new(super::skill_tool::SkillTool));
         registry.register(Arc::new(super::sleep_tool::SleepTool));
         registry.register(Arc::new(super::tasks::TaskCreateTool));
         registry.register(Arc::new(super::tasks::TaskUpdateTool));
