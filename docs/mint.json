@@ -1,0 +1,96 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "rs-code",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#07C983",
+    "dark": "#0D9373",
+    "anchors": {
+      "from": "#0D9373",
+      "to": "#07C983"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/avala-ai/rs-code"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "Install",
+    "url": "https://github.com/avala-ai/rs-code#install"
+  },
+  "tabs": [
+    {
+      "name": "API Reference",
+      "url": "api-reference"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "GitHub",
+      "icon": "github",
+      "url": "https://github.com/avala-ai/rs-code"
+    },
+    {
+      "name": "Crates.io",
+      "icon": "box",
+      "url": "https://crates.io/crates/rs-code"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "overview",
+        "quickstart",
+        "installation"
+      ]
+    },
+    {
+      "group": "Core Concepts",
+      "pages": [
+        "concepts/agent-loop",
+        "concepts/tools",
+        "concepts/permissions",
+        "concepts/memory",
+        "concepts/sessions"
+      ]
+    },
+    {
+      "group": "Configuration",
+      "pages": [
+        "configuration/settings",
+        "configuration/providers",
+        "configuration/mcp-servers",
+        "configuration/hooks"
+      ]
+    },
+    {
+      "group": "Extending",
+      "pages": [
+        "extending/skills",
+        "extending/plugins",
+        "extending/custom-tools",
+        "extending/ide-bridge"
+      ]
+    },
+    {
+      "group": "Reference",
+      "pages": [
+        "reference/tools",
+        "reference/commands",
+        "reference/cli-flags",
+        "reference/environment-variables"
+      ]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/avala-ai/rs-code"
+  }
+}

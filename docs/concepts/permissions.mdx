@@ -1,0 +1,92 @@
+---
+title: "Permissions"
+description: "Controlling what the agent can do"
+---
+
+Every tool call passes through the permission system before executing. This gives you fine-grained control over what the agent is allowed to do.
+
+## Permission modes
+
+Set the mode via CLI flag or config:
+
+| Mode | Behavior |
+|------|----------|
+| `ask` (default) | Prompt before mutations, auto-allow reads |
+| `allow` | Auto-approve everything |
+| `deny` | Block all mutations |
+| `plan` | Read-only tools only (strictest) |
+| `accept_edits` | Auto-approve file edits, ask for shell commands |
+
+```bash
+# CLI
+rc --permission-mode plan
+
+# Skip all checks (CI/scripting only)
+rc --dangerously-skip-permissions
+```
+
+## Permission rules
+
+Configure per-tool rules in your settings file:
+
+```toml
+# .rc/settings.toml or ~/.config/rs-code/config.toml
+
+[permissions]
+default_mode = "ask"
+
+# Auto-approve git commands
+[[permissions.rules]]
+tool = "Bash"
+pattern = "git *"
+action = "allow"
+
+# Block destructive commands
+[[permissions.rules]]
+tool = "Bash"
+pattern = "rm -rf *"
+action = "deny"
+
+# Allow writes only to /tmp
+[[permissions.rules]]
+tool = "FileWrite"
+pattern = "/tmp/*"
+action = "allow"
+```
+
+Rules are evaluated in order. The first matching rule wins. If no rule matches, the default mode applies.
+
+## Built-in safety
+
+The Bash tool includes additional safety checks beyond the permission system:
+
+- **Destructive command detection**: warns before `rm -rf`, `git reset --hard`, `DROP TABLE`, `chmod -R 777`, and other dangerous patterns
+- **System path blocking**: prevents writes to `/etc`, `/usr`, `/bin`, `/sbin`, `/boot`, `/sys`, `/proc`
+- **Output truncation**: large outputs are persisted to disk instead of flooding context
+
+## Plan mode
+
+Plan mode restricts the agent to read-only operations. Use it when you want the agent to analyze and plan without making changes:
+
+```
+> /plan
+Plan mode enabled. Only read-only tools available.
+
+> analyze the architecture and suggest improvements
+(agent reads files, searches code, but cannot edit or run commands)
+
+> /plan
+Plan mode disabled. All tools available.
+```
+
+## Denial tracking
+
+Permission denials are recorded with the tool name, reason, and input summary. View them with `/permissions`:
+
+```
+> /permissions
+Permission mode: Ask
+Rules:
+  Bash git * -> Allow
+  Bash rm * -> Deny
+```

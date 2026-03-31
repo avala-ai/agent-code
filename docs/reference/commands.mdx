@@ -1,0 +1,68 @@
+---
+title: "Commands Reference"
+description: "All 32 slash commands"
+---
+
+Type `/` followed by a command name in the REPL. Unknown commands are passed to the agent as prompts. Skill names work as commands too.
+
+## Session
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all commands and loaded skills |
+| `/exit` | Exit the REPL |
+| `/clear` | Reset conversation history |
+| `/resume <id>` | Restore a previous session by ID |
+| `/sessions` | List recent saved sessions |
+| `/export` | Export conversation to markdown file |
+| `/version` | Show rs-code version |
+
+## Context
+
+| Command | Description |
+|---------|-------------|
+| `/cost` | Token usage and estimated session cost |
+| `/context` | Context window usage and auto-compact threshold |
+| `/compact` | Free context by clearing stale tool results |
+| `/model [name]` | Show or switch the active model |
+| `/verbose` | Toggle verbose output (shows token counts) |
+
+## Git
+
+| Command | Description |
+|---------|-------------|
+| `/diff` | Show current git changes |
+| `/status` | Show git status |
+| `/commit [msg]` | Review diff and create a commit |
+| `/review` | Analyze diff for bugs and issues |
+| `/branch [name]` | Show or switch git branch |
+| `/log` | Show recent git history |
+
+## Agent Control
+
+| Command | Description |
+|---------|-------------|
+| `/plan` | Toggle plan mode (read-only) |
+| `/permissions` | Show permission mode and rules |
+| `/agents` | List available agent types |
+| `/tasks` | List background tasks |
+
+## Configuration
+
+| Command | Description |
+|---------|-------------|
+| `/init` | Create `.rc/settings.toml` for this project |
+| `/doctor` | Check environment health (tools, config, git) |
+| `/mcp` | List connected MCP servers |
+| `/hooks` | Show hook configuration |
+| `/plugins` | List loaded plugins |
+| `/memory` | Show loaded memory context |
+| `/skills` | List available skills |
+| `/theme` | Show and configure color theme |
+
+## Diagnostics
+
+| Command | Description |
+|---------|-------------|
+| `/stats` | Session statistics (turns, tools used, cost) |
+| `/files` | List working directory contents |

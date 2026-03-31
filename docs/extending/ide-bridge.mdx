@@ -1,0 +1,52 @@
+---
+title: "IDE Bridge"
+description: "Connecting IDEs to a running rs-code session"
+---
+
+The IDE bridge allows editor extensions (VS Code, JetBrains, etc.) to communicate with a running rs-code instance over HTTP.
+
+## How it works
+
+When rs-code starts, it writes a lock file to `~/.cache/rs-code/bridge/`. IDE extensions scan for lock files to discover running sessions.
+
+The lock file contains:
+
+```json
+{
+  "port": 8432,
+  "pid": 12345,
+  "cwd": "/home/user/project",
+  "started_at": "2026-03-31T20:00:00Z"
+}
+```
+
+## Protocol
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/status` | GET | Agent status (idle/active, model, session info) |
+| `/messages` | GET | Conversation history |
+| `/message` | POST | Send a user message |
+| `/events` | GET | SSE stream of real-time events |
+
+## Discovery
+
+Stale lock files (where the PID is no longer running) are automatically cleaned up when any client scans for bridges.
+
+```rust
+use rs_code::services::bridge::discover_bridges;
+
+let bridges = discover_bridges();
+for b in &bridges {
+    println!("Found: pid={} port={} cwd={}", b.pid, b.port, b.cwd);
+}
+```
+
+## Building an extension
+
+1. Scan `~/.cache/rs-code/bridge/` for `.lock` files
+2. Parse the JSON to get the port
+3. Connect to `http://localhost:{port}`
+4. Use the HTTP endpoints to interact with the session
+
+The bridge is read-only by default — the IDE can observe but not control the agent without explicit user action.

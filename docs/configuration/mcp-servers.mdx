@@ -1,0 +1,78 @@
+---
+title: "MCP Servers"
+description: "Connecting external tool servers via the Model Context Protocol"
+---
+
+[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) lets you extend rs-code with tools and resources from external servers. Any MCP-compatible server can be connected.
+
+## Configuration
+
+Add servers to your config file:
+
+```toml
+# .rc/settings.toml or ~/.config/rs-code/config.toml
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_..." }
+
+[mcp_servers.postgres]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
+```
+
+## Transports
+
+### Stdio (default)
+
+The server runs as a subprocess, communicating via stdin/stdout JSON-RPC:
+
+```toml
+[mcp_servers.myserver]
+command = "path/to/server"
+args = ["--flag", "value"]
+env = { API_KEY = "..." }
+```
+
+### SSE (HTTP)
+
+For servers that expose an HTTP endpoint:
+
+```toml
+[mcp_servers.remote]
+url = "http://localhost:8080"
+```
+
+## How it works
+
+1. At startup, rs-code connects to each configured server
+2. The `initialize` handshake negotiates capabilities
+3. Tools are discovered via `tools/list` and registered as `mcp__server__tool` in the agent's tool pool
+4. When the LLM calls an MCP tool, the request is proxied to the server via `tools/call`
+5. Resources can be browsed with `ListMcpResources` and read with `ReadMcpResource`
+
+## Commands
+
+```
+> /mcp
+2 MCP server(s) configured:
+  filesystem (stdio)
+  github (stdio)
+```
+
+## Popular MCP servers
+
+| Server | What it provides |
+|--------|-----------------|
+| `@modelcontextprotocol/server-filesystem` | File system access with path restrictions |
+| `@modelcontextprotocol/server-github` | GitHub API (issues, PRs, repos) |
+| `@modelcontextprotocol/server-postgres` | PostgreSQL query execution |
+| `@modelcontextprotocol/server-sqlite` | SQLite database access |
+| `@modelcontextprotocol/server-slack` | Slack messaging |
+
+Find more at [modelcontextprotocol.io](https://modelcontextprotocol.io/).

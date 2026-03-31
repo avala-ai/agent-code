@@ -1,0 +1,97 @@
+---
+title: "Tools"
+description: "How the agent interacts with your environment"
+---
+
+Tools are the bridge between the LLM's intentions and your local environment. Each tool defines what it can do, what inputs it accepts, and whether it's safe to run in parallel.
+
+## How tools work
+
+1. The LLM decides which tool to call and with what arguments
+2. The agent validates the input against the tool's schema
+3. Permission checks run (allow/deny/ask based on your rules)
+4. The tool executes and returns a result
+5. The result is sent back to the LLM for the next step
+
+## Tool categories
+
+### File operations
+
+| Tool | What it does |
+|------|-------------|
+| **FileRead** | Read files with line numbers. Handles text, PDF (via `pdftotext`), Jupyter notebooks, and images (base64 for vision). |
+| **FileWrite** | Create or overwrite files. Auto-creates parent directories. |
+| **FileEdit** | Search-and-replace within files. Requires unique match unless `replace_all` is set. |
+| **NotebookEdit** | Edit Jupyter notebook cells (replace, insert, delete). |
+
+### Search
+
+| Tool | What it does |
+|------|-------------|
+| **Grep** | Regex content search powered by ripgrep. Supports context lines, glob filtering, case sensitivity. |
+| **Glob** | Find files by pattern, sorted by modification time. |
+| **ToolSearch** | Discover available tools by keyword or direct name. |
+
+### Execution
+
+| Tool | What it does |
+|------|-------------|
+| **Bash** | Run shell commands with timeout, background execution, destructive command detection, and output truncation. |
+| **REPL** | Execute Python or Node.js code snippets in an interpreter. |
+
+### Agent coordination
+
+| Tool | What it does |
+|------|-------------|
+| **Agent** | Spawn subagents for parallel tasks with optional git worktree isolation. |
+| **SendMessage** | Send messages between running agents. |
+| **Skill** | Invoke user-defined skills programmatically. |
+
+### Planning and tracking
+
+| Tool | What it does |
+|------|-------------|
+| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode for safe exploration. |
+| **TaskCreate / TaskUpdate / TaskGet / TaskList / TaskStop / TaskOutput** | Full task lifecycle management. |
+| **TodoWrite** | Structured todo list management. |
+
+### Web and external
+
+| Tool | What it does |
+|------|-------------|
+| **WebFetch** | HTTP GET with HTML-to-text conversion. |
+| **WebSearch** | Web search with result extraction. |
+| **LSP** | Language server diagnostics with linter fallbacks. |
+
+### MCP integration
+
+| Tool | What it does |
+|------|-------------|
+| **McpProxy** | Calls tools on connected MCP servers. |
+| **ListMcpResources** | Browse MCP server resources. |
+| **ReadMcpResource** | Read a specific MCP resource by URI. |
+
+### Workspace
+
+| Tool | What it does |
+|------|-------------|
+| **EnterWorktree / ExitWorktree** | Create and manage isolated git worktrees. |
+| **AskUserQuestion** | Prompt the user with structured multi-choice questions. |
+| **Sleep** | Async pause with cancellation. |
+
+## Concurrency
+
+Tools declare whether they're safe to run in parallel:
+
+- **Read-only tools** (FileRead, Grep, Glob, etc.) run concurrently
+- **Mutation tools** (Bash, FileWrite, FileEdit) run serially
+
+This maximizes throughput while preventing race conditions on file writes.
+
+## Result handling
+
+Tool results larger than 64KB are automatically persisted to disk (`~/.cache/rs-code/tool-results/`). The conversation receives a truncated preview with a file path reference so the full output isn't lost.
+
+## Writing custom tools
+
+See [Custom Tools](/extending/custom-tools) for how to implement the `Tool` trait and register new tools.

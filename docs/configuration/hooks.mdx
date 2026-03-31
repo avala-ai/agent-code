@@ -1,0 +1,94 @@
+---
+title: "Hooks"
+description: "Run custom actions at lifecycle events"
+---
+
+Hooks let you run shell commands or HTTP requests at specific points in the agent's lifecycle. Use them for auto-formatting, linting, notifications, or custom validation.
+
+## Configuration
+
+```toml
+# .rc/settings.toml
+
+# Auto-format Rust files after any write
+[[hooks]]
+event = "post_tool_use"
+tool_name = "FileWrite"
+[hooks.action]
+type = "shell"
+command = "cargo fmt"
+
+# Lint after edits
+[[hooks]]
+event = "post_tool_use"
+tool_name = "FileEdit"
+[hooks.action]
+type = "shell"
+command = "cargo clippy --quiet"
+
+# Notify on session start
+[[hooks]]
+event = "session_start"
+[hooks.action]
+type = "http"
+url = "https://hooks.slack.com/services/T.../B.../..."
+method = "POST"
+```
+
+## Hook events
+
+| Event | When it fires |
+|-------|--------------|
+| `session_start` | Session begins |
+| `session_stop` | Session ends |
+| `pre_tool_use` | Before a tool executes |
+| `post_tool_use` | After a tool completes |
+| `user_prompt_submit` | User submits input |
+
+## Hook actions
+
+### Shell
+
+Run a command in the project directory:
+
+```toml
+[hooks.action]
+type = "shell"
+command = "make lint"
+```
+
+### HTTP
+
+Send a request to a URL:
+
+```toml
+[hooks.action]
+type = "http"
+url = "https://example.com/webhook"
+method = "POST"
+```
+
+## Filtering by tool
+
+Use `tool_name` to run hooks only for specific tools:
+
+```toml
+[[hooks]]
+event = "pre_tool_use"
+tool_name = "Bash"
+[hooks.action]
+type = "shell"
+command = "echo 'Bash command about to run'"
+```
+
+Without `tool_name`, the hook fires for all tools.
+
+## Commands
+
+```
+> /hooks
+Hook system active. Configure hooks in .rc/settings.toml:
+  [[hooks]]
+  event = "pre_tool_use"
+  action = { type = "shell", command = "./check.sh" }
+```

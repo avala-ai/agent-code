@@ -1,0 +1,53 @@
+---
+title: "Plugins"
+description: "Bundle skills, hooks, and config as packages"
+---
+
+Plugins package skills, hooks, and configuration together as installable units. A plugin is a directory with a `plugin.toml` manifest.
+
+## Plugin structure
+
+```
+my-plugin/
+  plugin.toml        ← manifest
+  skills/
+    deploy.md        ← bundled skills
+    rollback.md
+```
+
+## Manifest
+
+```toml
+# plugin.toml
+
+name = "my-deploy-plugin"
+version = "1.0.0"
+description = "Deployment workflows for our stack"
+author = "team@company.com"
+
+skills = ["deploy", "rollback"]
+
+[[hooks]]
+event = "post_tool_use"
+tool_name = "Bash"
+command = "notify-deploy-status"
+```
+
+## Installing plugins
+
+Place plugin directories in:
+
+| Location | Scope |
+|----------|-------|
+| `.rc/plugins/` | Project-specific |
+| `~/.config/rs-code/plugins/` | Available in all projects |
+
+## Commands
+
+```
+> /plugins
+Loaded 1 plugins:
+  my-deploy-plugin v1.0.0 — Deployment workflows for our stack
+```
+
+Skills from plugins are automatically registered and appear in `/skills` output.

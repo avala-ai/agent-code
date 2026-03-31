@@ -1,0 +1,38 @@
+---
+title: "Environment Variables"
+description: "All environment variables recognized by rs-code"
+---
+
+## API Configuration
+
+| Variable | Description |
+|----------|-------------|
+| `RC_API_KEY` | API key (highest priority, works with any provider) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (auto-selects Anthropic provider) |
+| `OPENAI_API_KEY` | OpenAI API key (auto-selects OpenAI provider) |
+| `RC_API_BASE_URL` | API endpoint URL override |
+| `RC_MODEL` | Model name override |
+
+## Behavior
+
+| Variable | Description |
+|----------|-------------|
+| `EDITOR` | Determines REPL editing mode (`vi` if contains "vi", else emacs) |
+| `SHELL` | Reported in the system prompt environment section |
+
+## Resolution order
+
+API key is resolved from the first available:
+
+1. `--api-key` CLI flag
+2. Config file (`api.api_key`)
+3. `RC_API_KEY` env var
+4. `ANTHROPIC_API_KEY` env var
+5. `OPENAI_API_KEY` env var
+
+Base URL auto-detection:
+
+- If only `OPENAI_API_KEY` is set → defaults to `https://api.openai.com/v1`
+- Otherwise → defaults to `https://api.anthropic.com/v1`
+
+This can always be overridden with `--api-base-url` or the config file.

@@ -1,0 +1,108 @@
+---
+title: "Custom Tools"
+description: "Implementing new tools in Rust"
+---
+
+Tools implement the `Tool` trait. Each tool defines its input schema, permission behavior, and execution logic.
+
+## The Tool trait
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// Unique name used in API tool_use blocks.
+    fn name(&self) -> &'static str;
+
+    /// Description sent to the LLM.
+    fn description(&self) -> &'static str;
+
+    /// JSON Schema for input parameters.
+    fn input_schema(&self) -> serde_json::Value;
+
+    /// Execute the tool.
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError>;
+
+    /// Whether this tool only reads (no mutations).
+    fn is_read_only(&self) -> bool { false }
+
+    /// Whether it's safe to run in parallel with other tools.
+    fn is_concurrency_safe(&self) -> bool { self.is_read_only() }
+}
+```
+
+## Example: a simple tool
+
+```rust
+pub struct TimeTool;
+
+#[async_trait]
+impl Tool for TimeTool {
+    fn name(&self) -> &'static str { "Time" }
+
+    fn description(&self) -> &'static str {
+        "Returns the current date and time."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    fn is_read_only(&self) -> bool { true }
+
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(ToolResult::success(now))
+    }
+}
+```
+
+## Registering the tool
+
+In `src/tools/registry.rs`:
+
+```rust
+pub fn default_tools() -> Self {
+    let mut registry = Self::new();
+    // ... existing tools ...
+    registry.register(Arc::new(TimeTool));
+    registry
+}
+```
+
+## ToolContext
+
+Every tool receives a `ToolContext` with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cwd` | `PathBuf` | Current working directory |
+| `cancel` | `CancellationToken` | Check for Ctrl+C |
+| `permission_checker` | `Arc<PermissionChecker>` | Check permissions |
+| `verbose` | `bool` | Verbose output mode |
+| `plan_mode` | `bool` | Read-only mode active |
+| `file_cache` | `Option<Arc<Mutex<FileCache>>>` | Shared file cache |
+| `denial_tracker` | `Option<Arc<Mutex<DenialTracker>>>` | Permission denial log |
+
+## ToolResult
+
+```rust
+// Success
+Ok(ToolResult::success("output text"))
+
+// Error (sent back to LLM as an error result)
+Ok(ToolResult::error("what went wrong"))
+
+// Fatal error (stops the tool, not sent to LLM)
+Err(ToolError::ExecutionFailed("crash details".into()))
+```

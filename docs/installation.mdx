@@ -1,0 +1,96 @@
+---
+title: "Installation"
+description: "All the ways to install rs-code"
+---
+
+## Requirements
+
+- A supported LLM API key (Anthropic, OpenAI, or any compatible provider)
+- `git` and `rg` (ripgrep) for full functionality
+
+## Install methods
+
+### Cargo (recommended)
+
+If you have Rust installed:
+
+```bash
+cargo install rs-code
+```
+
+This installs the `rc` binary to `~/.cargo/bin/`.
+
+### Homebrew
+
+On macOS or Linux:
+
+```bash
+brew install avala-ai/tap/rs-code
+```
+
+### Prebuilt binaries
+
+Download from [GitHub Releases](https://github.com/avala-ai/rs-code/releases):
+
+| Platform | Architecture | Download |
+|----------|-------------|----------|
+| Linux    | x86_64      | `rc-linux-x86_64.tar.gz` |
+| Linux    | aarch64     | `rc-linux-aarch64.tar.gz` |
+| macOS    | x86_64      | `rc-macos-x86_64.tar.gz` |
+| macOS    | Apple Silicon| `rc-macos-aarch64.tar.gz` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -L https://github.com/avala-ai/rs-code/releases/latest/download/rc-macos-aarch64.tar.gz | tar xz
+sudo mv rc /usr/local/bin/
+```
+
+### From source
+
+```bash
+git clone https://github.com/avala-ai/rs-code.git
+cd rs-code
+cargo build --release
+sudo cp target/release/rc /usr/local/bin/
+```
+
+## Verify installation
+
+```bash
+rc --version
+# rc 0.1.1
+```
+
+Run the environment check:
+
+```bash
+rc --dump-system-prompt | head -5
+# You are an AI coding agent...
+```
+
+## Uninstall
+
+```bash
+# Cargo
+cargo uninstall rs-code
+
+# Homebrew
+brew uninstall rs-code
+
+# Manual
+rm $(which rc)
+```
+
+## Data locations
+
+| What | Path |
+|------|------|
+| User config | `~/.config/rs-code/config.toml` |
+| Session data | `~/.config/rs-code/sessions/` |
+| Memory | `~/.config/rs-code/memory/` |
+| Skills | `~/.config/rs-code/skills/` |
+| Plugins | `~/.config/rs-code/plugins/` |
+| Keybindings | `~/.config/rs-code/keybindings.json` |
+| History | `~/.local/share/rs-code/history.txt` |
+| Tool output cache | `~/.cache/rs-code/tool-results/` |
+| Task output | `~/.cache/rs-code/tasks/` |

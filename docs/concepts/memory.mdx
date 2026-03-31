@@ -1,0 +1,74 @@
+---
+title: "Memory"
+description: "Persistent context across sessions"
+---
+
+Memory gives the agent context that persists across sessions. There are two layers:
+
+## Project memory
+
+Place a `CONTEXT.md` file in your project root or `.rc/CONTEXT.md`:
+
+```markdown
+# Project Context
+
+This is a Rust web API using Axum and SQLx.
+The database is PostgreSQL, migrations are in db/migrations/.
+Run tests with `cargo test`. The CI pipeline is in .github/workflows/ci.yml.
+Always run `cargo fmt` before committing.
+```
+
+This is loaded automatically at the start of every session in that project directory. Use it for project-specific instructions, conventions, and context that every session needs.
+
+## User memory
+
+User-level memory lives in `~/.config/rs-code/memory/`:
+
+- `MEMORY.md` — the index file, loaded automatically
+- Individual memory files linked from the index
+
+```markdown
+<!-- ~/.config/rs-code/memory/MEMORY.md -->
+- [Preferences](preferences.md) — coding style and response preferences
+- [Work context](work.md) — current projects and priorities
+```
+
+```markdown
+<!-- ~/.config/rs-code/memory/preferences.md -->
+---
+name: preferences
+description: User coding style preferences
+type: user
+---
+
+- I prefer explicit error handling over unwrap/expect
+- Use descriptive variable names, not single letters
+- Always include tests for new functions
+```
+
+## How memory is used
+
+Memory files are injected into the system prompt at session start:
+
+1. Project `CONTEXT.md` → appears under "# Project Context"
+2. User `MEMORY.md` index → appears under "# User Memory"
+3. Individual memory files linked from the index → loaded and appended
+
+The agent sees this context on every turn, so it can follow your conventions and understand your project without being told every time.
+
+## Size limits
+
+| Limit | Value |
+|-------|-------|
+| Max file size | 25KB per memory file |
+| Max index lines | 200 lines |
+
+Files exceeding these limits are truncated with a `(truncated)` marker.
+
+## Commands
+
+```
+> /memory
+Project context: loaded
+User memory: loaded (2 files)
+```
