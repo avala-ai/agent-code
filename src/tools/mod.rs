@@ -18,6 +18,8 @@
 //! 3. Tool execution (`call`)
 //! 4. Result mapping (to API format)
 
+pub mod agent;
+pub mod ask_user;
 pub mod bash;
 pub mod executor;
 pub mod file_edit;
@@ -26,6 +28,7 @@ pub mod file_write;
 pub mod glob;
 pub mod grep;
 pub mod registry;
+pub mod web_fetch;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

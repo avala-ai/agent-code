@@ -18,12 +18,15 @@ impl ToolRegistry {
     /// Create a registry with all default built-in tools.
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
+        registry.register(Arc::new(super::agent::AgentTool));
         registry.register(Arc::new(super::bash::BashTool));
         registry.register(Arc::new(super::file_read::FileReadTool));
         registry.register(Arc::new(super::file_write::FileWriteTool));
         registry.register(Arc::new(super::file_edit::FileEditTool));
         registry.register(Arc::new(super::grep::GrepTool));
         registry.register(Arc::new(super::glob::GlobTool));
+        registry.register(Arc::new(super::web_fetch::WebFetchTool));
+        registry.register(Arc::new(super::ask_user::AskUserQuestionTool));
         registry
     }
 
