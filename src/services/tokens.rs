@@ -101,12 +101,23 @@ pub fn estimate_context_tokens(messages: &[Message]) -> u64 {
 
 /// Get the context window size for a model.
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("opus") {
+    let lower = model.to_lowercase();
+
+    // Check for extended context variants first.
+    if lower.contains("1m") || lower.contains("1000k") {
+        return 1_000_000;
+    }
+
+    if lower.contains("opus") {
         200_000
-    } else if model.contains("sonnet") {
+    } else if lower.contains("sonnet") {
         200_000
-    } else if model.contains("haiku") {
+    } else if lower.contains("haiku") {
         200_000
+    } else if lower.contains("gpt-4") {
+        128_000
+    } else if lower.contains("gpt-3.5") {
+        16_384
     } else {
         // Conservative default.
         128_000
@@ -115,12 +126,27 @@ pub fn context_window_for_model(model: &str) -> u64 {
 
 /// Get the max output tokens for a model.
 pub fn max_output_tokens_for_model(model: &str) -> u64 {
-    if model.contains("opus") || model.contains("sonnet") {
+    let lower = model.to_lowercase();
+    if lower.contains("opus") || lower.contains("sonnet") {
         16_384
-    } else if model.contains("haiku") {
+    } else if lower.contains("haiku") {
         8_192
     } else {
         16_384
+    }
+}
+
+/// Get the maximum thinking token budget for a model.
+pub fn max_thinking_tokens_for_model(model: &str) -> u64 {
+    let lower = model.to_lowercase();
+    if lower.contains("opus") {
+        32_000
+    } else if lower.contains("sonnet") {
+        16_000
+    } else if lower.contains("haiku") {
+        8_000
+    } else {
+        16_000
     }
 }
 
