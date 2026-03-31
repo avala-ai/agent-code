@@ -1,11 +1,11 @@
 [package]
-name = "rs-code"
+name = "agent-code"
 version = "0.2.0"
 edition = "2024"
 description = "An AI-powered coding agent for the terminal, written in pure Rust"
 license = "MIT"
-repository = "https://github.com/avala-ai/rs-code"
-homepage = "https://github.com/avala-ai/rs-code"
+repository = "https://github.com/avala-ai/agent-code"
+homepage = "https://github.com/avala-ai/agent-code"
 readme = "README.md"
 keywords = ["ai", "agent", "coding", "cli", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
@@ -13,7 +13,7 @@ authors = ["Avala AI <emal@avala.ai>"]
 exclude = [".github/", "tests/", "target/"]
 
 [[bin]]
-name = "rc"
+name = "agent"
 path = "src/main.rs"
 
 [dependencies]

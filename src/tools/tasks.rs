@@ -303,7 +303,7 @@ impl Tool for TaskOutputTool {
         // Check the output file in the cache directory.
         let output_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("rs-code")
+            .join("agent-code")
             .join("tasks")
             .join(format!("{id}.out"));
 

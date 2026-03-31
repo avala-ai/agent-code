@@ -3,11 +3,11 @@
 
 | Variable | Description |
 |----------|-------------|
-| `RC_API_KEY` | API key (highest priority, works with any provider) |
+| `AGENT_CODE_API_KEY` | API key (highest priority, works with any provider) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (auto-selects Anthropic provider) |
 | `OPENAI_API_KEY` | OpenAI API key (auto-selects OpenAI provider) |
-| `RC_API_BASE_URL` | API endpoint URL override |
-| `RC_MODEL` | Model name override |
+| `AGENT_CODE_API_BASE_URL` | API endpoint URL override |
+| `AGENT_CODE_MODEL` | Model name override |
 
 ## Behavior
 
@@ -22,7 +22,7 @@ API key is resolved from the first available:
 
 1. `--api-key` CLI flag
 2. Config file (`api.api_key`)
-3. `RC_API_KEY` env var
+3. `AGENT_CODE_API_KEY` env var
 4. `ANTHROPIC_API_KEY` env var
 5. `OPENAI_API_KEY` env var
 

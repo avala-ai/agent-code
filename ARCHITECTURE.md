@@ -1,10 +1,10 @@
 # Architecture
 
-This document describes how rs-code is organized and how the major subsystems interact.
+This document describes how agent-code is organized and how the major subsystems interact.
 
 ## Overview
 
-rs-code is a terminal-based AI coding agent. The user types a request, the agent calls an LLM, the LLM responds with text and tool calls, the agent executes the tools, feeds results back, and repeats until the task is done.
+agent-code is a terminal-based AI coding agent. The user types a request, the agent calls an LLM, the LLM responds with text and tool calls, the agent executes the tools, feeds results back, and repeats until the task is done.
 
 ```
 User input

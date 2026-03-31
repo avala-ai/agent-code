@@ -117,7 +117,7 @@ impl Tool for AgentTool {
         // This gives full isolation — separate process, separate context.
         let rc_binary = std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "rc".to_string());
+            .unwrap_or_else(|_| "agent".to_string());
 
         let mut cmd = tokio::process::Command::new(&rc_binary);
         cmd.arg("--prompt")
@@ -128,11 +128,11 @@ impl Tool for AgentTool {
 
         // Pass through environment so the subagent uses the same provider.
         for var in &[
-            "RC_API_KEY",
+            "AGENT_CODE_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
-            "RC_API_BASE_URL",
-            "RC_MODEL",
+            "AGENT_CODE_API_BASE_URL",
+            "AGENT_CODE_MODEL",
         ] {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);

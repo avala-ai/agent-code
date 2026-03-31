@@ -11,7 +11,7 @@ Type `/` followed by a command name in the REPL. Unknown commands are passed to 
 | `/resume <id>` | Restore a previous session by ID |
 | `/sessions` | List recent saved sessions |
 | `/export` | Export conversation to markdown file |
-| `/version` | Show rs-code version |
+| `/version` | Show agent-code version |
 
 ## Context
 

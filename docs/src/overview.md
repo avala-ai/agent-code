@@ -1,7 +1,7 @@
 
-# What is rs-code?
+# What is agent-code?
 
-rs-code is an open-source, AI-powered coding agent for the terminal. You describe what you want in natural language, and the agent reads your codebase, runs commands, edits files, and iterates until the task is done.
+agent-code is an open-source, AI-powered coding agent for the terminal. You describe what you want in natural language, and the agent reads your codebase, runs commands, edits files, and iterates until the task is done.
 
 It's built in pure Rust for speed, safety, and a single static binary with zero runtime dependencies.
 
@@ -88,6 +88,6 @@ Agent:
     Get up and running in 2 minutes.
   
   
-    All the ways to install rs-code.
+    All the ways to install agent-code.
   
 

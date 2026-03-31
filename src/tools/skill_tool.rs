@@ -20,7 +20,7 @@ impl Tool for SkillTool {
 
     fn description(&self) -> &'static str {
         "Invoke a user-defined skill by name. Skills are reusable \
-         workflows loaded from .rc/skills/ or ~/.config/rs-code/skills/."
+         workflows loaded from .rc/skills/ or ~/.config/agent-code/skills/."
     }
 
     fn input_schema(&self) -> serde_json::Value {

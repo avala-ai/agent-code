@@ -75,6 +75,6 @@ pub fn cleanup_old_outputs() {
 fn output_store_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rs-code")
+        .join("agent-code")
         .join("tool-results")
 }

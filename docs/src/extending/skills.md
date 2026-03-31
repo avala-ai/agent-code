@@ -1,5 +1,5 @@
 
-Skills are reusable prompt templates that define multi-step workflows. They're markdown files with YAML frontmatter, loaded from `.rc/skills/` or `~/.config/rs-code/skills/`.
+Skills are reusable prompt templates that define multi-step workflows. They're markdown files with YAML frontmatter, loaded from `.rc/skills/` or `~/.config/agent-code/skills/`.
 
 ## Creating a skill
 
@@ -82,7 +82,7 @@ For complex skills with supporting files, use a directory:
 | Location | Scope |
 |----------|-------|
 | `.rc/skills/` | Project-specific |
-| `~/.config/rs-code/skills/` | Available in all projects |
+| `~/.config/agent-code/skills/` | Available in all projects |
 
 ## Commands
 

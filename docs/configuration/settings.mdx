@@ -1,23 +1,23 @@
 ---
 title: "Settings"
-description: "Configuring rs-code behavior"
+description: "Configuring agent-code behavior"
 ---
 
 Configuration loads from three layers (highest priority first):
 
 1. **CLI flags and environment variables**
 2. **Project config** — `.rc/settings.toml` in your repo
-3. **User config** — `~/.config/rs-code/config.toml`
+3. **User config** — `~/.config/agent-code/config.toml`
 
 ## Full config reference
 
 ```toml
-# ~/.config/rs-code/config.toml
+# ~/.config/agent-code/config.toml
 
 [api]
 base_url = "https://api.anthropic.com/v1"
 model = "claude-sonnet-4-20250514"
-# api_key is resolved from env: RC_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
+# api_key is resolved from env: AGENT_CODE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
 max_output_tokens = 16384
 thinking = "enabled"          # "enabled", "disabled", or omit for default
 effort = "high"               # "low", "medium", "high"
@@ -73,9 +73,9 @@ Created .rc/settings.toml
 
 | Variable | Purpose |
 |----------|---------|
-| `RC_API_KEY` | API key (highest priority) |
+| `AGENT_CODE_API_KEY` | API key (highest priority) |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `OPENAI_API_KEY` | OpenAI API key |
-| `RC_API_BASE_URL` | API endpoint override |
-| `RC_MODEL` | Model override |
+| `AGENT_CODE_API_BASE_URL` | API endpoint override |
+| `AGENT_CODE_MODEL` | Model override |
 | `EDITOR` | Determines vi/emacs REPL mode |

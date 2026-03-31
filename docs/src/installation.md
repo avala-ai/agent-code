@@ -11,17 +11,17 @@
 Works on Linux and macOS (x86_64 and aarch64):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/avala-ai/rs-code/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
 ```
 
-Detects your OS and architecture, downloads the latest release, and installs `rc` to `/usr/local/bin`. Set `RC_INSTALL_DIR` to change the install location.
+Detects your OS and architecture, downloads the latest release, and installs `agent` to `/usr/local/bin`. Set `AGENT_CODE_INSTALL_DIR` to change the install location.
 
 ### Cargo
 
 If you have Rust installed:
 
 ```bash
-cargo install rs-code
+cargo install agent-code
 ```
 
 This installs the `rc` binary to `~/.cargo/bin/`.
@@ -31,12 +31,12 @@ This installs the `rc` binary to `~/.cargo/bin/`.
 On macOS or Linux:
 
 ```bash
-brew install avala-ai/tap/rs-code
+brew install avala-ai/tap/agent-code
 ```
 
 ### Prebuilt binaries
 
-Download from [GitHub Releases](https://github.com/avala-ai/rs-code/releases):
+Download from [GitHub Releases](https://github.com/avala-ai/agent-code/releases):
 
 | Platform | Architecture | Download |
 |----------|-------------|----------|
@@ -47,17 +47,17 @@ Download from [GitHub Releases](https://github.com/avala-ai/rs-code/releases):
 
 ```bash
 # Example: macOS Apple Silicon
-curl -L https://github.com/avala-ai/rs-code/releases/latest/download/rc-macos-aarch64.tar.gz | tar xz
-sudo mv rc /usr/local/bin/
+curl -L https://github.com/avala-ai/agent-code/releases/latest/download/rc-macos-aarch64.tar.gz | tar xz
+sudo mv agent /usr/local/bin/
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/avala-ai/rs-code.git
-cd rs-code
+git clone https://github.com/avala-ai/agent-code.git
+cd agent-code
 cargo build --release
-sudo cp target/release/rc /usr/local/bin/
+sudo cp target/release/agent /usr/local/bin/
 ```
 
 ## Verify installation
@@ -78,25 +78,25 @@ rc --dump-system-prompt | head -5
 
 ```bash
 # Cargo
-cargo uninstall rs-code
+cargo uninstall agent-code
 
 # Homebrew
-brew uninstall rs-code
+brew uninstall agent-code
 
 # Manual
-rm $(which rc)
+rm $(which agent)
 ```
 
 ## Data locations
 
 | What | Path |
 |------|------|
-| User config | `~/.config/rs-code/config.toml` |
-| Session data | `~/.config/rs-code/sessions/` |
-| Memory | `~/.config/rs-code/memory/` |
-| Skills | `~/.config/rs-code/skills/` |
-| Plugins | `~/.config/rs-code/plugins/` |
-| Keybindings | `~/.config/rs-code/keybindings.json` |
-| History | `~/.local/share/rs-code/history.txt` |
-| Tool output cache | `~/.cache/rs-code/tool-results/` |
-| Task output | `~/.cache/rs-code/tasks/` |
+| User config | `~/.config/agent-code/config.toml` |
+| Session data | `~/.config/agent-code/sessions/` |
+| Memory | `~/.config/agent-code/memory/` |
+| Skills | `~/.config/agent-code/skills/` |
+| Plugins | `~/.config/agent-code/plugins/` |
+| Keybindings | `~/.config/agent-code/keybindings.json` |
+| History | `~/.local/share/agent-code/history.txt` |
+| Tool output cache | `~/.cache/agent-code/tool-results/` |
+| Task output | `~/.cache/agent-code/tasks/` |

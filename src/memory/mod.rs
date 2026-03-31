@@ -5,7 +5,7 @@
 //!
 //! - **Project memory**: `.rc/CONTEXT.md` in the project root — loaded
 //!   automatically, provides project-specific instructions and context.
-//! - **User memory**: `~/.config/rs-code/MEMORY.md` — user-level
+//! - **User memory**: `~/.config/agent-code/MEMORY.md` — user-level
 //!   preferences, patterns, and learned context.
 //!
 //! Memory files are injected into the system prompt at session start.
@@ -26,7 +26,7 @@ const MAX_MEMORY_FILE_BYTES: usize = 25_000;
 pub struct MemoryContext {
     /// Project-level context (from .rc/CONTEXT.md).
     pub project_context: Option<String>,
-    /// User-level memory index (from ~/.config/rs-code/MEMORY.md).
+    /// User-level memory index (from ~/.config/agent-code/MEMORY.md).
     pub user_memory: Option<String>,
     /// Individual memory files loaded from the index.
     pub memory_files: Vec<MemoryFile>,
@@ -175,7 +175,7 @@ fn load_referenced_files(index: &str, base_dir: &Path) -> Vec<MemoryFile> {
 
 /// Get the user memory directory.
 fn user_memory_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("memory"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("memory"))
 }
 
 /// Get the project memory directory for the given project root.

@@ -5,7 +5,7 @@
 //!
 //! 1. CLI flags and environment variables
 //! 2. Project-local settings (`.rc/settings.toml`)
-//! 3. User settings (`~/.config/rs-code/config.toml`)
+//! 3. User settings (`~/.config/agent-code/config.toml`)
 //!
 //! Each layer is merged into the final `Config` struct.
 
@@ -74,7 +74,7 @@ impl Config {
 
 /// Returns the user-level config file path.
 fn user_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("config.toml"))
 }
 
 /// Walk up from the current directory to find `.rc/settings.toml`.

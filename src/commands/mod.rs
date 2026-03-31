@@ -378,7 +378,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             )));
             if skills.all().is_empty() {
                 println!(
-                    "No skills loaded. Add .md files to .rc/skills/ or ~/.config/rs-code/skills/"
+                    "No skills loaded. Add .md files to .rc/skills/ or ~/.config/agent-code/skills/"
                 );
             } else {
                 println!("Loaded {} skills:", skills.all().len());
@@ -561,7 +561,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 std::path::Path::new(&engine.state().cwd),
             ));
             if plugins.all().is_empty() {
-                println!("No plugins loaded. Add plugin directories to ~/.config/rs-code/plugins/");
+                println!(
+                    "No plugins loaded. Add plugin directories to ~/.config/agent-code/plugins/"
+                );
             } else {
                 println!("Loaded {} plugins:", plugins.all().len());
                 for p in plugins.all() {
@@ -601,7 +603,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 "Theme: {} (dark is the default)",
                 engine.state().config.ui.theme
             );
-            println!("Configure in ~/.config/rs-code/config.toml under [ui]");
+            println!("Configure in ~/.config/agent-code/config.toml under [ui]");
             CommandResult::Handled
         }
         Some("stats") => {

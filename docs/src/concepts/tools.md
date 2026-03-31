@@ -86,7 +86,7 @@ This maximizes throughput while preventing race conditions on file writes.
 
 ## Result handling
 
-Tool results larger than 64KB are automatically persisted to disk (`~/.cache/rs-code/tool-results/`). The conversation receives a truncated preview with a file path reference so the full output isn't lost.
+Tool results larger than 64KB are automatically persisted to disk (`~/.cache/agent-code/tool-results/`). The conversation receives a truncated preview with a file path reference so the full output isn't lost.
 
 ## Writing custom tools
 

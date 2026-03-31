@@ -3,14 +3,14 @@ title: "MCP Servers"
 description: "Connecting external tool servers via the Model Context Protocol"
 ---
 
-[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) lets you extend rs-code with tools and resources from external servers. Any MCP-compatible server can be connected.
+[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) lets you extend agent-code with tools and resources from external servers. Any MCP-compatible server can be connected.
 
 ## Configuration
 
 Add servers to your config file:
 
 ```toml
-# .rc/settings.toml or ~/.config/rs-code/config.toml
+# .rc/settings.toml or ~/.config/agent-code/config.toml
 
 [mcp_servers.filesystem]
 command = "npx"
@@ -50,7 +50,7 @@ url = "http://localhost:8080"
 
 ## How it works
 
-1. At startup, rs-code connects to each configured server
+1. At startup, agent-code connects to each configured server
 2. The `initialize` handshake negotiates capabilities
 3. Tools are discovered via `tools/list` and registered as `mcp__server__tool` in the agent's tool pool
 4. When the LLM calls an MCP tool, the request is proxied to the server via `tools/call`

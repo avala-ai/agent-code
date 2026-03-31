@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">rs-code</h1>
+  <h1 align="center">agent-code</h1>
   <p align="center">
     A fast, open-source AI coding agent for the terminal.<br>
     Built in pure Rust by <a href="https://github.com/avala-ai">Avala AI</a>.
@@ -7,22 +7,22 @@
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/rs-code"><img src="https://img.shields.io/crates/v/rs-code.svg" alt="crates.io"></a>
-  <a href="https://github.com/avala-ai/rs-code/actions"><img src="https://github.com/avala-ai/rs-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/avala-ai/rs-code/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://crates.io/crates/agent-code"><img src="https://img.shields.io/crates/v/agent-code.svg" alt="crates.io"></a>
+  <a href="https://github.com/avala-ai/agent-code/actions"><img src="https://github.com/avala-ai/agent-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/avala-ai/agent-code/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 ---
 
-`rs-code` is an AI-powered coding agent that lives in your terminal. It reads your codebase, executes commands, edits files, and handles multi-step engineering tasks autonomously. Think of it as a senior engineer that works alongside you in the shell.
+`agent-code` is an AI-powered coding agent that lives in your terminal. It reads your codebase, executes commands, edits files, and handles multi-step engineering tasks autonomously. Think of it as a senior engineer that works alongside you in the shell.
 
 ```
-$ cargo install rs-code
-$ export RC_API_KEY="your-api-key"
+$ cargo install agent-code
+$ export AGENT_CODE_API_KEY="your-api-key"
 $ rc
 ```
 
-## Why rs-code
+## Why agent-code
 
 - **Fast.** Single static binary, ~8MB. Starts instantly. Streams responses as they arrive.
 - **Private.** Runs locally. No telemetry. Your code never leaves your machine except for the LLM API call.
@@ -34,48 +34,48 @@ $ rc
 
 **One-line install** (Linux/macOS):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/avala-ai/rs-code/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
 ```
 
 **From crates.io:**
 ```bash
-cargo install rs-code
+cargo install agent-code
 ```
 
 **Homebrew:**
 ```bash
-brew install avala-ai/tap/rs-code
+brew install avala-ai/tap/agent-code
 ```
 
 **From source:**
 ```bash
-git clone https://github.com/avala-ai/rs-code.git
-cd rs-code
+git clone https://github.com/avala-ai/agent-code.git
+cd agent-code
 cargo build --release
-# Binary is at target/release/rc
+# Binary is at target/release/agent
 ```
 
 **From GitHub Releases:**
 
-Download prebuilt binaries for Linux (x86_64, aarch64) and macOS (x86_64, aarch64) from the [Releases page](https://github.com/avala-ai/rs-code/releases).
+Download prebuilt binaries for Linux (x86_64, aarch64) and macOS (x86_64, aarch64) from the [Releases page](https://github.com/avala-ai/agent-code/releases).
 
 ## Quick Start
 
 ```bash
 # Set your API key
-export RC_API_KEY="your-api-key"
+export AGENT_CODE_API_KEY="your-api-key"
 
 # Interactive mode
 rc
 
 # One-shot: ask a question and exit
-rc --prompt "find all TODO comments in this repo"
+agent --prompt "find all TODO comments in this repo"
 
 # Use a specific model
-rc --model claude-opus-4-20250514
+agent --model claude-opus-4-20250514
 
 # Print the system prompt (useful for debugging)
-rc --dump-system-prompt
+agent --dump-system-prompt
 ```
 
 Once inside the REPL, type naturally. The agent reads files, runs commands, and edits code to accomplish what you ask. Type `/help` to see all available commands.
@@ -143,12 +143,12 @@ The core loop: receive user input, call the LLM with conversation history and to
 
 Configuration loads from three layers (highest priority first):
 
-1. **CLI flags and environment variables** (`RC_API_KEY`, `--model`, etc.)
+1. **CLI flags and environment variables** (`AGENT_CODE_API_KEY`, `--model`, etc.)
 2. **Project config** (`.rc/settings.toml` in your repo)
-3. **User config** (`~/.config/rs-code/config.toml`)
+3. **User config** (`~/.config/agent-code/config.toml`)
 
 ```toml
-# ~/.config/rs-code/config.toml
+# ~/.config/agent-code/config.toml
 
 [api]
 base_url = "https://api.anthropic.com/v1"
@@ -226,11 +226,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 | `/plugins` | List loaded plugins |
 | `/hooks` | Show hook configuration |
 
-## Extending rs-code
+## Extending agent-code
 
 ### Skills
 
-Skills are reusable workflows defined as markdown files with YAML frontmatter. Drop them in `.rc/skills/` or `~/.config/rs-code/skills/`.
+Skills are reusable workflows defined as markdown files with YAML frontmatter. Drop them in `.rc/skills/` or `~/.config/agent-code/skills/`.
 
 ```markdown
 ---
@@ -284,15 +284,15 @@ action = { type = "shell", command = "cargo fmt" }
 Persistent context that carries across sessions:
 
 - **Project memory:** `.rc/CONTEXT.md` in your repo root. Loaded automatically.
-- **User memory:** `~/.config/rs-code/memory/MEMORY.md`. Personal preferences and patterns.
+- **User memory:** `~/.config/agent-code/memory/MEMORY.md`. Personal preferences and patterns.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and PR process.
 
 ```bash
-git clone https://github.com/avala-ai/rs-code.git
-cd rs-code
+git clone https://github.com/avala-ai/agent-code.git
+cd agent-code
 cargo build
 cargo test
 cargo clippy

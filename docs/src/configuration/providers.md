@@ -1,5 +1,5 @@
 
-rs-code works with any LLM that speaks the Anthropic Messages API or OpenAI Chat Completions API. The provider is auto-detected from your model name and base URL.
+agent-code works with any LLM that speaks the Anthropic Messages API or OpenAI Chat Completions API. The provider is auto-detected from your model name and base URL.
 
 ## Anthropic (Claude)
 

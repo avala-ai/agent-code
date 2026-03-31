@@ -1,4 +1,4 @@
-# Contributing to rs-code
+# Contributing to agent-code
 
 Thank you for your interest in contributing.
 
@@ -6,8 +6,8 @@ Thank you for your interest in contributing.
 
 ```bash
 # Clone
-git clone https://github.com/avala-ai/rs-code.git
-cd rs-code
+git clone https://github.com/avala-ai/agent-code.git
+cd agent-code
 
 # Build
 cargo build

@@ -18,19 +18,19 @@ This is loaded automatically at the start of every session in that project direc
 
 ## User memory
 
-User-level memory lives in `~/.config/rs-code/memory/`:
+User-level memory lives in `~/.config/agent-code/memory/`:
 
 - `MEMORY.md` — the index file, loaded automatically
 - Individual memory files linked from the index
 
 ```markdown
-<!-- ~/.config/rs-code/memory/MEMORY.md -->
+<!-- ~/.config/agent-code/memory/MEMORY.md -->
 - [Preferences](preferences.md) — coding style and response preferences
 - [Work context](work.md) — current projects and priorities
 ```
 
 ```markdown
-<!-- ~/.config/rs-code/memory/preferences.md -->
+<!-- ~/.config/agent-code/memory/preferences.md -->
 
 - I prefer explicit error handling over unwrap/expect
 - Use descriptive variable names, not single letters

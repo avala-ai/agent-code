@@ -41,7 +41,7 @@ pub struct ApiConfig {
     pub base_url: String,
     /// Model identifier.
     pub model: String,
-    /// API key. Resolved from (in order): config, RC_API_KEY,
+    /// API key. Resolved from (in order): config, AGENT_CODE_API_KEY,
     /// ANTHROPIC_API_KEY, OPENAI_API_KEY env vars.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
@@ -62,14 +62,14 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         // Resolve API key from multiple environment variables.
-        let api_key = std::env::var("RC_API_KEY")
+        let api_key = std::env::var("AGENT_CODE_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
 
         // Auto-detect base URL from which key is set.
         let base_url = if std::env::var("OPENAI_API_KEY").is_ok()
-            && std::env::var("RC_API_KEY").is_err()
+            && std::env::var("AGENT_CODE_API_KEY").is_err()
             && std::env::var("ANTHROPIC_API_KEY").is_err()
         {
             "https://api.openai.com/v1".to_string()

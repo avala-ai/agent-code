@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rs-code installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/avala-ai/rs-code/main/install.sh | bash
+# agent-code installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
 
-REPO="avala-ai/rs-code"
-BINARY="rc"
-INSTALL_DIR="${RC_INSTALL_DIR:-/usr/local/bin}"
+REPO="avala-ai/agent-code"
+BINARY="agent"
+INSTALL_DIR="${AGENT_CODE_INSTALL_DIR:-/usr/local/bin}"
 
 # Colors
 RED='\033[0;31m'
@@ -26,13 +26,13 @@ detect_platform() {
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
         Darwin*) os="macos" ;;
-        *)       error "Unsupported OS: $(uname -s). Use cargo install rs-code instead." ;;
+        *)       error "Unsupported OS: $(uname -s). Use cargo install agent-code instead." ;;
     esac
 
     case "$(uname -m)" in
         x86_64|amd64)  arch="x86_64" ;;
         aarch64|arm64) arch="aarch64" ;;
-        *)             error "Unsupported architecture: $(uname -m). Use cargo install rs-code instead." ;;
+        *)             error "Unsupported architecture: $(uname -m). Use cargo install agent-code instead." ;;
     esac
 
     echo "${os}-${arch}"
@@ -47,7 +47,7 @@ get_latest_version() {
 }
 
 main() {
-    info "Installing rs-code..."
+    info "Installing agent-code..."
 
     local platform version url tmpdir
 
@@ -88,16 +88,16 @@ main() {
 
     # Verify
     if command -v "$BINARY" &>/dev/null; then
-        success "rs-code ${version} installed to ${INSTALL_DIR}/${BINARY}"
+        success "agent-code ${version} installed to ${INSTALL_DIR}/${BINARY}"
         echo ""
         echo "  ${BOLD}${BINARY} --version${RESET}"
         "$BINARY" --version 2>/dev/null || true
         echo ""
         echo "  Get started:"
-        echo "    export RC_API_KEY=\"your-api-key\""
+        echo "    export AGENT_CODE_API_KEY=\"your-api-key\""
         echo "    ${BINARY}"
         echo ""
-        echo "  Docs: https://avala-ai.github.io/rs-code/"
+        echo "  Docs: https://avala-ai.github.io/agent-code/"
     else
         success "Installed to ${INSTALL_DIR}/${BINARY}"
         echo ""

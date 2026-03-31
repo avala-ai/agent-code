@@ -1,6 +1,6 @@
 //! Customizable keyboard shortcuts.
 //!
-//! Keybindings are loaded from `~/.config/rs-code/keybindings.json`.
+//! Keybindings are loaded from `~/.config/agent-code/keybindings.json`.
 //! Each binding maps a key chord to an action (command, prompt, or
 //! built-in function).
 
@@ -113,7 +113,7 @@ impl KeybindingRegistry {
 }
 
 fn keybindings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("keybindings.json"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("keybindings.json"))
 }
 
 fn load_keybindings_file(path: &PathBuf) -> Result<Vec<Keybinding>, String> {

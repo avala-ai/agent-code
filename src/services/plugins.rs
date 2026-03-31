@@ -7,7 +7,7 @@
 //! - `skills/` — skill files to register
 //! - `hooks/` — hook definitions
 //!
-//! Plugins are loaded from `~/.config/rs-code/plugins/` and
+//! Plugins are loaded from `~/.config/agent-code/plugins/` and
 //! project-level `.rc/plugins/`.
 
 use serde::{Deserialize, Serialize};
@@ -157,5 +157,5 @@ fn load_plugin(path: &Path) -> Result<Plugin, String> {
 }
 
 fn user_plugin_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("plugins"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("plugins"))
 }

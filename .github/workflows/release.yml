@@ -16,16 +16,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: rc-linux-x86_64
+            artifact: agent-linux-x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact: rc-linux-aarch64
+            artifact: agent-linux-aarch64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: rc-macos-x86_64
+            artifact: agent-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: rc-macos-aarch64
+            artifact: agent-macos-aarch64
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -58,10 +58,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            rc-linux-x86_64/rc-linux-x86_64.tar.gz
-            rc-linux-aarch64/rc-linux-aarch64.tar.gz
-            rc-macos-x86_64/rc-macos-x86_64.tar.gz
-            rc-macos-aarch64/rc-macos-aarch64.tar.gz
+            agent-linux-x86_64/agent-linux-x86_64.tar.gz
+            agent-linux-aarch64/agent-linux-aarch64.tar.gz
+            agent-macos-x86_64/agent-macos-x86_64.tar.gz
+            agent-macos-aarch64/agent-macos-aarch64.tar.gz
           generate_release_notes: true
 
   publish-crate:

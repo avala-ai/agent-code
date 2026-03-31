@@ -114,7 +114,7 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     } else {
         checks.push(Check::fail(
             "config:api_key",
-            "No API key set (RC_API_KEY or --api-key)",
+            "No API key set (AGENT_CODE_API_KEY or --api-key)",
         ));
     }
 
@@ -142,7 +142,7 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 5. Config file locations.
-    let user_config = dirs::config_dir().map(|d| d.join("rs-code").join("config.toml"));
+    let user_config = dirs::config_dir().map(|d| d.join("agent-code").join("config.toml"));
     if let Some(ref path) = user_config {
         if path.exists() {
             checks.push(Check::pass(

@@ -1,7 +1,7 @@
 //! Skill system.
 //!
 //! Skills are reusable, user-defined workflows loaded from markdown
-//! files in `.rc/skills/` or `~/.config/rs-code/skills/`. Each
+//! files in `.rc/skills/` or `~/.config/agent-code/skills/`. Each
 //! skill is a markdown file with YAML frontmatter that defines:
 //!
 //! - `description`: what the skill does
@@ -246,7 +246,7 @@ fn serde_yaml_parse(yaml: &str) -> Result<SkillMetadata, String> {
 
 /// Get the user-level skills directory.
 fn user_skills_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("skills"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("skills"))
 }
 
 #[cfg(test)]

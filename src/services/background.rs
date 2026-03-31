@@ -186,7 +186,7 @@ impl TaskManager {
 fn task_output_path(id: &TaskId) -> PathBuf {
     let dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rs-code")
+        .join("agent-code")
         .join("tasks");
     dir.join(format!("{id}.out"))
 }

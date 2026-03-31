@@ -2,7 +2,7 @@
 //!
 //! Saves and restores conversation state across sessions. Each session
 //! gets a unique ID and is stored as a JSON file in the sessions
-//! directory (`~/.config/rs-code/sessions/`).
+//! directory (`~/.config/agent-code/sessions/`).
 
 use std::path::PathBuf;
 
@@ -33,7 +33,7 @@ pub struct SessionData {
 
 /// Sessions directory path.
 fn sessions_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rs-code").join("sessions"))
+    dirs::config_dir().map(|d| d.join("agent-code").join("sessions"))
 }
 
 /// Save the current session to disk.

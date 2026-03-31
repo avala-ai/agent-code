@@ -1,4 +1,4 @@
-//! rs-code: An AI-powered coding agent for the terminal.
+//! agent-code: An AI-powered coding agent for the terminal.
 //!
 //! Entry point for the `rc` binary. Handles CLI argument parsing,
 //! configuration loading, and launches the interactive REPL or
@@ -35,22 +35,22 @@ use crate::tools::registry::ToolRegistry;
 
 /// AI-powered coding agent for the terminal.
 #[derive(Parser, Debug)]
-#[command(name = "rc", version, about)]
+#[command(name = "agent", version, about)]
 struct Cli {
     /// Execute a single prompt and exit (non-interactive mode).
     #[arg(short, long)]
     prompt: Option<String>,
 
     /// API base URL override.
-    #[arg(long, env = "RC_API_BASE_URL")]
+    #[arg(long, env = "AGENT_CODE_API_BASE_URL")]
     api_base_url: Option<String>,
 
     /// Model to use.
-    #[arg(long, short, env = "RC_MODEL")]
+    #[arg(long, short, env = "AGENT_CODE_MODEL")]
     model: Option<String>,
 
     /// API key.
-    #[arg(long, env = "RC_API_KEY", hide_env_values = true)]
+    #[arg(long, env = "AGENT_CODE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
     /// Enable verbose output.
@@ -126,10 +126,9 @@ async fn main() -> anyhow::Result<()> {
         };
     }
 
-    let api_key =
-        config.api.api_key.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("API key required. Set RC_API_KEY or pass --api-key.")
-        })?;
+    let api_key = config.api.api_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("API key required. Set AGENT_CODE_API_KEY or pass --api-key.")
+    })?;
 
     // Initialize LLM provider.
     let provider_kind = match cli.provider.as_str() {

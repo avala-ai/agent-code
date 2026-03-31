@@ -4,23 +4,23 @@
 **One-line install** (Linux/macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/avala-ai/rs-code/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
 ```
 
 Or via package managers:
 
 ```bash
 # crates.io
-cargo install rs-code
+cargo install agent-code
 
 # homebrew
-brew install avala-ai/tap/rs-code
+brew install avala-ai/tap/agent-code
 ```
 
 
 ## Set your API key
 
-rs-code works with any LLM provider. Set the key for the one you use:
+agent-code works with any LLM provider. Set the key for the one you use:
 
 
 ```bash Anthropic (Claude)
@@ -32,8 +32,8 @@ export OPENAI_API_KEY="sk-..."
 ```
 
 ```bash Any provider
-export RC_API_KEY="your-key"
-export RC_API_BASE_URL="https://api.your-provider.com/v1"
+export AGENT_CODE_API_KEY="your-key"
+export AGENT_CODE_API_BASE_URL="https://api.your-provider.com/v1"
 ```
 
 

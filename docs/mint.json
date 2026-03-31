@@ -1,6 +1,6 @@
 {
   "$schema": "https://mintlify.com/schema.json",
-  "name": "rs-code",
+  "name": "agent-code",
   "logo": {
     "dark": "/logo/dark.svg",
     "light": "/logo/light.svg"
@@ -18,12 +18,12 @@
   "topbarLinks": [
     {
       "name": "GitHub",
-      "url": "https://github.com/avala-ai/rs-code"
+      "url": "https://github.com/avala-ai/agent-code"
     }
   ],
   "topbarCtaButton": {
     "name": "Install",
-    "url": "https://github.com/avala-ai/rs-code#install"
+    "url": "https://github.com/avala-ai/agent-code#install"
   },
   "tabs": [
     {
@@ -35,12 +35,12 @@
     {
       "name": "GitHub",
       "icon": "github",
-      "url": "https://github.com/avala-ai/rs-code"
+      "url": "https://github.com/avala-ai/agent-code"
     },
     {
       "name": "Crates.io",
       "icon": "box",
-      "url": "https://crates.io/crates/rs-code"
+      "url": "https://crates.io/crates/agent-code"
     }
   ],
   "navigation": [
@@ -91,6 +91,6 @@
     }
   ],
   "footerSocials": {
-    "github": "https://github.com/avala-ai/rs-code"
+    "github": "https://github.com/avala-ai/agent-code"
   }
 }

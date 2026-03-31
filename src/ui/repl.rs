@@ -170,7 +170,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let session_id = crate::services::session::new_session_id();
 
     // Load history.
-    let history_path = dirs::data_dir().map(|d| d.join("rs-code").join("history.txt"));
+    let history_path = dirs::data_dir().map(|d| d.join("agent-code").join("history.txt"));
     if let Some(ref path) = history_path {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = rl.load_history(path);
@@ -185,7 +185,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     };
     println!(
         "{} {}{}\n{}\n",
-        " rc ".on_dark_cyan().white().bold(),
+        " agent ".on_dark_cyan().white().bold(),
         format!("session {session_id}").dark_grey(),
         mode_label.dark_grey(),
         "Type your message, or /help for commands. Ctrl+C to cancel, Ctrl+D to exit.".dark_grey(),

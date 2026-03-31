@@ -76,7 +76,7 @@ impl McpClient {
                         "resources": {}
                     },
                     "clientInfo": {
-                        "name": "rc",
+                        "name": "agent-code",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 })),

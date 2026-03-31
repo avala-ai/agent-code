@@ -1,5 +1,5 @@
 [book]
-title = "rs-code Documentation"
+title = "agent-code Documentation"
 authors = ["Avala AI"]
 language = "en"
 src = "src"
@@ -10,5 +10,5 @@ build-dir = "../docs-out"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/avala-ai/rs-code"
-site-url = "https://avala-ai.github.io/rs-code/"
+git-repository-url = "https://github.com/avala-ai/agent-code"
+site-url = "https://avala-ai.github.io/agent-code/"

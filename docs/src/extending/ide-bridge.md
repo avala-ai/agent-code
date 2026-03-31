@@ -1,9 +1,9 @@
 
-The IDE bridge allows editor extensions (VS Code, JetBrains, etc.) to communicate with a running rs-code instance over HTTP.
+The IDE bridge allows editor extensions (VS Code, JetBrains, etc.) to communicate with a running agent-code instance over HTTP.
 
 ## How it works
 
-When rs-code starts, it writes a lock file to `~/.cache/rs-code/bridge/`. IDE extensions scan for lock files to discover running sessions.
+When agent-code starts, it writes a lock file to `~/.cache/agent-code/bridge/`. IDE extensions scan for lock files to discover running sessions.
 
 The lock file contains:
 
@@ -40,7 +40,7 @@ for b in &bridges {
 
 ## Building an extension
 
-1. Scan `~/.cache/rs-code/bridge/` for `.lock` files
+1. Scan `~/.cache/agent-code/bridge/` for `.lock` files
 2. Parse the JSON to get the port
 3. Connect to `http://localhost:{port}`
 4. Use the HTTP endpoints to interact with the session

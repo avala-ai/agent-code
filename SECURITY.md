@@ -8,7 +8,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in rs-code, please report it responsibly.
+If you discover a security vulnerability in agent-code, please report it responsibly.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
@@ -23,7 +23,7 @@ We will acknowledge your report within 48 hours and provide a timeline for a fix
 
 ## Security Model
 
-rs-code executes shell commands and modifies files on behalf of the user. The security model is designed to prevent the AI agent from taking actions the user hasn't approved.
+agent-code executes shell commands and modifies files on behalf of the user. The security model is designed to prevent the AI agent from taking actions the user hasn't approved.
 
 ### Permission System
 
@@ -74,9 +74,9 @@ The Bash tool includes built-in safety checks:
 ### Data Handling
 
 - No telemetry is collected or transmitted
-- Session data is stored locally in `~/.config/rs-code/`
+- Session data is stored locally in `~/.config/agent-code/`
 - Conversation history never leaves the machine except for LLM API calls
-- Tool result persistence is local only (`~/.cache/rs-code/`)
+- Tool result persistence is local only (`~/.cache/agent-code/`)
 
 ## Threat Model
 
@@ -90,6 +90,6 @@ The Bash tool includes built-in safety checks:
 ### Out of scope
 
 - Security of the LLM API endpoint itself
-- Security of the user's local machine beyond what rs-code touches
+- Security of the user's local machine beyond what agent-code touches
 - Attacks requiring physical access to the machine
 - Social engineering of the user

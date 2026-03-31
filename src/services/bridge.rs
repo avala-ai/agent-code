@@ -49,7 +49,7 @@ pub struct BridgeMessageRequest {
 pub fn write_lock_file(port: u16, cwd: &str) -> Result<PathBuf, String> {
     let lock_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rs-code")
+        .join("agent-code")
         .join("bridge");
 
     std::fs::create_dir_all(&lock_dir)
@@ -81,7 +81,7 @@ pub fn remove_lock_file(lock_file: &PathBuf) {
 /// Discover running bridge instances by scanning lock files.
 pub fn discover_bridges() -> Vec<BridgeInstance> {
     let lock_dir = match dirs::cache_dir() {
-        Some(d) => d.join("rs-code").join("bridge"),
+        Some(d) => d.join("agent-code").join("bridge"),
         None => return Vec::new(),
     };
 
