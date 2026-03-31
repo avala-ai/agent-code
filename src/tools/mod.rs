@@ -140,6 +140,8 @@ pub struct ToolContext {
     pub verbose: bool,
     /// Plan mode: only read-only tools allowed.
     pub plan_mode: bool,
+    /// File content cache for avoiding redundant reads.
+    pub file_cache: Option<Arc<tokio::sync::Mutex<crate::services::file_cache::FileCache>>>,
 }
 
 /// Result of a tool execution.

@@ -46,6 +46,7 @@ pub struct QueryEngineConfig {
 pub struct QueryEngine {
     llm: Arc<dyn Provider>,
     tools: ToolRegistry,
+    file_cache: Arc<tokio::sync::Mutex<crate::services::file_cache::FileCache>>,
     permissions: Arc<PermissionChecker>,
     state: AppState,
     config: QueryEngineConfig,
@@ -86,6 +87,9 @@ impl QueryEngine {
         Self {
             llm,
             tools,
+            file_cache: Arc::new(tokio::sync::Mutex::new(
+                crate::services::file_cache::FileCache::new(),
+            )),
             permissions: Arc::new(permissions),
             state,
             config,
@@ -189,10 +193,26 @@ impl QueryEngine {
                                 "LLM compaction failed (attempt {})",
                                 compact_tracking.consecutive_failures
                             );
-                            // Fallback: aggressive microcompact.
-                            let freed2 = compact::microcompact(&mut self.state.messages, 2);
-                            if freed2 > 0 {
-                                sink.on_compact(freed2);
+                            // Fallback: context collapse (snip middle messages).
+                            let effective = compact::effective_context_window(&model);
+                            if let Some(collapse) =
+                                crate::services::context_collapse::collapse_to_budget(
+                                    self.state.history(),
+                                    effective,
+                                )
+                            {
+                                info!(
+                                    "Context collapse snipped {} messages, freed ~{} tokens",
+                                    collapse.snipped_count, collapse.tokens_freed
+                                );
+                                self.state.messages = collapse.api_messages;
+                                sink.on_compact(collapse.tokens_freed);
+                            } else {
+                                // Last resort: aggressive microcompact.
+                                let freed2 = compact::microcompact(&mut self.state.messages, 2);
+                                if freed2 > 0 {
+                                    sink.on_compact(freed2);
+                                }
                             }
                         }
                     }
@@ -383,6 +403,7 @@ impl QueryEngine {
                 permission_checker: self.permissions.clone(),
                 verbose: self.config.verbose,
                 plan_mode: self.state.plan_mode,
+                file_cache: Some(self.file_cache.clone()),
             };
 
             // Fire pre-tool-use hooks.
