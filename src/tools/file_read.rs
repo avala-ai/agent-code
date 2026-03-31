@@ -75,11 +75,50 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(2000) as usize;
 
-        let content = tokio::fs::read_to_string(file_path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {file_path}: {e}")))?;
+        let path = std::path::Path::new(file_path);
 
-        // Apply line range and add line numbers (1-indexed, matching `cat -n`).
+        // Handle binary/special file types.
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => {
+                return Ok(ToolResult::success(format!(
+                    "(PDF file: {file_path} — use a PDF extraction tool for contents)"
+                )));
+            }
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "bmp") => {
+                let meta = tokio::fs::metadata(file_path).await.ok();
+                let size = meta.map(|m| m.len()).unwrap_or(0);
+                return Ok(ToolResult::success(format!(
+                    "(Image file: {file_path}, {size} bytes)"
+                )));
+            }
+            Some("wasm" | "exe" | "dll" | "so" | "dylib" | "o" | "a") => {
+                let meta = tokio::fs::metadata(file_path).await.ok();
+                let size = meta.map(|m| m.len()).unwrap_or(0);
+                return Ok(ToolResult::success(format!(
+                    "(Binary file: {file_path}, {size} bytes)"
+                )));
+            }
+            _ => {}
+        }
+
+        // Try to read as text; if it fails (binary content), report the file type.
+        let content = match tokio::fs::read_to_string(file_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                // May be binary — try to read size at least.
+                if let Ok(meta) = tokio::fs::metadata(file_path).await {
+                    return Ok(ToolResult::success(format!(
+                        "(Binary or unreadable file: {file_path}, {} bytes: {e})",
+                        meta.len()
+                    )));
+                }
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to read {file_path}: {e}"
+                )));
+            }
+        };
+
+        // Apply line range and add line numbers (1-indexed).
         let lines: Vec<&str> = content.lines().collect();
         let start = (offset.saturating_sub(1)).min(lines.len());
         let end = (start + limit).min(lines.len());
