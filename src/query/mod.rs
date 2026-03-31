@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::LlmError;
+use crate::hooks::{HookEvent, HookRegistry};
 use crate::llm::client::{CompletionRequest, LlmClient};
 use crate::llm::message::*;
 use crate::llm::stream::StreamEvent;
@@ -50,6 +51,7 @@ pub struct QueryEngine {
     state: AppState,
     config: QueryEngineConfig,
     cancel: CancellationToken,
+    hooks: HookRegistry,
 }
 
 /// Callback for streaming events to the UI.
@@ -89,6 +91,7 @@ impl QueryEngine {
             state,
             config,
             cancel: CancellationToken::new(),
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -351,7 +354,7 @@ impl QueryEngine {
                 return Ok(());
             }
 
-            // Step 8: Execute tool calls.
+            // Step 8: Execute tool calls with pre/post hooks.
             info!("Executing {} tool call(s)", tool_calls.len());
             let cwd = PathBuf::from(&self.state.cwd);
             let tool_ctx = ToolContext {
@@ -361,6 +364,17 @@ impl QueryEngine {
                 verbose: self.config.verbose,
             };
 
+            // Fire pre-tool-use hooks.
+            for call in &tool_calls {
+                self.hooks
+                    .run_hooks(
+                        &HookEvent::PreToolUse,
+                        Some(&call.name),
+                        &call.input,
+                    )
+                    .await;
+            }
+
             let results = execute_tool_calls(
                 &tool_calls,
                 self.tools.all(),
@@ -369,9 +383,22 @@ impl QueryEngine {
             )
             .await;
 
-            // Step 9: Inject tool results as user messages.
+            // Step 9: Inject tool results + fire post-tool-use hooks.
             for result in &results {
                 sink.on_tool_result(&result.tool_name, &result.result);
+
+                // Fire post-tool-use hooks.
+                self.hooks
+                    .run_hooks(
+                        &HookEvent::PostToolUse,
+                        Some(&result.tool_name),
+                        &serde_json::json!({
+                            "tool": result.tool_name,
+                            "is_error": result.result.is_error,
+                        }),
+                    )
+                    .await;
+
                 let msg = tool_result_message(
                     &result.tool_use_id,
                     &result.result.content,
