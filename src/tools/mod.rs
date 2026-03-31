@@ -33,6 +33,7 @@ pub mod lsp_tool;
 pub mod plan_mode;
 pub mod registry;
 pub mod send_message;
+pub mod streaming_executor;
 pub mod sleep_tool;
 pub mod tasks;
 pub mod todo_write;
