@@ -131,6 +131,8 @@ pub struct ToolContext {
     pub permission_checker: Arc<PermissionChecker>,
     /// Whether to produce verbose output.
     pub verbose: bool,
+    /// Plan mode: only read-only tools allowed.
+    pub plan_mode: bool,
 }
 
 /// Result of a tool execution.

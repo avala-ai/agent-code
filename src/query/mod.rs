@@ -362,6 +362,7 @@ impl QueryEngine {
                 cancel: self.cancel.clone(),
                 permission_checker: self.permissions.clone(),
                 verbose: self.config.verbose,
+                plan_mode: self.state.plan_mode,
             };
 
             // Fire pre-tool-use hooks.

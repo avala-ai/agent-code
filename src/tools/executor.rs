@@ -117,6 +117,7 @@ pub async fn execute_tool_calls(
                         let ctx_verbose = ctx.verbose;
                         let perm_checker = ctx.permission_checker.clone();
 
+                        let ctx_plan_mode = ctx.plan_mode;
                         // Read-only tools still go through permission checks.
                         handles.push(tokio::spawn(async move {
                             execute_single_tool(&call, &*tool, &ToolContext {
@@ -124,6 +125,7 @@ pub async fn execute_tool_calls(
                                 cancel: ctx_cancel,
                                 permission_checker: perm_checker.clone(),
                                 verbose: ctx_verbose,
+                                plan_mode: ctx_plan_mode,
                             }, &*perm_checker).await
                         }));
                     }
@@ -160,6 +162,18 @@ async fn execute_single_tool(
     ctx: &ToolContext,
     permission_checker: &PermissionChecker,
 ) -> ToolCallResult {
+    // Block non-read-only tools in plan mode.
+    if ctx.plan_mode && !tool.is_read_only() {
+        return ToolCallResult {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            result: ToolResult::error(
+                "Plan mode active: only read-only tools are allowed. \
+                 Use ExitPlanMode to enable mutations.".to_string(),
+            ),
+        };
+    }
+
     // Check permissions.
     let decision = tool.check_permissions(&call.input, permission_checker).await;
     match decision {

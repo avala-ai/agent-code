@@ -26,6 +26,8 @@ pub struct AppState {
     pub cwd: String,
     /// Per-model token usage.
     pub model_usage: HashMap<String, Usage>,
+    /// Whether plan mode is active (read-only tools only).
+    pub plan_mode: bool,
 }
 
 impl AppState {
@@ -43,6 +45,7 @@ impl AppState {
             turn_count: 0,
             cwd,
             model_usage: HashMap::new(),
+            plan_mode: false,
         }
     }
 
