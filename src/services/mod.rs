@@ -9,6 +9,7 @@ pub mod compact;
 pub mod coordinator;
 pub mod diagnostics;
 pub mod git;
+pub mod history;
 pub mod lsp;
 pub mod mcp;
 pub mod plugins;
