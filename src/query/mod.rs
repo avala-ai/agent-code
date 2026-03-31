@@ -468,13 +468,17 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
     );
 
     // Environment context.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+    let is_git = std::path::Path::new(&state.cwd).join(".git").exists();
     prompt.push_str(&format!(
         "# Environment\n\
          - Working directory: {}\n\
          - Platform: {}\n\
-         - Shell: bash\n\n",
+         - Shell: {shell}\n\
+         - Git repository: {}\n\n",
         state.cwd,
         std::env::consts::OS,
+        if is_git { "yes" } else { "no" },
     ));
 
     // Inject memory context (project + user).
@@ -490,6 +494,26 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
         if tool.is_enabled() {
             prompt.push_str(&format!("## {}\n{}\n\n", tool.name(), tool.prompt()));
         }
+    }
+
+    // Available skills.
+    let skills = crate::skills::SkillRegistry::load_all(Some(std::path::Path::new(&state.cwd)));
+    let invocable = skills.user_invocable();
+    if !invocable.is_empty() {
+        prompt.push_str("# Available Skills\n\n");
+        for skill in invocable {
+            let desc = skill.metadata.description.as_deref().unwrap_or("");
+            let when = skill.metadata.when_to_use.as_deref().unwrap_or("");
+            prompt.push_str(&format!("- `/{}`", skill.name));
+            if !desc.is_empty() {
+                prompt.push_str(&format!(": {desc}"));
+            }
+            if !when.is_empty() {
+                prompt.push_str(&format!(" (use when: {when})"));
+            }
+            prompt.push('\n');
+        }
+        prompt.push('\n');
     }
 
     // Guidelines.
