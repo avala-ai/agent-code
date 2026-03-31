@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long, default_value = "ask")]
     permission_mode: String,
 
+    /// LLM provider: anthropic, openai, or auto (default).
+    #[arg(long, default_value = "auto")]
+    provider: String,
+
     /// Print system prompt and exit.
     #[arg(long)]
     dump_system_prompt: bool,
@@ -108,8 +112,12 @@ async fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("API key required. Set RC_API_KEY or pass --api-key.")
         })?;
 
-    // Initialize LLM provider based on model/URL auto-detection.
-    let provider_kind = detect_provider(&config.api.model, &config.api.base_url);
+    // Initialize LLM provider.
+    let provider_kind = match cli.provider.as_str() {
+        "anthropic" => ProviderKind::Anthropic,
+        "openai" => ProviderKind::OpenAi,
+        _ => detect_provider(&config.api.model, &config.api.base_url),
+    };
     let llm: Arc<dyn crate::llm::provider::Provider> = match provider_kind {
         ProviderKind::Anthropic => Arc::new(crate::llm::anthropic::AnthropicProvider::new(
             &config.api.base_url,
