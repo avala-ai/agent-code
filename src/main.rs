@@ -61,9 +61,14 @@ struct Cli {
     #[arg(short = 'C', long)]
     cwd: Option<String>,
 
-    /// Permission mode: ask, allow, deny.
+    /// Permission mode: ask, allow, deny, plan, accept_edits.
     #[arg(long, default_value = "ask")]
     permission_mode: String,
+
+    /// Skip all permission checks. Equivalent to --permission-mode allow.
+    /// Use only in trusted environments (CI, scripting).
+    #[arg(long)]
+    dangerously_skip_permissions: bool,
 
     /// LLM provider: anthropic, openai, or auto (default).
     #[arg(long, default_value = "auto")]
@@ -105,6 +110,20 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref key) = cli.api_key {
         config.api.api_key = Some(key.clone());
+    }
+
+    // Apply permission mode from CLI.
+    if cli.dangerously_skip_permissions {
+        config.permissions.default_mode = crate::config::PermissionMode::Allow;
+        tracing::warn!("All permission checks disabled (--dangerously-skip-permissions)");
+    } else {
+        config.permissions.default_mode = match cli.permission_mode.as_str() {
+            "allow" => crate::config::PermissionMode::Allow,
+            "deny" => crate::config::PermissionMode::Deny,
+            "plan" => crate::config::PermissionMode::Plan,
+            "accept_edits" => crate::config::PermissionMode::AcceptEdits,
+            _ => crate::config::PermissionMode::Ask,
+        };
     }
 
     let api_key =
