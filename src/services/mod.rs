@@ -5,6 +5,7 @@
 
 pub mod background;
 pub mod compact;
+pub mod coordinator;
 pub mod mcp;
 pub mod session;
 pub mod tokens;
