@@ -13,6 +13,7 @@ mod memory;
 mod permissions;
 mod query;
 mod services;
+mod skills;
 mod state;
 mod tools;
 mod ui;
