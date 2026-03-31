@@ -1,7 +1,7 @@
 //! Core services layer.
 //!
 //! Services handle cross-cutting concerns like history compaction,
-//! token estimation, and memory persistence. Each service is
-//! independently testable.
+//! token estimation, and memory persistence.
 
-// Future modules: compact, token_estimation, memory, analytics
+pub mod compact;
+pub mod tokens;
