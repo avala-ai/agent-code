@@ -106,7 +106,15 @@ impl Provider for AnthropicProvider {
             body["temperature"] = serde_json::json!(temp);
         }
 
-        debug!("Anthropic request to {url}");
+        // Thinking configuration (adaptive or budgeted).
+        let thinking_budget =
+            crate::services::tokens::max_thinking_tokens_for_model(&request.model);
+        body["thinking"] = serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": thinking_budget,
+        });
+
+        debug!("Anthropic request to {url} (thinking budget: {thinking_budget})");
 
         let response = self
             .http

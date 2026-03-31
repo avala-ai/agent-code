@@ -11,14 +11,18 @@ use std::time::Duration;
 
 use crossterm::style::Stylize;
 
-/// Phrases cycled through during LLM response wait.
-const THINKING_PHRASES: &[&str] = &[
-    "reasoning",
-    "considering",
-    "analyzing",
-    "evaluating",
-    "processing",
-    "formulating",
+/// Status labels displayed while waiting for a response.
+const WAIT_LABELS: &[&str] = &[
+    "working",
+    "running",
+    "figuring",
+    "searching",
+    "assembling",
+    "parsing",
+    "resolving",
+    "mapping",
+    "tracing",
+    "scanning",
 ];
 
 /// Frames for the dot animation.
@@ -43,7 +47,7 @@ impl ActivityIndicator {
 
             while active_clone.load(Ordering::Relaxed) {
                 let dots = DOT_FRAMES[frame % DOT_FRAMES.len()];
-                let phrase = THINKING_PHRASES[phrase_idx % THINKING_PHRASES.len()];
+                let phrase = WAIT_LABELS[phrase_idx % WAIT_LABELS.len()];
 
                 let status = if label.is_empty() {
                     format!("{phrase}{dots}")

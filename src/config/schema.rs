@@ -47,6 +47,12 @@ pub struct ApiConfig {
     pub api_key: Option<String>,
     /// Maximum output tokens per response.
     pub max_output_tokens: Option<u32>,
+    /// Thinking mode: "enabled", "disabled", or "adaptive".
+    pub thinking: Option<String>,
+    /// Effort level: "low", "medium", "high".
+    pub effort: Option<String>,
+    /// Maximum spend per session in USD.
+    pub max_cost_usd: Option<f64>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
     /// Maximum retry attempts for transient errors.
@@ -76,6 +82,9 @@ impl Default for ApiConfig {
             model: "claude-sonnet-4-20250514".to_string(),
             api_key,
             max_output_tokens: Some(16384),
+            thinking: None,
+            effort: None,
+            max_cost_usd: None,
             timeout_secs: 120,
             max_retries: 3,
         }

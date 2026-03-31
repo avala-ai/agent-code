@@ -402,9 +402,13 @@ fn blocks_to_openai_content(blocks: &[ContentBlock]) -> serde_json::Value {
                 "content": content,
                 "is_error": is_error,
             }),
-            other => serde_json::json!({
+            ContentBlock::Thinking { thinking, .. } => serde_json::json!({
                 "type": "text",
-                "text": format!("{other:?}"),
+                "text": thinking,
+            }),
+            ContentBlock::ToolUse { name, input, .. } => serde_json::json!({
+                "type": "text",
+                "text": format!("[Tool call: {name}({input})]"),
             }),
         })
         .collect();
