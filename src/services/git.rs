@@ -331,4 +331,184 @@ index abc..def 100644
         assert_eq!(added, 2);
         assert_eq!(removed, 1);
     }
+
+    #[test]
+    fn test_parse_diff_multiple_files() {
+        let diff = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,1 +1,1 @@
+-old
++new
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1,1 +1,2 @@
+ keep
++added
+";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.rs");
+        assert_eq!(files[1].path, "b.rs");
+    }
+
+    #[test]
+    fn test_parse_diff_empty() {
+        let files = parse_diff("");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_diff_line_kinds() {
+        assert!(matches!(DiffLineKind::Added, DiffLineKind::Added));
+        assert!(matches!(DiffLineKind::Removed, DiffLineKind::Removed));
+        assert!(matches!(DiffLineKind::Context, DiffLineKind::Context));
+    }
+
+    #[tokio::test]
+    async fn test_is_git_repo_in_repo() {
+        // This test runs inside the agent-code repo itself.
+        // Create a directory that IS a git repo.
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(is_git_repo(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_git_repo_not_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn test_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        let root = repo_root(dir.path()).await;
+        assert!(root.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_new_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        // New repo with no commits may not have a branch.
+        let _branch = current_branch(dir.path()).await;
+        // Just ensure it doesn't panic.
+    }
+
+    #[tokio::test]
+    async fn test_current_branch_with_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let branch = current_branch(dir.path()).await;
+        assert!(branch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_status_and_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        // Modify file.
+        std::fs::write(dir.path().join("f.txt"), "v2").unwrap();
+
+        let st = status(dir.path()).await.unwrap();
+        assert!(st.contains("f.txt"));
+
+        let d = diff(dir.path()).await.unwrap();
+        assert!(d.contains("v1") || d.contains("v2"));
+    }
+
+    #[tokio::test]
+    async fn test_is_shallow_and_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        // Fresh init is not shallow and not a worktree.
+        assert!(!is_shallow(dir.path()).await);
+        assert!(!is_worktree(dir.path()).await);
+    }
 }

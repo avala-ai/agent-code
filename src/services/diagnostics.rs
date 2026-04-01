@@ -292,3 +292,110 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
 
     checks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_constructors() {
+        let p = Check::pass("test", "ok");
+        assert_eq!(p.status, CheckStatus::Pass);
+        assert_eq!(p.symbol(), "ok");
+
+        let w = Check::warn("test", "warning");
+        assert_eq!(w.status, CheckStatus::Warn);
+        assert_eq!(w.symbol(), "!?");
+
+        let f = Check::fail("test", "failed");
+        assert_eq!(f.status, CheckStatus::Fail);
+        assert_eq!(f.symbol(), "xx");
+    }
+
+    #[test]
+    fn test_check_fields() {
+        let c = Check::pass("git:repo", "Git repository on branch 'main'");
+        assert_eq!(c.name, "git:repo");
+        assert!(c.detail.contains("main"));
+    }
+
+    #[tokio::test]
+    async fn test_run_all_returns_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let checks = run_all(dir.path(), &config).await;
+
+        // Should always return at least a few checks.
+        assert!(checks.len() >= 3);
+
+        // Should always check for git.
+        assert!(checks.iter().any(|c| c.name.starts_with("tool:")));
+    }
+
+    #[tokio::test]
+    async fn test_run_all_in_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let config = crate::config::Config::default();
+        let checks = run_all(dir.path(), &config).await;
+
+        let git_check = checks.iter().find(|c| c.name == "git:repo");
+        assert!(git_check.is_some());
+        assert_eq!(git_check.unwrap().status, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn test_run_all_no_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.api.api_key = None;
+
+        let checks = run_all(dir.path(), &config).await;
+
+        let api_check = checks.iter().find(|c| c.name == "config:api_key");
+        assert!(api_check.is_some());
+        assert_eq!(api_check.unwrap().status, CheckStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn test_run_all_with_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.api.api_key = Some("test-key".to_string());
+
+        let checks = run_all(dir.path(), &config).await;
+
+        let api_check = checks.iter().find(|c| c.name == "config:api_key");
+        assert!(api_check.is_some());
+        assert_eq!(api_check.unwrap().status, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn test_run_all_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.mcp_servers.insert(
+            "test-server".to_string(),
+            crate::config::McpServerEntry {
+                command: Some("nonexistent-binary-xyz".to_string()),
+                args: vec![],
+                url: None,
+                env: std::collections::HashMap::new(),
+            },
+        );
+
+        let checks = run_all(dir.path(), &config).await;
+
+        // Should have a check for the MCP server.
+        let mcp_check = checks.iter().find(|c| c.name == "mcp:test-server");
+        assert!(mcp_check.is_some());
+        // The binary won't exist, so it should fail.
+        assert_eq!(mcp_check.unwrap().status, CheckStatus::Fail);
+    }
+}
