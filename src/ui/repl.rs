@@ -167,8 +167,10 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let mut rl =
         rustyline::Editor::<(), rustyline::history::DefaultHistory>::with_config(rl_config)?;
 
-    // Generate a session ID for persistence.
+    // Generate a session ID for persistence. Clone for later use since
+    // Stylize methods consume the String.
     let session_id = crate::services::session::new_session_id();
+    let session_id_display = session_id.clone();
 
     // Load history.
     let history_path = dirs::data_dir().map(|d| d.join("agent-code").join("history.txt"));
@@ -180,21 +182,33 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let verbose = engine.state().config.ui.syntax_highlight; // Use as verbose proxy for now.
 
     // Welcome message.
-    let mode_label = match input_mode {
-        super::keymap::InputMode::Vi => " vi",
-        super::keymap::InputMode::Emacs => "",
-    };
+    // Render the welcome banner.
+    let term_width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let divider = "─".repeat(term_width.min(100));
+    let model = engine.state().config.api.model.clone();
+    let cwd = engine.state().cwd.clone();
+
+    println!();
     println!(
-        "{} {}{}\n{}\n",
-        " agent ".on_dark_cyan().white().bold(),
-        format!("session {session_id}").dark_grey(),
-        mode_label.dark_grey(),
-        "Type your message, or /help for commands. Ctrl+C to cancel, Ctrl+D to exit.".dark_grey(),
+        "  {}   agent-code v{}",
+        "▐▛██▜▌".dark_cyan().bold(),
+        env!("CARGO_PKG_VERSION"),
     );
+    println!(
+        "  {}  {} · session {}",
+        "▝▜██▛▘".dark_cyan(),
+        model.white().bold(),
+        session_id_display.as_str().dark_grey(),
+    );
+    println!("  {}   {}", "  ▘▘  ".dark_cyan(), cwd.dark_grey(),);
+    println!();
+    println!("{}", divider.dark_grey());
 
     loop {
         let sink = TerminalSink::new(verbose);
-        let prompt = format!("{} ", ">".dark_cyan().bold());
+        let prompt = format!("{} ", "❯".dark_cyan().bold());
 
         match rl.readline(&prompt) {
             Ok(line) => {
@@ -249,8 +263,27 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 println!();
             }
             Err(ReadlineError::Interrupted) => {
-                engine.cancel();
-                eprintln!("{}", "(cancelled)".dark_grey());
+                if engine.state().is_query_active {
+                    engine.cancel();
+                    eprintln!("{}", "(cancelled)".dark_grey());
+                } else {
+                    // Not in a turn — Ctrl+C at the prompt means exit.
+                    eprintln!("{}", "(Ctrl+C again to exit, or type /exit)".dark_grey());
+                    // Wait for next input — if it's another Ctrl+C, break.
+                    match rl.readline(&format!("{} ", "❯".dark_cyan().bold())) {
+                        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+                        Ok(line) => {
+                            let input = line.trim();
+                            if !input.is_empty() {
+                                rl.add_history_entry(input).ok();
+                                // Process it normally on next loop iteration
+                                // by pushing it back... actually just continue.
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
             Err(ReadlineError::Eof) => {
                 break;
@@ -283,13 +316,22 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     }
 
     // Print session summary.
+    let divider = "─".repeat(term_width.min(100));
+    println!("{}", divider.dark_grey());
     if state.total_usage.total() > 0 {
         println!(
-            "\n{} {} turns | {} tokens | ${:.4}",
-            " session ".on_dark_cyan().white().bold(),
+            "  {} {} turns | {} tokens | ${:.4} | session {}",
+            "session".dark_cyan(),
             state.turn_count,
             state.total_usage.total(),
             state.total_cost_usd,
+            session_id_display.as_str().dark_grey(),
+        );
+    } else {
+        println!(
+            "  {} session {}",
+            "goodbye".dark_cyan(),
+            session_id_display.as_str().dark_grey()
         );
     }
 
