@@ -372,8 +372,20 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
 
     let mut ctrl_c_pending = false;
 
-    // Render the status bar before each prompt.
-    let render_status = |engine: &QueryEngine| {
+    let mut status_visible = false;
+
+    // Clear the status bar if one was printed.
+    let clear_status = |visible: &mut bool| {
+        if *visible {
+            // Move up one line, clear it.
+            eprint!("\x1b[A\x1b[2K\r");
+            let _ = std::io::stderr().flush();
+            *visible = false;
+        }
+    };
+
+    // Print the status bar (single line, will be cleared before next prompt).
+    let render_status = |engine: &QueryEngine, visible: &mut bool| {
         let state = engine.state();
         let turns = state.turn_count;
         if turns == 0 {
@@ -383,19 +395,23 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
         let cost = state.total_cost_usd;
         let model_str = &state.config.api.model;
         super::tui::render_status_bar(model_str, turns, tokens, cost);
+        *visible = true;
     };
 
     loop {
         let sink = TerminalSink::new(verbose);
         let t = super::theme::current();
 
-        // Show status bar before prompt.
-        render_status(engine);
+        // Clear previous status bar, then render fresh one.
+        clear_status(&mut status_visible);
+        render_status(engine, &mut status_visible);
 
         let prompt = format!("{} ", "❯".with(t.accent).bold());
 
         match rl.readline(&prompt) {
             Ok(line) => {
+                // Clear the status bar now that user submitted input.
+                clear_status(&mut status_visible);
                 ctrl_c_pending = false;
                 let mut input_buf = line.clone();
 
