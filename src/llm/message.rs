@@ -491,3 +491,128 @@ pub fn messages_to_api_params_cached(messages: &[Message]) -> Vec<serde_json::Va
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_user_message_creates_text() {
+        let msg = user_message("hello");
+        if let Message::User(u) = &msg {
+            assert_eq!(u.content.len(), 1);
+            assert_eq!(u.content[0].as_text(), Some("hello"));
+            assert!(!u.is_meta);
+        } else {
+            panic!("Expected User");
+        }
+    }
+
+    #[test]
+    fn test_tool_result_message_success() {
+        let msg = tool_result_message("c1", "output", false);
+        if let Message::User(u) = &msg {
+            assert!(u.is_meta);
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } = &u.content[0]
+            {
+                assert_eq!(tool_use_id, "c1");
+                assert!(!is_error);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tool_result_message_error() {
+        let msg = tool_result_message("c2", "fail", true);
+        if let Message::User(u) = &msg
+            && let ContentBlock::ToolResult { is_error, .. } = &u.content[0]
+        {
+            assert!(is_error);
+        }
+    }
+
+    #[test]
+    fn test_as_text() {
+        assert_eq!(
+            ContentBlock::Text { text: "hi".into() }.as_text(),
+            Some("hi")
+        );
+        assert_eq!(
+            ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "X".into(),
+                input: serde_json::json!({})
+            }
+            .as_text(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_as_tool_use() {
+        let b = ContentBlock::ToolUse {
+            id: "a".into(),
+            name: "B".into(),
+            input: serde_json::json!(1),
+        };
+        let (id, name, _) = b.as_tool_use().unwrap();
+        assert_eq!(id, "a");
+        assert_eq!(name, "B");
+        assert!(
+            ContentBlock::Text { text: "x".into() }
+                .as_tool_use()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_usage_total() {
+        let u = Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 7,
+        };
+        assert_eq!(u.total(), 40);
+    }
+
+    #[test]
+    fn test_usage_merge() {
+        let mut u = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        u.merge(&Usage {
+            input_tokens: 200,
+            output_tokens: 30,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 10,
+        });
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.output_tokens, 80);
+        assert_eq!(u.cache_creation_input_tokens, 5);
+    }
+
+    #[test]
+    fn test_usage_default() {
+        assert_eq!(Usage::default().total(), 0);
+    }
+
+    #[test]
+    fn test_message_uuid_accessible() {
+        let _ = user_message("t").uuid();
+    }
+
+    #[test]
+    fn test_messages_to_api_params_filters_system() {
+        let messages = vec![user_message("hi")];
+        let params = messages_to_api_params(&messages);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["role"], "user");
+    }
+}

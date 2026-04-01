@@ -124,3 +124,104 @@ pub enum CacheEvent {
     /// No cache interaction (first call or caching disabled).
     Miss,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_tracker() {
+        let t = CacheTracker::new();
+        assert_eq!(t.call_count, 0);
+        assert_eq!(t.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_first_call_miss() {
+        let mut t = CacheTracker::new();
+        let event = t.record(&Usage {
+            cache_creation_input_tokens: 1000,
+            ..Default::default()
+        });
+        assert!(matches!(event, CacheEvent::Miss));
+        assert_eq!(t.call_count, 1);
+    }
+
+    #[test]
+    fn test_cache_hit() {
+        let mut t = CacheTracker::new();
+        // First call — miss.
+        t.record(&Usage {
+            cache_creation_input_tokens: 1000,
+            ..Default::default()
+        });
+        // Second call — hit.
+        let event = t.record(&Usage {
+            cache_read_input_tokens: 900,
+            ..Default::default()
+        });
+        assert!(matches!(event, CacheEvent::Hit { .. }));
+        assert_eq!(t.hit_count, 1);
+    }
+
+    #[test]
+    fn test_cache_break() {
+        let mut t = CacheTracker::new();
+        // First call with reads.
+        t.record(&Usage {
+            cache_read_input_tokens: 500,
+            ..Default::default()
+        });
+        // Second call — no reads, only writes = break.
+        let event = t.record(&Usage {
+            cache_creation_input_tokens: 1000,
+            ..Default::default()
+        });
+        assert!(matches!(event, CacheEvent::Break { .. }));
+        assert_eq!(t.break_count, 1);
+    }
+
+    #[test]
+    fn test_partial_hit() {
+        let mut t = CacheTracker::new();
+        t.record(&Usage::default()); // First call.
+        let event = t.record(&Usage {
+            cache_read_input_tokens: 500,
+            cache_creation_input_tokens: 200,
+            ..Default::default()
+        });
+        assert!(matches!(event, CacheEvent::Partial { .. }));
+    }
+
+    #[test]
+    fn test_hit_rate() {
+        let mut t = CacheTracker::new();
+        t.record(&Usage::default()); // Miss.
+        t.record(&Usage {
+            cache_read_input_tokens: 100,
+            ..Default::default()
+        }); // Hit.
+        assert!((t.hit_rate() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_fingerprint_change_detection() {
+        let mut t = CacheTracker::new();
+        let changed = t.update_fingerprint("system prompt v1", 10);
+        assert!(!changed); // First call, no previous fingerprint.
+
+        let changed = t.update_fingerprint("system prompt v1", 10);
+        assert!(!changed); // Same fingerprint.
+
+        let changed = t.update_fingerprint("system prompt v2", 10);
+        assert!(changed); // Different prompt.
+    }
+
+    #[test]
+    fn test_fingerprint_tool_count_change() {
+        let mut t = CacheTracker::new();
+        t.update_fingerprint("prompt", 10);
+        let changed = t.update_fingerprint("prompt", 15);
+        assert!(changed); // Different tool count.
+    }
+}

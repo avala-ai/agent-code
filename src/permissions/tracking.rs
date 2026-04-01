@@ -111,3 +111,83 @@ fn summarize_input(tool_name: &str, input: &serde_json::Value) -> String {
             .collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_tracker() {
+        let t = DenialTracker::new(50);
+        assert_eq!(t.total(), 0);
+        assert!(t.denials().is_empty());
+    }
+
+    #[test]
+    fn test_record_denial() {
+        let mut t = DenialTracker::new(10);
+        t.record(
+            "Bash",
+            "call_1",
+            "too dangerous",
+            &serde_json::json!({"command": "rm -rf /"}),
+        );
+        assert_eq!(t.total(), 1);
+        assert_eq!(t.denials().len(), 1);
+        assert_eq!(t.denials()[0].tool_name, "Bash");
+    }
+
+    #[test]
+    fn test_denials_for_tool() {
+        let mut t = DenialTracker::new(10);
+        t.record("Bash", "c1", "reason", &serde_json::json!({}));
+        t.record("FileWrite", "c2", "reason", &serde_json::json!({}));
+        t.record("Bash", "c3", "reason", &serde_json::json!({}));
+        assert_eq!(t.denials_for_tool("Bash").len(), 2);
+        assert_eq!(t.denials_for_tool("FileWrite").len(), 1);
+        assert_eq!(t.denials_for_tool("Grep").len(), 0);
+    }
+
+    #[test]
+    fn test_bounded_capacity() {
+        let mut t = DenialTracker::new(3);
+        for i in 0..5 {
+            t.record("Bash", &format!("c{i}"), "r", &serde_json::json!({}));
+        }
+        assert_eq!(t.total(), 5); // Total tracks all.
+        assert_eq!(t.denials().len(), 3); // Deque bounded.
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut t = DenialTracker::new(10);
+        t.record("Bash", "c1", "r", &serde_json::json!({}));
+        t.clear();
+        assert_eq!(t.total(), 0);
+        assert!(t.denials().is_empty());
+    }
+
+    #[test]
+    fn test_input_summary_bash() {
+        let mut t = DenialTracker::new(10);
+        t.record(
+            "Bash",
+            "c1",
+            "r",
+            &serde_json::json!({"command": "rm -rf /"}),
+        );
+        assert!(t.denials()[0].input_summary.contains("rm -rf"));
+    }
+
+    #[test]
+    fn test_input_summary_file() {
+        let mut t = DenialTracker::new(10);
+        t.record(
+            "FileWrite",
+            "c1",
+            "r",
+            &serde_json::json!({"file_path": "/etc/passwd"}),
+        );
+        assert!(t.denials()[0].input_summary.contains("/etc/passwd"));
+    }
+}

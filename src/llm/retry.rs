@@ -113,6 +113,7 @@ pub enum RetryableError {
 }
 
 /// Action the caller should take after a failure.
+#[derive(Debug)]
 pub enum RetryAction {
     /// Wait and retry with the same model.
     Retry { after: Duration },
@@ -138,4 +139,81 @@ fn rand_f64() -> f64 {
         .unwrap_or_default()
         .subsec_nanos();
     (nanos % 1000) as f64 / 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let c = RetryConfig::default();
+        assert_eq!(c.max_retries, 3);
+        assert!(c.multiplier > 1.0);
+    }
+
+    #[test]
+    fn test_retry_on_rate_limit() {
+        let mut state = RetryState::default();
+        let config = RetryConfig::default();
+        let err = RetryableError::RateLimited { retry_after: 500 };
+        match state.next_action(&err, &config) {
+            RetryAction::Retry { after } => assert!(after.as_millis() >= 500),
+            other => panic!("Expected Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_retry_exhaustion() {
+        let mut state = RetryState::default();
+        let config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let err = RetryableError::RateLimited { retry_after: 100 };
+        let _ = state.next_action(&err, &config); // First retry.
+        match state.next_action(&err, &config) {
+            RetryAction::Abort(_) => {}
+            other => panic!("Expected Abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_non_retryable_aborts() {
+        let mut state = RetryState::default();
+        let config = RetryConfig::default();
+        let err = RetryableError::NonRetryable("bad request".into());
+        match state.next_action(&err, &config) {
+            RetryAction::Abort(msg) => assert!(msg.contains("bad request")),
+            other => panic!("Expected Abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_overload_escalates_to_fallback() {
+        let mut state = RetryState::default();
+        let config = RetryConfig {
+            max_overload_retries: 2,
+            ..Default::default()
+        };
+        let err = RetryableError::Overloaded;
+        let _ = state.next_action(&err, &config);
+        let _ = state.next_action(&err, &config);
+        match state.next_action(&err, &config) {
+            RetryAction::FallbackModel => {}
+            other => panic!("Expected FallbackModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reset_preserves_fallback() {
+        let mut state = RetryState {
+            using_fallback: true,
+            consecutive_failures: 5,
+            ..Default::default()
+        };
+        state.reset();
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.using_fallback); // Preserved.
+    }
 }

@@ -86,3 +86,71 @@ fn estimate_cost(usage: &Usage, model: &str) -> f64 {
         usage.cache_creation_input_tokens,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_state() {
+        let state = AppState::new(crate::config::Config::default());
+        assert!(!state.cwd.is_empty());
+        assert_eq!(state.turn_count, 0);
+        assert_eq!(state.total_cost_usd, 0.0);
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn test_push_message() {
+        let mut state = AppState::new(crate::config::Config::default());
+        state.push_message(crate::llm::message::user_message("hello"));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.history().len(), 1);
+    }
+
+    #[test]
+    fn test_record_usage() {
+        let mut state = AppState::new(crate::config::Config::default());
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        state.record_usage(&usage, "claude-sonnet-4");
+        assert_eq!(state.total_usage.input_tokens, 1000);
+        assert_eq!(state.total_usage.output_tokens, 500);
+        assert!(state.total_cost_usd > 0.0);
+    }
+
+    #[test]
+    fn test_record_usage_accumulates() {
+        let mut state = AppState::new(crate::config::Config::default());
+        let u1 = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        let u2 = Usage {
+            input_tokens: 200,
+            output_tokens: 30,
+            ..Default::default()
+        };
+        state.record_usage(&u1, "claude-sonnet-4");
+        state.record_usage(&u2, "claude-sonnet-4");
+        assert_eq!(state.total_usage.output_tokens, 80); // 50 + 30.
+    }
+
+    #[test]
+    fn test_model_usage_tracking() {
+        let mut state = AppState::new(crate::config::Config::default());
+        let u1 = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        state.record_usage(&u1, "model-a");
+        state.record_usage(&u1, "model-b");
+        assert!(state.model_usage.contains_key("model-a"));
+        assert!(state.model_usage.contains_key("model-b"));
+    }
+}

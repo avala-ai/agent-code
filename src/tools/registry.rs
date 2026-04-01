@@ -117,3 +117,56 @@ const DEFERRED_TOOLS: &[&str] = &[
 fn is_deferred(name: &str) -> bool {
     DEFERRED_TOOLS.contains(&name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_tools_count() {
+        let reg = ToolRegistry::default_tools();
+        assert!(reg.all().len() >= 30);
+    }
+
+    #[test]
+    fn test_get_by_name() {
+        let reg = ToolRegistry::default_tools();
+        assert!(reg.get("Bash").is_some());
+        assert!(reg.get("FileRead").is_some());
+        assert!(reg.get("NonExistent").is_none());
+    }
+
+    #[test]
+    fn test_schemas_returns_enabled() {
+        let reg = ToolRegistry::default_tools();
+        let schemas = reg.schemas();
+        assert!(!schemas.is_empty());
+    }
+
+    #[test]
+    fn test_core_schemas_excludes_deferred() {
+        let reg = ToolRegistry::default_tools();
+        let core = reg.core_schemas();
+        let all = reg.schemas();
+        assert!(core.len() < all.len());
+    }
+
+    #[test]
+    fn test_deferred_names() {
+        let reg = ToolRegistry::default_tools();
+        let deferred = reg.deferred_names();
+        assert!(deferred.contains(&"NotebookEdit"));
+        assert!(deferred.contains(&"Sleep"));
+        assert!(!deferred.contains(&"Bash"));
+        assert!(!deferred.contains(&"FileRead"));
+    }
+
+    #[test]
+    fn test_register_custom_tool() {
+        let mut reg = ToolRegistry::new();
+        assert_eq!(reg.all().len(), 0);
+        reg.register(Arc::new(super::super::bash::BashTool));
+        assert_eq!(reg.all().len(), 1);
+        assert!(reg.get("Bash").is_some());
+    }
+}

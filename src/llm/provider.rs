@@ -172,3 +172,142 @@ pub enum ProviderKind {
     Together,
     OpenAiCompatible,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_from_url_anthropic() {
+        assert!(matches!(
+            detect_provider("any", "https://api.anthropic.com/v1"),
+            ProviderKind::Anthropic
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_openai() {
+        assert!(matches!(
+            detect_provider("any", "https://api.openai.com/v1"),
+            ProviderKind::OpenAi
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_bedrock() {
+        assert!(matches!(
+            detect_provider("any", "https://bedrock-runtime.us-east-1.amazonaws.com"),
+            ProviderKind::Bedrock
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_vertex() {
+        assert!(matches!(
+            detect_provider("any", "https://us-central1-aiplatform.googleapis.com/v1"),
+            ProviderKind::Vertex
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_xai() {
+        assert!(matches!(
+            detect_provider("any", "https://api.x.ai/v1"),
+            ProviderKind::Xai
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_deepseek() {
+        assert!(matches!(
+            detect_provider("any", "https://api.deepseek.com/v1"),
+            ProviderKind::DeepSeek
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_groq() {
+        assert!(matches!(
+            detect_provider("any", "https://api.groq.com/openai/v1"),
+            ProviderKind::Groq
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_mistral() {
+        assert!(matches!(
+            detect_provider("any", "https://api.mistral.ai/v1"),
+            ProviderKind::Mistral
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_together() {
+        assert!(matches!(
+            detect_provider("any", "https://api.together.xyz/v1"),
+            ProviderKind::Together
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_localhost() {
+        assert!(matches!(
+            detect_provider("any", "http://localhost:11434/v1"),
+            ProviderKind::OpenAiCompatible
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_claude() {
+        assert!(matches!(
+            detect_provider("claude-sonnet-4", ""),
+            ProviderKind::Anthropic
+        ));
+        assert!(matches!(
+            detect_provider("claude-opus-4", ""),
+            ProviderKind::Anthropic
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_gpt() {
+        assert!(matches!(
+            detect_provider("gpt-4.1-mini", ""),
+            ProviderKind::OpenAi
+        ));
+        assert!(matches!(
+            detect_provider("o3-mini", ""),
+            ProviderKind::OpenAi
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_grok() {
+        assert!(matches!(detect_provider("grok-3", ""), ProviderKind::Xai));
+    }
+
+    #[test]
+    fn test_detect_from_model_gemini() {
+        assert!(matches!(
+            detect_provider("gemini-2.5-flash", ""),
+            ProviderKind::Google
+        ));
+    }
+
+    #[test]
+    fn test_detect_unknown_defaults_openai_compat() {
+        assert!(matches!(
+            detect_provider("some-random-model", "https://my-server.com"),
+            ProviderKind::OpenAiCompatible
+        ));
+    }
+
+    #[test]
+    fn test_url_takes_priority_over_model() {
+        // URL says OpenAI but model says Claude — URL wins.
+        assert!(matches!(
+            detect_provider("claude-sonnet", "https://api.openai.com/v1"),
+            ProviderKind::OpenAi
+        ));
+    }
+}
