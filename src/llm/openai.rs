@@ -91,9 +91,8 @@ impl OpenAiProvider {
                         .collect::<Vec<_>>()
                         .join("");
 
-                    if !text.is_empty() {
-                        msg_json["content"] = serde_json::Value::String(text);
-                    }
+                    // OpenAI requires content to be a string, never null.
+                    msg_json["content"] = serde_json::Value::String(text);
                     if !tool_calls.is_empty() {
                         msg_json["tool_calls"] = serde_json::Value::Array(tool_calls);
                     }
