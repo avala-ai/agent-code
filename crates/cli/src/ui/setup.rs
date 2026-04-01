@@ -461,11 +461,18 @@ pub fn write_config(result: &SetupResult) {
         .as_deref()
         .unwrap_or("https://api.openai.com/v1");
     let model = result.model.as_deref().unwrap_or("gpt-5.4");
+    // Include API key in config if provided (so it persists across sessions).
+    let api_key_line = if !result.api_key.is_empty() && result.api_key != "ollama" {
+        format!("api_key = \"{}\"\n", result.api_key)
+    } else {
+        String::new()
+    };
+
     let config = format!(
         r#"[api]
 base_url = "{base_url}"
 model = "{model}"
-
+{api_key_line}
 [permissions]
 default_mode = "{}"
 

@@ -389,68 +389,41 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
 
     let mut ctrl_c_pending = false;
 
-    // Fixed footer using DECSTBM scroll regions.
-    // Reserve the last 2 rows for the status bar. Content scrolls above.
-    let update_footer = |engine: &QueryEngine| {
-        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let w = term_w as usize;
-        let h = term_h as usize;
-
-        let state = engine.state();
-        let model_str = &state.config.api.model;
-        let turns = state.turn_count;
-        let tokens = state.total_usage.total();
-        let cost = state.total_cost_usd;
-
-        // Build the status line.
-        let left = format!(" {model_str} ");
-        let right = if turns > 0 {
-            format!(" turn {turns} │ {tokens} tokens │ ${cost:.4} ")
-        } else {
-            " ? for shortcuts ".to_string()
-        };
-        let mid_len = w.saturating_sub(left.len() + right.len());
-        let mid = "─".repeat(mid_len);
-
-        // Save cursor, move to last row, write status, restore cursor.
-        eprint!("\x1b7\x1b[{h};1H\x1b[2K\x1b[90m{left}{mid}{right}\x1b[0m\x1b8");
-        let _ = std::io::stderr().flush();
-    };
-
-    // Set scroll region: rows 1 to (height-1), pinning last row.
-    // Then move cursor to bottom of scroll region so text fills from bottom up.
-    let setup_scroll_region = || {
-        let (_w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let scroll_bottom = h - 1;
-        // Set scroll region, then move cursor to the bottom of that region.
-        eprint!("\x1b[1;{scroll_bottom}r\x1b[{scroll_bottom};1H");
-        let _ = std::io::stderr().flush();
-    };
-
-    // Reset scroll region on exit.
-    let reset_scroll_region = || {
-        eprint!("\x1b[r");
-        let _ = std::io::stderr().flush();
-    };
-
-    setup_scroll_region();
-    update_footer(engine);
-
     loop {
         let sink = TerminalSink::new(verbose);
         let t = super::theme::current();
 
-        // Update the pinned footer, then temporarily reset scroll region
-        // so rustyline gets clean terminal state for input.
-        update_footer(engine);
-        reset_scroll_region();
+        // Inline status divider before prompt (after first turn).
+        {
+            let state = engine.state();
+            if state.turn_count > 0 {
+                let term_w = crossterm::terminal::size()
+                    .map(|(w, _)| w as usize)
+                    .unwrap_or(80)
+                    .min(100);
+                let status = format!(
+                    " {} · turn {} · {} tokens · ${:.4} ",
+                    state.config.api.model,
+                    state.turn_count,
+                    state.total_usage.total(),
+                    state.total_cost_usd,
+                );
+                let pad = term_w.saturating_sub(status.len());
+                let left = pad / 2;
+                let right = pad - left;
+                eprintln!(
+                    "{}{}{}",
+                    "─".repeat(left).with(t.muted),
+                    status.with(t.muted),
+                    "─".repeat(right).with(t.muted),
+                );
+            }
+        }
 
         let prompt = format!("{} ", "❯".with(t.accent).bold());
 
         match rl.readline(&prompt) {
             Ok(line) => {
-                // Restore scroll region for output.
-                setup_scroll_region();
                 ctrl_c_pending = false;
                 let mut input_buf = line.clone();
 
@@ -794,9 +767,6 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
             session_id_display.as_str().with(t.muted)
         );
     }
-
-    // Reset scroll region before exiting.
-    reset_scroll_region();
 
     Ok(())
 }
