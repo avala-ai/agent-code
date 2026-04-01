@@ -55,6 +55,7 @@ pub struct QueryEngine {
     denial_tracker: Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
 }
 
 /// Callback for streaming events to the UI.
@@ -106,6 +107,7 @@ impl QueryEngine {
                 crate::memory::extraction::ExtractionState::new(),
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            permission_prompter: None,
         }
     }
 
@@ -545,6 +547,7 @@ impl QueryEngine {
                 denial_tracker: Some(self.denial_tracker.clone()),
                 task_manager: Some(self.state.task_manager.clone()),
                 session_allows: Some(self.session_allows.clone()),
+                permission_prompter: self.permission_prompter.clone(),
             };
 
             // Fire pre-tool-use hooks.

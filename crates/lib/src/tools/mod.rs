@@ -131,6 +131,33 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Permission prompt response from the UI layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionResponse {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
+
+/// Trait for prompting the user for permission decisions.
+/// Implemented by the CLI's UI layer; the lib engine uses this abstraction.
+pub trait PermissionPrompter: Send + Sync {
+    fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input_preview: Option<&str>,
+    ) -> PermissionResponse;
+}
+
+/// Default prompter that always allows (for non-interactive/testing).
+pub struct AutoAllowPrompter;
+impl PermissionPrompter for AutoAllowPrompter {
+    fn ask(&self, _: &str, _: &str, _: Option<&str>) -> PermissionResponse {
+        PermissionResponse::AllowOnce
+    }
+}
+
 /// Context passed to every tool during execution.
 pub struct ToolContext {
     /// Current working directory.
@@ -152,6 +179,8 @@ pub struct ToolContext {
     pub task_manager: Option<Arc<crate::services::background::TaskManager>>,
     /// Tools allowed for the rest of the session (via "Allow for session" prompt).
     pub session_allows: Option<Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Permission prompter for interactive approval.
+    pub permission_prompter: Option<Arc<dyn PermissionPrompter>>,
 }
 
 /// Result of a tool execution.

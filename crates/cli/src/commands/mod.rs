@@ -9,7 +9,7 @@
 //! Commands have access to the query engine state and can modify
 //! the conversation, change settings, or execute side effects.
 
-use crate::query::QueryEngine;
+use agent_code_lib::query::QueryEngine;
 
 /// Result of executing a command.
 pub enum CommandResult {
@@ -319,9 +319,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
 
             // Show skill commands.
-            let skills = crate::skills::SkillRegistry::load_all(Some(std::path::Path::new(
-                &engine.state().cwd,
-            )));
+            let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
+                std::path::Path::new(&engine.state().cwd),
+            ));
             let invocable = skills.user_invocable();
             if !invocable.is_empty() {
                 println!("\nSkills:");
@@ -340,7 +340,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("compact") => {
-            let freed = crate::services::compact::microcompact(&mut engine.state_mut().messages, 2);
+            let freed = agent_code_lib::services::compact::microcompact(
+                &mut engine.state_mut().messages,
+                2,
+            );
             if freed > 0 {
                 println!("Freed ~{freed} estimated tokens.");
             } else {
@@ -374,7 +377,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("resume") => {
             if let Some(id) = args {
-                match crate::services::session::load_session(id) {
+                match agent_code_lib::services::session::load_session(id) {
                     Ok(data) => {
                         engine.state_mut().messages = data.messages;
                         engine.state_mut().turn_count = data.turn_count;
@@ -394,7 +397,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("sessions") => {
-            let sessions = crate::services::session::list_sessions(10);
+            let sessions = agent_code_lib::services::session::list_sessions(10);
             if sessions.is_empty() {
                 println!("No saved sessions.");
             } else {
@@ -424,8 +427,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Prompt(msg)
         }
         Some("memory") => {
-            let memory =
-                crate::memory::MemoryContext::load(Some(std::path::Path::new(&engine.state().cwd)));
+            let memory = agent_code_lib::memory::MemoryContext::load(Some(std::path::Path::new(
+                &engine.state().cwd,
+            )));
             if memory.is_empty() {
                 println!("No memory loaded.");
             } else {
@@ -439,9 +443,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("skills") => {
-            let skills = crate::skills::SkillRegistry::load_all(Some(std::path::Path::new(
-                &engine.state().cwd,
-            )));
+            let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
+                std::path::Path::new(&engine.state().cwd),
+            ));
             if skills.all().is_empty() {
                 println!(
                     "No skills loaded. Add .md files to .agent/skills/ or ~/.config/agent-code/skills/"
@@ -471,7 +475,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             let config = engine.state().config.clone();
             let rt = tokio::runtime::Handle::current();
             let checks = std::thread::spawn(move || {
-                rt.block_on(crate::services::diagnostics::run_all(&cwd, &config))
+                rt.block_on(agent_code_lib::services::diagnostics::run_all(
+                    &cwd, &config,
+                ))
             })
             .join()
             .unwrap_or_default();
@@ -479,20 +485,20 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             println!("Environment diagnostics:\n");
             for check in &checks {
                 let icon = match check.status {
-                    crate::services::diagnostics::CheckStatus::Pass => "✓".to_string(),
-                    crate::services::diagnostics::CheckStatus::Warn => "!".to_string(),
-                    crate::services::diagnostics::CheckStatus::Fail => "✗".to_string(),
+                    agent_code_lib::services::diagnostics::CheckStatus::Pass => "✓".to_string(),
+                    agent_code_lib::services::diagnostics::CheckStatus::Warn => "!".to_string(),
+                    agent_code_lib::services::diagnostics::CheckStatus::Fail => "✗".to_string(),
                 };
                 println!("  {icon} {}: {}", check.name, check.detail);
             }
 
             let pass = checks
                 .iter()
-                .filter(|c| c.status == crate::services::diagnostics::CheckStatus::Pass)
+                .filter(|c| c.status == agent_code_lib::services::diagnostics::CheckStatus::Pass)
                 .count();
             let fail = checks
                 .iter()
-                .filter(|c| c.status == crate::services::diagnostics::CheckStatus::Fail)
+                .filter(|c| c.status == agent_code_lib::services::diagnostics::CheckStatus::Fail)
                 .count();
             println!("\n  {pass} passed, {fail} failed, {} total", checks.len());
             CommandResult::Handled
@@ -550,19 +556,23 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 let mut md = String::from("# Conversation Export\n\n");
                 for msg in messages {
                     match msg {
-                        crate::llm::message::Message::User(u) => {
+                        agent_code_lib::llm::message::Message::User(u) => {
                             md.push_str("## User\n\n");
                             for block in &u.content {
-                                if let crate::llm::message::ContentBlock::Text { text } = block {
+                                if let agent_code_lib::llm::message::ContentBlock::Text { text } =
+                                    block
+                                {
                                     md.push_str(text);
                                     md.push_str("\n\n");
                                 }
                             }
                         }
-                        crate::llm::message::Message::Assistant(a) => {
+                        agent_code_lib::llm::message::Message::Assistant(a) => {
                             md.push_str("## Assistant\n\n");
                             for block in &a.content {
-                                if let crate::llm::message::ContentBlock::Text { text } = block {
+                                if let agent_code_lib::llm::message::ContentBlock::Text { text } =
+                                    block
+                                {
                                     md.push_str(text);
                                     md.push_str("\n\n");
                                 }
@@ -592,10 +602,11 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
         }
         Some("context") | Some("ctx") => {
-            let tokens = crate::services::tokens::estimate_context_tokens(&engine.state().messages);
+            let tokens =
+                agent_code_lib::services::tokens::estimate_context_tokens(&engine.state().messages);
             let model = &engine.state().config.api.model;
-            let window = crate::services::tokens::context_window_for_model(model);
-            let threshold = crate::services::compact::auto_compact_threshold(model);
+            let window = agent_code_lib::services::tokens::context_window_for_model(model);
+            let threshold = agent_code_lib::services::compact::auto_compact_threshold(model);
             let pct = if window > 0 {
                 (tokens as f64 / window as f64 * 100.0).round() as u64
             } else {
@@ -610,7 +621,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("agents") => {
-            let registry = crate::services::coordinator::AgentRegistry::with_defaults();
+            let registry = agent_code_lib::services::coordinator::AgentRegistry::with_defaults();
             println!("Available agent types:\n");
             for agent in registry.list() {
                 let ro = if agent.read_only { " (read-only)" } else { "" };
@@ -626,7 +637,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("plugins") => {
-            let plugins = crate::services::plugins::PluginRegistry::load_all(Some(
+            let plugins = agent_code_lib::services::plugins::PluginRegistry::load_all(Some(
                 std::path::Path::new(&engine.state().cwd),
             ));
             if plugins.all().is_empty() {
@@ -678,8 +689,8 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         Some("stats") => {
             let state = engine.state();
             let msg_count = state.messages.len();
-            let tool_count = crate::services::history::tool_use_count(&state.messages);
-            let tools_used = crate::services::history::tools_used(&state.messages);
+            let tool_count = agent_code_lib::services::history::tool_use_count(&state.messages);
+            let tools_used = agent_code_lib::services::history::tools_used(&state.messages);
             println!(
                 "Session stats:\n  \
                  Turns: {}\n  \
@@ -719,12 +730,12 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             let mut found_assistant = false;
             while let Some(msg) = messages.last() {
                 match msg {
-                    crate::llm::message::Message::Assistant(_) => {
+                    agent_code_lib::llm::message::Message::Assistant(_) => {
                         messages.pop();
                         removed += 1;
                         found_assistant = true;
                     }
-                    crate::llm::message::Message::User(u) if found_assistant => {
+                    agent_code_lib::llm::message::Message::User(u) if found_assistant => {
                         // Also remove the user message that triggered the turn.
                         if !u.is_compact_summary {
                             messages.pop();
@@ -840,9 +851,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             // Fork = save current session, start fresh from this point
             let state = engine.state();
-            let fork_id = crate::services::session::new_session_id();
+            let fork_id = agent_code_lib::services::session::new_session_id();
             let msg_count = state.messages.len();
-            match crate::services::session::save_session(
+            match agent_code_lib::services::session::save_session(
                 &fork_id,
                 &state.messages,
                 &state.cwd,
@@ -889,12 +900,15 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 println!("Conversation ({} messages):\n", messages.len());
                 for (i, msg) in messages.iter().enumerate() {
                     match msg {
-                        crate::llm::message::Message::User(u) => {
+                        agent_code_lib::llm::message::Message::User(u) => {
                             let text: String = u
                                 .content
                                 .iter()
                                 .filter_map(|b| {
-                                    if let crate::llm::message::ContentBlock::Text { text } = b {
+                                    if let agent_code_lib::llm::message::ContentBlock::Text {
+                                        text,
+                                    } = b
+                                    {
                                         Some(text.as_str())
                                     } else {
                                         None
@@ -909,12 +923,15 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                             };
                             println!("  [{i}] USER: {preview}");
                         }
-                        crate::llm::message::Message::Assistant(a) => {
+                        agent_code_lib::llm::message::Message::Assistant(a) => {
                             let text: String = a
                                 .content
                                 .iter()
                                 .filter_map(|b| {
-                                    if let crate::llm::message::ContentBlock::Text { text } = b {
+                                    if let agent_code_lib::llm::message::ContentBlock::Text {
+                                        text,
+                                    } = b
+                                    {
                                         Some(text.as_str())
                                     } else {
                                         None
@@ -926,7 +943,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                                 .content
                                 .iter()
                                 .filter(|b| {
-                                    matches!(b, crate::llm::message::ContentBlock::ToolUse { .. })
+                                    matches!(
+                                        b,
+                                        agent_code_lib::llm::message::ContentBlock::ToolUse { .. }
+                                    )
                                 })
                                 .count();
                             let preview = if text.len() > 120 {
@@ -970,9 +990,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         _ => {
             // Check if it's a skill invocation.
-            let skills = crate::skills::SkillRegistry::load_all(Some(std::path::Path::new(
-                &engine.state().cwd,
-            )));
+            let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
+                std::path::Path::new(&engine.state().cwd),
+            ));
             if let Some(skill) = skills.find(cmd) {
                 let expanded = skill.expand(args);
                 CommandResult::Prompt(expanded)

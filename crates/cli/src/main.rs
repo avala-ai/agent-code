@@ -8,17 +8,6 @@
 #![allow(dead_code)]
 
 mod commands;
-mod config;
-mod error;
-mod hooks;
-mod llm;
-mod memory;
-mod permissions;
-mod query;
-mod services;
-mod skills;
-mod state;
-mod tools;
 mod ui;
 
 use clap::Parser;
@@ -26,12 +15,12 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
-use crate::config::Config;
-use crate::llm::provider::{ProviderKind, detect_provider};
-use crate::permissions::PermissionChecker;
-use crate::query::QueryEngine;
-use crate::state::AppState;
-use crate::tools::registry::ToolRegistry;
+use agent_code_lib::config::Config;
+use agent_code_lib::llm::provider::{ProviderKind, detect_provider};
+use agent_code_lib::permissions::PermissionChecker;
+use agent_code_lib::query::QueryEngine;
+use agent_code_lib::state::AppState;
+use agent_code_lib::tools::registry::ToolRegistry;
 
 /// AI-powered coding agent for the terminal.
 #[derive(Parser, Debug)]
@@ -115,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Detect session environment.
-    let session_env = services::session_env::SessionEnvironment::detect().await;
+    let session_env = agent_code_lib::services::session_env::SessionEnvironment::detect().await;
     tracing::debug!(
         "Environment: {} on {}, git={}, shell={}",
         session_env.project_root.display(),
@@ -140,15 +129,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Apply permission mode from CLI.
     if cli.dangerously_skip_permissions {
-        config.permissions.default_mode = crate::config::PermissionMode::Allow;
+        config.permissions.default_mode = agent_code_lib::config::PermissionMode::Allow;
         tracing::warn!("All permission checks disabled (--dangerously-skip-permissions)");
     } else {
         config.permissions.default_mode = match cli.permission_mode.as_str() {
-            "allow" => crate::config::PermissionMode::Allow,
-            "deny" => crate::config::PermissionMode::Deny,
-            "plan" => crate::config::PermissionMode::Plan,
-            "accept_edits" => crate::config::PermissionMode::AcceptEdits,
-            _ => crate::config::PermissionMode::Ask,
+            "allow" => agent_code_lib::config::PermissionMode::Allow,
+            "deny" => agent_code_lib::config::PermissionMode::Deny,
+            "plan" => agent_code_lib::config::PermissionMode::Plan,
+            "accept_edits" => agent_code_lib::config::PermissionMode::AcceptEdits,
+            _ => agent_code_lib::config::PermissionMode::Ask,
         };
     }
 
@@ -219,9 +208,9 @@ async fn main() -> anyhow::Result<()> {
         };
         config.api.base_url = default_url.to_string();
     }
-    let llm: Arc<dyn crate::llm::provider::Provider> = match provider_kind {
+    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match provider_kind {
         ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex => Arc::new(
-            crate::llm::anthropic::AnthropicProvider::new(&config.api.base_url, api_key),
+            agent_code_lib::llm::anthropic::AnthropicProvider::new(&config.api.base_url, api_key),
         ),
         // All other providers use the OpenAI-compatible wire format.
         ProviderKind::OpenAi
@@ -231,10 +220,9 @@ async fn main() -> anyhow::Result<()> {
         | ProviderKind::Groq
         | ProviderKind::Mistral
         | ProviderKind::Together
-        | ProviderKind::OpenAiCompatible => Arc::new(crate::llm::openai::OpenAiProvider::new(
-            &config.api.base_url,
-            api_key,
-        )),
+        | ProviderKind::OpenAiCompatible => Arc::new(
+            agent_code_lib::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
+        ),
     };
     tracing::info!(
         "Using {:?} provider at {}",
@@ -249,29 +237,33 @@ async fn main() -> anyhow::Result<()> {
     // Connect configured MCP servers and register their tools.
     for (name, entry) in &config.mcp_servers {
         let transport = if let Some(ref cmd) = entry.command {
-            services::mcp::McpTransport::Stdio {
+            agent_code_lib::services::mcp::McpTransport::Stdio {
                 command: cmd.clone(),
                 args: entry.args.clone(),
             }
         } else if let Some(ref url) = entry.url {
-            services::mcp::McpTransport::Sse { url: url.clone() }
+            agent_code_lib::services::mcp::McpTransport::Sse { url: url.clone() }
         } else {
             tracing::warn!("MCP server '{name}': no command or url configured, skipping");
             continue;
         };
 
-        let mcp_config = services::mcp::McpServerConfig {
+        let mcp_config = agent_code_lib::services::mcp::McpServerConfig {
             transport,
             name: name.clone(),
             env: entry.env.clone(),
         };
 
-        let mut client = services::mcp::McpClient::new(mcp_config);
+        let mut client = agent_code_lib::services::mcp::McpClient::new(mcp_config);
         match client.connect().await {
             Ok(()) => {
                 let discovered = client.tools().to_vec();
                 let client_arc = std::sync::Arc::new(tokio::sync::Mutex::new(client));
-                let proxies = tools::mcp_proxy::create_proxy_tools(name, &discovered, client_arc);
+                let proxies = agent_code_lib::tools::mcp_proxy::create_proxy_tools(
+                    name,
+                    &discovered,
+                    client_arc,
+                );
                 let count = proxies.len();
                 for proxy in proxies {
                     tool_registry.register(proxy);
@@ -285,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cli.dump_system_prompt {
-        let prompt = query::build_system_prompt(&tool_registry, &app_state);
+        let prompt = agent_code_lib::query::build_system_prompt(&tool_registry, &app_state);
         println!("{prompt}");
         return Ok(());
     }
@@ -297,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
         tool_registry,
         permission_checker,
         app_state,
-        query::QueryEngineConfig {
+        agent_code_lib::query::QueryEngineConfig {
             max_turns: cli.max_turns,
             verbose: cli.verbose,
             unattended: cli.prompt.is_some(),
@@ -308,15 +300,16 @@ async fn main() -> anyhow::Result<()> {
     engine.load_hooks(&config.hooks);
 
     // Run memory consolidation in the background if due.
-    if let Some(memory_dir) = memory::ensure_memory_dir()
-        && memory::consolidation::should_consolidate(&memory_dir)
-        && let Some(lock_path) = memory::consolidation::try_acquire_lock(&memory_dir)
+    if let Some(memory_dir) = agent_code_lib::memory::ensure_memory_dir()
+        && agent_code_lib::memory::consolidation::should_consolidate(&memory_dir)
+        && let Some(lock_path) =
+            agent_code_lib::memory::consolidation::try_acquire_lock(&memory_dir)
     {
         let consolidation_llm = llm_for_consolidation;
         let consolidation_model = config.api.model.clone();
         tokio::spawn(async move {
             tracing::info!("Memory consolidation starting (background)");
-            memory::consolidation::run_consolidation(
+            agent_code_lib::memory::consolidation::run_consolidation(
                 &memory_dir,
                 &lock_path,
                 consolidation_llm,
@@ -334,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
         Some(prompt) => {
             // One-shot mode: use a simple sink that prints to stdout.
             struct StdoutSink;
-            impl query::StreamSink for StdoutSink {
+            impl agent_code_lib::query::StreamSink for StdoutSink {
                 fn on_text(&self, text: &str) {
                     print!("{text}");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -342,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
                 fn on_tool_start(&self, name: &str, _: &serde_json::Value) {
                     eprintln!("[{name}]");
                 }
-                fn on_tool_result(&self, name: &str, r: &tools::ToolResult) {
+                fn on_tool_result(&self, name: &str, r: &agent_code_lib::tools::ToolResult) {
                     if r.is_error {
                         eprintln!("[{name} error: {}]", r.content.lines().next().unwrap_or(""));
                     }

@@ -388,7 +388,7 @@ fn color_to_bg_code(color: Color) -> String {
 
 /// Interactive scrollable conversation history viewer.
 /// Uses crossterm raw mode for keyboard input. Press q or Esc to exit.
-pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
+pub fn scrollback_viewer(messages: &[agent_code_lib::llm::message::Message]) {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent},
         terminal,
@@ -405,7 +405,7 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
 
     for (idx, msg) in messages.iter().enumerate() {
         match msg {
-            crate::llm::message::Message::User(u) => {
+            agent_code_lib::llm::message::Message::User(u) => {
                 // User header.
                 all_lines.push(Line::from(vec![Span::styled(
                     format!(" [{idx}] USER "),
@@ -417,13 +417,15 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
                 // User content.
                 for block in &u.content {
                     match block {
-                        crate::llm::message::ContentBlock::Text { text } => {
+                        agent_code_lib::llm::message::ContentBlock::Text { text } => {
                             for line in text.lines() {
                                 all_lines.push(Line::from(Span::raw(format!("  {line}"))));
                             }
                         }
-                        crate::llm::message::ContentBlock::ToolResult {
-                            content, is_error, ..
+                        agent_code_lib::llm::message::ContentBlock::ToolResult {
+                            content,
+                            is_error,
+                            ..
                         } => {
                             let color = if *is_error { error } else { success };
                             let icon = if *is_error { "✗" } else { "✓" };
@@ -444,7 +446,7 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
                 }
                 all_lines.push(Line::from(""));
             }
-            crate::llm::message::Message::Assistant(a) => {
+            agent_code_lib::llm::message::Message::Assistant(a) => {
                 // Assistant header.
                 let model_tag = a
                     .model
@@ -462,7 +464,7 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
                 let mut tool_count = 0;
                 for block in &a.content {
                     match block {
-                        crate::llm::message::ContentBlock::Text { text } => {
+                        agent_code_lib::llm::message::ContentBlock::Text { text } => {
                             for line in text.lines().take(20) {
                                 all_lines.push(Line::from(Span::raw(format!("  {line}"))));
                             }
@@ -473,7 +475,7 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
                                 )));
                             }
                         }
-                        crate::llm::message::ContentBlock::ToolUse { name, .. } => {
+                        agent_code_lib::llm::message::ContentBlock::ToolUse { name, .. } => {
                             tool_count += 1;
                             all_lines.push(Line::from(vec![
                                 Span::styled("  → ", Style::default().fg(muted)),
@@ -483,7 +485,9 @@ pub fn scrollback_viewer(messages: &[crate::llm::message::Message]) {
                                 ),
                             ]));
                         }
-                        crate::llm::message::ContentBlock::Thinking { thinking, .. } => {
+                        agent_code_lib::llm::message::ContentBlock::Thinking {
+                            thinking, ..
+                        } => {
                             let preview: String = thinking.chars().take(80).collect();
                             all_lines.push(Line::from(Span::styled(
                                 format!("  (thinking: {preview}...)"),

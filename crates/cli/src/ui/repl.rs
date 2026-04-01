@@ -17,10 +17,10 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 
-use crate::llm::message::Usage;
-use crate::query::{QueryEngine, StreamSink};
-use crate::tools::ToolResult;
 use crate::ui::activity::ActivityIndicator;
+use agent_code_lib::llm::message::Usage;
+use agent_code_lib::query::{QueryEngine, StreamSink};
+use agent_code_lib::tools::ToolResult;
 
 /// Tab-completion helper for slash commands.
 struct CommandCompleter;
@@ -285,12 +285,12 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
 
     // Generate a session ID for persistence. Clone for later use since
     // Stylize methods consume the String.
-    let session_id = crate::services::session::new_session_id();
+    let session_id = agent_code_lib::services::session::new_session_id();
     let session_id_display = session_id.clone();
 
     // Initialize session notes and clean up old ones.
-    crate::memory::session_notes::init_session_notes(&session_id);
-    crate::memory::session_notes::cleanup_old_notes();
+    agent_code_lib::memory::session_notes::init_session_notes(&session_id);
+    agent_code_lib::memory::session_notes::cleanup_old_notes();
 
     // Load history.
     let history_path = dirs::data_dir().map(|d| d.join("agent-code").join("history.txt"));
@@ -472,7 +472,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     // Persist session.
     let state = engine.state();
     if !state.messages.is_empty() {
-        match crate::services::session::save_session(
+        match agent_code_lib::services::session::save_session(
             &session_id,
             &state.messages,
             &state.cwd,

@@ -135,6 +135,7 @@ pub async fn execute_tool_calls(
                                     denial_tracker: None,
                                     task_manager: None,
                                     session_allows: None,
+                                    permission_prompter: None,
                                 },
                                 &perm_checker,
                             )
@@ -213,26 +214,28 @@ async fn execute_single_tool(
             {
                 // Already allowed for this session — skip prompt.
             } else {
-                // Prompt the user for permission with detailed TUI modal.
+                // Prompt the user for permission via the prompter trait.
                 let description = format!("{}: {}", call.name, prompt);
                 let input_preview = serde_json::to_string_pretty(&call.input).ok();
-                let response = crate::ui::prompt::ask_permission_detailed(
-                    &call.name,
-                    &description,
-                    input_preview.as_deref(),
-                );
+
+                let response = if let Some(ref prompter) = ctx.permission_prompter {
+                    prompter.ask(&call.name, &description, input_preview.as_deref())
+                } else {
+                    // No prompter = auto-allow (non-interactive mode).
+                    super::PermissionResponse::AllowOnce
+                };
 
                 match response {
-                    crate::ui::prompt::PermissionResponse::AllowOnce => {
+                    super::PermissionResponse::AllowOnce => {
                         // Continue to execution.
                     }
-                    crate::ui::prompt::PermissionResponse::AllowSession => {
+                    super::PermissionResponse::AllowSession => {
                         // Record session-level allow so future calls skip the prompt.
                         if let Some(ref allows) = ctx.session_allows {
                             allows.lock().await.insert(call.name.clone());
                         }
                     }
-                    crate::ui::prompt::PermissionResponse::Deny => {
+                    super::PermissionResponse::Deny => {
                         if let Some(ref tracker) = ctx.denial_tracker {
                             tracker.lock().await.record(
                                 &call.name,
