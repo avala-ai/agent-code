@@ -48,6 +48,8 @@ agent-code works with any LLM provider. Set one environment variable and go:
 
 Plus any OpenAI-compatible endpoint via `--api-base-url`.
 
+**Tested and verified** (12/12 on our E2E test suite): GPT-4.1-mini (OpenAI), Qwen3 8B (Ollama). Models need function calling / tool use support for full functionality.
+
 ## Install
 
 **One-line install** (Linux/macOS):
@@ -98,9 +100,11 @@ agent --dump-system-prompt
 
 Once inside the REPL, type naturally. The agent reads files, runs commands, and edits code to accomplish what you ask. Type `/help` to see all available commands.
 
+The REPL supports tab completion for `/` commands, inline hints, vi/emacs editing modes (auto-detected from `$EDITOR`, or set with `/vim` and `/emacs`), reverse history search (Ctrl+R), and multi-line input with `\` continuation.
+
 ## What It Can Do
 
-The agent has 23 built-in tools and 26 slash commands. Here are the highlights:
+The agent has 30 built-in tools and 35+ slash commands. Here are the highlights:
 
 **Read and understand code:**
 ```
@@ -197,10 +201,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 |------|-------------|
 | **Agent** | Spawn subagents for parallel work (with optional git worktree isolation) |
 | **Bash** | Run shell commands with timeout and cancellation |
-| **FileRead** | Read files with line numbers (handles binary, PDF, images gracefully) |
+| **FileRead** | Read files with line numbers (PDF page ranges, images, notebooks, binary detection) |
 | **FileWrite** | Create or overwrite files, auto-creates parent directories |
-| **FileEdit** | Targeted search-and-replace with uniqueness validation |
-| **Grep** | Regex search powered by ripgrep, with context lines and filtering |
+| **FileEdit** | Targeted search-and-replace with uniqueness validation and size limits |
+| **Grep** | Regex search powered by ripgrep (-A/-B/-C context, output modes, multiline, type filter, pagination) |
 | **Glob** | Find files by pattern, sorted by modification time |
 | **WebFetch** | Fetch URLs with HTML-to-text conversion |
 | **WebSearch** | Web search with result extraction |
@@ -243,6 +247,16 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 | `/agents` | List agent types (general, explore, plan) |
 | `/plugins` | List loaded plugins |
 | `/hooks` | Show hook configuration |
+| `/permissions` | Show permission mode and rules |
+| `/vim`, `/emacs` | Switch editing mode |
+| `/transcript` | Show conversation history |
+| `/bug` | Report a bug |
+| `/verbose` | Toggle verbose output |
+| `/stats` | Session statistics (turns, tokens, cost, tools used) |
+| `/log` | Recent git log |
+| `/files` | List files in working directory |
+| `/tasks` | List background tasks |
+| `/theme` | Show or switch color theme |
 
 ## Extending agent-code
 
