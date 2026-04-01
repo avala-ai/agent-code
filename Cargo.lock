@@ -21,6 +21,7 @@ dependencies = [
  "dirs",
  "indicatif",
  "predicates",
+ "pulldown-cmark",
  "ratatui",
  "rustyline",
  "serde",

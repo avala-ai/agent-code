@@ -1,9 +1,10 @@
 //! Terminal rendering for markdown and code.
 //!
 //! Converts markdown text to styled terminal output with syntax
-//! highlighting for fenced code blocks. Uses termimad for markdown
-//! structure and syntect for code coloring.
+//! highlighting for fenced code blocks. Uses pulldown-cmark for markdown
+//! parsing and syntect for code coloring.
 
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -11,62 +12,366 @@ use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 
 /// Render markdown text to the terminal with syntax highlighting.
 ///
-/// Handles fenced code blocks (```lang ... ```) with syntect coloring,
-/// and delegates the rest to termimad for structural rendering.
+/// Uses pulldown-cmark to parse markdown structure, routes fenced code
+/// blocks to syntect highlighting, and tables to box-drawing rendering.
 pub fn render_markdown(text: &str) -> String {
+    let t = super::theme::current();
+    let accent = color_to_ansi(t.accent);
+    let tool = color_to_ansi(t.tool);
+    let muted = color_to_ansi(t.muted);
+    let reset = "\x1b[0m";
+
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_ext(text, opts);
+
     let mut output = String::new();
+
+    // State tracking.
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buffer = String::new();
-    let mut table_buffer: Vec<String> = Vec::new();
+    let mut in_heading = false;
+    let mut heading_text = String::new();
+    let mut bold_depth: u32 = 0;
+    let mut italic_depth: u32 = 0;
+    let mut in_link = false;
+    let mut link_url = String::new();
+    let mut link_text = String::new();
+    let mut list_stack: Vec<Option<u64>> = Vec::new(); // None = unordered, Some(n) = ordered
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+    let mut _in_table_head = false;
+    let mut paragraph_text = String::new();
+    let mut in_paragraph = false;
 
-    for line in text.lines() {
-        if line.starts_with("```") {
-            if in_code_block {
-                // End of code block — render with syntax highlighting.
+    for event in parser {
+        match event {
+            // --- Paragraphs ---
+            Event::Start(Tag::Paragraph) => {
+                in_paragraph = true;
+                paragraph_text.clear();
+            }
+            Event::End(TagEnd::Paragraph) => {
+                in_paragraph = false;
+                output.push_str(&paragraph_text);
+                output.push('\n');
+                paragraph_text.clear();
+            }
+
+            // --- Headings ---
+            Event::Start(Tag::Heading { .. }) => {
+                in_heading = true;
+                heading_text.clear();
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                in_heading = false;
+                output.push_str(&format!("\x1b[1;4m{heading_text}{reset}\n"));
+                heading_text.clear();
+            }
+
+            // --- Code blocks ---
+            Event::Start(Tag::CodeBlock(kind)) => {
+                in_code_block = true;
+                code_buffer.clear();
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) => lang.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
                 output.push_str(&highlight_code(&code_buffer, &code_lang));
                 output.push('\n');
                 code_buffer.clear();
                 code_lang.clear();
-                in_code_block = false;
-            } else {
-                // Start of code block — extract language hint.
-                code_lang = line.trim_start_matches('`').trim().to_string();
-                in_code_block = true;
             }
-            continue;
-        }
 
-        if in_code_block {
-            code_buffer.push_str(line);
-            code_buffer.push('\n');
-        } else if is_table_line(line) {
-            // Accumulate table lines for batch rendering.
-            table_buffer.push(line.to_string());
-        } else {
-            // Flush any accumulated table before non-table content.
-            if !table_buffer.is_empty() {
-                output.push_str(&render_table(&table_buffer));
-                table_buffer.clear();
+            // --- Emphasis / strong ---
+            Event::Start(Tag::Emphasis) => {
+                italic_depth += 1;
+                push_to_active(
+                    &mut output,
+                    &mut heading_text,
+                    &mut paragraph_text,
+                    &mut link_text,
+                    &mut current_cell,
+                    in_heading,
+                    in_paragraph,
+                    in_link,
+                    in_table,
+                    "\x1b[3m",
+                );
             }
-            // Render inline markdown elements.
-            output.push_str(&render_inline(line));
-            output.push('\n');
+            Event::End(TagEnd::Emphasis) => {
+                italic_depth = italic_depth.saturating_sub(1);
+                push_to_active(
+                    &mut output,
+                    &mut heading_text,
+                    &mut paragraph_text,
+                    &mut link_text,
+                    &mut current_cell,
+                    in_heading,
+                    in_paragraph,
+                    in_link,
+                    in_table,
+                    reset,
+                );
+                // Restore bold if still active.
+                if bold_depth > 0 {
+                    push_to_active(
+                        &mut output,
+                        &mut heading_text,
+                        &mut paragraph_text,
+                        &mut link_text,
+                        &mut current_cell,
+                        in_heading,
+                        in_paragraph,
+                        in_link,
+                        in_table,
+                        "\x1b[1m",
+                    );
+                }
+            }
+            Event::Start(Tag::Strong) => {
+                bold_depth += 1;
+                push_to_active(
+                    &mut output,
+                    &mut heading_text,
+                    &mut paragraph_text,
+                    &mut link_text,
+                    &mut current_cell,
+                    in_heading,
+                    in_paragraph,
+                    in_link,
+                    in_table,
+                    "\x1b[1m",
+                );
+            }
+            Event::End(TagEnd::Strong) => {
+                bold_depth = bold_depth.saturating_sub(1);
+                push_to_active(
+                    &mut output,
+                    &mut heading_text,
+                    &mut paragraph_text,
+                    &mut link_text,
+                    &mut current_cell,
+                    in_heading,
+                    in_paragraph,
+                    in_link,
+                    in_table,
+                    reset,
+                );
+                // Restore italic if still active.
+                if italic_depth > 0 {
+                    push_to_active(
+                        &mut output,
+                        &mut heading_text,
+                        &mut paragraph_text,
+                        &mut link_text,
+                        &mut current_cell,
+                        in_heading,
+                        in_paragraph,
+                        in_link,
+                        in_table,
+                        "\x1b[3m",
+                    );
+                }
+            }
+
+            // --- Inline code ---
+            Event::Code(code) => {
+                let formatted = format!("{accent}{code}{reset}");
+                if in_heading {
+                    heading_text.push_str(&formatted);
+                } else if in_link {
+                    link_text.push_str(&formatted);
+                } else if in_table {
+                    current_cell.push_str(&code);
+                } else if in_paragraph {
+                    paragraph_text.push_str(&formatted);
+                } else {
+                    output.push_str(&formatted);
+                }
+            }
+
+            // --- Links ---
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                in_link = true;
+                link_url = dest_url.to_string();
+                link_text.clear();
+            }
+            Event::End(TagEnd::Link) => {
+                in_link = false;
+                let formatted = if link_url.is_empty() {
+                    link_text.clone()
+                } else {
+                    format!("{link_text} ({muted}{link_url}{reset})")
+                };
+                if in_paragraph {
+                    paragraph_text.push_str(&formatted);
+                } else {
+                    output.push_str(&formatted);
+                }
+                link_text.clear();
+                link_url.clear();
+            }
+
+            // --- Lists ---
+            Event::Start(Tag::List(first_item)) => {
+                list_stack.push(first_item);
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let indent = "  ".repeat(list_stack.len().saturating_sub(1));
+                if let Some(ordered_start) = list_stack.last().copied().flatten() {
+                    // Ordered list — figure out the current number.
+                    // pulldown-cmark gives us the start, we track from there.
+                    output.push_str(&format!("{indent}{tool}{ordered_start}.{reset} "));
+                    // Increment for next sibling.
+                    if let Some(entry) = list_stack.last_mut() {
+                        *entry = Some(ordered_start + 1);
+                    }
+                } else {
+                    output.push_str(&format!("{indent}  {tool}•{reset} "));
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                // Ensure line break after list item.
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+
+            // --- Tables ---
+            Event::Start(Tag::Table(_)) => {
+                in_table = true;
+                table_rows.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                // Convert table_rows to the format render_table expects.
+                let lines: Vec<String> = table_rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, row)| {
+                        let data_line = format!("| {} |", row.join(" | "));
+                        if i == 0 && table_rows.len() > 1 {
+                            // Insert separator after header.
+                            let sep = format!(
+                                "| {} |",
+                                row.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+                            );
+                            vec![data_line, sep]
+                        } else {
+                            vec![data_line]
+                        }
+                    })
+                    .collect();
+                if !lines.is_empty() {
+                    output.push_str(&render_table(&lines));
+                }
+                table_rows.clear();
+            }
+            Event::Start(Tag::TableHead) => {
+                _in_table_head = true;
+                current_row.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                _in_table_head = false;
+                table_rows.push(current_row.clone());
+                current_row.clear();
+            }
+            Event::Start(Tag::TableRow) => {
+                current_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                table_rows.push(current_row.clone());
+                current_row.clear();
+            }
+            Event::Start(Tag::TableCell) => {
+                current_cell.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                current_row.push(current_cell.clone());
+                current_cell.clear();
+            }
+
+            // --- Text ---
+            Event::Text(txt) => {
+                if in_code_block {
+                    code_buffer.push_str(&txt);
+                } else if in_heading {
+                    heading_text.push_str(&txt);
+                } else if in_link {
+                    link_text.push_str(&txt);
+                } else if in_table {
+                    current_cell.push_str(&txt);
+                } else if in_paragraph {
+                    paragraph_text.push_str(&txt);
+                } else {
+                    output.push_str(&txt);
+                }
+            }
+
+            // --- Soft/hard breaks ---
+            Event::SoftBreak => {
+                if in_heading {
+                    heading_text.push(' ');
+                } else if in_paragraph {
+                    paragraph_text.push(' ');
+                } else {
+                    output.push(' ');
+                }
+            }
+            Event::HardBreak => {
+                if in_paragraph {
+                    paragraph_text.push('\n');
+                } else {
+                    output.push('\n');
+                }
+            }
+
+            // --- Horizontal rule ---
+            Event::Rule => {
+                output.push_str(&format!("{muted}────────────────────{reset}\n"));
+            }
+
+            _ => {}
         }
-    }
-
-    // Flush any trailing table.
-    if !table_buffer.is_empty() {
-        output.push_str(&render_table(&table_buffer));
-    }
-
-    // Handle unclosed code block.
-    if in_code_block && !code_buffer.is_empty() {
-        output.push_str(&highlight_code(&code_buffer, &code_lang));
-        output.push('\n');
     }
 
     output
+}
+
+/// Push text to whichever buffer is currently active.
+#[allow(clippy::too_many_arguments)]
+fn push_to_active(
+    output: &mut String,
+    heading: &mut String,
+    paragraph: &mut String,
+    link: &mut String,
+    cell: &mut String,
+    in_heading: bool,
+    in_paragraph: bool,
+    in_link: bool,
+    in_table: bool,
+    text: &str,
+) {
+    if in_heading {
+        heading.push_str(text);
+    } else if in_link {
+        link.push_str(text);
+    } else if in_table {
+        cell.push_str(text);
+    } else if in_paragraph {
+        paragraph.push_str(text);
+    } else {
+        output.push_str(text);
+    }
 }
 
 /// Syntax-highlight a code block using syntect.
@@ -103,76 +408,12 @@ fn highlight_code(code: &str, lang: &str) -> String {
 
 /// Render inline markdown elements (bold, italic, code spans, links).
 /// Uses the active theme for colors instead of hardcoded ANSI codes.
+/// Kept for any callers that need single-line inline rendering.
 fn render_inline(line: &str) -> String {
-    let t = super::theme::current();
-
-    // Convert theme Color to ANSI escape string.
-    let accent_code = color_to_ansi(t.accent);
-    let tool_code = color_to_ansi(t.tool);
-
-    let mut result = String::new();
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        // Inline code: `code`
-        if chars[i] == '`'
-            && let Some(end) = find_closing(&chars, i + 1, '`')
-        {
-            let code: String = chars[i + 1..end].iter().collect();
-            result.push_str(&format!("{accent_code}{code}\x1b[0m"));
-            i = end + 1;
-            continue;
-        }
-
-        // Bold: **text** or __text__
-        if i + 1 < chars.len()
-            && chars[i] == '*'
-            && chars[i + 1] == '*'
-            && let Some(end) = find_double_closing(&chars, i + 2, '*')
-        {
-            let text: String = chars[i + 2..end].iter().collect();
-            result.push_str(&format!("\x1b[1m{text}\x1b[0m"));
-            i = end + 2;
-            continue;
-        }
-
-        // Italic: *text* or _text_
-        if chars[i] == '*' || chars[i] == '_' {
-            let marker = chars[i];
-            if i + 1 < chars.len()
-                && chars[i + 1] != ' '
-                && let Some(end) = find_closing(&chars, i + 1, marker)
-                && end > i + 1
-            {
-                let text: String = chars[i + 1..end].iter().collect();
-                result.push_str(&format!("\x1b[3m{text}\x1b[0m"));
-                i = end + 1;
-                continue;
-            }
-        }
-
-        // Headings: # at start of line.
-        if i == 0 && chars[i] == '#' {
-            let level = chars.iter().take_while(|&&c| c == '#').count();
-            let text: String = chars[level..].iter().collect();
-            let text = text.trim_start();
-            result.push_str(&format!("\x1b[1;4m{text}\x1b[0m"));
-            return result;
-        }
-
-        // List items: - or * at start.
-        if i == 0 && (chars[i] == '-' || chars[i] == '*') && chars.get(1) == Some(&' ') {
-            let text: String = chars[2..].iter().collect();
-            result.push_str(&format!("  {tool_code}•\x1b[0m {text}"));
-            return result;
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    result
+    // Delegate to the pulldown-cmark parser for consistency.
+    let result = render_markdown(line);
+    // Strip trailing newline that render_markdown adds.
+    result.trim_end_matches('\n').to_string()
 }
 
 /// Convert a crossterm Color to an ANSI escape sequence prefix.
@@ -304,14 +545,6 @@ fn render_table(lines: &[String]) -> String {
     out
 }
 
-fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    (start..chars.len()).find(|&i| chars[i] == marker)
-}
-
-fn find_double_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    (start..chars.len().saturating_sub(1)).find(|&i| chars[i] == marker && chars[i + 1] == marker)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_render_list_item() {
-        let result = render_inline("- item one");
+        let result = render_markdown("- item one");
         assert!(result.contains("•"));
         assert!(result.contains("item one"));
     }
