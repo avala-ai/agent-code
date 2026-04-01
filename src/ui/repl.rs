@@ -156,31 +156,18 @@ impl StreamSink for TerminalSink {
     fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value) {
         self.stop_indicator();
         self.ensure_newline();
-        let t = super::theme::current();
         let detail = summarize_tool_input(tool_name, input);
-
-        // Box-drawing header for tool execution.
-        let header = format!(" {tool_name} ");
-        eprintln!(
-            "  {} {} {}",
-            "╭".with(t.muted),
-            super::theme::label(&header, t.tool, crossterm::style::Color::Black),
-            detail.with(t.muted),
-        );
+        super::tui::render_tool_block(tool_name, &detail, None, false);
     }
 
     fn on_tool_result(&self, _tool_name: &str, result: &ToolResult) {
+        // Re-render the tool block with result (overwrites the start block).
+        // For now, just append the result line.
         let t = super::theme::current();
         if result.is_error {
             let first_line = result.content.lines().next().unwrap_or("");
-            eprintln!(
-                "  {} {} {}",
-                "╰".with(t.muted),
-                "✗".with(t.error),
-                first_line.with(t.error),
-            );
+            eprintln!("  {} {}", "✗".with(t.error), first_line.with(t.error),);
         } else {
-            // Show success with brief content preview.
             let preview = result
                 .content
                 .lines()
@@ -198,8 +185,7 @@ impl StreamSink for TerminalSink {
                 String::new()
             };
             eprintln!(
-                "  {} {} {}{}",
-                "╰".with(t.muted),
+                "  {} {}{}",
                 "✓".with(t.success),
                 preview.with(t.muted),
                 suffix,
@@ -211,22 +197,7 @@ impl StreamSink for TerminalSink {
 
     fn on_thinking(&self, text: &str) {
         self.stop_indicator();
-        let t = super::theme::current();
-        if text.len() <= 200 {
-            // Short thinking — show full content.
-            eprint!(
-                "\r{}\r",
-                format!("  thinking: {}", text.trim()).with(t.muted)
-            );
-        } else {
-            // Long thinking — show preview.
-            let preview: String = text.chars().take(120).collect();
-            let preview = preview.trim();
-            eprint!(
-                "\r{}\r",
-                format!("  thinking: {preview}... ({} chars)", text.len()).with(t.muted)
-            );
-        }
+        super::tui::render_thinking_block(text);
     }
 
     fn on_turn_complete(&self, turn: usize) {
