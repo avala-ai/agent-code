@@ -3,8 +3,6 @@
 //! When a tool requires permission in "ask" mode, display the
 //! request and wait for user approval.
 
-use std::io::Write;
-
 use crossterm::style::Stylize;
 
 /// Ask the user whether to allow a tool operation.
@@ -18,17 +16,21 @@ pub fn ask_permission(tool_name: &str, description: &str) -> bool {
         tool_name.bold(),
     );
     eprintln!("  {}", description.dark_grey());
-    eprint!("  Allow? [y/N] ");
-    let _ = std::io::stderr().flush();
 
-    let mut input = String::new();
-    match std::io::stdin().read_line(&mut input) {
-        Ok(_) => {
-            let answer = input.trim().to_lowercase();
-            matches!(answer.as_str(), "y" | "yes")
-        }
-        Err(_) => false,
-    }
+    let choice = super::selector::select(&[
+        super::selector::SelectOption {
+            label: "Allow".into(),
+            description: "".into(),
+            value: "y".into(),
+        },
+        super::selector::SelectOption {
+            label: "Deny".into(),
+            description: "".into(),
+            value: "n".into(),
+        },
+    ]);
+
+    matches!(choice.as_str(), "y")
 }
 
 /// Display a diff with colored lines.
