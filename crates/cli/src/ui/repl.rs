@@ -324,7 +324,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let info_lines = [
         String::new(),
         String::new(),
-        format!("  agent-code v{}", env!("CARGO_PKG_VERSION")),
+        format!("  \x1b[1mAgent Code\x1b[0m v{}", env!("CARGO_PKG_VERSION")),
         format!("  {} · session {}", model, session_id_display.as_str()),
         format!("  {cwd}"),
         String::new(),
