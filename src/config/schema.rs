@@ -65,10 +65,17 @@ impl Default for ApiConfig {
         let api_key = std::env::var("AGENT_CODE_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .or_else(|_| std::env::var("XAI_API_KEY"))
             .ok();
 
         // Auto-detect base URL from which key is set.
-        let base_url = if std::env::var("OPENAI_API_KEY").is_ok()
+        let base_url = if std::env::var("XAI_API_KEY").is_ok()
+            && std::env::var("AGENT_CODE_API_KEY").is_err()
+            && std::env::var("ANTHROPIC_API_KEY").is_err()
+            && std::env::var("OPENAI_API_KEY").is_err()
+        {
+            "https://api.x.ai/v1".to_string()
+        } else if std::env::var("OPENAI_API_KEY").is_ok()
             && std::env::var("AGENT_CODE_API_KEY").is_err()
             && std::env::var("ANTHROPIC_API_KEY").is_err()
         {

@@ -23,15 +23,17 @@ brew install avala-ai/tap/agent-code
 agent-code works with any LLM provider. Set the key for the one you use:
 
 
-```bash Anthropic (Claude)
+```bash
+# Anthropic (Claude)
 export ANTHROPIC_API_KEY="sk-ant-..."
-```
 
-```bash OpenAI (GPT)
+# OpenAI (GPT)
 export OPENAI_API_KEY="sk-..."
-```
 
-```bash Any provider
+# xAI (Grok)
+export XAI_API_KEY="xai-..."
+
+# Any provider
 export AGENT_CODE_API_KEY="your-key"
 export AGENT_CODE_API_BASE_URL="https://api.your-provider.com/v1"
 ```

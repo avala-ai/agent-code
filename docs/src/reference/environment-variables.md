@@ -6,6 +6,7 @@
 | `AGENT_CODE_API_KEY` | API key (highest priority, works with any provider) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (auto-selects Anthropic provider) |
 | `OPENAI_API_KEY` | OpenAI API key (auto-selects OpenAI provider) |
+| `XAI_API_KEY` | xAI API key (auto-selects Grok provider) |
 | `AGENT_CODE_API_BASE_URL` | API endpoint URL override |
 | `AGENT_CODE_MODEL` | Model name override |
 
@@ -25,9 +26,11 @@ API key is resolved from the first available:
 3. `AGENT_CODE_API_KEY` env var
 4. `ANTHROPIC_API_KEY` env var
 5. `OPENAI_API_KEY` env var
+6. `XAI_API_KEY` env var
 
 Base URL auto-detection:
 
+- If only `XAI_API_KEY` is set → defaults to `https://api.x.ai/v1`
 - If only `OPENAI_API_KEY` is set → defaults to `https://api.openai.com/v1`
 - Otherwise → defaults to `https://api.anthropic.com/v1`
 

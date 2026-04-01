@@ -60,7 +60,7 @@ main() {
     fi
     info "Latest version: ${version}"
 
-    url="https://github.com/${REPO}/releases/download/${version}/rc-${platform}.tar.gz"
+    url="https://github.com/${REPO}/releases/download/${version}/agent-${platform}.tar.gz"
     info "Downloading ${url}..."
 
     tmpdir=$(mktemp -d)

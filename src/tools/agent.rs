@@ -131,6 +131,7 @@ impl Tool for AgentTool {
             "AGENT_CODE_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
+            "XAI_API_KEY",
             "AGENT_CODE_API_BASE_URL",
             "AGENT_CODE_MODEL",
         ] {

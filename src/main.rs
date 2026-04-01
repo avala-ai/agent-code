@@ -70,7 +70,7 @@ struct Cli {
     #[arg(long)]
     dangerously_skip_permissions: bool,
 
-    /// LLM provider: anthropic, openai, or auto (default).
+    /// LLM provider: anthropic, openai, xai (grok), or auto (default).
     #[arg(long, default_value = "auto")]
     provider: String,
 
@@ -134,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
     let provider_kind = match cli.provider.as_str() {
         "anthropic" => ProviderKind::Anthropic,
         "openai" => ProviderKind::OpenAi,
+        "xai" | "grok" => ProviderKind::Xai,
         _ => detect_provider(&config.api.model, &config.api.base_url),
     };
     let llm: Arc<dyn crate::llm::provider::Provider> = match provider_kind {
@@ -141,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
             &config.api.base_url,
             api_key,
         )),
-        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => Arc::new(
+        ProviderKind::OpenAi | ProviderKind::Xai | ProviderKind::OpenAiCompatible => Arc::new(
             crate::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
         ),
     };

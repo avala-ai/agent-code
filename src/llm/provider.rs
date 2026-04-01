@@ -76,8 +76,10 @@ pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
     if url_lower.contains("openai.com") {
         return ProviderKind::OpenAi;
     }
+    if url_lower.contains("x.ai") || url_lower.contains("xai.") {
+        return ProviderKind::Xai;
+    }
     if url_lower.contains("localhost") || url_lower.contains("127.0.0.1") {
-        // Local server — likely Ollama or LMStudio, both OpenAI-compatible.
         return ProviderKind::OpenAiCompatible;
     }
 
@@ -95,8 +97,10 @@ pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
+    if model_lower.starts_with("grok") {
+        return ProviderKind::Xai;
+    }
 
-    // Default: assume OpenAI-compatible (the most common API shape).
     ProviderKind::OpenAiCompatible
 }
 
@@ -105,5 +109,6 @@ pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
+    Xai,
     OpenAiCompatible,
 }
