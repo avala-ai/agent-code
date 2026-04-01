@@ -76,8 +76,8 @@ impl Default for ApiConfig {
         // Auto-detect base URL from which key is set.
         let has_generic = std::env::var("AGENT_CODE_API_KEY").is_ok();
         let base_url = if has_generic {
-            // Generic key — default to Anthropic unless base URL is overridden.
-            "https://api.anthropic.com/v1".to_string()
+            // Generic key — default to OpenAI (default model is gpt-5.4).
+            "https://api.openai.com/v1".to_string()
         } else if std::env::var("GOOGLE_API_KEY").is_ok() {
             "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
         } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
@@ -93,12 +93,12 @@ impl Default for ApiConfig {
         } else if std::env::var("OPENAI_API_KEY").is_ok() {
             "https://api.openai.com/v1".to_string()
         } else {
-            "https://api.anthropic.com/v1".to_string()
+            "https://api.openai.com/v1".to_string()
         };
 
         Self {
             base_url,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "gpt-4.1".to_string(),
             api_key,
             max_output_tokens: Some(16384),
             thinking: None,
