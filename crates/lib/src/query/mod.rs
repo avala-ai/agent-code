@@ -598,6 +598,11 @@ impl QueryEngine {
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
+
+    /// Get a cloneable cancel token for use in background tasks.
+    pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
 }
 
 /// Build the system prompt from tool definitions, app state, and memory.
