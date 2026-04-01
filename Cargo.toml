@@ -1,6 +1,6 @@
 [package]
 name = "agent-code"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 description = "An AI-powered coding agent for the terminal, written in pure Rust"
 license = "MIT"
