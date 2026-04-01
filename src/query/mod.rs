@@ -445,19 +445,22 @@ impl QueryEngine {
                 self.state.is_query_active = false;
 
                 // Fire background memory extraction (fire-and-forget).
-                let extraction_messages = self.state.messages.clone();
-                let extraction_state = self.extraction_state.clone();
-                let extraction_llm = self.llm.clone();
-                let extraction_model = model.clone();
-                tokio::spawn(async move {
-                    crate::memory::extraction::extract_memories_background(
-                        extraction_messages,
-                        extraction_state,
-                        extraction_llm,
-                        extraction_model,
-                    )
-                    .await;
-                });
+                // Only runs if memory directory exists (user opted into memory).
+                if crate::memory::ensure_memory_dir().is_some() {
+                    let extraction_messages = self.state.messages.clone();
+                    let extraction_state = self.extraction_state.clone();
+                    let extraction_llm = self.llm.clone();
+                    let extraction_model = model.clone();
+                    tokio::spawn(async move {
+                        crate::memory::extraction::extract_memories_background(
+                            extraction_messages,
+                            extraction_state,
+                            extraction_llm,
+                            extraction_model,
+                        )
+                        .await;
+                    });
+                }
 
                 return Ok(());
             }
