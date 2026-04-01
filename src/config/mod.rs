@@ -4,7 +4,7 @@
 //! priority (highest to lowest):
 //!
 //! 1. CLI flags and environment variables
-//! 2. Project-local settings (`.rc/settings.toml`)
+//! 2. Project-local settings (`.agent/settings.toml`)
 //! 3. User settings (`~/.config/agent-code/config.toml`)
 //!
 //! Each layer is merged into the final `Config` struct.
@@ -77,7 +77,7 @@ fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("agent-code").join("config.toml"))
 }
 
-/// Walk up from the current directory to find `.rc/settings.toml`.
+/// Walk up from the current directory to find `.agent/settings.toml`.
 fn find_project_config() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     find_config_in_ancestors(&cwd)
@@ -86,7 +86,7 @@ fn find_project_config() -> Option<PathBuf> {
 fn find_config_in_ancestors(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
-        let candidate = dir.join(".rc").join("settings.toml");
+        let candidate = dir.join(".agent").join("settings.toml");
         if candidate.exists() {
             return Some(candidate);
         }

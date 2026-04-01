@@ -8,7 +8,7 @@ Hooks let you run shell commands or HTTP requests at specific points in the agen
 ## Configuration
 
 ```toml
-# .rc/settings.toml
+# .agent/settings.toml
 
 # Auto-format Rust files after any write
 [[hooks]]
@@ -87,7 +87,7 @@ Without `tool_name`, the hook fires for all tools.
 
 ```
 > /hooks
-Hook system active. Configure hooks in .rc/settings.toml:
+Hook system active. Configure hooks in .agent/settings.toml:
   [[hooks]]
   event = "pre_tool_use"
   action = { type = "shell", command = "./check.sh" }

@@ -162,7 +162,7 @@ The core loop: receive user input, call the LLM with conversation history and to
 Configuration loads from three layers (highest priority first):
 
 1. **CLI flags and environment variables** (`AGENT_CODE_API_KEY`, `--model`, etc.)
-2. **Project config** (`.rc/settings.toml` in your repo)
+2. **Project config** (`.agent/settings.toml` in your repo)
 3. **User config** (`~/.config/agent-code/config.toml`)
 
 ```toml
@@ -235,7 +235,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 | `/resume <id>` | Restore a previous session |
 | `/sessions` | List saved sessions |
 | `/export` | Export conversation to markdown |
-| `/init` | Create `.rc/settings.toml` for this project |
+| `/init` | Create `.agent/settings.toml` for this project |
 | `/doctor` | Check environment (tools, config, git, disk) |
 | `/mcp` | List connected MCP servers |
 | `/memory` | Show loaded memory context |
@@ -248,7 +248,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/docs"]
 
 ### Skills
 
-Skills are reusable workflows defined as markdown files with YAML frontmatter. Drop them in `.rc/skills/` or `~/.config/agent-code/skills/`.
+Skills are reusable workflows defined as markdown files with YAML frontmatter. Drop them in `.agent/skills/` or `~/.config/agent-code/skills/`.
 
 ```markdown
 ---
@@ -290,7 +290,7 @@ my-plugin/
 Run shell commands or HTTP requests at lifecycle points:
 
 ```toml
-# .rc/settings.toml
+# .agent/settings.toml
 [[hooks]]
 event = "post_tool_use"
 tool_name = "FileWrite"
@@ -301,7 +301,7 @@ action = { type = "shell", command = "cargo fmt" }
 
 Persistent context that carries across sessions:
 
-- **Project memory:** `.rc/CONTEXT.md` in your repo root. Loaded automatically.
+- **Project memory:** `.agent/CONTEXT.md` in your repo root. Loaded automatically.
 - **User memory:** `~/.config/agent-code/memory/MEMORY.md`. Personal preferences and patterns.
 
 ## Contributing

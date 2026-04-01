@@ -35,7 +35,7 @@ Place plugin directories in:
 
 | Location | Scope |
 |----------|-------|
-| `.rc/plugins/` | Project-specific |
+| `.agent/plugins/` | Project-specific |
 | `~/.config/agent-code/plugins/` | Available in all projects |
 
 ## Commands

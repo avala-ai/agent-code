@@ -120,8 +120,8 @@ impl MemoryContext {
 ///
 /// Checks (in priority order, lowest to highest):
 /// 1. User global: ~/.config/agent-code/CONTEXT.md
-/// 2. Project root: CONTEXT.md, .rc/CONTEXT.md
-/// 3. Project rules: .rc/rules/*.md (all files concatenated)
+/// 2. Project root: CONTEXT.md, .agent/CONTEXT.md
+/// 3. Project rules: .agent/rules/*.md (all files concatenated)
 /// 4. Project local: CONTEXT.local.md (gitignored overrides)
 ///
 /// Files closer to cwd have higher priority (loaded later, overrides earlier).
@@ -139,7 +139,7 @@ fn load_project_context(project_root: &Path) -> Option<String> {
     // Layer 2: Project root context.
     for path in &[
         project_root.join("CONTEXT.md"),
-        project_root.join(".rc").join("CONTEXT.md"),
+        project_root.join(".agent").join("CONTEXT.md"),
     ] {
         if let Some(content) = load_truncated_file(path) {
             debug!("Loaded project context from {}", path.display());
@@ -148,7 +148,7 @@ fn load_project_context(project_root: &Path) -> Option<String> {
     }
 
     // Layer 3: Rules directory (all .md files).
-    let rules_dir = project_root.join(".rc").join("rules");
+    let rules_dir = project_root.join(".agent").join("rules");
     if rules_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&rules_dir)
     {
@@ -259,7 +259,7 @@ fn user_memory_dir() -> Option<PathBuf> {
 }
 
 pub fn project_memory_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".rc")
+    project_root.join(".agent")
 }
 
 pub fn ensure_memory_dir() -> Option<PathBuf> {

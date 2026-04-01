@@ -45,7 +45,7 @@ impl Tool for ListMcpResourcesTool {
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult::success(
             "MCP resource listing requires connected servers. \
-             Configure servers in .rc/settings.toml under [mcp_servers].",
+             Configure servers in .agent/settings.toml under [mcp_servers].",
         ))
     }
 }

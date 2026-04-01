@@ -157,7 +157,7 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
         }
     }
 
-    let project_config = cwd.join(".rc").join("settings.toml");
+    let project_config = cwd.join(".agent").join("settings.toml");
     if project_config.exists() {
         checks.push(Check::pass(
             "config:project_file",

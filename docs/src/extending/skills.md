@@ -1,9 +1,9 @@
 
-Skills are reusable prompt templates that define multi-step workflows. They're markdown files with YAML frontmatter, loaded from `.rc/skills/` or `~/.config/agent-code/skills/`.
+Skills are reusable prompt templates that define multi-step workflows. They're markdown files with YAML frontmatter, loaded from `.agent/skills/` or `~/.config/agent-code/skills/`.
 
 ## Creating a skill
 
-Create a file in `.rc/skills/test-and-fix.md`:
+Create a file in `.agent/skills/test-and-fix.md`:
 
 ```markdown
 
@@ -71,7 +71,7 @@ The LLM can invoke skills when it determines one is appropriate:
 For complex skills with supporting files, use a directory:
 
 ```
-.rc/skills/
+.agent/skills/
   deploy/
     SKILL.md      ← the skill definition
     checklist.md  ← referenced by the skill
@@ -81,7 +81,7 @@ For complex skills with supporting files, use a directory:
 
 | Location | Scope |
 |----------|-------|
-| `.rc/skills/` | Project-specific |
+| `.agent/skills/` | Project-specific |
 | `~/.config/agent-code/skills/` | Available in all projects |
 
 ## Commands

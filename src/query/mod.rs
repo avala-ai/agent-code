@@ -50,6 +50,7 @@ pub struct QueryEngine {
     cancel: CancellationToken,
     hooks: HookRegistry,
     cache_tracker: crate::services::cache_tracking::CacheTracker,
+    denial_tracker: Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>,
 }
 
 /// Callback for streaming events to the UI.
@@ -94,6 +95,9 @@ impl QueryEngine {
             cancel: CancellationToken::new(),
             hooks: HookRegistry::new(),
             cache_tracker: crate::services::cache_tracking::CacheTracker::new(),
+            denial_tracker: Arc::new(tokio::sync::Mutex::new(
+                crate::permissions::tracking::DenialTracker::new(100),
+            )),
         }
     }
 
@@ -448,7 +452,7 @@ impl QueryEngine {
                 verbose: self.config.verbose,
                 plan_mode: self.state.plan_mode,
                 file_cache: Some(self.file_cache.clone()),
-                denial_tracker: None,
+                denial_tracker: Some(self.denial_tracker.clone()),
                 task_manager: Some(self.state.task_manager.clone()),
             };
 
@@ -617,7 +621,14 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
          - Skip filler, preamble, and unnecessary transitions.\n\
          - Don't restate what the user said.\n\
          - If you can say it in one sentence, don't use three.\n\
-         - Focus output on: decisions that need input, status updates, and errors that change the plan.\n",
+         - Focus output on: decisions that need input, status updates, and errors that change the plan.\n\n\
+         # Memory\n\n\
+         You can save information across sessions by writing memory files.\n\
+         - Save to: ~/.config/agent-code/memory/ (one .md file per topic)\n\
+         - Each file needs YAML frontmatter: name, description, type (user/feedback/project/reference)\n\
+         - After writing a file, update MEMORY.md with a one-line pointer\n\
+         - Do NOT store: code patterns, git history, debugging solutions, anything derivable from code\n\
+         - Memory is a hint — always verify against current state before acting on it\n",
     );
 
     prompt

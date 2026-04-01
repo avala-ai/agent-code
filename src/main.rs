@@ -124,6 +124,17 @@ async fn main() -> anyhow::Result<()> {
         session_env.shell,
     );
 
+    // Check if memory consolidation should run (background "dreaming").
+    if let Some(memory_dir) = memory::ensure_memory_dir()
+        && memory::consolidation::should_consolidate(&memory_dir)
+        && let Some(lock_path) = memory::consolidation::try_acquire_lock(&memory_dir)
+    {
+        tracing::info!("Memory consolidation due — would run dream agent here");
+        // Future: spawn a background consolidation agent.
+        // For now, just release the lock to update the timestamp.
+        memory::consolidation::release_lock(&lock_path);
+    }
+
     // Load configuration (files + env + CLI overrides).
     let mut config = Config::load()?;
     if let Some(ref url) = cli.api_base_url {

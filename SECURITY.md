@@ -34,7 +34,7 @@ Every tool call passes through a permission check before execution:
 - **Deny mode**: blocks all mutations
 - **Plan mode**: restricts to read-only tools
 
-Configure per-tool rules in `.rc/settings.toml`:
+Configure per-tool rules in `.agent/settings.toml`:
 
 ```toml
 [permissions]

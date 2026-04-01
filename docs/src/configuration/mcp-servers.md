@@ -6,7 +6,7 @@
 Add servers to your config file:
 
 ```toml
-# .rc/settings.toml or ~/.config/agent-code/config.toml
+# .agent/settings.toml or ~/.config/agent-code/config.toml
 
 [mcp_servers.filesystem]
 command = "npx"

@@ -8,7 +8,7 @@
 //! - `hooks/` — hook definitions
 //!
 //! Plugins are loaded from `~/.config/agent-code/plugins/` and
-//! project-level `.rc/plugins/`.
+//! project-level `.agent/plugins/`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -70,7 +70,7 @@ impl PluginRegistry {
 
         // Project-level plugins.
         if let Some(root) = project_root {
-            registry.load_from_dir(&root.join(".rc").join("plugins"));
+            registry.load_from_dir(&root.join(".agent").join("plugins"));
         }
 
         debug!("Loaded {} plugins", registry.plugins.len());

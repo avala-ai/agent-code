@@ -138,7 +138,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "init",
         aliases: &[],
-        description: "Initialize project config (.rc/settings.toml)",
+        description: "Initialize project config (.agent/settings.toml)",
         hidden: false,
     },
     Command {
@@ -378,7 +378,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             )));
             if skills.all().is_empty() {
                 println!(
-                    "No skills loaded. Add .md files to .rc/skills/ or ~/.config/agent-code/skills/"
+                    "No skills loaded. Add .md files to .agent/skills/ or ~/.config/agent-code/skills/"
                 );
             } else {
                 println!("Loaded {} skills:", skills.all().len());
@@ -461,7 +461,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("init") => {
-            let config_dir = std::path::Path::new(&engine.state().cwd).join(".rc");
+            let config_dir = std::path::Path::new(&engine.state().cwd).join(".agent");
             let config_file = config_dir.join("settings.toml");
             if config_file.exists() {
                 println!("Project already initialized: {}", config_file.display());
@@ -553,7 +553,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("hooks") => {
-            println!("Hook system active. Configure hooks in .rc/settings.toml:");
+            println!("Hook system active. Configure hooks in .agent/settings.toml:");
             println!("  [[hooks]]");
             println!("  event = \"pre_tool_use\"");
             println!("  action = {{ type = \"shell\", command = \"./check.sh\" }}");

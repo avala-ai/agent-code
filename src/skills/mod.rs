@@ -1,7 +1,7 @@
 //! Skill system.
 //!
 //! Skills are reusable, user-defined workflows loaded from markdown
-//! files in `.rc/skills/` or `~/.config/agent-code/skills/`. Each
+//! files in `.agent/skills/` or `~/.config/agent-code/skills/`. Each
 //! skill is a markdown file with YAML frontmatter that defines:
 //!
 //! - `description`: what the skill does
@@ -75,7 +75,7 @@ impl SkillRegistry {
 
         // Load from project-level skills directory.
         if let Some(root) = project_root {
-            let project_skills = root.join(".rc").join("skills");
+            let project_skills = root.join(".agent").join("skills");
             if project_skills.is_dir() {
                 registry.load_from_dir(&project_skills);
             }

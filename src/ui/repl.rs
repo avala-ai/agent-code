@@ -172,6 +172,10 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let session_id = crate::services::session::new_session_id();
     let session_id_display = session_id.clone();
 
+    // Initialize session notes and clean up old ones.
+    crate::memory::session_notes::init_session_notes(&session_id);
+    crate::memory::session_notes::cleanup_old_notes();
+
     // Load history.
     let history_path = dirs::data_dir().map(|d| d.join("agent-code").join("history.txt"));
     if let Some(ref path) = history_path {

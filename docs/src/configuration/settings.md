@@ -2,7 +2,7 @@
 Configuration loads from three layers (highest priority first):
 
 1. **CLI flags and environment variables**
-2. **Project config** — `.rc/settings.toml` in your repo
+2. **Project config** — `.agent/settings.toml` in your repo
 3. **User config** — `~/.config/agent-code/config.toml`
 
 ## Full config reference
@@ -55,14 +55,14 @@ command = "cargo fmt"
 
 ## Project config
 
-Create `.rc/settings.toml` in your repo root for project-specific settings. These override user config but are overridden by CLI flags.
+Create `.agent/settings.toml` in your repo root for project-specific settings. These override user config but are overridden by CLI flags.
 
 Initialize with:
 
 ```bash
 agent
 > /init
-Created .rc/settings.toml
+Created .agent/settings.toml
 ```
 
 ## Environment variables

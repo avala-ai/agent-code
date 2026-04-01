@@ -26,7 +26,7 @@ agent --dangerously-skip-permissions
 Configure per-tool rules in your settings file:
 
 ```toml
-# .rc/settings.toml or ~/.config/agent-code/config.toml
+# .agent/settings.toml or ~/.config/agent-code/config.toml
 
 [permissions]
 default_mode = "ask"
