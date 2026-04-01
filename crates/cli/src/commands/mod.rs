@@ -371,7 +371,74 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 engine.state_mut().config.api.model = new_model.to_string();
                 println!("Model changed to: {new_model}");
             } else {
-                println!("Model: {}", engine.state().config.api.model);
+                // Interactive model selector based on configured provider.
+                let current = engine.state().config.api.model.clone();
+                let base_url = engine.state().config.api.base_url.clone();
+                let provider = agent_code_lib::llm::provider::detect_provider(&current, &base_url);
+
+                use agent_code_lib::llm::provider::ProviderKind;
+                let models: Vec<(&str, &str)> = match provider {
+                    ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex => vec![
+                        ("claude-opus-4-20250514", "Opus 4 · Most capable"),
+                        ("claude-sonnet-4-20250514", "Sonnet 4 · Balanced"),
+                        ("claude-haiku-4-20250414", "Haiku 4 · Fast"),
+                    ],
+                    ProviderKind::OpenAi => vec![
+                        ("gpt-5.4", "GPT-5.4 · Most capable"),
+                        ("gpt-5.4-mini", "GPT-5.4 Mini · Balanced"),
+                        ("gpt-5.4-nano", "GPT-5.4 Nano · Fast"),
+                        ("gpt-4.1", "GPT-4.1 · Previous gen"),
+                        ("gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
+                        ("gpt-4.1-nano", "GPT-4.1 Nano · Fastest"),
+                        ("o3", "o3 · Reasoning"),
+                        ("o3-mini", "o3 Mini · Fast reasoning"),
+                    ],
+                    ProviderKind::Xai => vec![
+                        ("grok-3", "Grok 3 · Most capable"),
+                        ("grok-3-mini", "Grok 3 Mini · Fast"),
+                    ],
+                    ProviderKind::Google => vec![
+                        ("gemini-2.5-pro", "Gemini 2.5 Pro · Most capable"),
+                        ("gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
+                    ],
+                    ProviderKind::DeepSeek => vec![
+                        ("deepseek-chat", "DeepSeek Chat · General"),
+                        ("deepseek-reasoner", "DeepSeek Reasoner · Reasoning"),
+                    ],
+                    ProviderKind::Mistral => vec![
+                        ("mistral-large-latest", "Mistral Large · Most capable"),
+                        ("codestral-latest", "Codestral · Code-focused"),
+                    ],
+                    _ => vec![],
+                };
+
+                if models.is_empty() {
+                    println!("Model: {current}");
+                    println!("Use /model <name> to change.");
+                } else {
+                    println!();
+                    println!("  Select model");
+                    println!();
+
+                    let options: Vec<crate::ui::selector::SelectOption> = models
+                        .iter()
+                        .map(|(name, desc)| {
+                            let check = if *name == current { " ✔" } else { "" };
+                            crate::ui::selector::SelectOption {
+                                label: format!("{name}{check}"),
+                                description: desc.to_string(),
+                                value: name.to_string(),
+                                preview: None,
+                            }
+                        })
+                        .collect();
+
+                    let chosen = crate::ui::selector::select(&options);
+                    if !chosen.is_empty() {
+                        engine.state_mut().config.api.model = chosen.clone();
+                        println!("Model changed to: {chosen}");
+                    }
+                }
             }
             CommandResult::Handled
         }
