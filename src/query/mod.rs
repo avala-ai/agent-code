@@ -388,8 +388,23 @@ impl QueryEngine {
             self.state.push_message(assistant_msg);
             self.state.record_usage(&usage, &model);
 
-            // Record cache performance.
+            // Record cache and telemetry.
             let _cache_event = self.cache_tracker.record(&usage);
+            {
+                let mut span = crate::services::telemetry::api_call_span(
+                    &model,
+                    turn + 1,
+                    &self.state.session_id,
+                );
+                crate::services::telemetry::record_usage(&mut span, &usage);
+                span.finish();
+                tracing::debug!(
+                    "API call: {}ms, {}in/{}out tokens",
+                    span.duration_ms().unwrap_or(0),
+                    usage.input_tokens,
+                    usage.output_tokens,
+                );
+            }
 
             // Step 6: Handle stream errors.
             if got_error {
