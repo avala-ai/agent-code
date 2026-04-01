@@ -88,7 +88,14 @@ fn highlight_code(code: &str, lang: &str) -> String {
 }
 
 /// Render inline markdown elements (bold, italic, code spans, links).
+/// Uses the active theme for colors instead of hardcoded ANSI codes.
 fn render_inline(line: &str) -> String {
+    let t = super::theme::current();
+
+    // Convert theme Color to ANSI escape string.
+    let accent_code = color_to_ansi(t.accent);
+    let tool_code = color_to_ansi(t.tool);
+
     let mut result = String::new();
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -99,7 +106,7 @@ fn render_inline(line: &str) -> String {
             && let Some(end) = find_closing(&chars, i + 1, '`')
         {
             let code: String = chars[i + 1..end].iter().collect();
-            result.push_str(&format!("\x1b[36m{code}\x1b[0m")); // cyan
+            result.push_str(&format!("{accent_code}{code}\x1b[0m"));
             i = end + 1;
             continue;
         }
@@ -111,7 +118,7 @@ fn render_inline(line: &str) -> String {
             && let Some(end) = find_double_closing(&chars, i + 2, '*')
         {
             let text: String = chars[i + 2..end].iter().collect();
-            result.push_str(&format!("\x1b[1m{text}\x1b[0m")); // bold
+            result.push_str(&format!("\x1b[1m{text}\x1b[0m"));
             i = end + 2;
             continue;
         }
@@ -125,7 +132,7 @@ fn render_inline(line: &str) -> String {
                 && end > i + 1
             {
                 let text: String = chars[i + 1..end].iter().collect();
-                result.push_str(&format!("\x1b[3m{text}\x1b[0m")); // italic
+                result.push_str(&format!("\x1b[3m{text}\x1b[0m"));
                 i = end + 1;
                 continue;
             }
@@ -136,14 +143,14 @@ fn render_inline(line: &str) -> String {
             let level = chars.iter().take_while(|&&c| c == '#').count();
             let text: String = chars[level..].iter().collect();
             let text = text.trim_start();
-            result.push_str(&format!("\x1b[1;4m{text}\x1b[0m")); // bold + underline
+            result.push_str(&format!("\x1b[1;4m{text}\x1b[0m"));
             return result;
         }
 
         // List items: - or * at start.
         if i == 0 && (chars[i] == '-' || chars[i] == '*') && chars.get(1) == Some(&' ') {
             let text: String = chars[2..].iter().collect();
-            result.push_str(&format!("  \x1b[36m•\x1b[0m {text}"));
+            result.push_str(&format!("  {tool_code}•\x1b[0m {text}"));
             return result;
         }
 
@@ -152,6 +159,25 @@ fn render_inline(line: &str) -> String {
     }
 
     result
+}
+
+/// Convert a crossterm Color to an ANSI escape sequence prefix.
+fn color_to_ansi(color: crossterm::style::Color) -> String {
+    match color {
+        crossterm::style::Color::Rgb { r, g, b } => format!("\x1b[38;2;{r};{g};{b}m"),
+        crossterm::style::Color::DarkCyan => "\x1b[36m".to_string(),
+        crossterm::style::Color::Cyan => "\x1b[96m".to_string(),
+        crossterm::style::Color::Red => "\x1b[31m".to_string(),
+        crossterm::style::Color::Green => "\x1b[32m".to_string(),
+        crossterm::style::Color::Yellow => "\x1b[33m".to_string(),
+        crossterm::style::Color::Blue => "\x1b[34m".to_string(),
+        crossterm::style::Color::Magenta => "\x1b[35m".to_string(),
+        crossterm::style::Color::Grey => "\x1b[37m".to_string(),
+        crossterm::style::Color::DarkGrey => "\x1b[90m".to_string(),
+        crossterm::style::Color::White => "\x1b[97m".to_string(),
+        crossterm::style::Color::Black => "\x1b[30m".to_string(),
+        _ => "\x1b[36m".to_string(), // fallback to cyan
+    }
 }
 
 fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {

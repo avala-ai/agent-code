@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::style::Stylize;
+use crossterm::style::{Stylize, style};
 
 /// Status labels displayed while waiting for a response.
 const WAIT_LABELS: &[&str] = &[
@@ -55,7 +55,8 @@ impl ActivityIndicator {
                     format!("{label}{dots}")
                 };
 
-                print!("\r{}", status.dark_grey());
+                let color = super::theme::current().muted;
+                print!("\r{}", style(status).with(color));
                 let _ = std::io::stdout().flush();
 
                 tokio::time::sleep(Duration::from_millis(400)).await;
