@@ -439,6 +439,7 @@ impl QueryEngine {
                 plan_mode: self.state.plan_mode,
                 file_cache: Some(self.file_cache.clone()),
                 denial_tracker: None,
+                task_manager: Some(self.state.task_manager.clone()),
             };
 
             // Fire pre-tool-use hooks.

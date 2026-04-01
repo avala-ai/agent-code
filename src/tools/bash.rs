@@ -154,7 +154,7 @@ impl Tool for BashTool {
 
         // Background execution: spawn and return immediately.
         if run_in_background {
-            return run_background(command, &ctx.cwd).await;
+            return run_background(command, &ctx.cwd, ctx.task_manager.as_ref()).await;
         }
 
         let mut child = Command::new("bash")
@@ -212,8 +212,13 @@ impl Tool for BashTool {
 }
 
 /// Run a command in the background, returning a task ID immediately.
-async fn run_background(command: &str, cwd: &std::path::Path) -> Result<ToolResult, ToolError> {
-    let task_mgr = crate::services::background::TaskManager::new();
+async fn run_background(
+    command: &str,
+    cwd: &std::path::Path,
+    task_mgr: Option<&std::sync::Arc<crate::services::background::TaskManager>>,
+) -> Result<ToolResult, ToolError> {
+    let default_mgr = crate::services::background::TaskManager::new();
+    let task_mgr = task_mgr.map(|m| m.as_ref()).unwrap_or(&default_mgr);
     let task_id = task_mgr
         .spawn_shell(command, command, cwd)
         .await

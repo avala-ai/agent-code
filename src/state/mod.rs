@@ -28,6 +28,10 @@ pub struct AppState {
     pub model_usage: HashMap<String, Usage>,
     /// Whether plan mode is active (read-only tools only).
     pub plan_mode: bool,
+    /// Shared background task manager.
+    pub task_manager: std::sync::Arc<crate::services::background::TaskManager>,
+    /// Session ID for persistence.
+    pub session_id: String,
 }
 
 impl AppState {
@@ -46,6 +50,8 @@ impl AppState {
             cwd,
             model_usage: HashMap::new(),
             plan_mode: false,
+            task_manager: std::sync::Arc::new(crate::services::background::TaskManager::new()),
+            session_id: crate::services::session::new_session_id(),
         }
     }
 

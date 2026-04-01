@@ -133,6 +133,7 @@ pub async fn execute_tool_calls(
                                     plan_mode: ctx_plan_mode,
                                     file_cache: ctx_file_cache,
                                     denial_tracker: None,
+                                    task_manager: None,
                                 },
                                 &perm_checker,
                             )

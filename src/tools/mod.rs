@@ -148,6 +148,8 @@ pub struct ToolContext {
     /// Permission denial tracker for reporting.
     pub denial_tracker:
         Option<Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>>,
+    /// Shared background task manager.
+    pub task_manager: Option<Arc<crate::services::background::TaskManager>>,
 }
 
 /// Result of a tool execution.
