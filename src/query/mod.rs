@@ -54,6 +54,7 @@ pub struct QueryEngine {
     cache_tracker: crate::services::cache_tracking::CacheTracker,
     denial_tracker: Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
+    session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Callback for streaming events to the UI.
@@ -104,6 +105,7 @@ impl QueryEngine {
             extraction_state: Arc::new(tokio::sync::Mutex::new(
                 crate::memory::extraction::ExtractionState::new(),
             )),
+            session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -542,6 +544,7 @@ impl QueryEngine {
                 file_cache: Some(self.file_cache.clone()),
                 denial_tracker: Some(self.denial_tracker.clone()),
                 task_manager: Some(self.state.task_manager.clone()),
+                session_allows: Some(self.session_allows.clone()),
             };
 
             // Fire pre-tool-use hooks.

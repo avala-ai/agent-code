@@ -150,6 +150,8 @@ pub struct ToolContext {
         Option<Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>>,
     /// Shared background task manager.
     pub task_manager: Option<Arc<crate::services::background::TaskManager>>,
+    /// Tools allowed for the rest of the session (via "Allow for session" prompt).
+    pub session_allows: Option<Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 /// Result of a tool execution.

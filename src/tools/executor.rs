@@ -134,6 +134,7 @@ pub async fn execute_tool_calls(
                                     file_cache: ctx_file_cache,
                                     denial_tracker: None,
                                     task_manager: None,
+                                    session_allows: None,
                                 },
                                 &perm_checker,
                             )
@@ -206,39 +207,48 @@ async fn execute_single_tool(
             };
         }
         PermissionDecision::Ask(prompt) => {
-            // Prompt the user for permission with detailed TUI modal.
-            let description = format!("{}: {}", call.name, prompt);
-            let input_preview = serde_json::to_string_pretty(&call.input).ok();
-            let response = crate::ui::prompt::ask_permission_detailed(
-                &call.name,
-                &description,
-                input_preview.as_deref(),
-            );
+            // Check session-level allows first (user previously chose "Allow for session").
+            if let Some(ref allows) = ctx.session_allows
+                && allows.lock().await.contains(call.name.as_str())
+            {
+                // Already allowed for this session — skip prompt.
+            } else {
+                // Prompt the user for permission with detailed TUI modal.
+                let description = format!("{}: {}", call.name, prompt);
+                let input_preview = serde_json::to_string_pretty(&call.input).ok();
+                let response = crate::ui::prompt::ask_permission_detailed(
+                    &call.name,
+                    &description,
+                    input_preview.as_deref(),
+                );
 
-            match response {
-                crate::ui::prompt::PermissionResponse::AllowOnce => {
-                    // Continue to execution.
-                }
-                crate::ui::prompt::PermissionResponse::AllowSession => {
-                    // TODO: Record session-level allow for this tool.
-                    // For now, just continue.
-                }
-                crate::ui::prompt::PermissionResponse::Deny => {
-                    if let Some(ref tracker) = ctx.denial_tracker {
-                        tracker.lock().await.record(
-                            &call.name,
-                            &call.id,
-                            "user denied",
-                            &call.input,
-                        );
+                match response {
+                    crate::ui::prompt::PermissionResponse::AllowOnce => {
+                        // Continue to execution.
                     }
-                    return ToolCallResult {
-                        tool_use_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        result: ToolResult::error("Permission denied by user".to_string()),
-                    };
+                    crate::ui::prompt::PermissionResponse::AllowSession => {
+                        // Record session-level allow so future calls skip the prompt.
+                        if let Some(ref allows) = ctx.session_allows {
+                            allows.lock().await.insert(call.name.clone());
+                        }
+                    }
+                    crate::ui::prompt::PermissionResponse::Deny => {
+                        if let Some(ref tracker) = ctx.denial_tracker {
+                            tracker.lock().await.record(
+                                &call.name,
+                                &call.id,
+                                "user denied",
+                                &call.input,
+                            );
+                        }
+                        return ToolCallResult {
+                            tool_use_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            result: ToolResult::error("Permission denied by user".to_string()),
+                        };
+                    }
                 }
-            }
+            } // close else block
         }
     }
 
