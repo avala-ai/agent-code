@@ -149,7 +149,7 @@ fn pick_provider() -> (String, String, String, String) {
             "openai",
             "OPENAI_API_KEY",
             "https://api.openai.com/v1",
-            "gpt-4.1",
+            "gpt-5.4",
         ),
         "c" => ("xai", "XAI_API_KEY", "https://api.x.ai/v1", "grok-3"),
         "d" => (

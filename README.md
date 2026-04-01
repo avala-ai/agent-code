@@ -37,7 +37,7 @@ agent-code works with any LLM provider. Set one environment variable and go:
 | Provider | Env Variable | Models |
 |----------|-------------|--------|
 | **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus, Sonnet, Haiku |
-| **OpenAI** | `OPENAI_API_KEY` | GPT-4.1, GPT-4.1-mini, GPT-4.1-nano, GPT-4o, o1, o3 |
+| **OpenAI** | `OPENAI_API_KEY` | GPT-5.4, GPT-5.4-mini, GPT-5.4-nano, GPT-4.1, GPT-4o, o1, o3 |
 | **xAI** | `XAI_API_KEY` | Grok-3, Grok-3-mini, Grok-2 |
 | **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Flash, Gemini 2.5 Pro |
 | **DeepSeek** | `DEEPSEEK_API_KEY` | DeepSeek-V3, DeepSeek-Chat |

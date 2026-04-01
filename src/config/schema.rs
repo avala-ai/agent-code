@@ -98,7 +98,7 @@ impl Default for ApiConfig {
 
         Self {
             base_url,
-            model: "gpt-4.1".to_string(),
+            model: "gpt-5.4".to_string(),
             api_key,
             max_output_tokens: Some(16384),
             thinking: None,
