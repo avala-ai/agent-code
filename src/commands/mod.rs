@@ -400,32 +400,35 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 .to_string(),
         ),
         Some("doctor") => {
-            // Quick environment check.
-            let mut checks = Vec::new();
+            // Run the full async diagnostics synchronously via a blocking call.
+            let cwd = std::path::Path::new(&engine.state().cwd).to_path_buf();
+            let config = engine.state().config.clone();
+            let rt = tokio::runtime::Handle::current();
+            let checks = std::thread::spawn(move || {
+                rt.block_on(crate::services::diagnostics::run_all(&cwd, &config))
+            })
+            .join()
+            .unwrap_or_default();
 
-            // Check for required tools.
-            for tool in &["git", "rg", "bash"] {
-                let available = std::process::Command::new("which")
-                    .arg(tool)
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-                checks.push(format!("  {} {}", if available { "✓" } else { "✗" }, tool,));
+            println!("Environment diagnostics:\n");
+            for check in &checks {
+                let icon = match check.status {
+                    crate::services::diagnostics::CheckStatus::Pass => "✓".to_string(),
+                    crate::services::diagnostics::CheckStatus::Warn => "!".to_string(),
+                    crate::services::diagnostics::CheckStatus::Fail => "✗".to_string(),
+                };
+                println!("  {icon} {}: {}", check.name, check.detail);
             }
 
-            // Config status.
-            let config = &engine.state().config;
-            checks.push(format!("  Model: {}", config.api.model));
-            checks.push(format!(
-                "  API key: {}",
-                if config.api.api_key.is_some() {
-                    "set"
-                } else {
-                    "missing"
-                }
-            ));
-
-            println!("Environment check:\n{}", checks.join("\n"));
+            let pass = checks
+                .iter()
+                .filter(|c| c.status == crate::services::diagnostics::CheckStatus::Pass)
+                .count();
+            let fail = checks
+                .iter()
+                .filter(|c| c.status == crate::services::diagnostics::CheckStatus::Fail)
+                .count();
+            println!("\n  {pass} passed, {fail} failed, {} total", checks.len());
             CommandResult::Handled
         }
         Some("mcp") => {

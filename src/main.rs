@@ -110,6 +110,16 @@ async fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("AGENT_CODE_API_KEY", &result.api_key) };
     }
 
+    // Detect session environment.
+    let session_env = services::session_env::SessionEnvironment::detect().await;
+    tracing::debug!(
+        "Environment: {} on {}, git={}, shell={}",
+        session_env.project_root.display(),
+        session_env.platform,
+        session_env.is_git_repo,
+        session_env.shell,
+    );
+
     // Load configuration (files + env + CLI overrides).
     let mut config = Config::load()?;
     if let Some(ref url) = cli.api_base_url {

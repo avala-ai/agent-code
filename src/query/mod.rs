@@ -52,6 +52,7 @@ pub struct QueryEngine {
     config: QueryEngineConfig,
     cancel: CancellationToken,
     hooks: HookRegistry,
+    cache_tracker: crate::services::cache_tracking::CacheTracker,
 }
 
 /// Callback for streaming events to the UI.
@@ -95,6 +96,7 @@ impl QueryEngine {
             config,
             cancel: CancellationToken::new(),
             hooks: HookRegistry::new(),
+            cache_tracker: crate::services::cache_tracking::CacheTracker::new(),
         }
     }
 
@@ -385,6 +387,9 @@ impl QueryEngine {
             });
             self.state.push_message(assistant_msg);
             self.state.record_usage(&usage, &model);
+
+            // Record cache performance.
+            let _cache_event = self.cache_tracker.record(&usage);
 
             // Step 6: Handle stream errors.
             if got_error {
