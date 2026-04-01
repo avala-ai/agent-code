@@ -358,12 +358,34 @@ impl QueryEngine {
                                 continue;
                             }
                             // Before giving up, try reactive compact for size errors.
+                            // Two-stage recovery: context collapse first, then microcompact.
                             if let ProviderError::RequestTooLarge(body) = &e {
                                 let gap = compact::parse_prompt_too_long_gap(body);
+
+                                // Stage 1: Context collapse (snip middle messages).
+                                let effective = compact::effective_context_window(&model);
+                                if let Some(collapse) =
+                                    crate::services::context_collapse::collapse_to_budget(
+                                        self.state.history(),
+                                        effective,
+                                    )
+                                {
+                                    info!(
+                                        "Reactive collapse: snipped {} messages, freed ~{} tokens",
+                                        collapse.snipped_count, collapse.tokens_freed
+                                    );
+                                    self.state.messages = collapse.api_messages;
+                                    sink.on_compact(collapse.tokens_freed);
+                                    continue;
+                                }
+
+                                // Stage 2: Aggressive microcompact.
                                 let freed = compact::microcompact(&mut self.state.messages, 1);
                                 if freed > 0 {
                                     sink.on_compact(freed);
-                                    info!("Reactive compact freed ~{freed} tokens (gap: {gap:?})");
+                                    info!(
+                                        "Reactive microcompact freed ~{freed} tokens (gap: {gap:?})"
+                                    );
                                     continue;
                                 }
                             }
