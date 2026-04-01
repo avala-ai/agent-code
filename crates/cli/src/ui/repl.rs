@@ -316,18 +316,55 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let t = super::theme::current();
 
     println!();
-    println!(
-        "  {}   agent-code v{}",
-        "▐▛██▜▌".with(t.accent).bold(),
-        env!("CARGO_PKG_VERSION"),
-    );
-    println!(
-        "  {}  {} · session {}",
-        "▝▜██▛▘".with(t.accent),
-        model.with(t.text).bold(),
-        session_id_display.as_str().with(t.muted),
-    );
-    println!("  {}   {}", "  ▘▘  ".with(t.accent), cwd.with(t.muted),);
+
+    // Render pixel art crab with shimmer animation.
+    let crab_lines = super::tui::render_crab_banner();
+    let info_lines = [
+        String::new(),
+        String::new(),
+        format!("  agent-code v{}", env!("CARGO_PKG_VERSION")),
+        format!("  {} · session {}", model, session_id_display.as_str()),
+        format!("  {cwd}"),
+        String::new(),
+        String::new(),
+    ];
+
+    for (i, crab_line) in crab_lines.iter().enumerate() {
+        let info = info_lines.get(i).cloned().unwrap_or_default();
+        if info.is_empty() {
+            println!("{crab_line}");
+        } else {
+            println!("{crab_line}{info}");
+        }
+    }
+
+    // Brief shimmer animation (3 frames, 120ms each).
+    for frame in 0..3 {
+        let shimmer_lines = super::tui::render_crab_shimmer(frame);
+        // Move cursor up to overwrite the crab.
+        eprint!("\x1b[{}A", shimmer_lines.len());
+        for (i, crab_line) in shimmer_lines.iter().enumerate() {
+            let info = info_lines.get(i).cloned().unwrap_or_default();
+            if info.is_empty() {
+                println!("{crab_line}");
+            } else {
+                println!("{crab_line}{info}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+
+    // Final static frame.
+    eprint!("\x1b[{}A", crab_lines.len());
+    for (i, crab_line) in crab_lines.iter().enumerate() {
+        let info = info_lines.get(i).cloned().unwrap_or_default();
+        if info.is_empty() {
+            println!("{crab_line}");
+        } else {
+            println!("{crab_line}{info}");
+        }
+    }
+
     println!();
     println!("{}", divider.with(t.muted));
 

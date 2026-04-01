@@ -642,3 +642,222 @@ fn truncate(s: &str, max: usize) -> String {
         s[..max].to_string()
     }
 }
+
+// ---- Pixel art crab banner ----
+
+/// Render the crab mascot as pixel art using half-block characters.
+/// Each cell uses ▀ with fg=top pixel, bg=bottom pixel for 2x vertical resolution.
+/// Returns a Vec of pre-rendered ANSI strings (one per display line).
+pub fn render_crab_banner() -> Vec<String> {
+    // Color palette (matching the pixel art logo).
+    const X: u8 = 0; // transparent (use terminal default)
+    const P: u8 = 1; // purple body (#A422E1)
+    const D: u8 = 2; // dark purple (shadow/outline)
+    const L: u8 = 3; // light purple (belly highlight)
+    const W: u8 = 4; // white (eyes)
+    const B: u8 = 5; // black (pupils)
+    const G: u8 = 6; // grey (gear)
+    const T: u8 = 7; // dark grey (terminal screen)
+    const C: u8 = 8; // cyan (terminal text)
+
+    fn palette(idx: u8) -> Option<Color> {
+        match idx {
+            0 => None,                            // transparent
+            1 => Some(Color::Rgb(164, 34, 225)),  // purple #A422E1
+            2 => Some(Color::Rgb(100, 15, 140)),  // dark purple
+            3 => Some(Color::Rgb(200, 140, 220)), // light purple
+            4 => Some(Color::White),
+            5 => Some(Color::Black),
+            6 => Some(Color::Rgb(150, 150, 160)), // gear grey
+            7 => Some(Color::Rgb(50, 50, 65)),    // terminal dark
+            8 => Some(Color::Rgb(80, 220, 120)),  // terminal green
+            _ => None,
+        }
+    }
+
+    // 18 wide x 14 tall pixel grid.
+    // The crab: claw holding terminal, wide body, big eyes, gear belly, legs.
+    #[rustfmt::skip]
+    let pixels: &[&[u8]] = &[
+        //                  terminal
+        &[X,X,X,X,X,X,T,T,T,T,T,X,X,X,X,X,X,X],
+        &[X,X,X,X,X,X,T,C,C,C,T,X,X,X,X,X,X,X],
+        &[X,X,X,X,X,X,T,T,T,T,T,X,X,X,X,X,X,X],
+        //         claw up to terminal, body starts
+        &[X,X,X,D,P,P,D,X,X,X,X,X,X,X,X,X,X,X],
+        &[X,X,D,P,P,D,D,P,P,P,P,D,X,X,X,X,X,X],
+        //         wide body with eyes
+        &[X,D,P,P,W,B,P,P,P,P,W,B,P,P,D,X,X,X],
+        &[X,D,P,P,W,W,P,P,P,P,W,W,P,P,D,X,X,X],
+        //         body with gear
+        &[X,X,D,P,P,L,L,G,G,L,L,P,P,D,X,X,X,X],
+        &[X,X,D,P,L,L,G,G,G,G,L,L,P,D,X,X,X,X],
+        //         lower body
+        &[X,X,X,D,P,P,L,L,L,L,P,P,D,X,X,X,X,X],
+        &[X,X,X,D,D,P,P,P,P,P,P,D,D,X,X,X,X,X],
+        //         legs
+        &[X,X,D,P,X,D,P,X,X,P,D,X,P,D,X,X,X,X],
+        &[X,D,P,X,X,X,D,P,P,D,X,X,X,P,D,X,X,X],
+        &[D,P,X,X,X,X,X,D,D,X,X,X,X,X,P,D,X,X],
+    ];
+
+    let height = pixels.len();
+    let mut lines = Vec::new();
+
+    // Process 2 rows at a time using ▀ (upper half block).
+    let mut row = 0;
+    while row < height {
+        let mut line = String::new();
+        line.push_str("  "); // left margin
+
+        let top_row = pixels[row];
+        let bot_row = if row + 1 < height {
+            pixels[row + 1]
+        } else {
+            &[0u8; 18] as &[u8]
+        };
+
+        for (top, bot) in top_row.iter().zip(bot_row.iter()) {
+            let fg = palette(*top);
+            let bg = palette(*bot);
+            render_half_block(&mut line, fg, bg);
+        }
+
+        lines.push(line);
+        row += 2;
+    }
+
+    lines
+}
+
+fn render_half_block(line: &mut String, fg: Option<Color>, bg: Option<Color>) {
+    match (fg, bg) {
+        (None, None) => line.push(' '),
+        (Some(fg_c), None) => {
+            line.push_str(&format!("\x1b[{}m▀\x1b[0m", rgb_fg(fg_c)));
+        }
+        (None, Some(bg_c)) => {
+            line.push_str(&format!("\x1b[{}m▄\x1b[0m", rgb_fg(bg_c)));
+        }
+        (Some(fg_c), Some(bg_c)) => {
+            line.push_str(&format!("\x1b[{};{}m▀\x1b[0m", rgb_fg(fg_c), rgb_bg(bg_c)));
+        }
+    }
+}
+
+/// Render a shimmer frame of the crab. The purple pixels shift brightness
+/// in a wave pattern based on the frame number.
+pub fn render_crab_shimmer(frame: usize) -> Vec<String> {
+    // Same pixel grid as render_crab_banner but with animated colors.
+    const X: u8 = 0;
+    const P: u8 = 1;
+    const D: u8 = 2;
+    const L: u8 = 3;
+    const W: u8 = 4;
+    const B: u8 = 5;
+    const G: u8 = 6;
+    const T: u8 = 7;
+    const C: u8 = 8;
+
+    fn palette_shimmer(idx: u8, col: usize, frame: usize) -> Option<Color> {
+        match idx {
+            0 => None,
+            1 => {
+                // Purple with wave shimmer.
+                let wave = ((col + frame * 3) % 6) as i16;
+                let boost = if wave < 3 { wave * 15 } else { (6 - wave) * 15 };
+                Some(Color::Rgb(
+                    (164 + boost).min(255) as u8,
+                    (34 + boost / 2).min(100) as u8,
+                    (225 + boost / 3).min(255) as u8,
+                ))
+            }
+            2 => Some(Color::Rgb(100, 15, 140)),
+            3 => {
+                let wave = ((col + frame * 3) % 6) as i16;
+                let boost = if wave < 3 { wave * 10 } else { (6 - wave) * 10 };
+                Some(Color::Rgb(
+                    (200 + boost).min(255) as u8,
+                    (140 + boost).min(200) as u8,
+                    (220 + boost / 2).min(255) as u8,
+                ))
+            }
+            4 => Some(Color::White),
+            5 => Some(Color::Black),
+            6 => Some(Color::Rgb(150, 150, 160)),
+            7 => Some(Color::Rgb(50, 50, 65)),
+            8 => {
+                // Terminal text blinks.
+                if frame.is_multiple_of(2) {
+                    Some(Color::Rgb(80, 220, 120))
+                } else {
+                    Some(Color::Rgb(50, 50, 65))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[rustfmt::skip]
+    let pixels: &[&[u8]] = &[
+        &[X,X,X,X,X,X,T,T,T,T,T,X,X,X,X,X,X,X],
+        &[X,X,X,X,X,X,T,C,C,C,T,X,X,X,X,X,X,X],
+        &[X,X,X,X,X,X,T,T,T,T,T,X,X,X,X,X,X,X],
+        &[X,X,X,D,P,P,D,X,X,X,X,X,X,X,X,X,X,X],
+        &[X,X,D,P,P,D,D,P,P,P,P,D,X,X,X,X,X,X],
+        &[X,D,P,P,W,B,P,P,P,P,W,B,P,P,D,X,X,X],
+        &[X,D,P,P,W,W,P,P,P,P,W,W,P,P,D,X,X,X],
+        &[X,X,D,P,P,L,L,G,G,L,L,P,P,D,X,X,X,X],
+        &[X,X,D,P,L,L,G,G,G,G,L,L,P,D,X,X,X,X],
+        &[X,X,X,D,P,P,L,L,L,L,P,P,D,X,X,X,X,X],
+        &[X,X,X,D,D,P,P,P,P,P,P,D,D,X,X,X,X,X],
+        &[X,X,D,P,X,D,P,X,X,P,D,X,P,D,X,X,X,X],
+        &[X,D,P,X,X,X,D,P,P,D,X,X,X,P,D,X,X,X],
+        &[D,P,X,X,X,X,X,D,D,X,X,X,X,X,P,D,X,X],
+    ];
+
+    let height = pixels.len();
+    let mut lines = Vec::new();
+
+    let mut row = 0;
+    while row < height {
+        let mut line = String::new();
+        line.push_str("  ");
+
+        let top_row = pixels[row];
+        let bot_row: &[u8] = if row + 1 < height {
+            pixels[row + 1]
+        } else {
+            &[0u8; 18]
+        };
+
+        for (col, (top, bot)) in top_row.iter().zip(bot_row.iter()).enumerate() {
+            let fg = palette_shimmer(*top, col, frame);
+            let bg = palette_shimmer(*bot, col, frame);
+            render_half_block(&mut line, fg, bg);
+        }
+
+        lines.push(line);
+        row += 2;
+    }
+
+    lines
+}
+
+fn rgb_fg(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+        Color::White => "97".into(),
+        Color::Black => "30".into(),
+        _ => "39".into(),
+    }
+}
+
+fn rgb_bg(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => format!("48;2;{r};{g};{b}"),
+        Color::White => "107".into(),
+        Color::Black => "40".into(),
+        _ => "49".into(),
+    }
+}
