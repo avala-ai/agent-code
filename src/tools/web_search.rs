@@ -62,7 +62,7 @@ impl Tool for WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent("rc/0.1")
+            .user_agent("agent-code/0.2")
             .build()
             .map_err(|e| ToolError::ExecutionFailed(format!("HTTP client error: {e}")))?;
 

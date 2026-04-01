@@ -60,7 +60,7 @@ Create `.rc/settings.toml` in your repo root for project-specific settings. Thes
 Initialize with:
 
 ```bash
-rc
+agent
 > /init
 Created .rc/settings.toml
 ```

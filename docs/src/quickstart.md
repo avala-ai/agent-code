@@ -42,7 +42,7 @@ export AGENT_CODE_API_BASE_URL="https://api.your-provider.com/v1"
 ## Start the agent
 
 ```bash
-rc
+agent
 ```
 
 You'll see:

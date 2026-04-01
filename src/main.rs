@@ -1,6 +1,6 @@
 //! agent-code: An AI-powered coding agent for the terminal.
 //!
-//! Entry point for the `rc` binary. Handles CLI argument parsing,
+//! Entry point for the `agent` binary. Handles CLI argument parsing,
 //! configuration loading, and launches the interactive REPL or
 //! one-shot execution mode.
 

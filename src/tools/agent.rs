@@ -113,13 +113,13 @@ impl Tool for AgentTool {
             ctx.cwd.clone()
         };
 
-        // Run the subagent as a Bash tool call to ourselves (rc --prompt).
+        // Spawn the subagent as a subprocess (agent --prompt).
         // This gives full isolation — separate process, separate context.
-        let rc_binary = std::env::current_exe()
+        let agent_binary = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "agent".to_string());
 
-        let mut cmd = tokio::process::Command::new(&rc_binary);
+        let mut cmd = tokio::process::Command::new(&agent_binary);
         cmd.arg("--prompt")
             .arg(prompt)
             .current_dir(&agent_cwd)
@@ -199,7 +199,7 @@ async fn create_worktree(base_cwd: &PathBuf) -> Result<PathBuf, String> {
             .next()
             .unwrap_or("tmp")
     );
-    let worktree_path = std::env::temp_dir().join(format!("rc-worktree-{branch_name}"));
+    let worktree_path = std::env::temp_dir().join(format!("agent-wt-{branch_name}"));
 
     let output = tokio::process::Command::new("git")
         .args(["worktree", "add", "-b", &branch_name])

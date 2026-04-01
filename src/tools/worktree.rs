@@ -57,7 +57,7 @@ impl Tool for EnterWorktreeTool {
                 )
             });
 
-        let worktree_path = std::env::temp_dir().join(format!("rc-wt-{branch}"));
+        let worktree_path = std::env::temp_dir().join(format!("agent-wt-{branch}"));
 
         let output = tokio::process::Command::new("git")
             .args(["worktree", "add", "-b", &branch])

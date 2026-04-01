@@ -70,7 +70,7 @@ impl Tool for WebFetchTool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::limited(10))
-            .user_agent("rc/0.1")
+            .user_agent("agent-code/0.2")
             .build()
             .map_err(|e| ToolError::ExecutionFailed(format!("HTTP client error: {e}")))?;
 

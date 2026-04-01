@@ -635,7 +635,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 .into(),
         ),
         Some("version") => {
-            println!("rc {}", env!("CARGO_PKG_VERSION"));
+            println!("agent {}", env!("CARGO_PKG_VERSION"));
             CommandResult::Handled
         }
         _ => {

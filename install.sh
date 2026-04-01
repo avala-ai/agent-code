@@ -64,13 +64,13 @@ main() {
     info "Downloading ${url}..."
 
     tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
+    trap 'rm -rf "${tmpdir:-/nonexistent}"' EXIT
 
-    if ! curl -fsSL "$url" -o "${tmpdir}/rc.tar.gz"; then
+    if ! curl -fsSL "$url" -o "${tmpdir}/agent.tar.gz"; then
         error "Download failed. Check that a release exists for your platform at:\n  https://github.com/${REPO}/releases"
     fi
 
-    tar xzf "${tmpdir}/rc.tar.gz" -C "$tmpdir"
+    tar xzf "${tmpdir}/agent.tar.gz" -C "$tmpdir"
 
     if [ ! -f "${tmpdir}/${BINARY}" ]; then
         error "Binary not found in archive. The release may be packaged differently."
