@@ -334,29 +334,43 @@ pub fn run_setup() -> Option<SetupResult> {
             .ok()
             .or_else(|| std::env::var("AGENT_CODE_API_KEY").ok());
 
-        if let Some(key) = existing_key {
+        if let Some(ref key) = existing_key {
             let masked = if key.len() > 8 {
                 format!("{}...{}", &key[..4], &key[key.len() - 4..])
             } else {
                 "****".to_string()
             };
-            println!("    {} found ({masked})\n", env_var.green());
-            key
+            println!("    {} found in env ({masked})", env_var.green());
+        }
+
+        // Always ask for API key — user can press Enter to keep the env key,
+        // or paste a new one to override.
+        let hint = if existing_key.is_some() {
+            "  Paste API key (Enter to keep existing, or paste new): ".to_string()
         } else {
-            eprint!("  Paste your API key (or Enter to set {env_var} later): ");
-            let _ = std::io::stderr().flush();
-            let mut input = String::new();
-            let _ = std::io::stdin().read_line(&mut input);
-            let key = input.trim().to_string();
-            if key.is_empty() {
+            format!("  Paste your {env_var}: ")
+        };
+        eprint!("{hint}");
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        let pasted = input.trim().to_string();
+
+        let key = if pasted.is_empty() {
+            if let Some(env_key) = existing_key {
+                env_key
+            } else {
                 println!(
                     "    {}",
                     format!("Set {env_var} before running agent.").yellow()
                 );
+                String::new()
             }
-            println!();
-            key
-        }
+        } else {
+            pasted
+        };
+        println!();
+        key
     };
 
     // Custom provider: ask for URL and model.
