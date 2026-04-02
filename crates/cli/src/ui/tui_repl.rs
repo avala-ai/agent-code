@@ -267,7 +267,8 @@ impl App {
                 Action::None
             }
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.input.truncate(self.cursor);
+                let byte_idx = self.char_to_byte(self.cursor);
+                self.input.truncate(byte_idx);
                 Action::None
             }
             (KeyCode::Up, _) => {
@@ -277,7 +278,7 @@ impl App {
                     }
                     self.hist_idx -= 1;
                     self.input = self.history[self.hist_idx].clone();
-                    self.cursor = self.input.len();
+                    self.cursor = self.input.chars().count();
                 }
                 Action::None
             }
@@ -289,7 +290,7 @@ impl App {
                     } else {
                         self.history[self.hist_idx].clone()
                     };
-                    self.cursor = self.input.len();
+                    self.cursor = self.input.chars().count();
                 }
                 Action::None
             }
@@ -409,8 +410,10 @@ impl App {
         println!();
 
         // Record in content for alt-screen history.
-        self.content
-            .push(format!("  ❯ {}", &input[..input.len().min(60)]));
+        self.content.push(format!(
+            "  ❯ {}",
+            input.chars().take(60).collect::<String>()
+        ));
 
         // Auto-save.
         let state = engine.state();
@@ -537,18 +540,18 @@ impl StreamSink for PrintSink {
             .chars()
             .take(80)
             .collect();
-        println!("\r\x1b[2K  \x1b[{color}m{icon}\x1b[0m \x1b[90m{preview}\x1b[0m");
+        println!("  \x1b[{color}m{icon}\x1b[0m \x1b[90m{preview}\x1b[0m");
     }
     fn on_error(&self, error: &str) {
-        println!("\r\x1b[2K  \x1b[31mERROR\x1b[0m {error}");
+        println!("  \x1b[31mERROR\x1b[0m {error}");
     }
     fn on_thinking(&self, _: &str) {}
     fn on_turn_complete(&self, _: usize) {}
     fn on_usage(&self, _: &Usage) {}
     fn on_compact(&self, freed: u64) {
-        println!("\r\x1b[2K  \x1b[90m↻ compacted ~{freed} tokens\x1b[0m");
+        println!("  \x1b[90m↻ compacted ~{freed} tokens\x1b[0m");
     }
     fn on_warning(&self, msg: &str) {
-        println!("\r\x1b[2K  \x1b[33mWARN\x1b[0m {msg}");
+        println!("  \x1b[33mWARN\x1b[0m {msg}");
     }
 }
