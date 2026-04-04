@@ -26,6 +26,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: agent-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: agent-windows-x86_64
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -39,10 +42,16 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.artifact }}.tar.gz agent
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/agent.exe" -DestinationPath "${{ matrix.artifact }}.zip"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
@@ -62,6 +71,7 @@ jobs:
             agent-linux-aarch64/agent-linux-aarch64.tar.gz
             agent-macos-x86_64/agent-macos-x86_64.tar.gz
             agent-macos-aarch64/agent-macos-aarch64.tar.gz
+            agent-windows-x86_64/agent-windows-x86_64.zip
           generate_release_notes: true
 
   publish-crate:

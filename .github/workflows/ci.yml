@@ -21,13 +21,21 @@ jobs:
       - run: cargo check --all-targets
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get install -y ripgrep
+      - name: Install ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ripgrep
+      - name: Install ripgrep (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y
       - run: cargo test --all-targets
 
   fmt:
@@ -63,6 +71,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             binary: agent
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: agent.exe
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
