@@ -291,6 +291,30 @@ pub const COMMANDS: &[Command] = &[
         description: "Show version information",
         hidden: true,
     },
+    Command {
+        name: "release-notes",
+        aliases: &["rn"],
+        description: "Show release notes for the current version",
+        hidden: false,
+    },
+    Command {
+        name: "summary",
+        aliases: &[],
+        description: "Summarize what happened in this session",
+        hidden: false,
+    },
+    Command {
+        name: "feedback",
+        aliases: &[],
+        description: "Submit feedback or suggestions",
+        hidden: false,
+    },
+    Command {
+        name: "share",
+        aliases: &[],
+        description: "Export session as shareable markdown",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1068,6 +1092,125 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("version") => {
             println!("agent {}", env!("CARGO_PKG_VERSION"));
+            CommandResult::Handled
+        }
+        Some("release-notes") => {
+            let version = env!("CARGO_PKG_VERSION");
+            // Look for CHANGELOG.md in the project directory, then the binary's directory.
+            let changelog = std::path::Path::new(&engine.state().cwd).join("CHANGELOG.md");
+            let content = std::fs::read_to_string(&changelog).ok();
+            match content {
+                Some(text) => {
+                    // Extract the section for the current version.
+                    let header = format!("## [{version}]");
+                    if let Some(start) = text.find(&header) {
+                        let section = &text[start..];
+                        // Find the next version header or end of file.
+                        let end = section[header.len()..]
+                            .find("\n## [")
+                            .map(|i| i + header.len())
+                            .unwrap_or(section.len());
+                        println!("{}", section[..end].trim());
+                    } else {
+                        println!("No release notes found for v{version} in CHANGELOG.md.");
+                    }
+                }
+                None => {
+                    println!("No CHANGELOG.md found.");
+                    println!(
+                        "See https://github.com/avala-ai/agent-code/releases for release notes."
+                    );
+                }
+            }
+            CommandResult::Handled
+        }
+        Some("summary") => CommandResult::Prompt(
+            "Summarize this session concisely. List: (1) files modified, \
+             (2) key decisions made, (3) tools used and how many times, \
+             (4) what was accomplished. Be brief."
+                .to_string(),
+        ),
+        Some("feedback") => {
+            if let Some(text) = args {
+                let feedback_dir = dirs::data_local_dir()
+                    .unwrap_or_default()
+                    .join("agent-code/feedback");
+                let _ = std::fs::create_dir_all(&feedback_dir);
+                let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let path = feedback_dir.join(format!("{timestamp}.md"));
+                let content = format!(
+                    "# Feedback\n\nDate: {}\nVersion: {}\n\n{}\n",
+                    chrono::Utc::now().to_rfc3339(),
+                    env!("CARGO_PKG_VERSION"),
+                    text
+                );
+                match std::fs::write(&path, content) {
+                    Ok(_) => println!("Feedback saved. Thank you!"),
+                    Err(e) => println!("Failed to save feedback: {e}"),
+                }
+            } else {
+                println!("Usage: /feedback <your message>");
+                println!("Example: /feedback the /review command could show line numbers");
+            }
+            CommandResult::Handled
+        }
+        Some("share") => {
+            let messages = &engine.state().messages;
+            if messages.is_empty() {
+                println!("No conversation to share.");
+            } else {
+                let state = engine.state();
+                let mut md = format!(
+                    "# Agent Code Session\n\n\
+                     Model: {} | Turns: {} | Cost: ${:.4}\n\n---\n\n",
+                    state.config.api.model, state.turn_count, state.total_cost_usd,
+                );
+                for msg in messages {
+                    match msg {
+                        agent_code_lib::llm::message::Message::User(u) => {
+                            md.push_str("### User\n\n");
+                            for block in &u.content {
+                                if let agent_code_lib::llm::message::ContentBlock::Text { text } =
+                                    block
+                                {
+                                    md.push_str(text);
+                                    md.push_str("\n\n");
+                                }
+                            }
+                        }
+                        agent_code_lib::llm::message::Message::Assistant(a) => {
+                            md.push_str("### Assistant\n\n");
+                            for block in &a.content {
+                                match block {
+                                    agent_code_lib::llm::message::ContentBlock::Text { text } => {
+                                        md.push_str(text);
+                                        md.push_str("\n\n");
+                                    }
+                                    agent_code_lib::llm::message::ContentBlock::ToolUse {
+                                        name,
+                                        ..
+                                    } => {
+                                        md.push_str(&format!("*Used tool: {name}*\n\n"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let path = format!(
+                    "session-share-{}.md",
+                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                );
+                match std::fs::write(&path, &md) {
+                    Ok(_) => {
+                        println!("Session exported to {path}");
+                        println!("Share this file or paste its contents.");
+                    }
+                    Err(e) => println!("Export failed: {e}"),
+                }
+            }
             CommandResult::Handled
         }
         _ => {
