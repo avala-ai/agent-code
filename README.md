@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://siuhyr0peaacfwst.public.blob.vercel-storage.com/avala-marketing-site/news/avala-bot.webp" alt="Agent Code" width="200">
+  <img src="https://siuhyr0peaacfwst.public.blob.vercel-storage.com/avala-marketing-site/news/avala-bot-no-bg.png" alt="Agent Code" width="200">
 </p>
 
 <h1 align="center">Agent Code</h1>
