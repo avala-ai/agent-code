@@ -1,9 +1,12 @@
 <p align="center">
-  <h1 align="center">Agent Code</h1>
-  <p align="center">
-    AI coding agent for the terminal. Built in Rust.<br>
-    <a href="https://github.com/avala-ai">Avala AI</a>
-  </p>
+  <img src="https://siuhyr0peaacfwst.public.blob.vercel-storage.com/avala-marketing-site/news/avala-bot.webp" alt="Agent Code" width="200">
+</p>
+
+<h1 align="center">Agent Code</h1>
+
+<p align="center">
+  AI coding agent for the terminal. Built in Rust.<br>
+  <a href="https://github.com/avala-ai">Avala AI</a>
 </p>
 
 <p align="center">
