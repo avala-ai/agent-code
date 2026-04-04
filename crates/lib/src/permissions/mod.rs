@@ -50,10 +50,17 @@ impl PermissionChecker {
 
     /// Check whether a tool operation is permitted.
     ///
-    /// Evaluates rules in order. The first matching rule wins.
-    /// If no rule matches, the default mode is applied.
+    /// Evaluates in order: protected paths, explicit rules, default mode.
+    /// The first match wins.
     pub fn check(&self, tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
-        // Check explicit rules first.
+        // Block writes to protected directories regardless of rules.
+        if is_write_tool(tool_name)
+            && let Some(reason) = check_protected_path(input)
+        {
+            return PermissionDecision::Deny(reason);
+        }
+
+        // Check explicit rules.
         for rule in &self.rules {
             if !matches_tool(&rule.tool, tool_name) {
                 continue;
@@ -129,6 +136,42 @@ fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+/// Directories that should never be written to by the agent.
+const PROTECTED_DIRS: &[&str] = &[
+    ".git/",
+    ".git\\",
+    ".husky/",
+    ".husky\\",
+    "node_modules/",
+    "node_modules\\",
+];
+
+/// Returns true for tools that modify the filesystem.
+fn is_write_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "FileWrite" | "FileEdit" | "MultiEdit" | "NotebookEdit"
+    )
+}
+
+/// Check if the input targets a protected path. Returns the denial reason if so.
+fn check_protected_path(input: &serde_json::Value) -> Option<String> {
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    for dir in PROTECTED_DIRS {
+        if path.contains(dir) {
+            let dir_name = dir.trim_end_matches(['/', '\\']);
+            return Some(format!(
+                "Write to {dir_name}/ is blocked. This is a protected directory."
+            ));
+        }
+    }
+    None
+}
+
 fn mode_to_decision(mode: PermissionMode, tool_name: &str) -> PermissionDecision {
     match mode {
         PermissionMode::Allow | PermissionMode::AcceptEdits => PermissionDecision::Allow,
@@ -164,6 +207,64 @@ mod tests {
             checker.check("Bash", &serde_json::json!({"command": "ls"})),
             PermissionDecision::Allow
         ));
+    }
+
+    #[test]
+    fn test_protected_dirs_block_writes() {
+        let checker = PermissionChecker::allow_all();
+
+        // Writing to .git/ should be denied even with allow_all.
+        assert!(matches!(
+            checker.check(
+                "FileWrite",
+                &serde_json::json!({"file_path": ".git/config"})
+            ),
+            PermissionDecision::Deny(_)
+        ));
+
+        // Writing to node_modules/ should be denied.
+        assert!(matches!(
+            checker.check(
+                "FileEdit",
+                &serde_json::json!({"file_path": "node_modules/foo/index.js"})
+            ),
+            PermissionDecision::Deny(_)
+        ));
+
+        // Writing to .husky/ should be denied.
+        assert!(matches!(
+            checker.check(
+                "FileWrite",
+                &serde_json::json!({"file_path": ".husky/pre-commit"})
+            ),
+            PermissionDecision::Deny(_)
+        ));
+
+        // Reading .git/ should still be allowed.
+        assert!(matches!(
+            checker.check("FileRead", &serde_json::json!({"file_path": ".git/config"})),
+            PermissionDecision::Allow
+        ));
+
+        // Writing to normal paths should still work.
+        assert!(matches!(
+            checker.check(
+                "FileWrite",
+                &serde_json::json!({"file_path": "src/main.rs"})
+            ),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_protected_dirs_helper() {
+        assert!(check_protected_path(&serde_json::json!({"file_path": ".git/HEAD"})).is_some());
+        assert!(
+            check_protected_path(&serde_json::json!({"file_path": "node_modules/pkg/lib.js"}))
+                .is_some()
+        );
+        assert!(check_protected_path(&serde_json::json!({"file_path": "src/lib.rs"})).is_none());
+        assert!(check_protected_path(&serde_json::json!({"command": "ls"})).is_none());
     }
 
     #[test]
