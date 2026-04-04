@@ -168,6 +168,53 @@ impl SkillRegistry {
                  and important file locations. This helps the agent understand the project \
                  in future sessions.",
             ),
+            (
+                "security-review",
+                "Review code for security vulnerabilities",
+                true,
+                "Perform a security review of the current changes or specified files. \
+                 Check for: SQL injection (parameterized queries), XSS (output escaping), \
+                 command injection (shell argument safety), hardcoded secrets (API keys, \
+                 passwords, tokens), insecure deserialization, broken authentication, \
+                 path traversal, and SSRF. Verify input validation at system boundaries. \
+                 Report each finding with file:line, severity (critical/high/medium/low), \
+                 and a concrete fix.",
+            ),
+            (
+                "advisor",
+                "Analyze project architecture and suggest improvements",
+                true,
+                "Read the project structure, key entry points, and dependency manifest. \
+                 Evaluate: code organization (cohesion, coupling), dependency health \
+                 (outdated, unused, or vulnerable packages), test coverage gaps, error \
+                 handling patterns, and performance bottlenecks. Prioritize findings by \
+                 impact. For each suggestion, explain the current state, the risk of \
+                 inaction, and a specific next step.",
+            ),
+            (
+                "bughunter",
+                "Systematically search for bugs",
+                true,
+                "Hunt for bugs methodically. Run the test suite and analyze failures. \
+                 Read error handling paths and look for: unchecked return values, \
+                 off-by-one errors, null/nil/undefined dereferences, resource leaks \
+                 (files, connections, locks), race conditions, integer overflow, and \
+                 boundary conditions. For each bug found, provide: file:line, a minimal \
+                 reproduction, the root cause, and a fix. Verify fixes don't break \
+                 existing tests.",
+            ),
+            (
+                "plan",
+                "Create a detailed implementation plan",
+                true,
+                "Explore the codebase to understand the relevant architecture before \
+                 planning. Identify all files that need changes. For each change, specify: \
+                 the file path, what to modify, and why. Note dependencies between changes \
+                 (what must happen first). Flag risks: breaking changes, migration needs, \
+                 performance implications. Estimate scope (small/medium/large per file). \
+                 Present the plan as an ordered checklist the user can approve before \
+                 implementation begins.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
