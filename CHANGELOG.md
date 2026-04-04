@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **4 new bundled skills**: `/security-review` (OWASP vulnerability scan), `/advisor` (architecture analysis), `/bughunter` (systematic bug search), `/plan` (implementation planning)
+- **4 new commands**: `/release-notes` (show current version notes from CHANGELOG), `/summary` (session summary), `/feedback` (submit feedback), `/share` (export session as shareable markdown)
+- **Protected directories**: writes to `.git/`, `.husky/`, and `node_modules/` are blocked regardless of permission settings
+- **Windows support**: CI tests and release builds for `x86_64-pc-windows-msvc`, packaged as `.zip`
+- **Smoke tests**: end-to-end binary invocation tests (`--version`, `--help`, unknown flags)
+- `CHANGELOG.md` with full release history
 - `ROADMAP.md` with phased v1.0 improvement plan
 
 ## [0.9.7] - 2026-03-31

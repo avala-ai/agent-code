@@ -70,11 +70,24 @@ Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080
 
 ## 32 Built-in Tools
 
-File ops, search, shell, git, web, LSP, MCP, notebooks, tasks, and more. Tools execute during LLM streaming for faster turns. [Full list](https://github.com/avala-ai/agent-code/wiki/Tools)
+File ops, search, shell, git, web, LSP, MCP, notebooks, tasks, and more. Tools execute during LLM streaming for faster turns. [Full list →](docs/reference/tools.mdx)
 
-## 8 Bundled Skills
+## 12 Bundled Skills
 
-`/commit` `/review` `/test` `/explain` `/debug` `/pr` `/refactor` `/init`
+| Skill | Purpose |
+|-------|---------|
+| `/commit` | Create well-crafted git commits |
+| `/review` | Review diff for bugs and security issues |
+| `/test` | Run tests and fix failures |
+| `/explain` | Explain how code works |
+| `/debug` | Debug errors with root cause analysis |
+| `/pr` | Create pull requests |
+| `/refactor` | Refactor code for quality |
+| `/init` | Initialize project configuration |
+| `/security-review` | OWASP-oriented vulnerability scan |
+| `/advisor` | Architecture and dependency health analysis |
+| `/bughunter` | Systematic bug search |
+| `/plan` | Structured implementation planning |
 
 Add custom skills as markdown files in `.agent/skills/` or `~/.config/agent-code/skills/`.
 
@@ -109,15 +122,35 @@ crates/
 
 The engine is a reusable library. The binary is a thin wrapper.
 
+## 42 Slash Commands
+
+Session management, context control, git operations, agent coordination, configuration, diagnostics, and more. [Full list →](docs/reference/commands.mdx)
+
+Highlights: `/release-notes`, `/summary`, `/feedback`, `/share`, `/doctor`, `/plan`, `/model`, `/cost`, `/scroll`, `/rewind`, `/fork`
+
+## Security
+
+Protected directories (`.git/`, `.husky/`, `node_modules/`) are blocked from writes regardless of permission settings. Destructive shell commands trigger warnings. [Learn more →](SECURITY.md)
+
+## Platforms
+
+| Platform | Architecture | Install |
+|----------|-------------|---------|
+| Linux | x86_64, aarch64 | curl, cargo, homebrew, prebuilt binary |
+| macOS | x86_64, Apple Silicon | curl, cargo, homebrew, prebuilt binary |
+| Windows | x86_64 | cargo, prebuilt binary (.zip) |
+
 ## Contributing
 
 ```bash
 git clone https://github.com/avala-ai/agent-code.git
 cd agent-code
 cargo build
-cargo test    # 200 tests
+cargo test    # 190+ tests
 cargo clippy  # zero warnings
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [ROADMAP.md](ROADMAP.md) for planned improvements.
 
 ## License
 
