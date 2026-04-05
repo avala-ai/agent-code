@@ -20,6 +20,7 @@ dependencies = [
  "clap",
  "crossterm 0.29.0",
  "dirs",
+ "futures",
  "indicatif",
  "predicates",
  "pulldown-cmark",
@@ -32,6 +33,7 @@ dependencies = [
  "tempfile",
  "termimad",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2816,6 +2818,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
