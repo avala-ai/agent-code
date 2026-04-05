@@ -52,3 +52,12 @@ pulldown-cmark = "0.12"
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "compaction"
+harness = false
+
+[[bench]]
+name = "token_estimation"
+harness = false
