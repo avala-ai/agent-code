@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.13.1] - 2026-04-05
+
+### Fixed
+
+- **E2E C2 test**: `jq -e` treats JSON `false` and `0` as falsy — switched to `has()` for boolean/numeric status fields
+
+### Added
+
+- **Coding task E2E tests** (D9, D10): agent writes Python fizzbuzz and bash arithmetic scripts, tests verify the generated code actually runs and produces correct output
+
 ## [0.13.0] - 2026-04-05
 
 ### Added
@@ -119,7 +129,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/avala-ai/agent-code/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/avala-ai/agent-code/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/avala-ai/agent-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/avala-ai/agent-code/compare/v0.11.0...v0.11.1
