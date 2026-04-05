@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "crates/lib/src/**"
   workflow_dispatch:
 
 permissions:
@@ -27,8 +28,23 @@ jobs:
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.44/mdbook-v0.4.44-x86_64-unknown-linux-gnu.tar.gz | tar xz
           sudo mv mdbook /usr/local/bin/
 
-      - name: Build docs
+      - name: Build mdBook docs
         run: cd docs && mdbook build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rustdoc
+        run: cargo doc --no-deps -p agent-code-lib
+        env:
+          RUSTDOCFLAGS: "--default-theme ayu"
+
+      - name: Copy rustdoc into docs site
+        run: cp -r target/doc docs-out/api
+
+      - name: Add rustdoc redirect
+        run: echo '<meta http-equiv="refresh" content="0; url=agent_code_lib/">' > docs-out/api/index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
