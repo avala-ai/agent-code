@@ -1,0 +1,110 @@
+
+agent-code executes shell commands and modifies files on your behalf. The security model ensures the agent only takes actions you've approved.
+
+## Permission System
+
+Every tool call passes through a permission check:
+
+| Mode | Behavior |
+|------|----------|
+| `ask` (default) | Prompts before mutations, auto-allows reads |
+| `allow` | Auto-approves everything |
+| `deny` | Blocks all mutations |
+| `plan` | Read-only tools only |
+| `accept_edits` | Auto-approves file edits, asks for shell commands |
+
+Configure per-tool rules:
+
+```toml
+[permissions]
+default_mode = "ask"
+
+[[permissions.rules]]
+tool = "Bash"
+pattern = "git *"
+action = "allow"
+
+[[permissions.rules]]
+tool = "Bash"
+pattern = "rm *"
+action = "deny"
+```
+
+## Protected Directories
+
+These directories are blocked from writes regardless of permission config:
+
+- `.git/` — prevents repository corruption
+- `.husky/` — prevents hook tampering
+- `node_modules/` — prevents dependency modification
+
+Read access is unaffected.
+
+## Bash Safety
+
+The Bash tool detects destructive commands and warns before execution:
+
+- `rm -rf`, `git reset --hard`, `DROP TABLE`
+- `chmod -R 777`, `mkfs`, `dd`
+- System paths (`/etc`, `/usr`, `/bin`, `/sbin`, `/boot`)
+
+Large outputs are truncated and persisted to disk.
+
+## Skill Safety
+
+Skills from untrusted sources may contain embedded shell blocks. Disable them:
+
+```toml
+[security]
+disable_skill_shell_execution = true
+```
+
+Shell blocks in skill templates are stripped. Non-shell code blocks are preserved.
+
+## MCP Server Security
+
+- Servers run as local subprocesses (your permissions)
+- Tools are namespaced per server
+- Restrict with allowlist/denylist:
+
+```toml
+[security]
+mcp_server_allowlist = ["github", "filesystem"]
+```
+
+## API Key Safety
+
+- Keys resolved from environment variables only (never config files)
+- Never logged or included in error messages
+- Passed to subagents via environment only
+
+## Data Privacy
+
+- No telemetry collected or transmitted
+- Sessions stored locally (`~/.config/agent-code/sessions/`)
+- Code sent only to your configured LLM provider
+- Use Ollama for fully local, air-gapped operation
+
+## Bypass Prevention
+
+The `--dangerously-skip-permissions` flag disables all checks. To block it:
+
+```toml
+[security]
+disable_bypass_permissions = true
+```
+
+## Full Enterprise Config
+
+```toml
+[security]
+disable_bypass_permissions = true
+disable_skill_shell_execution = true
+mcp_server_allowlist = ["github", "filesystem"]
+env_allowlist = ["PATH", "HOME", "SHELL"]
+additional_directories = ["/shared/docs"]
+```
+
+## Reporting Vulnerabilities
+
+Email **security@avala.ai** — do not open public issues. See [SECURITY.md](https://github.com/avala-ai/agent-code/blob/main/SECURITY.md) for the full policy.

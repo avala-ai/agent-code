@@ -47,3 +47,4 @@
 
 - [Troubleshooting](troubleshooting.md)
 - [FAQ](faq.md)
+- [Security](security.md)
