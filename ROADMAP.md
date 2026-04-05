@@ -86,7 +86,7 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 
 - [x] Top-level rustdoc with module table, quick example, custom Tool example
 - [x] Add `///` doc comments to all key public structs, enums, and traits
-- [ ] Publish rustdoc via CI (GitHub Pages or docs.rs)
+- [x] Publish rustdoc via CI (GitHub Pages at `/api/`)
 
 ---
 

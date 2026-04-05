@@ -59,3 +59,7 @@
 - [Troubleshooting](troubleshooting.md)
 - [FAQ](faq.md)
 - [Security](security.md)
+
+---
+
+- [API Reference (rustdoc)](api/agent_code_lib/index.html)
