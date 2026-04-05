@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.12.0] - 2026-04-05
+
+### Added
+
+- **Cohere provider**: Command R+, Command R, Command Light (`COHERE_API_KEY`)
+- **Perplexity provider**: Sonar Pro, Sonar, Sonar Deep Research with web search (`PERPLEXITY_API_KEY`) — 15 providers total
+- **`agent --attach`**: connect to a running `--serve` instance from another terminal with auto-discovery via bridge lock files
+- **`/uninstall` command**: shows platform-specific removal instructions with paths
+- **Rustdoc comments**: enriched `///` docs on 15 key public types (Message, Config, AppState, QueryEngine, Tool, Skill, etc.)
+- **Multi-agent orchestration runtime**: `Coordinator` with `spawn_agent()`, `run_team()`, `send_message()`, team management
+- **Headless HTTP server**: `agent --serve` with POST /message, GET /status, /messages, /health endpoints
+
+### Fixed
+
+- **API key priority**: environment variables now correctly override stale keys in config files
+- **Serve mode crash**: skip interactive setup wizard when running headless without TTY
+
 ## [0.11.1] - 2026-04-05
 
 ### Added
@@ -84,7 +101,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/avala-ai/agent-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/avala-ai/agent-code/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/avala-ai/agent-code/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/avala-ai/agent-code/compare/v0.9.7...v0.10.0
