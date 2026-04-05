@@ -337,6 +337,58 @@ pub struct Coordinator {
     cwd: PathBuf,
 }
 
+/// Build a subprocess command for running an agent.
+///
+/// Shared by `run_agent()` and `run_team()` to avoid duplication.
+fn build_agent_command(
+    definition: &AgentDefinition,
+    prompt: &str,
+    cwd: &std::path::Path,
+) -> tokio::process::Command {
+    let full_prompt = if let Some(ref sys) = definition.system_prompt {
+        format!("{sys}\n\n{prompt}")
+    } else {
+        prompt.to_string()
+    };
+
+    let agent_binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "agent".to_string());
+
+    let mut cmd = tokio::process::Command::new(agent_binary);
+    cmd.arg("--prompt")
+        .arg(full_prompt)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    if let Some(ref model) = definition.model {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(max_turns) = definition.max_turns {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
+    if definition.read_only {
+        cmd.arg("--permission-mode").arg("plan");
+    }
+
+    // Pass through API keys so subagents use the same provider.
+    for var in &[
+        "AGENT_CODE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AGENT_CODE_API_BASE_URL",
+        "AGENT_CODE_MODEL",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
+    cmd
+}
+
 impl Coordinator {
     /// Create a new coordinator.
     pub fn new(cwd: PathBuf) -> Self {
@@ -394,82 +446,19 @@ impl Coordinator {
     /// Executes the agent as a subprocess and returns the result.
     /// The agent's status is updated throughout the lifecycle.
     pub async fn run_agent(&self, agent_id: &str, prompt: &str) -> Result<AgentResult, String> {
-        // Update status to Running.
-        {
+        // Single lock acquisition: update status, clone definition and name.
+        let (definition, agent_name) = {
             let mut instances = self.instances.lock().await;
             let instance = instances
                 .get_mut(agent_id)
                 .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
             instance.status = AgentStatus::Running;
-        }
-
-        let definition = {
-            let instances = self.instances.lock().await;
-            instances
-                .get(agent_id)
-                .ok_or_else(|| format!("Agent not found: {agent_id}"))?
-                .definition
-                .clone()
+            (instance.definition.clone(), instance.name.clone())
         };
-
-        let agent_name = {
-            let instances = self.instances.lock().await;
-            instances
-                .get(agent_id)
-                .map(|i| i.name.clone())
-                .unwrap_or_default()
-        };
-
-        // Build the full prompt with agent's system prompt.
-        let full_prompt = if let Some(ref sys) = definition.system_prompt {
-            format!("{sys}\n\n{prompt}")
-        } else {
-            prompt.to_string()
-        };
-
-        // Spawn as subprocess.
-        let agent_binary = std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "agent".to_string());
-
-        let mut cmd = tokio::process::Command::new(&agent_binary);
-        cmd.arg("--prompt")
-            .arg(&full_prompt)
-            .current_dir(&self.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        // Apply model override.
-        if let Some(ref model) = definition.model {
-            cmd.arg("--model").arg(model);
-        }
-
-        // Apply max turns.
-        if let Some(max_turns) = definition.max_turns {
-            cmd.arg("--max-turns").arg(max_turns.to_string());
-        }
-
-        // Apply read-only mode.
-        if definition.read_only {
-            cmd.arg("--permission-mode").arg("plan");
-        }
-
-        // Pass through API keys.
-        for var in &[
-            "AGENT_CODE_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "OPENROUTER_API_KEY",
-            "AGENT_CODE_API_BASE_URL",
-            "AGENT_CODE_MODEL",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
 
         debug!("Running agent '{agent_name}' ({agent_id})");
 
+        let mut cmd = build_agent_command(&definition, prompt, &self.cwd);
         let output = cmd
             .output()
             .await
@@ -560,45 +549,7 @@ impl Coordinator {
                     }
                 }
 
-                let full_prompt = if let Some(ref sys) = definition.system_prompt {
-                    format!("{sys}\n\n{prompt}")
-                } else {
-                    prompt
-                };
-
-                let agent_binary = std::env::current_exe()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "agent".to_string());
-
-                let mut cmd = tokio::process::Command::new(&agent_binary);
-                cmd.arg("--prompt")
-                    .arg(&full_prompt)
-                    .current_dir(&cwd)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-
-                if let Some(ref model) = definition.model {
-                    cmd.arg("--model").arg(model);
-                }
-                if let Some(max_turns) = definition.max_turns {
-                    cmd.arg("--max-turns").arg(max_turns.to_string());
-                }
-                if definition.read_only {
-                    cmd.arg("--permission-mode").arg("plan");
-                }
-
-                for var in &[
-                    "AGENT_CODE_API_KEY",
-                    "ANTHROPIC_API_KEY",
-                    "OPENAI_API_KEY",
-                    "OPENROUTER_API_KEY",
-                    "AGENT_CODE_API_BASE_URL",
-                    "AGENT_CODE_MODEL",
-                ] {
-                    if let Ok(val) = std::env::var(var) {
-                        cmd.env(var, val);
-                    }
-                }
+                let mut cmd = build_agent_command(&definition, &prompt, &cwd);
 
                 match cmd.output().await {
                     Ok(output) => {
