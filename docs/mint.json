@@ -53,6 +53,15 @@
       ]
     },
     {
+      "group": "Tutorials",
+      "pages": [
+        "tutorials/first-project",
+        "tutorials/custom-skills",
+        "tutorials/mcp-integration",
+        "tutorials/multi-provider"
+      ]
+    },
+    {
       "group": "Core Concepts",
       "pages": [
         "concepts/agent-loop",

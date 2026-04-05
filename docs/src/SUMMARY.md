@@ -7,6 +7,13 @@
 - [Quickstart](quickstart.md)
 - [Installation](installation.md)
 
+# Tutorials
+
+- [Your First Project](tutorials/first-project.md)
+- [Custom Skills](tutorials/custom-skills.md)
+- [MCP Integration](tutorials/mcp-integration.md)
+- [Multi-Provider Setup](tutorials/multi-provider.md)
+
 # Core Concepts
 
 - [Agent Loop](concepts/agent-loop.md)

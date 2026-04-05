@@ -1,0 +1,108 @@
+
+MCP lets you extend agent-code with tools from external servers — databases, APIs, file systems, and more.
+
+## What we'll do
+
+Connect the official GitHub MCP server so the agent can create issues, read PRs, and manage repositories.
+
+## Step 1: Create project config
+
+```bash
+agent   # start agent-code
+> /init  # creates .agent/settings.toml
+```
+
+Or create it manually:
+
+```bash
+mkdir -p .agent
+touch .agent/settings.toml
+```
+
+## Step 2: Add the MCP server
+
+Edit `.agent/settings.toml`:
+
+```toml
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_your_token_here" }
+```
+
+## Step 3: Restart and verify
+
+Restart agent-code and check the connection:
+
+```
+> /mcp
+1 MCP server(s) configured:
+  github (stdio)
+```
+
+## Step 4: Use it
+
+The agent now has access to GitHub tools:
+
+```
+> create a GitHub issue titled "Add input validation" with a description of what needs to be done
+```
+
+The agent calls the MCP server's `create_issue` tool, which creates the issue via the GitHub API.
+
+## SSE transport (remote servers)
+
+For servers that expose an HTTP endpoint:
+
+```toml
+[mcp_servers.my-api]
+url = "http://localhost:8080"
+```
+
+The agent connects via Server-Sent Events instead of stdio.
+
+## Multiple servers
+
+Add as many as you need:
+
+```toml
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_..." }
+
+[mcp_servers.postgres]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/docs"]
+```
+
+## Security
+
+MCP servers have access to whatever their underlying service provides. Restrict access with:
+
+```toml
+[security]
+mcp_server_allowlist = ["github", "filesystem"]  # Only these servers can connect
+```
+
+Or block specific ones:
+
+```toml
+[security]
+mcp_server_denylist = ["untrusted-server"]
+```
+
+## Browsing MCP resources
+
+Some MCP servers expose resources (like database schemas or file listings). The agent can browse them with the `ListMcpResources` and `ReadMcpResource` tools automatically.
+
+## Troubleshooting
+
+- **Server stuck connecting**: verify the command works manually — `npx -y @modelcontextprotocol/server-github`
+- **Tools not appearing**: restart agent-code after config changes
+- **Permission errors**: check the env vars (tokens, credentials) are correct
+- See the full [MCP configuration guide](../configuration/mcp-servers) for details
