@@ -35,7 +35,6 @@ indicatif = "0.18"
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 axum = "0.8"
-tokio-stream = "0.1"
 
 # Shared with lib (for types)
 serde = { version = "1", features = ["derive"] }

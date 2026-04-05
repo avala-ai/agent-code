@@ -33,13 +33,12 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use agent_code_lib::query::{QueryEngine, StreamSink};
 
 /// Shared server state wrapped for concurrent access.
 pub struct ServerState {
-    pub engine: Mutex<QueryEngine>,
+    pub engine: tokio::sync::Mutex<QueryEngine>,
 }
 
 /// Request body for POST /message.
@@ -85,29 +84,32 @@ pub struct MessageEntry {
 }
 
 /// A StreamSink that collects output text.
+///
+/// Uses std::sync::Mutex (not tokio) because locks are held only
+/// for brief string appends — no async work under the lock.
 struct CollectingSink {
-    text: Mutex<String>,
-    tools: Mutex<Vec<String>>,
+    text: std::sync::Mutex<String>,
+    tools: std::sync::Mutex<Vec<String>>,
 }
 
 impl CollectingSink {
     fn new() -> Self {
         Self {
-            text: Mutex::new(String::new()),
-            tools: Mutex::new(Vec::new()),
+            text: std::sync::Mutex::new(String::new()),
+            tools: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
 
 impl StreamSink for CollectingSink {
     fn on_text(&self, text: &str) {
-        if let Ok(mut t) = self.text.try_lock() {
+        if let Ok(mut t) = self.text.lock() {
             t.push_str(text);
         }
     }
 
     fn on_tool_start(&self, name: &str, _input: &serde_json::Value) {
-        if let Ok(mut tools) = self.tools.try_lock()
+        if let Ok(mut tools) = self.tools.lock()
             && !tools.contains(&name.to_string())
         {
             tools.push(name.to_string());
@@ -117,7 +119,7 @@ impl StreamSink for CollectingSink {
     fn on_tool_result(&self, _name: &str, _result: &agent_code_lib::tools::ToolResult) {}
 
     fn on_error(&self, error: &str) {
-        if let Ok(mut t) = self.text.try_lock() {
+        if let Ok(mut t) = self.text.lock() {
             t.push_str(&format!("\n[Error: {error}]"));
         }
     }
@@ -126,7 +128,7 @@ impl StreamSink for CollectingSink {
 /// Start the HTTP server.
 pub async fn run_server(engine: QueryEngine, port: u16) -> anyhow::Result<()> {
     let state = Arc::new(ServerState {
-        engine: Mutex::new(engine),
+        engine: tokio::sync::Mutex::new(engine),
     });
 
     let cwd = std::env::current_dir()
@@ -174,9 +176,6 @@ async fn handle_message(
     let sink = Arc::new(CollectingSink::new());
     let sink_ref: &dyn StreamSink = &*sink;
 
-    // Safety: sink_ref lives as long as the await below.
-    // We need to transmute the lifetime because axum handlers are 'static
-    // but the engine borrow is scoped. The Mutex ensures single access.
     let mut engine = state.engine.lock().await;
 
     engine
@@ -184,8 +183,8 @@ async fn handle_message(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response_text = sink.text.try_lock().map(|t| t.clone()).unwrap_or_default();
-    let tools_used = sink.tools.try_lock().map(|t| t.clone()).unwrap_or_default();
+    let response_text = sink.text.lock().map(|t| t.clone()).unwrap_or_default();
+    let tools_used = sink.tools.lock().map(|t| t.clone()).unwrap_or_default();
 
     let state_ref = engine.state();
     Ok(Json(MessageResponse {
