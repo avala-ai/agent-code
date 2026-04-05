@@ -14,12 +14,12 @@ Status key: **Planned** | **In Progress** | **Done**
 | Built-in tools | 32 (file ops, search, shell, web, LSP, MCP, agents, tasks) |
 | Slash commands | 43 (session, context, git, agent control, config, diagnostics, history, sharing, update) |
 | Bundled skills | 12 (commit, review, test, explain, debug, pr, refactor, init, security-review, advisor, bughunter, plan) |
-| LLM providers | 13 (Anthropic, OpenAI, xAI, Google, DeepSeek, Groq, Mistral, Together, Zhipu, Ollama, Bedrock, Vertex, OpenRouter) |
+| LLM providers | 14 (Anthropic, OpenAI, Azure OpenAI, xAI, Google, DeepSeek, Groq, Mistral, Together, Zhipu, Ollama, Bedrock, Vertex, OpenRouter) |
 | Tests | 232+ (unit + integration + smoke + benchmarks) |
 | Platforms | Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64, Docker |
 | Install methods | cargo, homebrew (custom tap), curl script, prebuilt binaries, Docker, npm |
 | Docs | 30+ pages (Mintlify + mdBook), tutorials, architecture, FAQ, security |
-| Server mode | Headless HTTP API (`agent --serve`) |
+| Server mode | Headless HTTP API (`agent --serve`) with SSE streaming |
 | Multi-agent | Coordinator with spawn, run_team, messaging |
 
 ---
@@ -152,7 +152,7 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 - [x] Bridge lock file for IDE discovery
 - [x] Graceful shutdown with Ctrl+C
 - [ ] **`agent attach <session-id>`** — Reconnect to a running headless session
-- [ ] SSE event stream for real-time updates
+- [x] SSE event stream for real-time updates (GET /events with 10 event types)
 
 ### 3.5 Self-Management Commands — Partially Done
 
@@ -165,12 +165,12 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 
 **Priority: Medium** | **Target: v0.12**
 
-### 4.1 New Providers — Partially Done
+### 4.1 New Providers — Done (4/5)
 
-- [ ] **Azure OpenAI** — separate from generic OpenAI, with Azure-specific auth (AD tokens, managed identity)
+- [x] **Azure OpenAI** — separate from generic OpenAI, with Azure-specific auth (AD tokens, managed identity, `AZURE_OPENAI_API_KEY`)
 - [x] **OpenRouter** — single API key for any model (`OPENROUTER_API_KEY`)
-- [ ] **Cohere** — Command R+ models
-- [ ] **Perplexity** — search-augmented generation
+- [x] **Cohere** — Command R+ models
+- [x] **Perplexity** — search-augmented generation
 - [ ] **GitHub Copilot** — Copilot token-based access for GitHub users
 
 ### 4.2 Provider Features
@@ -262,11 +262,11 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 
 These are tracked for future exploration. Not committed to a timeline.
 
-### 7.1 Agent Client Protocol (ACP)
+### 7.1 Agent Client Protocol (ACP) — Done
 
-- [ ] Implement ACP v1 for IDE integrations (Zed, VS Code, JetBrains)
-- [ ] Map ACP sessions to internal agent-code sessions
-- [ ] `agent acp` command to start ACP stdio server
+- [x] Implement ACP v1 for IDE integrations (Zed, VS Code, JetBrains)
+- [x] Map ACP sessions to internal agent-code sessions
+- [x] `agent acp` command to start ACP stdio server (JSON-RPC 2.0, 5 methods, 9 event types)
 
 ### 7.2 Multi-Agent Orchestration — Done
 
@@ -328,10 +328,10 @@ These are tracked for future exploration. Not committed to a timeline.
 Want to help? Pick any unchecked item above and open an issue to discuss the approach before starting. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
 
 Priority areas where contributions are most welcome:
-1. **New providers** (Phase 4.1) — Azure, Cohere, Perplexity, Copilot
-2. **ACP protocol** (Phase 7.1) — IDE integrations via Agent Client Protocol
-3. **SSE event stream** (Phase 3.4) — real-time updates for serve mode
-4. **Rustdoc comments** (Phase 1.9) — `///` docs on key public types
+1. **GitHub Copilot provider** (Phase 4.1) — Copilot token-based access for GitHub users
+2. **Provider features** (Phase 4.2) — Bedrock setup wizard, health checks, fallback chains
+3. **Rustdoc comments** (Phase 1.9) — `///` docs on key public types
+4. **Remote skill discovery** (Phase 2.4) — Skill index and `agent skill install`
 
 ---
 
