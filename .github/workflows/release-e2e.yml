@@ -1,0 +1,32 @@
+name: Release E2E Tests
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: E2E Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: sudo apt-get install -y ripgrep jq
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run E2E tests
+        run: chmod +x scripts/e2e-tests.sh && scripts/e2e-tests.sh
+        env:
+          AGENT_BINARY: target/release/agent
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_CODE_MODEL: gpt-4.1-mini
