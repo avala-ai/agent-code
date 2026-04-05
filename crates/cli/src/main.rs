@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod commands;
+mod serve;
 mod ui;
 mod update;
 
@@ -82,6 +83,14 @@ struct Cli {
     /// Maximum number of agent turns before stopping.
     #[arg(long)]
     max_turns: Option<usize>,
+
+    /// Start as a headless HTTP API server instead of interactive REPL.
+    #[arg(long)]
+    serve: bool,
+
+    /// Port for the HTTP server (default: 4096). Only used with --serve.
+    #[arg(long, default_value = "4096")]
+    port: u16,
 }
 
 fn run_setup_wizard() {
@@ -361,6 +370,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Install Ctrl+C handler for graceful cancellation.
     engine.install_signal_handler();
+
+    // Serve mode: start HTTP API server.
+    if cli.serve {
+        return serve::run_server(engine, cli.port).await;
+    }
 
     // One-shot or interactive mode.
     match cli.prompt {
