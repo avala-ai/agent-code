@@ -31,6 +31,11 @@ User-level memory lives in `~/.config/agent-code/memory/`:
 
 ```markdown
 <!-- ~/.config/agent-code/memory/preferences.md -->
+---
+name: preferences
+description: User coding style preferences
+type: user
+---
 
 - I prefer explicit error handling over unwrap/expect
 - Use descriptive variable names, not single letters

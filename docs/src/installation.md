@@ -6,17 +6,7 @@
 
 ## Install methods
 
-### One-line install (recommended)
-
-Works on Linux and macOS (x86_64 and aarch64):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
-```
-
-Detects your OS and architecture, downloads the latest release, and installs `agent` to `/usr/local/bin`. Set `AGENT_CODE_INSTALL_DIR` to change the install location.
-
-### Cargo
+### Cargo (recommended)
 
 If you have Rust installed:
 
@@ -44,6 +34,7 @@ Download from [GitHub Releases](https://github.com/avala-ai/agent-code/releases)
 | Linux    | aarch64     | `agent-linux-aarch64.tar.gz` |
 | macOS    | x86_64      | `agent-macos-x86_64.tar.gz` |
 | macOS    | Apple Silicon| `agent-macos-aarch64.tar.gz` |
+| Windows  | x86_64      | `agent-windows-x86_64.zip` |
 
 ```bash
 # Example: macOS Apple Silicon

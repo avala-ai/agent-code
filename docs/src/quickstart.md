@@ -1,43 +1,41 @@
 
 ## Install
 
-**One-line install** (Linux/macOS):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
+<CodeGroup>
+```bash cargo (recommended)
+cargo install agent-code
 ```
 
-Or via package managers:
-
-```bash
-# crates.io
-cargo install agent-code
-
-# homebrew
+```bash homebrew
 brew install avala-ai/tap/agent-code
 ```
 
+```bash from source
+git clone https://github.com/avala-ai/agent-code.git
+cd agent-code
+cargo build --release
+# Binary: target/release/agent
+```
+</CodeGroup>
 
 ## Set your API key
 
 agent-code works with any LLM provider. Set the key for the one you use:
 
-
-```bash
-# Anthropic (Claude)
+<CodeGroup>
+```bash Anthropic (Claude)
 export ANTHROPIC_API_KEY="sk-ant-..."
+```
 
-# OpenAI (GPT)
+```bash OpenAI (GPT)
 export OPENAI_API_KEY="sk-..."
+```
 
-# xAI (Grok)
-export XAI_API_KEY="xai-..."
-
-# Any provider
+```bash Any provider
 export AGENT_CODE_API_KEY="your-key"
 export AGENT_CODE_API_BASE_URL="https://api.your-provider.com/v1"
 ```
-
+</CodeGroup>
 
 ## Start the agent
 
@@ -106,17 +104,17 @@ agent --prompt "fix the failing tests" --dangerously-skip-permissions
 
 ## Next steps
 
-
-  
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="gear" href="/configuration/settings">
     Configure models, permissions, and behavior.
-  
-  
+  </Card>
+  <Card title="Tools" icon="wrench" href="/reference/tools">
     See all 31 built-in tools.
-  
-  
+  </Card>
+  <Card title="Skills" icon="wand-magic-sparkles" href="/extending/skills">
     Create custom reusable workflows.
-  
-  
+  </Card>
+  <Card title="MCP Servers" icon="plug" href="/configuration/mcp-servers">
     Connect external tool servers.
-  
-
+  </Card>
+</CardGroup>

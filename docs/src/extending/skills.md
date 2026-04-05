@@ -6,6 +6,11 @@ Skills are reusable prompt templates that define multi-step workflows. They're m
 Create a file in `.agent/skills/test-and-fix.md`:
 
 ```markdown
+---
+description: Run tests and fix failures
+whenToUse: When the user asks to test or fix failing tests
+userInvocable: true
+---
 
 Run the test suite with the project's test command. If any tests fail:
 
@@ -43,6 +48,10 @@ If `userInvocable: true`, invoke with the filename (minus `.md`):
 Use `{{arg}}` in the template for argument substitution:
 
 ```markdown
+---
+description: Review a specific file
+userInvocable: true
+---
 
 Review {{arg}} for bugs, security issues, and code quality problems.
 Focus on edge cases and error handling.
@@ -84,12 +93,32 @@ For complex skills with supporting files, use a directory:
 | `.agent/skills/` | Project-specific |
 | `~/.config/agent-code/skills/` | Available in all projects |
 
+## Bundled skills
+
+agent-code ships with 12 built-in skills. These are always available and can be overridden by placing a skill with the same name in your project or user skills directory.
+
+| Skill | Purpose |
+|-------|---------|
+| `/commit` | Create well-crafted git commits |
+| `/review` | Review diff for bugs and security issues |
+| `/test` | Run tests and fix failures |
+| `/explain` | Explain how code works |
+| `/debug` | Debug errors with root cause analysis |
+| `/pr` | Create pull requests |
+| `/refactor` | Refactor code for quality |
+| `/init` | Initialize project configuration |
+| `/security-review` | OWASP-oriented vulnerability scan |
+| `/advisor` | Architecture and dependency health analysis |
+| `/bughunter` | Systematic bug search |
+| `/plan` | Structured implementation planning |
+
 ## Commands
 
 ```
 > /skills
-Loaded 3 skills:
+Loaded 15 skills:
+  commit [invocable] — Create a well-crafted git commit
+  review [invocable] — Review code changes for bugs and issues
   test-and-fix [invocable] — Run tests and fix failures
-  review [invocable] — Review a specific file
   deploy — Production deployment checklist
 ```
