@@ -92,7 +92,8 @@
     {
       "group": "Help",
       "pages": [
-        "troubleshooting"
+        "troubleshooting",
+        "faq"
       ]
     }
   ],
