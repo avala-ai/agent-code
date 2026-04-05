@@ -1,6 +1,6 @@
 {
   "name": "@avala-ai/agent-code",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "AI coding agent for the terminal. Built in Rust.",
   "license": "MIT",
   "repository": {

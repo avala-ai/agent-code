@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.13.0] - 2026-04-05
+
+### Added
+
+- **Azure OpenAI provider**: first-class support with `api-key` header auth, Azure AD token fallback (`AZURE_OPENAI_AD_TOKEN`), configurable API version — 16 providers total
+- **SSE event stream**: `GET /events` endpoint on serve mode with 10 real-time event types (text_delta, tool_start, tool_result, thinking, turn_complete, usage, error, compact, warning, done)
+- **ACP (Agent Client Protocol)**: `agent --acp` starts a stdio JSON-RPC 2.0 server for IDE integrations (VS Code, Zed, JetBrains) with initialize, message, status, cancel, and shutdown methods
+- **Remote skill discovery**: `/skill search`, `/skill install <name>`, `/skill remove <name>`, `/skill installed` with configurable index URL and offline cache fallback
+- **`--attach [session-id]`**: connect to a specific serve instance by session ID prefix, with interactive selection when multiple instances are running
+- **Provider health check in `/doctor`**: detects active provider, uses provider-specific auth headers for connectivity test, warns on missing env vars
+- **Rustdoc via CI**: `cargo doc` builds alongside mdBook and deploys to GitHub Pages at `/api/`
+- **Rustdoc comments**: `///` docs on all remaining public types in the llm module
+- **E2E test expansion**: 31 → 60+ tests covering ACP protocol, SSE endpoint, CLI flags, protected directories, custom skills, config variants, and edge cases
+
+### Fixed
+
+- **E2E C3 flake**: POST /message uses 240s timeout with automatic retry for LLM cold-start latency
+
 ## [0.12.0] - 2026-04-05
 
 ### Added
@@ -101,7 +119,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/avala-ai/agent-code/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/avala-ai/agent-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/avala-ai/agent-code/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/avala-ai/agent-code/compare/v0.10.0...v0.11.0
