@@ -88,6 +88,12 @@
         "reference/cli-flags",
         "reference/environment-variables"
       ]
+    },
+    {
+      "group": "Help",
+      "pages": [
+        "troubleshooting"
+      ]
     }
   ],
   "footerSocials": {

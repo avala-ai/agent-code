@@ -54,6 +54,18 @@ Rules are evaluated in order. The first matching rule wins. If no rule matches, 
 
 ## Built-in safety
 
+### Protected directories
+
+Write tools (`FileWrite`, `FileEdit`, `MultiEdit`, `NotebookEdit`) are blocked from writing to these directories regardless of your permission rules:
+
+- `.git/` — prevent repository corruption
+- `.husky/` — prevent hook tampering
+- `node_modules/` — prevent dependency modification
+
+Read access to these directories is unaffected.
+
+### Shell safety
+
 The Bash tool includes additional safety checks beyond the permission system:
 
 - **Destructive command detection**: warns before `rm -rf`, `git reset --hard`, `DROP TABLE`, `chmod -R 777`, and other dangerous patterns

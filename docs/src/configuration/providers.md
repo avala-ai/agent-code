@@ -21,23 +21,6 @@ agent --model gpt-4o
 
 Supported models: GPT-4o, GPT-4, o1, o3, and others.
 
-## xAI (Grok)
-
-```bash
-export XAI_API_KEY="xai-..."
-agent --model grok-3
-```
-
-Supported models: Grok-3, Grok-3-mini, Grok-2, and others.
-
-Auto-detected from `XAI_API_KEY` env var, `x.ai` in the base URL, or model names starting with `grok`. Uses the OpenAI-compatible wire format.
-
-You can also set it explicitly:
-
-```bash
-agent --provider xai --model grok-3
-```
-
 ## Ollama (local)
 
 ```bash
@@ -79,7 +62,6 @@ If auto-detection doesn't work for your setup, force it:
 ```bash
 agent --provider anthropic  # Use Anthropic wire format
 agent --provider openai     # Use OpenAI wire format
-agent --provider xai        # Use xAI (Grok) via OpenAI wire format
 ```
 
 ## Auto-detection logic
@@ -89,20 +71,7 @@ The provider is chosen by checking (in order):
 1. `--provider` flag (if set)
 2. Base URL contains `anthropic.com` → Anthropic
 3. Base URL contains `openai.com` → OpenAI
-4. Base URL contains `x.ai` → xAI
-5. Base URL is `localhost` → OpenAI-compatible
-6. Model name starts with `claude`/`opus`/`sonnet`/`haiku` → Anthropic
-7. Model name starts with `gpt`/`o1`/`o3` → OpenAI
-8. Model name starts with `grok` → xAI
-9. Default → OpenAI-compatible (most common API shape)
-
-## API key resolution
-
-Keys are checked in this order (first found wins):
-
-1. `--api-key` CLI flag
-2. `AGENT_CODE_API_KEY` env var
-3. `ANTHROPIC_API_KEY` env var
-4. `OPENAI_API_KEY` env var
-5. `XAI_API_KEY` env var
-6. Config file (`api.api_key`)
+4. Base URL is `localhost` → OpenAI-compatible
+5. Model name starts with `claude`/`opus`/`sonnet`/`haiku` → Anthropic
+6. Model name starts with `gpt`/`o1`/`o3` → OpenAI
+7. Default → OpenAI-compatible (most common API shape)

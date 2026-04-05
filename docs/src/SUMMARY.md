@@ -35,3 +35,7 @@
 - [Commands Reference](reference/commands.md)
 - [CLI Flags](reference/cli-flags.md)
 - [Environment Variables](reference/environment-variables.md)
+
+# Help
+
+- [Troubleshooting](troubleshooting.md)

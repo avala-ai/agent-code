@@ -6,6 +6,7 @@
 | `FileRead` | Read files with line numbers. Handles text, PDF, notebooks, images. | Yes | Yes |
 | `FileWrite` | Create or overwrite files. Auto-creates parent dirs. | No | No |
 | `FileEdit` | Search-and-replace. Requires unique match or `replace_all`. | No | No |
+| `MultiEdit` | Batch multiple edits in a single atomic operation. | No | No |
 | `NotebookEdit` | Edit Jupyter cells (replace, insert, delete). | No | No |
 
 ## Search
@@ -21,6 +22,7 @@
 | Tool | Description | Read-only | Concurrent |
 |------|-------------|:---------:|:----------:|
 | `Bash` | Shell commands. Background mode, destructive detection, sandbox, timeout. | No | No |
+| `PowerShell` | PowerShell commands (Windows). | No | No |
 | `REPL` | Python or Node.js code execution. | No | No |
 
 ## Agent Coordination

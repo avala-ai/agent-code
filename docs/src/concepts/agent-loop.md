@@ -24,21 +24,21 @@ Each turn follows this sequence:
 
 Long sessions exceed the context window. The agent uses three strategies, tried in order:
 
-
-  
+<Steps>
+  <Step title="Microcompact">
     Clears the content of old tool results, replacing with `[Old tool result cleared]`.
     Keeps tool_use/tool_result pairing intact. Cheapest — no API call needed.
-  
-  
+  </Step>
+  <Step title="LLM summary">
     Calls the LLM to generate a concise summary of older messages. Replaces them
     with a compact boundary marker + summary. Costs one API call but frees significant context.
-  
-  
+  </Step>
+  <Step title="Context collapse">
     Removes message groups from the middle of the conversation, keeping the first
     (context/summary) and last (recent) groups. The full history stays in memory
     for session persistence — only the API-facing view is collapsed.
-  
-
+  </Step>
+</Steps>
 
 ## Error recovery
 
