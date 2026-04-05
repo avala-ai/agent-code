@@ -7,19 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.10.0] - 2026-04-05
+
+### Added
+
 ### Added
 
 - **4 new bundled skills**: `/security-review` (OWASP vulnerability scan), `/advisor` (architecture analysis), `/bughunter` (systematic bug search), `/plan` (implementation planning) — total now 12
-- **4 new commands**: `/release-notes` (show current version notes from CHANGELOG), `/summary` (session summary), `/feedback` (submit feedback), `/share` (export session as shareable markdown) — total now 42
+- **4 new commands**: `/release-notes`, `/summary`, `/feedback`, `/share` — total now 42
 - **Per-model cost breakdown** in `/cost` command with cache hit rate percentages
 - **`disable_skill_shell_execution`** security setting — strips shell blocks from skill templates when enabled
 - **Protected directories**: writes to `.git/`, `.husky/`, and `node_modules/` are blocked regardless of permission settings
 - **Windows support**: CI tests and release builds for `x86_64-pc-windows-msvc`, packaged as `.zip`
-- **Docker image**: multi-stage Dockerfile with GHCR publish workflow on release tags
+- **Docker image**: multi-stage Dockerfile with GHCR publish workflow (`ghcr.io/avala-ai/agent-code`)
 - **Troubleshooting guide**: 7 categories covering API, permissions, context, tools, MCP, installation, sessions
-- **FAQ page**: 18 questions across 6 categories (general, install, usage, cost, security, extensibility)
-- **Integration tests**: 11 new tests for skills and config systems (total now 220+)
-- **Smoke tests**: end-to-end binary invocation tests (`--version`, `--help`, unknown flags)
+- **FAQ page**: 18 questions across 6 categories
+- **Integration tests**: 11 new tests for skills and config systems
+- **Smoke tests**: end-to-end binary invocation tests
 - `CHANGELOG.md` with full release history
 - `ROADMAP.md` with phased v1.0 improvement plan
 
@@ -53,5 +59,6 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/avala-ai/agent-code/compare/v0.9.7...v0.10.0
 [0.9.7]: https://github.com/avala-ai/agent-code/releases/tag/v0.9.7
