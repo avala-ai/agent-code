@@ -7,6 +7,7 @@
 // Many types exist for the public API surface but aren't used internally yet.
 #![allow(dead_code)]
 
+mod attach;
 mod commands;
 mod serve;
 mod ui;
@@ -91,6 +92,11 @@ struct Cli {
     /// Port for the HTTP server (default: 4096). Only used with --serve.
     #[arg(long, default_value = "4096")]
     port: u16,
+
+    /// Attach to a running serve instance. Discovers via bridge lock files
+    /// or connects to the specified port.
+    #[arg(long)]
+    attach: bool,
 }
 
 fn run_setup_wizard() {
@@ -117,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
     // Set working directory if specified.
     if let Some(ref cwd) = cli.cwd {
         std::env::set_current_dir(cwd)?;
+    }
+
+    // Attach mode: connect to a running serve instance (no local API key needed).
+    if cli.attach {
+        return attach::run_attach(cli.port).await;
     }
 
     // Run setup wizard on first launch (no config file). Skip for non-interactive modes.

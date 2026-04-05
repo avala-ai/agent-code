@@ -321,6 +321,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Check for newer versions",
         hidden: false,
     },
+    Command {
+        name: "uninstall",
+        aliases: &[],
+        description: "Show instructions to remove agent-code",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1161,6 +1167,33 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                     println!("Could not check for updates. Try again later.");
                 }
             }
+            CommandResult::Handled
+        }
+        Some("uninstall") => {
+            let binary = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "agent".to_string());
+            let config_dir = dirs::config_dir()
+                .map(|d| d.join("agent-code").display().to_string())
+                .unwrap_or_else(|| "~/.config/agent-code".to_string());
+            let cache_dir = dirs::cache_dir()
+                .map(|d| d.join("agent-code").display().to_string())
+                .unwrap_or_else(|| "~/.cache/agent-code".to_string());
+            let data_dir = dirs::data_local_dir()
+                .map(|d| d.join("agent-code").display().to_string())
+                .unwrap_or_else(|| "~/.local/share/agent-code".to_string());
+
+            println!("To uninstall agent-code:\n");
+            println!("  # Remove the binary");
+            println!("  rm {binary}\n");
+            println!("  # Or if installed via cargo:");
+            println!("  cargo uninstall agent-code\n");
+            println!("  # Or if installed via homebrew:");
+            println!("  brew uninstall agent-code\n");
+            println!("  # Remove configuration and data (optional):");
+            println!("  rm -rf {config_dir}");
+            println!("  rm -rf {cache_dir}");
+            println!("  rm -rf {data_dir}");
             CommandResult::Handled
         }
         Some("release-notes") => {
