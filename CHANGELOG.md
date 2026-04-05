@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.11.1] - 2026-04-05
+
+### Added
+
+- **Release E2E test suite**: 31 automated tests covering CLI flags, serve mode HTTP API, tool verification (FileRead/FileWrite/FileEdit/Grep/Glob/Bash), permission system, skills, config, and edge cases
+- **`scripts/e2e-tests.sh`**: standalone bash test harness runnable locally or in CI
+- **`release-e2e.yml`** workflow: runs on tag push and manual dispatch via OpenRouter (~$0.03/run)
+
 ## [0.11.0] - 2026-04-05
 
 ### Added
@@ -76,7 +84,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/avala-ai/agent-code/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/avala-ai/agent-code/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/avala-ai/agent-code/compare/v0.9.7...v0.10.0
 [0.9.7]: https://github.com/avala-ai/agent-code/releases/tag/v0.9.7
