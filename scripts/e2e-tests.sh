@@ -22,6 +22,7 @@ MODEL="${AGENT_CODE_MODEL:-openai/gpt-5-nano}"
 SERVE_PORT=14096
 SERVE_URL="http://127.0.0.1:${SERVE_PORT}"
 API_TIMEOUT=120
+API_TIMEOUT_LONG=240
 WORKDIR=""
 SERVE_PID=""
 PASS_COUNT=0
@@ -78,8 +79,9 @@ api_get() {
 }
 
 api_post() {
+    local timeout="${3:-${API_TIMEOUT}}"
     HTTP_CODE=$(curl -s -o "${_CURL_BODY_FILE}" -w '%{http_code}' \
-        --max-time "${API_TIMEOUT}" \
+        --max-time "${timeout}" \
         -X POST -H "Content-Type: application/json" \
         -d "$2" "${SERVE_URL}$1" 2>/dev/null) || HTTP_CODE="000"
     HTTP_BODY=$(cat "${_CURL_BODY_FILE}")
@@ -258,20 +260,29 @@ else
         fail "C2: GET /status" "Missing fields. Code=${HTTP_CODE}, body=${HTTP_BODY:0:200}"
     fi
 
-    # C3: Message (valid)
-    api_post "/message" '{"content":"Reply with exactly: PONG"}'
-    if [[ "${HTTP_CODE}" == "200" ]] \
-        && echo "${HTTP_BODY}" | jq -e '.response' > /dev/null 2>&1 \
-        && echo "${HTTP_BODY}" | jq -e '.tools_used' > /dev/null 2>&1 \
-        && echo "${HTTP_BODY}" | jq -e '.cost_usd' > /dev/null 2>&1; then
-        resp=$(echo "${HTTP_BODY}" | jq -r '.response')
-        if echo "${resp}" | grep -qi "PONG"; then
-            pass "C3: POST /message → valid response with PONG"
-        else
-            pass "C3: POST /message → valid JSON (PONG not in response, but structure OK)"
+    # C3: Message (valid) — uses longer timeout + retry for LLM latency.
+    c3_ok=false
+    for c3_attempt in 1 2; do
+        api_post "/message" '{"content":"Reply with exactly: PONG"}' "${API_TIMEOUT_LONG}"
+        if [[ "${HTTP_CODE}" == "200" ]] \
+            && echo "${HTTP_BODY}" | jq -e '.response' > /dev/null 2>&1 \
+            && echo "${HTTP_BODY}" | jq -e '.tools_used' > /dev/null 2>&1 \
+            && echo "${HTTP_BODY}" | jq -e '.cost_usd' > /dev/null 2>&1; then
+            resp=$(echo "${HTTP_BODY}" | jq -r '.response')
+            if echo "${resp}" | grep -qi "PONG"; then
+                pass "C3: POST /message → valid response with PONG"
+            else
+                pass "C3: POST /message → valid JSON (PONG not in response, but structure OK)"
+            fi
+            c3_ok=true
+            break
         fi
-    else
-        fail "C3: POST /message" "Bad response. Code=${HTTP_CODE}, body=${HTTP_BODY:0:200}"
+        if [[ "${c3_attempt}" -eq 1 ]]; then
+            echo "  ⟳ C3: attempt 1 failed (code=${HTTP_CODE}), retrying..."
+        fi
+    done
+    if [[ "${c3_ok}" != "true" ]]; then
+        fail "C3: POST /message" "Bad response after 2 attempts. Code=${HTTP_CODE}, body=${HTTP_BODY:0:200}"
     fi
 
     # C4: Missing content
