@@ -112,6 +112,8 @@ impl Default for ApiConfig {
             .or_else(|_| std::env::var("ZHIPU_API_KEY"))
             .or_else(|_| std::env::var("TOGETHER_API_KEY"))
             .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .or_else(|_| std::env::var("COHERE_API_KEY"))
+            .or_else(|_| std::env::var("PERPLEXITY_API_KEY"))
             .ok();
 
         // Auto-detect base URL from which key is set.
@@ -150,6 +152,10 @@ impl Default for ApiConfig {
             "https://api.together.xyz/v1".to_string()
         } else if std::env::var("OPENROUTER_API_KEY").is_ok() {
             "https://openrouter.ai/api/v1".to_string()
+        } else if std::env::var("COHERE_API_KEY").is_ok() {
+            "https://api.cohere.com/v2".to_string()
+        } else if std::env::var("PERPLEXITY_API_KEY").is_ok() {
+            "https://api.perplexity.ai".to_string()
         } else {
             // Default to OpenAI (default model is gpt-5.4).
             "https://api.openai.com/v1".to_string()

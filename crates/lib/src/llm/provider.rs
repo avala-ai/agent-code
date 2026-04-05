@@ -129,6 +129,12 @@ pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
     if url_lower.contains("openrouter.ai") {
         return ProviderKind::OpenRouter;
     }
+    if url_lower.contains("cohere.com") || url_lower.contains("cohere.ai") {
+        return ProviderKind::Cohere;
+    }
+    if url_lower.contains("perplexity.ai") {
+        return ProviderKind::Perplexity;
+    }
     if url_lower.contains("localhost") || url_lower.contains("127.0.0.1") {
         return ProviderKind::OpenAiCompatible;
     }
@@ -165,6 +171,12 @@ pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
     if model_lower.starts_with("glm") {
         return ProviderKind::Zhipu;
     }
+    if model_lower.starts_with("command") {
+        return ProviderKind::Cohere;
+    }
+    if model_lower.starts_with("pplx") || model_lower.starts_with("sonar") {
+        return ProviderKind::Perplexity;
+    }
 
     ProviderKind::OpenAiCompatible
 }
@@ -193,6 +205,8 @@ pub enum ProviderKind {
     Together,
     Zhipu,
     OpenRouter,
+    Cohere,
+    Perplexity,
     OpenAiCompatible,
 }
 
@@ -210,6 +224,8 @@ impl ProviderKind {
             | Self::Together
             | Self::Zhipu
             | Self::OpenRouter
+            | Self::Cohere
+            | Self::Perplexity
             | Self::OpenAiCompatible => WireFormat::OpenAiCompatible,
         }
     }
@@ -229,6 +245,8 @@ impl ProviderKind {
             Self::Together => Some("https://api.together.xyz/v1"),
             Self::Zhipu => Some("https://open.bigmodel.cn/api/paas/v4"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
+            Self::Cohere => Some("https://api.cohere.com/v2"),
+            Self::Perplexity => Some("https://api.perplexity.ai"),
             // These require user-supplied URLs.
             Self::Bedrock | Self::Vertex | Self::OpenAiCompatible => None,
         }
@@ -247,6 +265,8 @@ impl ProviderKind {
             Self::Together => "TOGETHER_API_KEY",
             Self::Zhipu => "ZHIPU_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::Cohere => "COHERE_API_KEY",
+            Self::Perplexity => "PERPLEXITY_API_KEY",
             Self::OpenAiCompatible => "OPENAI_API_KEY",
         }
     }
@@ -325,6 +345,38 @@ mod tests {
         assert!(matches!(
             detect_provider("any", "https://api.together.xyz/v1"),
             ProviderKind::Together
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_cohere() {
+        assert!(matches!(
+            detect_provider("any", "https://api.cohere.com/v2"),
+            ProviderKind::Cohere
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_url_perplexity() {
+        assert!(matches!(
+            detect_provider("any", "https://api.perplexity.ai"),
+            ProviderKind::Perplexity
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_command_r() {
+        assert!(matches!(
+            detect_provider("command-r-plus", ""),
+            ProviderKind::Cohere
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_sonar() {
+        assert!(matches!(
+            detect_provider("sonar-pro", ""),
+            ProviderKind::Perplexity
         ));
     }
 

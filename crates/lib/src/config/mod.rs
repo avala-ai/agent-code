@@ -118,6 +118,8 @@ fn resolve_api_key_from_env() -> Option<String> {
         .or_else(|_| std::env::var("ZHIPU_API_KEY"))
         .or_else(|_| std::env::var("TOGETHER_API_KEY"))
         .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+        .or_else(|_| std::env::var("COHERE_API_KEY"))
+        .or_else(|_| std::env::var("PERPLEXITY_API_KEY"))
         .ok()
 }
 

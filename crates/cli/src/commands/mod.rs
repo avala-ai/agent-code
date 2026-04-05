@@ -482,6 +482,16 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                         ("glm-4.6-air", "GLM-4.6 Air · Fast"),
                         ("glm-4.5", "GLM-4.5 · Previous gen"),
                     ],
+                    ProviderKind::Cohere => vec![
+                        ("command-r-plus", "Command R+ · Most capable"),
+                        ("command-r", "Command R · Balanced"),
+                        ("command-light", "Command Light · Fast"),
+                    ],
+                    ProviderKind::Perplexity => vec![
+                        ("sonar-pro", "Sonar Pro · Most capable, web search"),
+                        ("sonar", "Sonar · Balanced, web search"),
+                        ("sonar-deep-research", "Sonar Deep Research · In-depth"),
+                    ],
                     ProviderKind::OpenRouter => vec![
                         ("anthropic/claude-sonnet-4", "Claude Sonnet 4 · Balanced"),
                         ("anthropic/claude-opus-4", "Claude Opus 4 · Most capable"),

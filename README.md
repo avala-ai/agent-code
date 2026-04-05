@@ -36,7 +36,7 @@ agent --model gpt-4.1-mini     # use a specific model
 
 The agent reads your codebase, runs commands, edits files, and handles multi-step tasks. Type `?` for keyboard shortcuts.
 
-## 13 Providers
+## 15 Providers
 
 Works with any LLM. Set one env var and go:
 
@@ -55,6 +55,8 @@ Works with any LLM. Set one env var and go:
 | AWS Bedrock | `AGENT_CODE_USE_BEDROCK` | claude-sonnet-4 |
 | Google Vertex | `AGENT_CODE_USE_VERTEX` | claude-sonnet-4 |
 | OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4 |
+| Cohere | `COHERE_API_KEY` | command-r-plus |
+| Perplexity | `PERPLEXITY_API_KEY` | sonar-pro |
 
 Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080/v1`
 
