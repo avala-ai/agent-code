@@ -94,10 +94,11 @@ struct Cli {
     #[arg(long, default_value = "4096")]
     port: u16,
 
-    /// Attach to a running serve instance. Discovers via bridge lock files
-    /// or connects to the specified port.
-    #[arg(long)]
-    attach: bool,
+    /// Attach to a running serve instance. Optionally pass a session ID
+    /// prefix to connect to a specific instance. Discovers via bridge lock
+    /// files or connects to the specified --port.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    attach: Option<String>,
 
     /// Start ACP (Agent Client Protocol) stdio server for IDE integrations.
     /// IDEs spawn `agent acp` and communicate via stdin/stdout JSON-RPC 2.0.
@@ -132,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Attach mode: connect to a running serve instance (no local API key needed).
-    if cli.attach {
-        return attach::run_attach(cli.port).await;
+    if let Some(ref session_filter) = cli.attach {
+        return attach::run_attach(cli.port, session_filter).await;
     }
 
     // Run setup wizard on first launch (no config file). Skip for non-interactive modes.

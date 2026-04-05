@@ -146,12 +146,12 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 - [x] Cache hit percentage per model
 - [x] Single-model sessions show inline cache hit rate
 
-### 3.4 Headless Mode — Partially Done
+### 3.4 Headless Mode — Done
 
 - [x] **`agent --serve`** — Headless HTTP API server (POST /message, GET /status, /messages, /health)
 - [x] Bridge lock file for IDE discovery
 - [x] Graceful shutdown with Ctrl+C
-- [ ] **`agent attach <session-id>`** — Reconnect to a running headless session
+- [x] **`agent --attach [session-id]`** — Reconnect by session ID prefix or interactive selection
 - [x] SSE event stream for real-time updates (GET /events with 10 event types)
 
 ### 3.5 Self-Management Commands — Partially Done

@@ -3,15 +3,35 @@
 //! Discovers running instances via bridge lock files, connects via HTTP,
 //! and provides an interactive REPL that sends prompts to the remote
 //! agent and displays responses.
+//!
+//! Supports connecting by:
+//! - Auto-discovery (single instance)
+//! - Session ID prefix (`--attach abc123`)
+//! - Explicit port (`--attach --port 8080`)
+//! - Interactive selection (multiple instances)
 
 use std::io::Write;
 
 /// Attach to a running serve instance and enter an interactive loop.
-pub async fn run_attach(port: u16) -> anyhow::Result<()> {
-    // Discover or use specified port.
+///
+/// `session_filter` is an optional session ID prefix. When non-empty,
+/// the attach command queries each discovered instance's `/status`
+/// endpoint and connects to the one whose session ID starts with the
+/// given prefix.
+pub async fn run_attach(port: u16, session_filter: &str) -> anyhow::Result<()> {
     let target_port = if port != 4096 {
         // User specified a port explicitly.
         port
+    } else if !session_filter.is_empty() {
+        // Find the instance matching the session ID prefix.
+        match find_by_session_id(session_filter).await {
+            Some(p) => p,
+            None => {
+                eprintln!("No running instance matches session '{session_filter}'.");
+                eprintln!("Run /status in a serve session to see its session ID.");
+                return Ok(());
+            }
+        }
     } else {
         // Try to discover a running instance.
         let bridges = agent_code_lib::services::bridge::discover_bridges();
@@ -28,12 +48,40 @@ pub async fn run_attach(port: u16) -> anyhow::Result<()> {
             );
             b.port
         } else {
+            // Interactive selection.
             eprintln!("Multiple instances found:\n");
             for (i, b) in bridges.iter().enumerate() {
-                eprintln!("  [{}] port {} — pid {} — {}", i + 1, b.port, b.pid, b.cwd);
+                // Fetch session ID for display.
+                let session = fetch_session_id(b.port).await.unwrap_or_default();
+                let session_display = if session.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — session {session}")
+                };
+                eprintln!(
+                    "  [{}] port {} — pid {} — {}{}",
+                    i + 1,
+                    b.port,
+                    b.pid,
+                    b.cwd,
+                    session_display
+                );
             }
-            eprintln!("\nUse --port <N> to connect to a specific one.");
-            return Ok(());
+            eprintln!();
+
+            // Read selection from stdin.
+            eprint!("Select [1-{}]: ", bridges.len());
+            std::io::stderr().flush()?;
+            let mut choice = String::new();
+            std::io::stdin().read_line(&mut choice)?;
+            let idx: usize = choice.trim().parse().unwrap_or(0);
+            if idx < 1 || idx > bridges.len() {
+                eprintln!("Invalid selection.");
+                return Ok(());
+            }
+            let b = &bridges[idx - 1];
+            eprintln!("Attaching to instance on port {} (pid {})", b.port, b.pid);
+            b.port
         }
     };
 
@@ -62,9 +110,12 @@ pub async fn run_attach(port: u16) -> anyhow::Result<()> {
         && let Ok(status) = resp.json::<serde_json::Value>().await
     {
         let model = status["model"].as_str().unwrap_or("unknown");
+        let session = status["session_id"].as_str().unwrap_or("?");
         let turns = status["turn_count"].as_u64().unwrap_or(0);
         let cost = status["cost_usd"].as_f64().unwrap_or(0.0);
-        eprintln!("Connected. Model: {model}, turns: {turns}, cost: ${cost:.4}\n");
+        eprintln!(
+            "Connected. Session: {session}, model: {model}, turns: {turns}, cost: ${cost:.4}\n"
+        );
     }
 
     eprintln!("Type a message and press Enter. Ctrl+D to detach.\n");
@@ -123,4 +174,42 @@ pub async fn run_attach(port: u16) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Find a running instance by session ID prefix.
+async fn find_by_session_id(prefix: &str) -> Option<u16> {
+    let bridges = agent_code_lib::services::bridge::discover_bridges();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    for b in &bridges {
+        if let Some(session_id) = fetch_session_id_with_client(&client, b.port).await
+            && session_id.starts_with(prefix)
+        {
+            eprintln!(
+                "Found session {session_id} on port {} (pid {}, {})",
+                b.port, b.pid, b.cwd
+            );
+            return Some(b.port);
+        }
+    }
+    None
+}
+
+/// Fetch the session ID from a running instance.
+async fn fetch_session_id(port: u16) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    fetch_session_id_with_client(&client, port).await
+}
+
+async fn fetch_session_id_with_client(client: &reqwest::Client, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/status");
+    let resp = client.get(&url).send().await.ok()?;
+    let status: serde_json::Value = resp.json().await.ok()?;
+    status["session_id"].as_str().map(|s| s.to_string())
 }
