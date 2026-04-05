@@ -315,6 +315,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Export session as shareable markdown",
         hidden: false,
     },
+    Command {
+        name: "update",
+        aliases: &["upgrade"],
+        description: "Check for newer versions",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1123,6 +1129,30 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("version") => {
             println!("agent {}", env!("CARGO_PKG_VERSION"));
+            CommandResult::Handled
+        }
+        Some("update") => {
+            println!("Checking for updates...");
+            let rt = tokio::runtime::Handle::current();
+            let check = std::thread::spawn(move || rt.block_on(crate::update::check_for_update()))
+                .join()
+                .ok()
+                .flatten();
+            match check {
+                Some(c) if c.is_newer => {
+                    println!("Update available: v{} → v{}", c.current, c.latest);
+                    println!("{}", c.release_url);
+                    println!("\nTo update:");
+                    println!("  cargo install agent-code");
+                    println!("  # or download from the release page above");
+                }
+                Some(c) => {
+                    println!("You're on the latest version (v{}).", c.current);
+                }
+                None => {
+                    println!("Could not check for updates. Try again later.");
+                }
+            }
             CommandResult::Handled
         }
         Some("release-notes") => {

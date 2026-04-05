@@ -9,6 +9,7 @@
 
 mod commands;
 mod ui;
+mod update;
 
 /// Estimate cost for a single model's usage (used by /cost command).
 fn estimate_model_cost(usage: &agent_code_lib::llm::message::Usage, model: &str) -> f64 {
@@ -387,7 +388,15 @@ async fn main() -> anyhow::Result<()> {
             println!();
         }
         None => {
+            // Check for updates in the background (non-blocking).
+            let update_handle = tokio::spawn(update::check_for_update());
+
             ui::repl::run_repl(&mut engine).await?;
+
+            // Show update notification after session ends.
+            if let Ok(Some(check)) = update_handle.await {
+                update::print_update_hint(&check);
+            }
         }
     }
 
