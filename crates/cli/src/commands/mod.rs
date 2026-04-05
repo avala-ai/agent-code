@@ -388,6 +388,37 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 usage.cache_read_input_tokens,
                 state.total_cost_usd,
             );
+
+            // Per-model breakdown (only shown when multiple models were used).
+            if state.model_usage.len() > 1 {
+                println!("\nPer model:");
+                let mut models: Vec<_> = state.model_usage.iter().collect();
+                models.sort_by(|a, b| a.0.cmp(b.0));
+                for (model, mu) in &models {
+                    let cost = crate::estimate_model_cost(mu, model);
+                    let cache_pct = if mu.input_tokens > 0 {
+                        (mu.cache_read_input_tokens as f64 / mu.input_tokens as f64 * 100.0).round()
+                            as u64
+                    } else {
+                        0
+                    };
+                    println!(
+                        "  {model}: {} tokens (in: {}, out: {}), cache hit: {cache_pct}%, ${cost:.4}",
+                        mu.total(),
+                        mu.input_tokens,
+                        mu.output_tokens,
+                    );
+                }
+            } else if state.model_usage.len() == 1 {
+                // Single model — show cache hit rate.
+                let (_, mu) = state.model_usage.iter().next().unwrap();
+                if mu.cache_read_input_tokens > 0 && mu.input_tokens > 0 {
+                    let cache_pct = (mu.cache_read_input_tokens as f64 / mu.input_tokens as f64
+                        * 100.0)
+                        .round() as u64;
+                    println!("Cache hit: {cache_pct}%");
+                }
+            }
             CommandResult::Handled
         }
         Some("model") => {

@@ -10,6 +10,17 @@
 mod commands;
 mod ui;
 
+/// Estimate cost for a single model's usage (used by /cost command).
+fn estimate_model_cost(usage: &agent_code_lib::llm::message::Usage, model: &str) -> f64 {
+    agent_code_lib::services::pricing::calculate_cost(
+        model,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    )
+}
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
