@@ -115,12 +115,12 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 - [x] Tools namespaced as `plugin__<name>__<binary>`
 - [x] `PluginRegistry::executable_tools()` returns discovered tools
 
-### 2.4 Remote Skill Discovery (Stretch)
+### 2.4 Remote Skill Discovery — Done
 
-- [ ] Skill index fetched from configurable URL
-- [ ] `agent skill install <name>` to download to user skills directory
-- [ ] Offline fallback to cached index
-- [ ] Depends on: 2.1 (solid bundled skills first)
+- [x] Skill index fetched from configurable URL (default: GitHub)
+- [x] `/skill install <name>` to download to user skills directory
+- [x] `/skill search [query]`, `/skill installed`, `/skill remove <name>`
+- [x] Offline fallback to cached index (1h cache, 24h stale warning)
 
 ---
 

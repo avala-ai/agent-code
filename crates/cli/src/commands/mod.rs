@@ -112,6 +112,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "skill",
+        aliases: &[],
+        description: "Manage skills: install, remove, search (try /skill help)",
+        hidden: false,
+    },
+    Command {
         name: "review",
         aliases: &[],
         description: "Ask the agent to review the current diff",
@@ -627,6 +633,108 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                     };
                     let desc = skill.metadata.description.as_deref().unwrap_or("");
                     println!("  {}{} — {}", skill.name, invocable, desc);
+                }
+            }
+            CommandResult::Handled
+        }
+        Some("skill") => {
+            let sub = args.unwrap_or("").trim().to_string();
+            let (subcmd, subarg) = sub
+                .split_once(char::is_whitespace)
+                .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+                .unwrap_or((sub.clone(), String::new()));
+
+            match subcmd.as_str() {
+                "install" | "add" if !subarg.is_empty() => {
+                    println!("Installing skill '{subarg}'...");
+                    let rt = tokio::runtime::Handle::current();
+                    let name = subarg.clone();
+                    match std::thread::spawn(move || {
+                        rt.block_on(agent_code_lib::skills::remote::install_skill(&name, None))
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err("Thread panicked".to_string()))
+                    {
+                        Ok(path) => println!("Installed to {}", path.display()),
+                        Err(e) => println!("Failed: {e}"),
+                    }
+                }
+                "remove" | "uninstall" if !subarg.is_empty() => {
+                    match agent_code_lib::skills::remote::uninstall_skill(&subarg) {
+                        Ok(()) => println!("Removed skill '{subarg}'."),
+                        Err(e) => println!("Failed: {e}"),
+                    }
+                }
+                "search" | "list-remote" => {
+                    println!("Fetching skill index...");
+                    let rt = tokio::runtime::Handle::current();
+                    let query = subarg.to_lowercase();
+                    match std::thread::spawn(move || {
+                        rt.block_on(agent_code_lib::skills::remote::fetch_index(None))
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err("Thread panicked".to_string()))
+                    {
+                        Ok(skills) => {
+                            let filtered: Vec<_> = if query.is_empty() {
+                                skills.iter().collect()
+                            } else {
+                                skills
+                                    .iter()
+                                    .filter(|s| {
+                                        s.name.to_lowercase().contains(&query)
+                                            || s.description.to_lowercase().contains(&query)
+                                    })
+                                    .collect()
+                            };
+                            let installed = agent_code_lib::skills::remote::list_installed();
+                            if filtered.is_empty() {
+                                println!("No skills found.");
+                            } else {
+                                println!("{} skill(s) available:\n", filtered.len());
+                                for skill in &filtered {
+                                    let tag = if installed.contains(&skill.name) {
+                                        " [installed]"
+                                    } else {
+                                        ""
+                                    };
+                                    let ver = if skill.version.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" v{}", skill.version)
+                                    };
+                                    println!(
+                                        "  {}{} — {}{}",
+                                        skill.name, ver, skill.description, tag
+                                    );
+                                }
+                                println!("\nInstall with: /skill install <name>");
+                            }
+                        }
+                        Err(e) => println!("Failed to fetch index: {e}"),
+                    }
+                }
+                "installed" => {
+                    let installed = agent_code_lib::skills::remote::list_installed();
+                    if installed.is_empty() {
+                        println!("No user-installed skills. Install with: /skill install <name>");
+                    } else {
+                        println!("{} installed skill(s):\n", installed.len());
+                        for name in &installed {
+                            println!("  {name}");
+                        }
+                    }
+                }
+                "help" | "" => {
+                    println!("Skill management commands:\n");
+                    println!("  /skill search [query]    Search the remote skill index");
+                    println!("  /skill install <name>    Install a skill from the index");
+                    println!("  /skill remove <name>     Remove an installed skill");
+                    println!("  /skill installed         List user-installed skills");
+                    println!("  /skill help              Show this help");
+                }
+                _ => {
+                    println!("Unknown subcommand: {subcmd}. Try /skill help");
                 }
             }
             CommandResult::Handled

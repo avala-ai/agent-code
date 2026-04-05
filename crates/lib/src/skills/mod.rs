@@ -11,6 +11,8 @@
 //! The body of the skill file is a prompt template that gets expanded
 //! when the skill is invoked. Supports `{{arg}}` substitution.
 
+pub mod remote;
+
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
