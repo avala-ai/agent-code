@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Run setup wizard on first launch (no config file). Skip for non-interactive modes.
-    if cli.prompt.is_none() && !cli.dump_system_prompt && ui::setup::needs_setup() {
+    if cli.prompt.is_none() && !cli.dump_system_prompt && !cli.serve && ui::setup::needs_setup() {
         run_setup_wizard();
     }
 
@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
     // If nothing found and interactive, run the setup wizard.
     let has_key = cli.api_key.is_some() || config.api.api_key.is_some();
 
-    if !has_key && cli.prompt.is_none() && !cli.dump_system_prompt {
+    if !has_key && cli.prompt.is_none() && !cli.dump_system_prompt && !cli.serve {
         eprintln!("No API key found. Starting setup...\n");
         run_setup_wizard();
         config = Config::load()?;
@@ -227,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         && !config.api.base_url.contains("127.0.0.1")
         && cli.prompt.is_none()
         && !cli.dump_system_prompt
+        && !cli.serve
     {
         let check_url = format!("{}/models", config.api.base_url);
         let key_invalid = std::process::Command::new("curl")
