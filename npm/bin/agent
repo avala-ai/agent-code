@@ -1,0 +1,1 @@
+#!/bin/sh\necho "Run npm install to download the agent binary" && exit 1

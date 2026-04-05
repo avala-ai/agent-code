@@ -1,0 +1,27 @@
+{
+  "name": "agent-code",
+  "version": "0.10.0",
+  "description": "AI coding agent for the terminal. Built in Rust.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avala-ai/agent-code"
+  },
+  "homepage": "https://github.com/avala-ai/agent-code",
+  "keywords": ["ai", "agent", "coding", "cli", "terminal", "llm"],
+  "bin": {
+    "agent": "bin/agent"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "install.js",
+    "bin/"
+  ]
+}
