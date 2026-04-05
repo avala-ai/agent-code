@@ -36,6 +36,17 @@
 - [Custom Tools](extending/custom-tools.md)
 - [IDE Bridge](extending/ide-bridge.md)
 
+# Architecture
+
+- [Context Compaction](architecture/compaction.md)
+- [Tool Execution](architecture/tool-execution.md)
+- [Provider Abstraction](architecture/provider-abstraction.md)
+- [MCP Protocol](architecture/mcp-protocol.md)
+
+# Guides
+
+- [Performance Tuning](guides/performance.md)
+
 # Reference
 
 - [Tools Reference](reference/tools.md)

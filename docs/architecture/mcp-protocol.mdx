@@ -1,0 +1,127 @@
+---
+title: "MCP Protocol"
+description: "How agent-code connects to and uses MCP servers"
+---
+
+## Overview
+
+[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) extends agent-code with tools and resources from external servers. agent-code acts as an MCP **client**, connecting to one or more MCP servers.
+
+## Connection Lifecycle
+
+```
+1. Startup: read mcp_servers from config
+2. For each server:
+   a. Spawn subprocess (stdio) or connect HTTP (SSE)
+   b. Send initialize request (protocol version, capabilities)
+   c. Receive initialize response (server capabilities)
+   d. Send tools/list request
+   e. Register discovered tools as mcp__<server>__<tool> in the tool pool
+   f. Send resources/list request (if supported)
+   g. Register discovered resources
+3. Ready: MCP tools available to the LLM alongside built-in tools
+```
+
+## Transports
+
+### Stdio
+
+The default transport. agent-code spawns the server as a subprocess and communicates via JSON-RPC over stdin/stdout.
+
+```toml
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_..." }
+```
+
+The subprocess inherits the configured `env` variables. Stderr is captured for debugging.
+
+### SSE (Server-Sent Events)
+
+For servers that expose an HTTP endpoint:
+
+```toml
+[mcp_servers.remote]
+url = "http://localhost:8080"
+```
+
+Uses HTTP POST for requests and SSE for responses/notifications.
+
+## Tool Proxying
+
+When the LLM calls an MCP tool, the request flows through `McpProxy`:
+
+```
+LLM: tool_use { name: "mcp__github__create_issue", input: {...} }
+    │
+    ▼
+McpProxy.call()
+    ├── Parse server name and tool name from the namespaced name
+    ├── Find the MCP client for "github"
+    ├── Send tools/call JSON-RPC request
+    ├── Wait for response
+    └── Return tool result to conversation
+```
+
+Tool names are namespaced as `mcp__<server>__<tool>` to prevent collisions between servers and with built-in tools.
+
+## Resource Access
+
+MCP servers can expose resources (database schemas, file listings, documentation). Two tools handle this:
+
+| Tool | Purpose |
+|------|---------|
+| `ListMcpResources` | Browse available resources across all connected servers |
+| `ReadMcpResource` | Read a specific resource by URI |
+
+The LLM uses these tools when it needs context from external systems.
+
+## Security
+
+### Allowlist / Denylist
+
+```toml
+[security]
+mcp_server_allowlist = ["github", "filesystem"]   # Only these can connect
+mcp_server_denylist = ["untrusted"]                # These are blocked
+```
+
+If `allowlist` is non-empty, only listed servers are connected. `denylist` is checked regardless.
+
+### Permission Integration
+
+MCP tool calls go through the same permission system as built-in tools. The namespaced tool name (`mcp__github__create_issue`) can be matched by permission rules:
+
+```toml
+[[permissions.rules]]
+tool = "mcp__github__*"
+action = "allow"
+```
+
+### Trust Boundary
+
+MCP servers run with the user's permissions. They can access the filesystem, network, and any service the user can. The security boundary is the same as running a shell command — use allowlists to restrict which servers connect.
+
+## Error Handling
+
+| Error | Behavior |
+|-------|----------|
+| Server fails to start | Warning logged, server skipped, agent continues without it |
+| Connection lost | Tool calls to that server return error results |
+| Tool call fails | Error message returned as tool result, LLM can retry or adjust |
+| Timeout | Transport-level timeout, error result returned |
+
+## JSON-RPC Protocol
+
+MCP uses JSON-RPC 2.0 over the chosen transport:
+
+```json
+// Request
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "create_issue", "arguments": {...}}}
+
+// Response
+{"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Issue created: #42"}]}}
+```
+
+**Source**: `services/mcp/client.rs` (client), `services/mcp/transport.rs` (stdio/SSE), `services/mcp/types.rs` (JSON-RPC types), `tools/mcp_proxy.rs` (tool proxy), `tools/mcp_resources.rs` (resource access)

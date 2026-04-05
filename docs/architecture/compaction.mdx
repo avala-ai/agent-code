@@ -1,0 +1,82 @@
+---
+title: "Context Compaction"
+description: "How agent-code manages conversation history within context limits"
+---
+
+Long sessions exceed the LLM's context window. The compaction system keeps conversations running indefinitely by strategically reducing history size.
+
+## Context Window Layout
+
+```
+|<--- context window (e.g., 200K tokens) ------------------------------>|
+|<--- effective window (context - 20K reserved for output) ------------>|
+|<--- auto-compact threshold (effective - 13K buffer) ----------------->|
+|                                                      ↑ compaction fires
+```
+
+The 20K reservation ensures the model always has room to respond. The 13K buffer prevents compaction from firing on every turn.
+
+## Three Strategies
+
+Strategies are tried in order. Each is progressively more aggressive.
+
+### 1. Microcompact
+
+**Cost**: zero (no API call). **Savings**: moderate.
+
+Clears the `content` field of old tool results, replacing them with `[Old tool result cleared]`. Keeps the tool_use/tool_result pairing intact so the conversation structure remains valid.
+
+```
+Before: ToolResult { content: "500 lines of file content..." }
+After:  ToolResult { content: "[Old tool result cleared]" }
+```
+
+The `keep_recent` parameter (default: 2) preserves the most recent N turns untouched.
+
+**Source**: `services/compact.rs` → `microcompact()`
+
+### 2. LLM Summary
+
+**Cost**: one API call. **Savings**: large.
+
+Sends older messages to the LLM with a prompt asking for a concise summary. Replaces those messages with a single compact boundary message containing the summary.
+
+The summary preserves: key decisions, file paths discussed, errors encountered, and the current task state.
+
+**Source**: `services/compact.rs` → `build_compact_summary_prompt()`
+
+### 3. Context Collapse
+
+**Cost**: zero. **Savings**: maximum.
+
+Removes message groups from the middle of the conversation, keeping only the first group (initial context/summary) and the last group (recent messages). The full history remains in memory for session persistence — only the API-facing view is collapsed.
+
+**Source**: `services/context_collapse.rs`
+
+## When Compaction Fires
+
+### Auto-compact
+
+Checked before every LLM call. Fires when estimated tokens exceed the threshold:
+
+```
+threshold = context_window - 20K (reserved) - 13K (buffer)
+```
+
+For a 200K context window, this fires at ~167K tokens.
+
+### Reactive compact
+
+Triggered by API `prompt_too_long` (413) errors. Parses the gap from the error message and runs microcompact + context collapse aggressively.
+
+### Manual
+
+Users can trigger compaction with `/compact` to proactively free context.
+
+## Token Estimation
+
+Token counts are estimated using a character-based heuristic: **4 bytes per token**. This is conservative for English text and intentionally overestimates to prevent context overflow.
+
+Images use a fixed estimate of 2,000 tokens. Tool use blocks estimate from the serialized JSON input.
+
+**Source**: `services/tokens.rs`

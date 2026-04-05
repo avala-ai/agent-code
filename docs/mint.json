@@ -90,6 +90,21 @@
       ]
     },
     {
+      "group": "Architecture",
+      "pages": [
+        "architecture/compaction",
+        "architecture/tool-execution",
+        "architecture/provider-abstraction",
+        "architecture/mcp-protocol"
+      ]
+    },
+    {
+      "group": "Guides",
+      "pages": [
+        "guides/performance"
+      ]
+    },
+    {
       "group": "Reference",
       "pages": [
         "reference/tools",

@@ -1,0 +1,96 @@
+
+## Execution Flow
+
+When the LLM responds with tool calls, the executor handles them in this order:
+
+```
+LLM response with tool_use blocks
+    │
+    ▼
+Parse pending tool calls
+    │
+    ▼
+For each tool call:
+    ├── Permission check (allow/deny/ask)
+    ├── Input validation (JSON schema)
+    ├── Plan mode check (block mutations)
+    └── Protected directory check (block .git/, .husky/, node_modules/)
+    │
+    ▼
+Partition into batches:
+    ├── Read-only tools → parallel batch (tokio::join!)
+    └── Mutation tools → serial execution
+    │
+    ▼
+Execute tools, collect results
+    │
+    ▼
+Fire post-tool-use hooks
+    │
+    ▼
+Inject tool results into conversation
+    │
+    ▼
+Back to LLM for next turn
+```
+
+## Batching Strategy
+
+Tools declare two properties:
+
+| Property | Meaning |
+|----------|---------|
+| `is_read_only()` | Tool only reads, never mutates |
+| `is_concurrency_safe()` | Safe to run alongside other tools (defaults to `is_read_only()`) |
+
+The executor uses these to partition:
+
+- **Parallel batch**: all concurrency-safe tools run simultaneously via `tokio::join!`
+- **Serial queue**: mutation tools run one at a time, in order
+
+This maximizes throughput for read-heavy turns (common when the agent explores code) while ensuring mutation ordering is preserved.
+
+## Permission Checks
+
+Every tool call passes through `PermissionChecker::check()` before execution:
+
+1. **Protected directories**: write tools blocked from `.git/`, `.husky/`, `node_modules/` (hardcoded, not overridable)
+2. **Explicit rules**: user-configured per-tool/pattern rules evaluated in order, first match wins
+3. **Default mode**: `ask`, `allow`, `deny`, `plan`, or `accept_edits`
+
+Read-only tools use a relaxed check (`check_read()`) that only blocks explicit deny rules.
+
+## Streaming Executor
+
+Tools begin execution as soon as their input is fully parsed from the SSE stream — they don't wait for the entire response to finish. This overlaps tool execution with LLM generation for faster turns.
+
+The streaming executor watches for complete `tool_use` content blocks in the accumulating response and dispatches them immediately.
+
+## Error Handling
+
+| Error | Recovery |
+|-------|----------|
+| Permission denied | Tool result reports denial, LLM adjusts approach |
+| Tool execution error | Error message returned as tool result |
+| Timeout | Tool cancelled via `CancellationToken`, error result injected |
+| Invalid input | Validation error returned before execution |
+
+## The Tool Trait
+
+Every tool implements:
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn input_schema(&self) -> serde_json::Value;
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError>;
+    fn is_read_only(&self) -> bool { false }
+    fn is_concurrency_safe(&self) -> bool { self.is_read_only() }
+}
+```
+
+Adding a new tool means implementing this trait and registering it in the `ToolRegistry`. No central enum to modify.
+
+**Source**: `tools/mod.rs` (trait), `tools/executor.rs` (dispatch), `tools/registry.rs` (registration)
