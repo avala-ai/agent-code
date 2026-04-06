@@ -298,4 +298,141 @@ mod tests {
             PermissionDecision::Ask(_)
         ));
     }
+
+    #[test]
+    fn test_deny_mode_blocks_all_tools() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![],
+        });
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "ls"})),
+            PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            checker.check("FileWrite", &serde_json::json!({"file_path": "src/main.rs"})),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn test_plan_mode_blocks_all_tools() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![],
+        });
+        let decision = checker.check("Bash", &serde_json::json!({"command": "ls"}));
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        if let PermissionDecision::Deny(msg) = decision {
+            assert!(msg.contains("Plan mode"));
+        }
+    }
+
+    #[test]
+    fn test_accept_edits_mode_allows_writes() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::AcceptEdits,
+            rules: vec![],
+        });
+        // Write to a non-protected path should be allowed.
+        assert!(matches!(
+            checker.check("FileWrite", &serde_json::json!({"file_path": "src/lib.rs"})),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_wildcard_tool_rule_matches_any_tool() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![PermissionRule {
+                tool: "*".into(),
+                pattern: None,
+                action: PermissionMode::Allow,
+            }],
+        });
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "ls"})),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            checker.check("FileRead", &serde_json::json!({"file_path": "foo.rs"})),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_check_read_allows_reads_with_deny_default() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![],
+        });
+        // check_read should allow even when default mode is Deny (no explicit deny rule).
+        assert!(matches!(
+            checker.check_read("FileRead", &serde_json::json!({"file_path": "src/lib.rs"})),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_check_read_blocks_with_explicit_deny_rule() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Allow,
+            rules: vec![PermissionRule {
+                tool: "FileRead".into(),
+                pattern: Some("*.secret".into()),
+                action: PermissionMode::Deny,
+            }],
+        });
+        assert!(matches!(
+            checker.check_read("FileRead", &serde_json::json!({"file_path": "keys.secret"})),
+            PermissionDecision::Deny(_)
+        ));
+        // Non-matching pattern should still allow.
+        assert!(matches!(
+            checker.check_read("FileRead", &serde_json::json!({"file_path": "src/lib.rs"})),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_matches_input_pattern_with_file_path() {
+        let input = serde_json::json!({"file_path": "src/main.rs"});
+        assert!(matches_input_pattern("src/*", &input));
+        assert!(!matches_input_pattern("test/*", &input));
+    }
+
+    #[test]
+    fn test_matches_input_pattern_with_pattern_field() {
+        let input = serde_json::json!({"pattern": "TODO"});
+        assert!(matches_input_pattern("TODO", &input));
+        assert!(!matches_input_pattern("FIXME", &input));
+    }
+
+    #[test]
+    fn test_is_write_tool_classification() {
+        assert!(is_write_tool("FileWrite"));
+        assert!(is_write_tool("FileEdit"));
+        assert!(is_write_tool("MultiEdit"));
+        assert!(is_write_tool("NotebookEdit"));
+        assert!(!is_write_tool("FileRead"));
+        assert!(!is_write_tool("Bash"));
+        assert!(!is_write_tool("Grep"));
+    }
+
+    #[test]
+    fn test_protected_path_windows_backslash() {
+        assert!(
+            check_protected_path(&serde_json::json!({"file_path": "repo\\.git\\config"}))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_protected_path_nested_git_objects() {
+        assert!(
+            check_protected_path(&serde_json::json!({"file_path": "some/path/.git/objects/foo"}))
+                .is_some()
+        );
+    }
 }

@@ -238,4 +238,91 @@ mod tests {
         let cost = calculate_cost("claude-sonnet-4", 0, 0, 0, 0);
         assert_eq!(cost, 0.0);
     }
+
+    #[test]
+    fn test_gemini_pro_pricing() {
+        let cost = calculate_cost("gemini-pro", 1_000_000, 0, 0, 0);
+        assert!((cost - 1.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gemini_flash_pricing() {
+        let cost = calculate_cost("gemini-flash", 1_000_000, 0, 0, 0);
+        assert!((cost - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt4o_pricing() {
+        let cost = calculate_cost("gpt-4o", 1_000_000, 0, 0, 0);
+        assert!((cost - 2.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt54_pricing() {
+        let cost = calculate_cost("gpt-5.4", 1_000_000, 0, 0, 0);
+        assert!((cost - 2.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt54_mini_pricing() {
+        let cost = calculate_cost("gpt-5.4-mini", 1_000_000, 0, 0, 0);
+        assert!((cost - 0.40).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt54_nano_pricing() {
+        let cost = calculate_cost("gpt-5.4-nano", 1_000_000, 0, 0, 0);
+        assert!((cost - 0.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt41_pricing() {
+        let cost = calculate_cost("gpt-4.1", 1_000_000, 0, 0, 0);
+        assert!((cost - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_gpt41_nano_pricing() {
+        let cost = calculate_cost("gpt-4.1-nano", 1_000_000, 0, 0, 0);
+        assert!((cost - 0.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_o3_pricing() {
+        let cost = calculate_cost("o3", 1_000_000, 0, 0, 0);
+        assert!((cost - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_o1_pricing() {
+        let cost = calculate_cost("o1", 1_000_000, 0, 0, 0);
+        assert!((cost - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_mistral_large_pricing() {
+        let cost = calculate_cost("mistral-large", 1_000_000, 0, 0, 0);
+        assert!((cost - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_combined_input_output_cost() {
+        // Opus: 1M input * $15/M + 500K output * $75/M = $15 + $37.5 = $52.5
+        let cost = calculate_cost("claude-opus-4", 1_000_000, 500_000, 0, 0);
+        assert!((cost - 52.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_grok_cache_pricing_is_zero() {
+        // Grok has zero cache rates.
+        let cost = calculate_cost("grok-3", 0, 0, 1_000_000, 1_000_000);
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn test_gemini_cache_pricing_is_zero() {
+        // Gemini has zero cache rates.
+        let cost = calculate_cost("gemini-pro", 0, 0, 1_000_000, 1_000_000);
+        assert_eq!(cost, 0.0);
+    }
 }

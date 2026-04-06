@@ -340,3 +340,476 @@ pub struct HookDefinition {
     /// Optional tool name filter (for PreToolUse/PostToolUse).
     pub tool_name: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- ApiConfig::default() ----
+
+    #[test]
+    fn api_config_default_model() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.model, "gpt-5.4");
+    }
+
+    #[test]
+    fn api_config_default_timeout() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.timeout_secs, 120);
+    }
+
+    #[test]
+    fn api_config_default_max_retries() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.max_retries, 3);
+    }
+
+    #[test]
+    fn api_config_default_max_output_tokens() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.max_output_tokens, Some(16384));
+    }
+
+    #[test]
+    fn api_config_default_base_url_contains_scheme() {
+        let cfg = ApiConfig::default();
+        assert!(
+            cfg.base_url.starts_with("https://"),
+            "base_url should start with https://, got: {}",
+            cfg.base_url
+        );
+    }
+
+    #[test]
+    fn api_config_default_thinking_is_none() {
+        let cfg = ApiConfig::default();
+        assert!(cfg.thinking.is_none());
+    }
+
+    #[test]
+    fn api_config_default_effort_is_none() {
+        let cfg = ApiConfig::default();
+        assert!(cfg.effort.is_none());
+    }
+
+    #[test]
+    fn api_config_default_max_cost_is_none() {
+        let cfg = ApiConfig::default();
+        assert!(cfg.max_cost_usd.is_none());
+    }
+
+    // ---- PermissionsConfig::default() ----
+
+    #[test]
+    fn permissions_config_default_mode_is_ask() {
+        let cfg = PermissionsConfig::default();
+        assert_eq!(cfg.default_mode, PermissionMode::Ask);
+    }
+
+    #[test]
+    fn permissions_config_default_rules_empty() {
+        let cfg = PermissionsConfig::default();
+        assert!(cfg.rules.is_empty());
+    }
+
+    // ---- UiConfig::default() ----
+
+    #[test]
+    fn ui_config_default_markdown_true() {
+        let cfg = UiConfig::default();
+        assert!(cfg.markdown);
+    }
+
+    #[test]
+    fn ui_config_default_syntax_highlight_true() {
+        let cfg = UiConfig::default();
+        assert!(cfg.syntax_highlight);
+    }
+
+    #[test]
+    fn ui_config_default_theme_dark() {
+        let cfg = UiConfig::default();
+        assert_eq!(cfg.theme, "dark");
+    }
+
+    #[test]
+    fn ui_config_default_edit_mode_emacs() {
+        let cfg = UiConfig::default();
+        assert_eq!(cfg.edit_mode, "emacs");
+    }
+
+    // ---- FeaturesConfig::default() ----
+
+    #[test]
+    fn features_config_default_all_true() {
+        let cfg = FeaturesConfig::default();
+        assert!(cfg.token_budget);
+        assert!(cfg.commit_attribution);
+        assert!(cfg.compaction_reminders);
+        assert!(cfg.unattended_retry);
+        assert!(cfg.history_snip);
+        assert!(cfg.auto_theme);
+        assert!(cfg.mcp_rich_output);
+        assert!(cfg.fork_conversation);
+        assert!(cfg.verification_agent);
+        assert!(cfg.extract_memories);
+        assert!(cfg.context_collapse);
+        assert!(cfg.reactive_compact);
+    }
+
+    // ---- SecurityConfig::default() ----
+
+    #[test]
+    fn security_config_default_empty_vecs() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.additional_directories.is_empty());
+        assert!(cfg.mcp_server_allowlist.is_empty());
+        assert!(cfg.mcp_server_denylist.is_empty());
+        assert!(cfg.env_allowlist.is_empty());
+    }
+
+    #[test]
+    fn security_config_default_booleans_false() {
+        let cfg = SecurityConfig::default();
+        assert!(!cfg.disable_bypass_permissions);
+        assert!(!cfg.disable_skill_shell_execution);
+    }
+
+    // ---- Config::default() composes sub-defaults ----
+
+    #[test]
+    fn config_default_composes_sub_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.api.model, "gpt-5.4");
+        assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
+        assert!(cfg.ui.markdown);
+        assert!(cfg.features.token_budget);
+        assert!(cfg.mcp_servers.is_empty());
+        assert!(cfg.hooks.is_empty());
+        assert!(cfg.security.additional_directories.is_empty());
+    }
+
+    // ---- PermissionMode serde round-trip ----
+
+    #[test]
+    fn permission_mode_serde_roundtrip_allow() {
+        let json = serde_json::to_string(&PermissionMode::Allow).unwrap();
+        assert_eq!(json, "\"allow\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::Allow);
+    }
+
+    #[test]
+    fn permission_mode_serde_roundtrip_deny() {
+        let json = serde_json::to_string(&PermissionMode::Deny).unwrap();
+        assert_eq!(json, "\"deny\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::Deny);
+    }
+
+    #[test]
+    fn permission_mode_serde_roundtrip_ask() {
+        let json = serde_json::to_string(&PermissionMode::Ask).unwrap();
+        assert_eq!(json, "\"ask\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::Ask);
+    }
+
+    #[test]
+    fn permission_mode_serde_roundtrip_accept_edits() {
+        let json = serde_json::to_string(&PermissionMode::AcceptEdits).unwrap();
+        assert_eq!(json, "\"accept_edits\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::AcceptEdits);
+    }
+
+    #[test]
+    fn permission_mode_serde_roundtrip_plan() {
+        let json = serde_json::to_string(&PermissionMode::Plan).unwrap();
+        assert_eq!(json, "\"plan\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::Plan);
+    }
+
+    // ---- HookEvent serde round-trip ----
+
+    #[test]
+    fn hook_event_serde_roundtrip_session_start() {
+        let json = serde_json::to_string(&HookEvent::SessionStart).unwrap();
+        assert_eq!(json, "\"session_start\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::SessionStart);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_session_stop() {
+        let json = serde_json::to_string(&HookEvent::SessionStop).unwrap();
+        assert_eq!(json, "\"session_stop\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::SessionStop);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_pre_tool_use() {
+        let json = serde_json::to_string(&HookEvent::PreToolUse).unwrap();
+        assert_eq!(json, "\"pre_tool_use\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::PreToolUse);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_post_tool_use() {
+        let json = serde_json::to_string(&HookEvent::PostToolUse).unwrap();
+        assert_eq!(json, "\"post_tool_use\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::PostToolUse);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_user_prompt_submit() {
+        let json = serde_json::to_string(&HookEvent::UserPromptSubmit).unwrap();
+        assert_eq!(json, "\"user_prompt_submit\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::UserPromptSubmit);
+    }
+
+    // ---- HookAction serde round-trip ----
+
+    #[test]
+    fn hook_action_serde_roundtrip_shell() {
+        let action = HookAction::Shell {
+            command: "echo hello".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"type\":\"shell\""));
+        assert!(json.contains("\"command\":\"echo hello\""));
+        let back: HookAction = serde_json::from_str(&json).unwrap();
+        match back {
+            HookAction::Shell { command } => assert_eq!(command, "echo hello"),
+            _ => panic!("expected Shell variant"),
+        }
+    }
+
+    #[test]
+    fn hook_action_serde_roundtrip_http() {
+        let action = HookAction::Http {
+            url: "https://example.com/hook".into(),
+            method: Some("POST".into()),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"type\":\"http\""));
+        let back: HookAction = serde_json::from_str(&json).unwrap();
+        match back {
+            HookAction::Http { url, method } => {
+                assert_eq!(url, "https://example.com/hook");
+                assert_eq!(method.unwrap(), "POST");
+            }
+            _ => panic!("expected Http variant"),
+        }
+    }
+
+    #[test]
+    fn hook_action_http_method_none() {
+        let action = HookAction::Http {
+            url: "https://example.com".into(),
+            method: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: HookAction = serde_json::from_str(&json).unwrap();
+        match back {
+            HookAction::Http { method, .. } => assert!(method.is_none()),
+            _ => panic!("expected Http variant"),
+        }
+    }
+
+    // ---- HookDefinition serde round-trip ----
+
+    #[test]
+    fn hook_definition_serde_roundtrip() {
+        let def = HookDefinition {
+            event: HookEvent::PreToolUse,
+            action: HookAction::Shell {
+                command: "lint.sh".into(),
+            },
+            tool_name: Some("Bash".into()),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let back: HookDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event, HookEvent::PreToolUse);
+        assert_eq!(back.tool_name, Some("Bash".into()));
+    }
+
+    #[test]
+    fn hook_definition_tool_name_none() {
+        let def = HookDefinition {
+            event: HookEvent::SessionStart,
+            action: HookAction::Shell {
+                command: "setup.sh".into(),
+            },
+            tool_name: None,
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let back: HookDefinition = serde_json::from_str(&json).unwrap();
+        assert!(back.tool_name.is_none());
+    }
+
+    // ---- Config TOML deserialization ----
+
+    #[test]
+    fn config_toml_deserialization_full() {
+        let toml_str = r#"
+[api]
+model = "test-model"
+timeout_secs = 60
+max_retries = 5
+base_url = "https://api.test.com/v1"
+
+[permissions]
+default_mode = "allow"
+
+[ui]
+markdown = false
+syntax_highlight = false
+theme = "light"
+edit_mode = "vi"
+
+[features]
+token_budget = false
+commit_attribution = false
+
+[security]
+disable_bypass_permissions = true
+additional_directories = ["/tmp"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.api.model, "test-model");
+        assert_eq!(cfg.api.timeout_secs, 60);
+        assert_eq!(cfg.api.max_retries, 5);
+        assert_eq!(cfg.api.base_url, "https://api.test.com/v1");
+        assert_eq!(cfg.permissions.default_mode, PermissionMode::Allow);
+        assert!(!cfg.ui.markdown);
+        assert!(!cfg.ui.syntax_highlight);
+        assert_eq!(cfg.ui.theme, "light");
+        assert_eq!(cfg.ui.edit_mode, "vi");
+        assert!(!cfg.features.token_budget);
+        assert!(!cfg.features.commit_attribution);
+        assert!(cfg.security.disable_bypass_permissions);
+        assert_eq!(cfg.security.additional_directories, vec!["/tmp"]);
+    }
+
+    #[test]
+    fn config_toml_empty_string_uses_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.api.timeout_secs, 120);
+        assert_eq!(cfg.permissions.default_mode, PermissionMode::Ask);
+        assert!(cfg.ui.markdown);
+    }
+
+    #[test]
+    fn config_toml_partial_override() {
+        let toml_str = r#"
+[ui]
+theme = "solarized"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        // Overridden field
+        assert_eq!(cfg.ui.theme, "solarized");
+        // Other fields keep defaults
+        assert!(cfg.ui.markdown);
+        assert!(cfg.ui.syntax_highlight);
+        assert_eq!(cfg.ui.edit_mode, "emacs");
+    }
+
+    // ---- McpServerEntry ----
+
+    #[test]
+    fn mcp_server_entry_with_command() {
+        let json = r#"{"command": "npx mcp-server", "args": ["--port", "3000"]}"#;
+        let entry: McpServerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.command, Some("npx mcp-server".into()));
+        assert_eq!(entry.args, vec!["--port", "3000"]);
+        assert!(entry.url.is_none());
+    }
+
+    #[test]
+    fn mcp_server_entry_with_url() {
+        let json = r#"{"url": "https://mcp.example.com/sse"}"#;
+        let entry: McpServerEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.command.is_none());
+        assert_eq!(entry.url, Some("https://mcp.example.com/sse".into()));
+        assert!(entry.args.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_entry_with_env() {
+        let json = r#"{"command": "server", "env": {"TOKEN": "abc"}}"#;
+        let entry: McpServerEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.env.get("TOKEN").unwrap(), "abc");
+    }
+
+    // ---- PermissionRule serialization ----
+
+    #[test]
+    fn permission_rule_serde_roundtrip_with_pattern() {
+        let rule = PermissionRule {
+            tool: "Bash".into(),
+            pattern: Some("rm -rf *".into()),
+            action: PermissionMode::Deny,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: PermissionRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool, "Bash");
+        assert_eq!(back.pattern, Some("rm -rf *".into()));
+        assert_eq!(back.action, PermissionMode::Deny);
+    }
+
+    #[test]
+    fn permission_rule_serde_roundtrip_without_pattern() {
+        let rule = PermissionRule {
+            tool: "Read".into(),
+            pattern: None,
+            action: PermissionMode::Allow,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: PermissionRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool, "Read");
+        assert!(back.pattern.is_none());
+        assert_eq!(back.action, PermissionMode::Allow);
+    }
+
+    // ---- Config with hooks in TOML ----
+
+    #[test]
+    fn config_toml_with_hooks() {
+        let toml_str = r#"
+[[hooks]]
+event = "session_start"
+tool_name = "Bash"
+
+[hooks.action]
+type = "shell"
+command = "echo starting"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.hooks.len(), 1);
+        assert_eq!(cfg.hooks[0].event, HookEvent::SessionStart);
+        assert_eq!(cfg.hooks[0].tool_name, Some("Bash".into()));
+    }
+
+    // ---- Config with mcp_servers in TOML ----
+
+    #[test]
+    fn config_toml_with_mcp_servers() {
+        let toml_str = r#"
+[mcp_servers.my_server]
+command = "npx my-mcp"
+args = ["--flag"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.mcp_servers.contains_key("my_server"));
+        let server = &cfg.mcp_servers["my_server"];
+        assert_eq!(server.command, Some("npx my-mcp".into()));
+        assert_eq!(server.args, vec!["--flag"]);
+    }
+}

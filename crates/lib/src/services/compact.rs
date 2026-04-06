@@ -520,4 +520,104 @@ mod tests {
         let prompt = build_compact_summary_prompt(&messages);
         assert!(prompt.contains("Summarize"));
     }
+
+    #[test]
+    fn test_effective_context_window_gpt_model() {
+        let eff = effective_context_window("gpt-4o");
+        // gpt-4: 128K context, 16K max output (capped at 20K → 16K), effective = 128K - 16K = 112K
+        assert_eq!(eff, 128_000 - 16_384);
+    }
+
+    #[test]
+    fn test_auto_compact_threshold_gpt_model() {
+        let threshold = auto_compact_threshold("gpt-4o");
+        assert_eq!(threshold, 128_000 - 16_384 - 13_000);
+    }
+
+    #[test]
+    fn test_parse_prompt_too_long_gap_with_comma_format() {
+        // Numbers without commas embedded, but different magnitudes.
+        let msg = "prompt is too long: 137500 tokens > 135000 maximum";
+        assert_eq!(parse_prompt_too_long_gap(msg), Some(2500));
+    }
+
+    #[test]
+    fn test_parse_prompt_too_long_gap_equal_tokens_returns_none() {
+        let msg = "prompt is too long: 135000 tokens > 135000 maximum";
+        // gap = 0, so returns None.
+        assert_eq!(parse_prompt_too_long_gap(msg), None);
+    }
+
+    #[test]
+    fn test_token_warning_state_large_count_should_compact() {
+        use crate::llm::message::*;
+        // Create a huge message that will exceed the threshold.
+        let big_text = "a".repeat(800_000); // ~200K tokens
+        let messages = vec![user_message(&big_text)];
+        let state = token_warning_state(&messages, "claude-sonnet");
+        assert!(state.should_compact);
+    }
+
+    #[test]
+    fn test_should_auto_compact_empty_tracking_small_conversation() {
+        let tracking = CompactTracking::default();
+        let messages = vec![crate::llm::message::user_message("tiny")];
+        assert!(!should_auto_compact(&messages, "claude-sonnet", &tracking));
+    }
+
+    #[test]
+    fn test_compact_boundary_message_content_format() {
+        let msg = compact_boundary_message("my summary");
+        if let Message::System(s) = &msg {
+            assert!(s.content.contains("my summary"));
+            assert!(s.content.starts_with("[Conversation compacted."));
+        } else {
+            panic!("Expected System message");
+        }
+    }
+
+    #[test]
+    fn test_build_compact_summary_prompt_includes_user_and_assistant() {
+        use crate::llm::message::*;
+        let messages = vec![
+            user_message("user said this"),
+            Message::Assistant(AssistantMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::Text {
+                    text: "assistant said that".into(),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+        ];
+        let prompt = build_compact_summary_prompt(&messages);
+        assert!(prompt.contains("user said this"));
+        assert!(prompt.contains("assistant said that"));
+        assert!(prompt.contains("User:"));
+        assert!(prompt.contains("Assistant:"));
+    }
+
+    #[test]
+    fn test_max_output_recovery_message_is_meta() {
+        let msg = max_output_recovery_message();
+        if let Message::User(u) = &msg {
+            assert!(u.is_meta);
+        } else {
+            panic!("Expected User message");
+        }
+    }
+
+    #[test]
+    fn test_calculate_keep_count_returns_at_least_5_for_large_list() {
+        use crate::llm::message::*;
+        // Create 20 messages with text content.
+        let messages: Vec<Message> = (0..20)
+            .map(|i| user_message(&format!("message {i}")))
+            .collect();
+        let keep = calculate_keep_count(&messages);
+        assert!(keep >= 5, "keep_count was {keep}, expected at least 5");
+    }
 }

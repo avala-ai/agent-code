@@ -316,4 +316,221 @@ mod tests {
             assert!(matches!(&u.content[0], ContentBlock::Document { .. }));
         }
     }
+
+    #[test]
+    fn test_tool_result_pairing_already_paired() {
+        let mut messages = vec![
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({}),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    extra_content: vec![],
+                }],
+                is_meta: true,
+                is_compact_summary: false,
+            }),
+        ];
+
+        ensure_tool_result_pairing(&mut messages);
+        // No change expected — already paired.
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_result_pairing_multiple_orphans() {
+        let mut messages = vec![Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_a".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_b".into(),
+                    name: "FileRead".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })];
+
+        ensure_tool_result_pairing(&mut messages);
+        // Should add two synthetic error results (one per orphan).
+        assert_eq!(messages.len(), 3);
+        for msg in &messages[1..] {
+            if let Message::User(u) = msg {
+                assert!(matches!(
+                    &u.content[0],
+                    ContentBlock::ToolResult { is_error: true, .. }
+                ));
+            } else {
+                panic!("Expected user message with tool result");
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_no_consecutive_users() {
+        let assistant = Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        });
+        let mut messages = vec![user_message("hello"), assistant, user_message("bye")];
+
+        merge_consecutive_user_messages(&mut messages);
+        assert_eq!(messages.len(), 3); // No change.
+    }
+
+    #[test]
+    fn test_merge_three_consecutive_users() {
+        let mut messages = vec![
+            user_message("one"),
+            user_message("two"),
+            user_message("three"),
+        ];
+
+        merge_consecutive_user_messages(&mut messages);
+        assert_eq!(messages.len(), 1); // All merged into one.
+        if let Message::User(u) = &messages[0] {
+            assert_eq!(u.content.len(), 3);
+        } else {
+            panic!("Expected user message");
+        }
+    }
+
+    #[test]
+    fn test_validate_alternation_with_system_messages() {
+        let messages = vec![
+            Message::System(SystemMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                subtype: SystemMessageType::Informational,
+                content: "system note".into(),
+                level: MessageLevel::Info,
+            }),
+            user_message("hello"),
+            Message::System(SystemMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                subtype: SystemMessageType::Informational,
+                content: "another note".into(),
+                level: MessageLevel::Info,
+            }),
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+        ];
+        assert!(validate_alternation(&messages).is_ok());
+    }
+
+    #[test]
+    fn test_validate_alternation_empty_list() {
+        let messages: Vec<Message> = vec![];
+        assert!(validate_alternation(&messages).is_ok());
+    }
+
+    #[test]
+    fn test_strip_empty_blocks_on_assistant() {
+        let mut messages = vec![Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![
+                ContentBlock::Text { text: "".into() },
+                ContentBlock::Text {
+                    text: "real content".into(),
+                },
+                ContentBlock::Text { text: "".into() },
+            ],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })];
+        strip_empty_blocks(&mut messages);
+        if let Message::Assistant(a) = &messages[0] {
+            assert_eq!(a.content.len(), 1);
+            assert_eq!(a.content[0].as_text(), Some("real content"));
+        }
+    }
+
+    #[test]
+    fn test_remove_empty_messages_preserves_system() {
+        let mut messages = vec![
+            Message::System(SystemMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                subtype: SystemMessageType::Informational,
+                content: "".into(), // Empty content but system messages are always kept.
+                level: MessageLevel::Info,
+            }),
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![], // Empty — should be removed.
+                is_meta: false,
+                is_compact_summary: false,
+            }),
+            user_message("keep me"),
+        ];
+        remove_empty_messages(&mut messages);
+        assert_eq!(messages.len(), 2); // System + "keep me".
+        assert!(matches!(&messages[0], Message::System(_)));
+        assert!(matches!(&messages[1], Message::User(_)));
+    }
+
+    #[test]
+    fn test_cap_document_blocks_no_title_uses_document() {
+        let mut messages = vec![Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![ContentBlock::Document {
+                media_type: "text/plain".into(),
+                data: "x".repeat(200),
+                title: None,
+            }],
+            is_meta: false,
+            is_compact_summary: false,
+        })];
+        cap_document_blocks(&mut messages, 100);
+        if let Message::User(u) = &messages[0] {
+            if let ContentBlock::Text { text } = &u.content[0] {
+                assert!(text.contains("document"), "should use fallback name 'document'");
+                assert!(text.contains("too large"));
+            } else {
+                panic!("Expected text block after capping");
+            }
+        }
+    }
 }
