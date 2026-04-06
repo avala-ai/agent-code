@@ -1,4 +1,4 @@
-name: Desktop E2E Tests
+name: Client E2E Tests
 
 on:
   workflow_dispatch:

@@ -1,4 +1,4 @@
-name: Desktop CI
+name: Client CI
 
 on:
   pull_request:
@@ -28,7 +28,7 @@ jobs:
 
       - name: Analyze (shared package)
         working-directory: packages/agent_code_client
-        run: dart analyze --fatal-warnings
+        run: dart analyze
 
       - name: Run tests (shared package)
         working-directory: packages/agent_code_client

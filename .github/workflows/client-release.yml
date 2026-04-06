@@ -1,4 +1,4 @@
-name: Desktop Release
+name: Client Release
 
 on:
   workflow_dispatch:
@@ -111,7 +111,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: desktop-macos-dmg
+          name: client-macos-dmg
           path: ${{ env.DMG_NAME }}
 
   build-linux:
@@ -150,7 +150,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: desktop-linux
+          name: client-linux
           path: AgentCode-${{ inputs.version }}-linux-x86_64.tar.gz
 
   build-web:
@@ -180,7 +180,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: desktop-web
+          name: client-web
           path: AgentCode-${{ inputs.version }}-web.tar.gz
 
   release:
@@ -200,7 +200,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ASSETS=""
-          for f in /tmp/release/desktop-*/*; do
+          for f in /tmp/release/client-*/*; do
             ASSETS="$ASSETS $f"
           done
 
