@@ -507,7 +507,7 @@ jobs:
   evals:
     strategy:
       matrix:
-        model: [claude-sonnet-4-6, gpt-4.1]
+        model: [default-model, fallback-model]
     steps:
       - run: cargo run --bin eval_runner -- --policy usually_passes --retries 3
       - uses: actions/upload-artifact@v4
@@ -618,7 +618,7 @@ The current `--prompt` one-shot mode outputs plain text. For CI/CD pipelines, Gi
 Each event is a single JSON line (JSONL) written to stdout:
 
 ```jsonl
-{"type":"session_start","session_id":"abc-123","model":"claude-sonnet-4-6","timestamp":"2026-04-06T12:00:00Z"}
+{"type":"session_start","session_id":"abc-123","model":"your-preferred-model","timestamp":"2026-04-06T12:00:00Z"}
 {"type":"text_delta","content":"I'll create the file now.","turn":1}
 {"type":"tool_call","tool":"FileWrite","input":{"file_path":"hello.py","content":"print('hello')"},"turn":1}
 {"type":"tool_result","tool":"FileWrite","output":"File written successfully","is_error":false,"turn":1}
@@ -793,7 +793,7 @@ All buffers are bounded FIFO — oldest entries evicted when full.
 ```jsonl
 // Server → Client: real-time events
 {"type":"tool_call","data":{"tool":"Bash","input":{"command":"cargo test"},"turn":3},"timestamp":"..."}
-{"type":"llm_request","data":{"model":"claude-sonnet-4-6","input_tokens":15234,"latency_ms":2340},"timestamp":"..."}
+{"type":"llm_request","data":{"model":"your-preferred-model","input_tokens":15234,"latency_ms":2340},"timestamp":"..."}
 
 // Client → Server: commands
 {"type":"command","action":"pause"}
@@ -843,11 +843,11 @@ jobs:
       - uses: avala-ai/agent-code-action@v1
         with:
           prompt: "Review this PR for security issues and test coverage gaps."
-          model: claude-sonnet-4-6
+          model: your-preferred-model
           max-cost-usd: 1.0
           output-format: json
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
@@ -1052,9 +1052,9 @@ Every turn currently sends the full system prompt, memory, project context, and 
 | Large file reads (>10KB) | Per-read | Cache per content hash |
 | Conversation history (older turns) | Per-turn | Sliding window cache |
 
-**Anthropic Prompt Caching:**
+**Provider-Native Prompt Caching:**
 
-Tag cacheable segments with `cache_control: { type: "ephemeral" }` in the API request:
+Tag cacheable segments with provider-specific cache control headers. For example, using `cache_control: { type: "ephemeral" }` in the API request:
 
 ```json
 {
@@ -1085,7 +1085,7 @@ Turn 3: 45,231 tokens (38,000 cached, 7,231 new) — $0.002 (90% savings)
 
 **Implementation Tasks:**
 - [ ] Add `CacheStrategy` to `llm/client.rs` — tag system prompt, tools, memory with cache control headers
-- [ ] Implement per-provider cache support: Anthropic (`cache_control`), Google (Context Caching API), OpenAI (automatic)
+- [ ] Implement per-provider cache support: providers with `cache_control` headers, Google (Context Caching API), OpenAI (automatic)
 - [ ] Add cache hit tracking: parse `cache_read_input_tokens` from API response
 - [ ] Display cache hit rate in `/cost` output and per-turn summary
 - [ ] Add content-hash-based cache keys for large file reads
@@ -1304,17 +1304,20 @@ The agent determines working focus from:
 - [ ] Add `/context` slash command showing resolved context with source annotations
 - [ ] Tests: multi-level merge, section override, array concatenation
 
-### 7.18 Shell Passthrough Mode
+### 7.18 Shell Passthrough Context Injection
 
 **Priority: Medium** | **Target: v1.1**
 
-When input begins with `!`, execute the command directly as a subprocess and silently append the output to the conversation context. This keeps developers in control without burning tokens for trivial commands, while giving the agent the context of build failures or test output.
+The `!` prefix already exists in the REPL (`crates/cli/src/ui/repl.rs:603`) and runs shell commands directly. However, the current implementation has two limitations:
 
-**Behavior:**
+1. **No context injection** — output is printed but NOT appended to conversation history, so the agent can't reference it in subsequent turns
+2. **No real-time streaming** — uses `.output()` (captures after completion) instead of `Stdio::inherit()`, so long-running commands show no output until they finish
+
+**Upgraded Behavior:**
 
 ```text
 > ! cargo test
-running 45 tests
+running 45 tests                    ← streams in real-time
 test auth::test_login ... ok
 test billing::test_charge ... FAILED
 
@@ -1324,23 +1327,13 @@ test billing::test_charge ... FAILED
 (Agent now has the test output in context without needing to run Bash tool)
 ```
 
-**Implementation:**
-
-- Detect `!` prefix in REPL input
-- Spawn subprocess with inherited stdin/stdout/stderr (user sees output in real-time)
-- Capture stdout+stderr into buffer
-- Append as a `System` message to conversation: `[Shell output from: cargo test]\n<output>`
-- Truncate output at 50KB (same as Bash tool limit)
-- Do NOT count as a turn or consume LLM tokens
-
 **Implementation Tasks:**
-- [ ] Add `!` prefix detection in REPL input handler
-- [ ] Spawn subprocess with `Stdio::inherit()` for real-time output
-- [ ] Capture output via `tee`-like approach (display + buffer simultaneously)
-- [ ] Append captured output as system message to conversation history
+- [ ] Switch from `.output()` to `Stdio::inherit()` or `tee`-like approach for real-time streaming
+- [ ] Capture stdout+stderr into buffer while displaying in real-time
+- [ ] Append captured output as system message to conversation history: `[Shell output from: cargo test]\n<output>`
 - [ ] Add output truncation at 50KB with "[truncated]" marker
-- [ ] Skip permission check (user explicitly invoked the command)
-- [ ] Tests: verify output capture, verify context injection, verify truncation
+- [ ] Do NOT count as a turn or consume LLM tokens
+- [ ] Tests: verify real-time streaming, verify context injection, verify truncation
 
 ### 7.19 Voice Mode
 
@@ -1358,7 +1351,8 @@ test billing::test_charge ... FAILED
 
 - [ ] Headless API server mode (`agent serve`) as the foundation
 - [ ] Web client connecting via HTTP + SSE
-- [ ] Desktop client via Tauri v2 wrapping the web client
+- [ ] Desktop client via Flutter (cross-platform: macOS, Windows, Linux, with future iOS/Android path)
+- [ ] Use JSON-RPC over WebSocket for bidirectional IPC between Flutter client and agent-code backend (per prior architectural decision: HTTP+SSE fails at bidirectional permission prompting; stdio fails at reconnection)
 - [ ] All clients share the same backend
 
 ---
@@ -1397,7 +1391,7 @@ Priority areas where contributions are most welcome:
 
 ### High Priority (v1.1)
 4. **Epic workflows** (7.12) — Stateful plan-based implementation with worktree isolation
-5. **Provider prompt caching** (7.13) — Anthropic cache_control headers, cache hit tracking
+5. **Provider prompt caching** (7.13) — cache_control headers, cache hit tracking
 6. **Advanced compression** (7.6) — File-level tracking with secret masking
 7. **Non-interactive JSON streaming** (7.7) — JSONL output format for CI/CD
 
