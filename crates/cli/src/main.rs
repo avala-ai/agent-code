@@ -10,6 +10,7 @@
 mod acp;
 mod attach;
 mod commands;
+mod daemon;
 mod serve;
 mod ui;
 mod update;
@@ -104,6 +105,76 @@ struct Cli {
     /// IDEs spawn `agent acp` and communicate via stdin/stdout JSON-RPC 2.0.
     #[arg(long)]
     acp: bool,
+
+    /// Subcommand (schedule, daemon).
+    #[command(subcommand)]
+    command: Option<SubCommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum SubCommand {
+    /// Manage scheduled agent runs.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+    /// Start the schedule daemon (cron loop + optional webhook server).
+    Daemon {
+        /// Port for the webhook trigger server.
+        #[arg(long)]
+        webhook_port: Option<u16>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ScheduleAction {
+    /// Add a new schedule.
+    Add {
+        /// Cron expression (5-field, e.g. "0 9 * * *").
+        cron: String,
+        /// Prompt to execute.
+        #[arg(long)]
+        prompt: String,
+        /// Schedule name.
+        #[arg(long)]
+        name: String,
+        /// Model override.
+        #[arg(long)]
+        model: Option<String>,
+        /// Max cost per run (USD).
+        #[arg(long)]
+        max_cost: Option<f64>,
+        /// Max agent turns per run.
+        #[arg(long)]
+        max_turns: Option<usize>,
+        /// Generate a webhook secret for HTTP triggers.
+        #[arg(long)]
+        webhook: bool,
+    },
+    /// List all schedules.
+    #[command(name = "list", alias = "ls")]
+    List,
+    /// Remove a schedule.
+    #[command(alias = "rm")]
+    Remove {
+        /// Schedule name.
+        name: String,
+    },
+    /// Run a schedule immediately.
+    Run {
+        /// Schedule name.
+        name: String,
+    },
+    /// Enable a disabled schedule.
+    Enable {
+        /// Schedule name.
+        name: String,
+    },
+    /// Disable a schedule without removing it.
+    Disable {
+        /// Schedule name.
+        name: String,
+    },
 }
 
 fn run_setup_wizard() {
@@ -130,6 +201,26 @@ async fn main() -> anyhow::Result<()> {
     // Set working directory if specified.
     if let Some(ref cwd) = cli.cwd {
         std::env::set_current_dir(cwd)?;
+    }
+
+    // Handle schedule subcommands that don't need an LLM provider.
+    if let Some(SubCommand::Schedule { ref action }) = cli.command {
+        match action {
+            ScheduleAction::List => {
+                return handle_schedule_list();
+            }
+            ScheduleAction::Remove { name } => {
+                return handle_schedule_remove(name);
+            }
+            ScheduleAction::Enable { name } => {
+                return handle_schedule_toggle(name, true);
+            }
+            ScheduleAction::Disable { name } => {
+                return handle_schedule_toggle(name, false);
+            }
+            // Add, Run, Daemon need the LLM — handled after provider setup.
+            _ => {}
+        }
     }
 
     // Attach mode: connect to a running serve instance (no local API key needed).
@@ -345,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build the query engine (agent loop).
+    let llm_for_schedule = llm.clone();
     let llm_for_consolidation = llm.clone();
     let mut engine = QueryEngine::new(
         llm,
@@ -397,6 +489,40 @@ async fn main() -> anyhow::Result<()> {
     // Install Ctrl+C handler for graceful cancellation.
     engine.install_signal_handler();
 
+    // Handle schedule/daemon subcommands that need the LLM.
+    match &cli.command {
+        Some(SubCommand::Schedule { action }) => match action {
+            ScheduleAction::Add {
+                cron,
+                prompt,
+                name,
+                model,
+                max_cost,
+                max_turns,
+                webhook,
+            } => {
+                return handle_schedule_add(
+                    name,
+                    cron,
+                    prompt,
+                    model.as_deref(),
+                    *max_cost,
+                    *max_turns,
+                    *webhook,
+                );
+            }
+            ScheduleAction::Run { name } => {
+                return handle_schedule_run(name, &llm_for_schedule, &config).await;
+            }
+            // List, Remove, Enable, Disable handled above (no LLM needed).
+            _ => {}
+        },
+        Some(SubCommand::Daemon { webhook_port }) => {
+            return daemon::run_daemon(llm_for_schedule, config, *webhook_port).await;
+        }
+        None => {}
+    }
+
     // Serve mode: start HTTP API server.
     if cli.serve {
         return serve::run_server(engine, cli.port).await;
@@ -445,5 +571,178 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schedule subcommand handlers
+// ---------------------------------------------------------------------------
+
+fn handle_schedule_list() -> anyhow::Result<()> {
+    let store =
+        agent_code_lib::schedule::ScheduleStore::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let schedules = store.list();
+
+    if schedules.is_empty() {
+        println!("No schedules configured.");
+        println!("\nAdd one with:");
+        println!("  agent schedule add \"0 9 * * *\" --prompt \"run tests\" --name daily-tests");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<7} {:<20} {:<16} PROMPT",
+        "NAME", "STATUS", "CRON", "LAST RUN"
+    );
+    println!("{}", "-".repeat(90));
+    for s in &schedules {
+        let status = if s.enabled { "active" } else { "paused" };
+        let last = s
+            .last_run_at
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".into());
+        let prompt = if s.prompt.len() > 30 {
+            format!("{}...", &s.prompt[..27])
+        } else {
+            s.prompt.clone()
+        };
+        println!(
+            "{:<20} {:<7} {:<20} {:<16} {}",
+            s.name, status, s.cron, last, prompt
+        );
+    }
+    println!("\n{} schedule(s)", schedules.len());
+    Ok(())
+}
+
+fn handle_schedule_remove(name: &str) -> anyhow::Result<()> {
+    let store =
+        agent_code_lib::schedule::ScheduleStore::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+    store.remove(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Removed schedule '{name}'");
+    Ok(())
+}
+
+fn handle_schedule_toggle(name: &str, enabled: bool) -> anyhow::Result<()> {
+    let store =
+        agent_code_lib::schedule::ScheduleStore::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut sched = store.load(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    sched.enabled = enabled;
+    store.save(&sched).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let verb = if enabled { "enabled" } else { "disabled" };
+    println!("Schedule '{name}' {verb}");
+    Ok(())
+}
+
+fn handle_schedule_add(
+    name: &str,
+    cron: &str,
+    prompt: &str,
+    model: Option<&str>,
+    max_cost: Option<f64>,
+    max_turns: Option<usize>,
+    webhook: bool,
+) -> anyhow::Result<()> {
+    // Validate cron expression.
+    agent_code_lib::schedule::CronExpr::parse(cron)
+        .map_err(|e| anyhow::anyhow!("Invalid cron expression: {e}"))?;
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+
+    let webhook_secret = if webhook {
+        Some(uuid::Uuid::new_v4().to_string().replace('-', ""))
+    } else {
+        None
+    };
+
+    let schedule = agent_code_lib::schedule::Schedule {
+        name: name.to_string(),
+        cron: cron.to_string(),
+        prompt: prompt.to_string(),
+        cwd,
+        enabled: true,
+        model: model.map(String::from),
+        permission_mode: None,
+        max_cost_usd: max_cost,
+        max_turns,
+        created_at: chrono::Utc::now(),
+        last_run_at: None,
+        last_result: None,
+        webhook_secret: webhook_secret.clone(),
+    };
+
+    let store =
+        agent_code_lib::schedule::ScheduleStore::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+    store.save(&schedule).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Created schedule '{name}'");
+    println!("  Cron: {cron}");
+    println!("  Prompt: {prompt}");
+    if let Some(ref secret) = webhook_secret {
+        println!("  Webhook: POST /trigger?secret={secret}");
+    }
+    println!("\nStart the daemon to begin executing:");
+    println!("  agent daemon");
+    Ok(())
+}
+
+async fn handle_schedule_run(
+    name: &str,
+    llm: &Arc<dyn agent_code_lib::llm::provider::Provider>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let store =
+        agent_code_lib::schedule::ScheduleStore::open().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let schedule = store.load(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!("Running schedule '{name}'...\n");
+
+    // Use a stdout sink so the user sees streaming output.
+    struct StdoutSink;
+    impl agent_code_lib::query::StreamSink for StdoutSink {
+        fn on_text(&self, text: &str) {
+            print!("{text}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        fn on_tool_start(&self, name: &str, _: &serde_json::Value) {
+            eprintln!("[{name}]");
+        }
+        fn on_tool_result(&self, name: &str, r: &agent_code_lib::tools::ToolResult) {
+            if r.is_error {
+                eprintln!("[{name} error: {}]", r.content.lines().next().unwrap_or(""));
+            }
+        }
+        fn on_error(&self, e: &str) {
+            eprintln!("Error: {e}");
+        }
+    }
+
+    let executor = agent_code_lib::schedule::ScheduleExecutor::new(llm.clone(), config.clone());
+    let outcome = executor
+        .run_once(&schedule, &StdoutSink)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Update last_run.
+    let mut updated = schedule;
+    updated.last_run_at = Some(chrono::Utc::now());
+    updated.last_result = Some(agent_code_lib::schedule::storage::RunResult {
+        started_at: chrono::Utc::now(),
+        finished_at: chrono::Utc::now(),
+        success: outcome.success,
+        turns: outcome.turns,
+        cost_usd: outcome.cost_usd,
+        summary: outcome.response_summary.clone(),
+        session_id: outcome.session_id.clone(),
+    });
+    let _ = store.save(&updated);
+
+    println!();
+    eprintln!(
+        "\nDone: {} turns, ${:.4}, session {}",
+        outcome.turns, outcome.cost_usd, outcome.session_id
+    );
     Ok(())
 }
