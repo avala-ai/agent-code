@@ -29,18 +29,23 @@
 //! curl -N http://localhost:4096/events
 //! ```
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use futures::stream::StreamExt;
+use futures::SinkExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as TokioMutex;
 use tokio_stream::wrappers::BroadcastStream;
+use uuid::Uuid;
 
 use agent_code_lib::query::{QueryEngine, StreamSink};
 
@@ -109,6 +114,10 @@ pub enum SseEvent {
 pub struct ServerState {
     pub engine: tokio::sync::Mutex<QueryEngine>,
     pub event_tx: tokio::sync::RwLock<Option<tokio::sync::broadcast::Sender<SseEvent>>>,
+    /// Auth token for WebSocket connections. Generated on startup.
+    pub auth_token: String,
+    /// Pending permission requests: request_id -> oneshot sender for the response.
+    pub permission_requests: TokioMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
 
 /// Request body for POST /message.
@@ -260,18 +269,22 @@ impl StreamSink for SseBroadcastSink {
 // ---------------------------------------------------------------------------
 
 /// Start the HTTP server.
+///
+/// When `port` is 0, the OS assigns a free port atomically (no TOCTOU race).
+/// The actual port is written to the bridge lock file for discovery.
 pub async fn run_server(engine: QueryEngine, port: u16) -> anyhow::Result<()> {
+    let auth_token = Uuid::new_v4().to_string();
+
     let state = Arc::new(ServerState {
         engine: tokio::sync::Mutex::new(engine),
         event_tx: tokio::sync::RwLock::new(None),
+        auth_token: auth_token.clone(),
+        permission_requests: TokioMutex::new(HashMap::new()),
     });
 
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-
-    // Write lock file for IDE discovery.
-    let lock_file = agent_code_lib::services::bridge::write_lock_file(port, &cwd).ok();
 
     let app = Router::new()
         .route("/message", post(handle_message))
@@ -279,19 +292,31 @@ pub async fn run_server(engine: QueryEngine, port: u16) -> anyhow::Result<()> {
         .route("/status", get(handle_status))
         .route("/messages", get(handle_messages))
         .route("/health", get(handle_health))
+        .route("/ws", get(handle_ws))
+        .route("/permission", post(handle_permission))
         .with_state(state);
 
+    // Bind to the requested port (0 = OS-assigned).
     let addr = format!("127.0.0.1:{port}");
-    eprintln!("agent-code server listening on http://{addr}");
-    eprintln!("POST /message  — send a prompt");
-    eprintln!("GET  /events   — SSE event stream");
-    eprintln!("GET  /status   — session status");
-    eprintln!("GET  /messages — conversation history");
-    eprintln!("GET  /health   — health check");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let actual_port = listener.local_addr()?.port();
+
+    // Write lock file with actual port and auth token.
+    let lock_file =
+        agent_code_lib::services::bridge::write_lock_file(actual_port, &cwd).ok();
+
+    eprintln!("agent-code server listening on http://127.0.0.1:{actual_port}");
+    eprintln!("POST /message    — send a prompt");
+    eprintln!("GET  /events     — SSE event stream");
+    eprintln!("GET  /ws         — WebSocket (JSON-RPC)");
+    eprintln!("GET  /status     — session status");
+    eprintln!("GET  /messages   — conversation history");
+    eprintln!("GET  /health     — health check");
+    eprintln!("POST /permission — respond to permission request");
     eprintln!();
+    eprintln!("Auth token: {auth_token}");
     eprintln!("Press Ctrl+C to stop.");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -485,6 +510,254 @@ async fn handle_messages(State(state): State<Arc<ServerState>>) -> Json<Messages
 /// GET /health — simple health check.
 async fn handle_health() -> &'static str {
     "ok"
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket handler (JSON-RPC 2.0)
+// ---------------------------------------------------------------------------
+
+/// GET /ws — WebSocket upgrade for JSON-RPC communication.
+///
+/// The first message must be an auth payload: `{"auth": "<token>"}`.
+/// After auth, the client speaks JSON-RPC 2.0:
+///   - Client sends: Requests (message, status, cancel) and Responses (permission answers)
+///   - Server sends: Notifications (events/*) and Requests (ask_permission)
+async fn handle_ws(
+    State(state): State<Arc<ServerState>>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+}
+
+async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
+    // Step 1: Authenticate. First message must contain the auth token.
+    let authed = match socket.recv().await {
+        Some(Ok(Message::Text(ref text))) => {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+                json.get("auth")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t == state.auth_token)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+
+    if !authed {
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Unauthorized"}}).to_string().into(),
+            ))
+            .await;
+        return;
+    }
+
+    // Step 2: Split socket. Use an mpsc channel for outbound messages
+    // so multiple tasks can send without holding a mutable reference.
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Task: forward outbound messages to the WebSocket.
+    let out_task = tokio::spawn(async move {
+        while let Some(text) = out_rx.recv().await {
+            if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let out_tx = Arc::new(out_tx);
+
+    // Step 3: Process incoming messages.
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        let text = match msg {
+            Message::Text(ref t) => t.to_string(),
+            Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let json: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let has_id = json.get("id").is_some() && !json["id"].is_null();
+        let has_method = json.get("method").is_some();
+
+        if has_id && has_method {
+            // JSON-RPC Request from the client (message, status, cancel).
+            let id = json["id"].clone();
+            let method = json["method"].as_str().unwrap_or("").to_string();
+            let params = json.get("params").cloned().unwrap_or(serde_json::Value::Null);
+
+            let result =
+                handle_ws_request(&state, &method, &params, Arc::clone(&out_tx)).await;
+
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            });
+
+            let _ = out_tx.send(response.to_string());
+        } else if has_id && !has_method {
+            // JSON-RPC Response from the client (permission answer).
+            let id = json["id"].as_str().unwrap_or("").to_string();
+            let decision = json
+                .get("result")
+                .and_then(|r| r.get("decision"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("deny")
+                .to_string();
+
+            let mut pending = state.permission_requests.lock().await;
+            if let Some(tx) = pending.remove(&id) {
+                let _ = tx.send(decision);
+            }
+        }
+        // Notifications from client are ignored (we don't expect any).
+    }
+
+    out_task.abort();
+}
+
+/// Handle a JSON-RPC request from the WebSocket client.
+async fn handle_ws_request(
+    state: &Arc<ServerState>,
+    method: &str,
+    params: &serde_json::Value,
+    out_tx: Arc<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> serde_json::Value {
+    match method {
+        "message" => {
+            let content = params
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let (sink, _rx) = SseBroadcastSink::new();
+            let sink = Arc::new(sink);
+
+            // Publish broadcast sender for SSE clients too.
+            {
+                let mut event_tx = state.event_tx.write().await;
+                *event_tx = Some(sink.tx.clone());
+            }
+
+            // Forward broadcast events to WebSocket as JSON-RPC notifications.
+            let out_tx_clone = Arc::clone(&out_tx);
+            let mut rx = sink.tx.subscribe();
+            let forward_task = tokio::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    let method_name = match &event {
+                        SseEvent::TextDelta { .. } => "events/text_delta",
+                        SseEvent::ToolStart { .. } => "events/tool_start",
+                        SseEvent::ToolResult { .. } => "events/tool_result",
+                        SseEvent::Thinking { .. } => "events/thinking",
+                        SseEvent::TurnComplete { .. } => "events/turn_complete",
+                        SseEvent::Usage { .. } => "events/usage",
+                        SseEvent::Error { .. } => "events/error",
+                        SseEvent::Compact { .. } => "events/compact",
+                        SseEvent::Warning { .. } => "events/warning",
+                        SseEvent::Done { .. } => "events/done",
+                    };
+                    let notification = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": method_name,
+                        "params": event,
+                    });
+                    if out_tx_clone.send(notification.to_string()).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let sink_ref: &dyn StreamSink = &*sink;
+            let mut engine = state.engine.lock().await;
+            let _ = engine.run_turn_with_sink(&content, sink_ref).await;
+
+            let response_text = sink.text.lock().map(|t| t.clone()).unwrap_or_default();
+            let tools_used = sink.tools.lock().map(|t| t.clone()).unwrap_or_default();
+            let turn_count = engine.state().turn_count;
+            let cost_usd = engine.state().total_cost_usd;
+
+            sink.send(SseEvent::Done {
+                response: response_text.clone(),
+                turn_count,
+                tools_used: tools_used.clone(),
+                cost_usd,
+            });
+
+            {
+                let mut event_tx = state.event_tx.write().await;
+                *event_tx = None;
+            }
+
+            forward_task.abort();
+
+            serde_json::json!({
+                "response": response_text,
+                "turn_count": turn_count,
+                "tools_used": tools_used,
+                "cost_usd": cost_usd,
+            })
+        }
+        "status" => {
+            let engine = state.engine.lock().await;
+            let s = engine.state();
+            serde_json::json!({
+                "session_id": s.session_id,
+                "model": s.config.api.model,
+                "cwd": s.cwd,
+                "turn_count": s.turn_count,
+                "message_count": s.messages.len(),
+                "cost_usd": s.total_cost_usd,
+                "plan_mode": s.plan_mode,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        }
+        "cancel" => {
+            let engine = state.engine.lock().await;
+            engine.cancel();
+            serde_json::json!({"cancelled": true})
+        }
+        _ => {
+            serde_json::json!({"error": format!("Unknown method: {method}")})
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permission endpoint (HTTP fallback for SSE clients)
+// ---------------------------------------------------------------------------
+
+/// POST /permission — respond to a pending permission request.
+///
+/// Used by SSE-based clients that can't send responses over the event stream.
+/// WebSocket clients should respond inline via JSON-RPC Response.
+async fn handle_permission(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<PermissionResponse>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut pending = state.permission_requests.lock().await;
+    if let Some(tx) = pending.remove(&req.id) {
+        let _ = tx.send(req.decision.clone());
+        Ok(Json(serde_json::json!({"ok": true})))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("No pending permission request with id: {}", req.id),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionResponse {
+    id: String,
+    decision: String,
 }
 
 /// Wait for Ctrl+C for graceful shutdown.
