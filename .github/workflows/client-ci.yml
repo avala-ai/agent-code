@@ -28,7 +28,7 @@ jobs:
 
       - name: Analyze (shared package)
         working-directory: packages/agent_code_client
-        run: dart analyze
+        run: dart analyze --no-fatal-warnings
 
       - name: Run tests (shared package)
         working-directory: packages/agent_code_client

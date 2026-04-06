@@ -21,15 +21,14 @@ void main() {
   final apiKey = Platform.environment['OPENROUTER_API_KEY'];
   final agentBinary = _findAgentBinary();
 
-  final canRun = apiKey != null && apiKey.isNotEmpty && agentBinary != null;
-
   group('Agent E2E', () {
     Process? agentProcess;
     AgentInstance? instance;
     WsClient? ws;
 
     setUp(() async {
-      if (!canRun || agentBinary == null || apiKey == null) return;
+      if (apiKey == null || apiKey.isEmpty || agentBinary == null) return;
+      // Type system narrows after the null check above.
       final binary = agentBinary;
       final key = apiKey;
 
@@ -57,7 +56,7 @@ void main() {
     });
 
     tearDown(() async {
-      if (!canRun) return;
+      if (apiKey == null || agentBinary == null) return;
       await ws?.dispose();
       if (agentProcess != null) {
         agentProcess!.kill();
@@ -70,7 +69,7 @@ void main() {
     test(
       'health endpoint responds',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
@@ -92,7 +91,7 @@ void main() {
     test(
       'status returns session info',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
@@ -109,7 +108,7 @@ void main() {
     test(
       'send message and receive streaming events',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
@@ -159,7 +158,7 @@ void main() {
     test(
       'send message that triggers a tool call',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
@@ -204,7 +203,7 @@ void main() {
     test(
       'multiple turns maintain conversation context',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
@@ -226,7 +225,7 @@ void main() {
     test(
       'status updates after a turn',
       () async {
-        if (!canRun) {
+        if (apiKey == null || agentBinary == null) {
           markTestSkipped('OPENROUTER_API_KEY not set or agent binary not found');
           return;
         }
