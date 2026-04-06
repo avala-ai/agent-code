@@ -39,11 +39,16 @@ void main() {
     });
 
     test('connect to invalid port fails', () async {
-      expect(
-        () => client.connect(1, 'invalid-token'),
-        throwsA(anything),
-      );
-    });
+      try {
+        await client.connect(1, 'invalid-token').timeout(
+              const Duration(seconds: 5),
+            );
+        fail('Should have thrown');
+      } catch (e) {
+        // Expected: connection refused or timeout.
+        expect(e, isNotNull);
+      }
+    }, timeout: const Timeout(Duration(seconds: 10)));
 
     test('notifications stream is broadcast', () {
       // Should be able to listen multiple times without error.

@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 
 /// Represents a running agent process.
 class AgentInstance {
@@ -17,9 +16,9 @@ class AgentInstance {
     this.sessionId,
   });
 
-  factory AgentInstance.fromLockFile(String path) {
-    final content = File(path).readAsStringSync();
-    final json = jsonDecode(content) as Map<String, dynamic>;
+  /// Parse from lockfile JSON content (not the file path — the caller reads the file).
+  factory AgentInstance.fromJson(String jsonContent) {
+    final json = jsonDecode(jsonContent) as Map<String, dynamic>;
     return AgentInstance(
       pid: json['pid'] as int,
       port: json['port'] as int,

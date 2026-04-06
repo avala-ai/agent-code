@@ -8,7 +8,9 @@ import 'session_state.dart';
 const _uuid = Uuid();
 
 class SessionBloc extends Bloc<SessionEvent, SessionState> {
-  final AgentManager agentManager;
+  /// The agent manager instance. Null on web (no dart:io process spawning).
+  /// Typed as dynamic because AgentManager uses dart:io which is unavailable on web.
+  final dynamic agentManager;
 
   SessionBloc({required this.agentManager}) : super(const SessionState()) {
     on<CreateSessionRequested>(_onCreateSession);
@@ -23,7 +25,13 @@ class SessionBloc extends Bloc<SessionEvent, SessionState> {
     Emitter<SessionState> emit,
   ) async {
     try {
-      final instance = await agentManager.spawn(event.cwd);
+      if (agentManager == null) {
+        emit(state.copyWith(
+            error: 'Cannot spawn agent processes on web. '
+                'Connect to an existing agent instead.'));
+        return;
+      }
+      final instance = await agentManager.spawn(event.cwd) as AgentInstance;
       final wsClient = WsClient();
       await wsClient.connect(instance.port, instance.token);
 
@@ -53,7 +61,7 @@ class SessionBloc extends Bloc<SessionEvent, SessionState> {
     if (session == null) return;
 
     await session.wsClient.dispose();
-    await agentManager.kill(session.instance.pid);
+    if (agentManager != null) await agentManager.kill(session.instance.pid);
 
     final remaining =
         state.sessions.where((s) => s.id != event.sessionId).toList();
@@ -110,7 +118,7 @@ class SessionBloc extends Bloc<SessionEvent, SessionState> {
     for (final session in state.sessions) {
       await session.wsClient.dispose();
     }
-    await agentManager.killAll();
+    if (agentManager != null) await agentManager.killAll();
     return super.close();
   }
 }

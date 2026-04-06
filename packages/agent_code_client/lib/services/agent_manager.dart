@@ -91,7 +91,7 @@ class AgentManager {
       // Try to read the lockfile.
       if (File(lockfilePath).existsSync()) {
         try {
-          instance = AgentInstance.fromLockFile(lockfilePath);
+          instance = AgentInstance.fromJson(File(lockfilePath).readAsStringSync());
           break;
         } catch (_) {
           // Lockfile not fully written yet, retry.
@@ -181,7 +181,8 @@ class AgentManager {
       if (entry is! File || !entry.path.endsWith('.lock')) continue;
 
       try {
-        final instance = AgentInstance.fromLockFile(entry.path);
+        final instance = AgentInstance.fromJson(
+            File(entry.path).readAsStringSync());
 
         // Skip already-managed.
         if (managedPids.contains(instance.pid)) continue;

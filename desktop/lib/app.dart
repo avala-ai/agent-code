@@ -1,29 +1,28 @@
 import 'package:agent_code_client/agent_code_client.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import 'bloc/session_bloc.dart';
 import 'ui/app_shell.dart';
+import 'platform/agent_manager_provider.dart';
 
 class AgentCodeApp extends StatelessWidget {
   const AgentCodeApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return RepositoryProvider(
-      create: (_) => AgentManager(),
-      child: BlocProvider(
-        create: (context) => SessionBloc(
-          agentManager: context.read<AgentManager>(),
-        ),
-        child: MaterialApp(
-          title: 'Agent Code',
-          debugShowCheckedModeBanner: false,
-          theme: _lightTheme(),
-          darkTheme: _darkTheme(),
-          themeMode: ThemeMode.system,
-          home: const AppShell(),
-        ),
+    return BlocProvider(
+      create: (_) => SessionBloc(
+        agentManager: createAgentManager(),
+      ),
+      child: MaterialApp(
+        title: 'Agent Code',
+        debugShowCheckedModeBanner: false,
+        theme: _lightTheme(),
+        darkTheme: _darkTheme(),
+        themeMode: ThemeMode.system,
+        home: const AppShell(),
       ),
     );
   }

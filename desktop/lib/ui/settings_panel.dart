@@ -1,5 +1,6 @@
-import 'package:agent_code_client/agent_code_client.dart';
 import 'package:flutter/material.dart';
+
+import '../platform/config_provider.dart';
 
 class SettingsPanel extends StatefulWidget {
   final VoidCallback onClose;
@@ -11,7 +12,6 @@ class SettingsPanel extends StatefulWidget {
 }
 
 class _SettingsPanelState extends State<SettingsPanel> {
-  final _config = ConfigService();
   late final TextEditingController _providerController;
   late final TextEditingController _modelController;
   late final TextEditingController _permissionController;
@@ -20,13 +20,11 @@ class _SettingsPanelState extends State<SettingsPanel> {
   @override
   void initState() {
     super.initState();
-    final config = _config.read();
-    _providerController =
-        TextEditingController(text: config['provider']?.toString() ?? '');
-    _modelController =
-        TextEditingController(text: config['model']?.toString() ?? '');
-    _permissionController = TextEditingController(
-        text: config['permission_mode']?.toString() ?? '');
+    final config = readConfig();
+    _providerController = TextEditingController(text: config['provider'] ?? '');
+    _modelController = TextEditingController(text: config['model'] ?? '');
+    _permissionController =
+        TextEditingController(text: config['permission_mode'] ?? '');
   }
 
   @override
@@ -41,13 +39,13 @@ class _SettingsPanelState extends State<SettingsPanel> {
     setState(() => _saving = true);
     try {
       if (_providerController.text.isNotEmpty) {
-        _config.set('provider', _providerController.text);
+        saveConfig('provider', _providerController.text);
       }
       if (_modelController.text.isNotEmpty) {
-        _config.set('model', _modelController.text);
+        saveConfig('model', _modelController.text);
       }
       if (_permissionController.text.isNotEmpty) {
-        _config.set('permission_mode', _permissionController.text);
+        saveConfig('permission_mode', _permissionController.text);
       }
     } catch (e) {
       if (mounted) {
@@ -78,11 +76,17 @@ class _SettingsPanelState extends State<SettingsPanel> {
               ],
             ),
             const SizedBox(height: 20),
-            _Field(label: 'Provider', controller: _providerController,
+            _Field(
+                label: 'Provider',
+                controller: _providerController,
                 hint: 'anthropic, openai, etc.'),
-            _Field(label: 'Model', controller: _modelController,
+            _Field(
+                label: 'Model',
+                controller: _modelController,
                 hint: 'claude-sonnet-4, gpt-4.1, etc.'),
-            _Field(label: 'Permission Mode', controller: _permissionController,
+            _Field(
+                label: 'Permission Mode',
+                controller: _permissionController,
                 hint: 'ask, auto, deny'),
             const SizedBox(height: 16),
             FilledButton(

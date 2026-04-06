@@ -1,0 +1,8 @@
+{
+  "name": "Agent Code",
+  "short_name": "Agent Code",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#1c1c1e",
+  "theme_color": "#0071E3"
+}
