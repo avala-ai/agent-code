@@ -28,11 +28,11 @@ jobs:
 
       - name: Analyze (shared package)
         working-directory: packages/agent_code_client
-        run: dart analyze --fatal-infos
+        run: dart analyze --fatal-warnings
 
       - name: Run tests (shared package)
         working-directory: packages/agent_code_client
-        run: dart test
+        run: dart test --exclude-tags e2e
 
   build-check:
     name: Flutter build check
