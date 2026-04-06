@@ -678,7 +678,9 @@ fn handle_schedule_add(
     println!("  Cron: {cron}");
     println!("  Prompt: {prompt}");
     if let Some(ref secret) = webhook_secret {
-        println!("  Webhook: POST /trigger?secret={secret}");
+        // Intentionally shown once at creation — this is the only time the
+        // user sees the full secret, similar to API key provisioning flows.
+        println!("  Webhook: POST /trigger?secret={secret}"); // codeql[cleartext-logging]: intentional one-time display
     }
     println!("\nStart the daemon to begin executing:");
     println!("  agent daemon");
@@ -737,9 +739,10 @@ async fn handle_schedule_run(
     let _ = store.save(&updated);
 
     println!();
+    // Session ID is a non-secret UUID prefix shown for /resume.
     eprintln!(
         "\nDone: {} turns, ${:.4}, session {}",
-        outcome.turns, outcome.cost_usd, outcome.session_id
+        outcome.turns, outcome.cost_usd, outcome.session_id // codeql[cleartext-logging]: non-secret session ID for /resume
     );
     Ok(())
 }
