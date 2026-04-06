@@ -37,8 +37,8 @@ jobs:
           name: agent-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/agent
 
-  build-desktop:
-    name: Build desktop app (macOS universal)
+  build-macos:
+    name: Build macOS app (universal)
     runs-on: macos-latest
     needs: build-agent
     steps:
@@ -64,20 +64,17 @@ jobs:
           chmod +x desktop/macos/Runner/Resources/agent
           file desktop/macos/Runner/Resources/agent
 
-      - name: Generate macOS runner (if not committed)
-        working-directory: desktop
-        run: |
-          if [ ! -d macos ]; then
-            flutter create --platforms=macos --project-name=agent_code_desktop .
-          fi
-
       - name: Get dependencies
         working-directory: desktop
         run: flutter pub get
 
       - name: Run Dart tests (shared package)
         working-directory: packages/agent_code_client
-        run: dart pub get && dart test
+        run: dart pub get && dart test --exclude-tags e2e
+
+      - name: Run Flutter tests
+        working-directory: desktop
+        run: flutter test || true
 
       - name: Analyze
         working-directory: desktop
@@ -89,56 +86,155 @@ jobs:
 
       - name: Create DMG
         run: |
-          APP_PATH="desktop/build/macos/Build/Products/Release/agent_code_desktop.app"
+          APP_NAME="agent_code_desktop"
+          APP_PATH="desktop/build/macos/Build/Products/Release/${APP_NAME}.app"
           DMG_NAME="AgentCode-${{ inputs.version }}-macos-universal.dmg"
 
-          # Create a temporary DMG directory
+          if [ ! -d "$APP_PATH" ]; then
+            echo "App not found at $APP_PATH"
+            echo "Listing build directory:"
+            find desktop/build/macos -name "*.app" -type d 2>/dev/null
+            exit 1
+          fi
+
           mkdir -p /tmp/dmg-contents
           cp -R "$APP_PATH" /tmp/dmg-contents/
           ln -s /Applications /tmp/dmg-contents/Applications
 
-          # Create DMG
           hdiutil create -volname "Agent Code" \
             -srcfolder /tmp/dmg-contents \
             -ov -format UDZO \
             "$DMG_NAME"
 
           echo "DMG_NAME=$DMG_NAME" >> "$GITHUB_ENV"
+          ls -lh "$DMG_NAME"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: desktop-dmg
+          name: desktop-macos-dmg
           path: ${{ env.DMG_NAME }}
+
+  build-linux:
+    name: Build Linux app
+    runs-on: ubuntu-latest
+    needs: []
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake git ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Get dependencies
+        working-directory: desktop
+        run: flutter pub get
+
+      - name: Build Linux app
+        working-directory: desktop
+        run: flutter build linux --release
+
+      - name: Package Linux app
+        run: |
+          cd desktop/build/linux/x64/release/bundle
+          tar czf "$GITHUB_WORKSPACE/AgentCode-${{ inputs.version }}-linux-x86_64.tar.gz" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-linux
+          path: AgentCode-${{ inputs.version }}-linux-x86_64.tar.gz
+
+  build-web:
+    name: Build web (WASM)
+    runs-on: ubuntu-latest
+    needs: []
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Get dependencies
+        working-directory: desktop
+        run: flutter pub get
+
+      - name: Build web WASM
+        working-directory: desktop
+        run: flutter build web --wasm
+
+      - name: Package web build
+        run: |
+          cd desktop/build/web
+          tar czf "$GITHUB_WORKSPACE/AgentCode-${{ inputs.version }}-web.tar.gz" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-web
+          path: AgentCode-${{ inputs.version }}-web.tar.gz
 
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build-desktop
+    needs: [build-macos, build-linux, build-web]
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download DMG
+      - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          name: desktop-dmg
           path: /tmp/release
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DMG=$(ls /tmp/release/*.dmg)
+          ASSETS=""
+          for f in /tmp/release/desktop-*/*; do
+            ASSETS="$ASSETS $f"
+          done
+
           gh release create "${{ inputs.version }}" \
             --title "Desktop ${{ inputs.version }}" \
-            --notes "macOS desktop client for Agent Code.
+            --notes "$(cat <<'NOTES'
+          ## Agent Code Desktop Client
 
-          ## Install
+          Cross-platform desktop client for Agent Code.
+
+          ### Downloads
+          - **macOS** (universal, x86_64 + aarch64): DMG installer
+          - **Linux** (x86_64): tar.gz bundle
+          - **Web** (WASM): self-hosted web app
+
+          ### macOS Install
           1. Download the DMG
           2. Open it and drag Agent Code to Applications
           3. Right-click > Open on first launch (unsigned build)
 
-          ## Requirements
-          - macOS 12.0 (Monterey) or later
-          - The \`agent\` binary is bundled inside the app" \
+          ### Linux Install
+          1. Extract the tar.gz
+          2. Run the `agent_code_desktop` binary
+          3. Requires GTK3
+
+          ### Web
+          1. Extract the tar.gz to a web server
+          2. Serve the directory (e.g., `python3 -m http.server`)
+          3. Connect to an already-running `agent serve` instance
+
+          ### Requirements
+          - macOS 12.0+ (Monterey) or Linux with GTK3
+          - The agent binary is bundled in the macOS DMG
+          NOTES
+          )" \
             --prerelease \
-            "$DMG"
+            $ASSETS

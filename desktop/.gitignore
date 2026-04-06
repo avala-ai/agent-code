@@ -11,6 +11,9 @@ pubspec.lock
 macos/Flutter/ephemeral/
 macos/Pods/
 
+# Linux
+linux/flutter/ephemeral/
+
 # IDE
 .idea/
 *.iml
