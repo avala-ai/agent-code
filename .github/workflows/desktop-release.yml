@@ -56,16 +56,16 @@ jobs:
 
       - name: Create universal agent binary
         run: |
-          mkdir -p desktop/macos/Runner/Resources
+          mkdir -p client/macos/Runner/Resources
           lipo -create \
             /tmp/agent-binaries/agent-x86_64/agent \
             /tmp/agent-binaries/agent-aarch64/agent \
-            -output desktop/macos/Runner/Resources/agent
-          chmod +x desktop/macos/Runner/Resources/agent
-          file desktop/macos/Runner/Resources/agent
+            -output client/macos/Runner/Resources/agent
+          chmod +x client/macos/Runner/Resources/agent
+          file client/macos/Runner/Resources/agent
 
       - name: Get dependencies
-        working-directory: desktop
+        working-directory: client
         run: flutter pub get
 
       - name: Run Dart tests (shared package)
@@ -73,27 +73,27 @@ jobs:
         run: dart pub get && dart test --exclude-tags e2e
 
       - name: Run Flutter tests
-        working-directory: desktop
+        working-directory: client
         run: flutter test || true
 
       - name: Analyze
-        working-directory: desktop
+        working-directory: client
         run: flutter analyze --no-fatal-infos || true
 
       - name: Build macOS app
-        working-directory: desktop
+        working-directory: client
         run: flutter build macos --release
 
       - name: Create DMG
         run: |
-          APP_NAME="agent_code_desktop"
-          APP_PATH="desktop/build/macos/Build/Products/Release/${APP_NAME}.app"
+          APP_NAME="agent_code_client_app"
+          APP_PATH="client/build/macos/Build/Products/Release/${APP_NAME}.app"
           DMG_NAME="AgentCode-${{ inputs.version }}-macos-universal.dmg"
 
           if [ ! -d "$APP_PATH" ]; then
             echo "App not found at $APP_PATH"
             echo "Listing build directory:"
-            find desktop/build/macos -name "*.app" -type d 2>/dev/null
+            find client/build/macos -name "*.app" -type d 2>/dev/null
             exit 1
           fi
 
@@ -136,16 +136,16 @@ jobs:
         run: flutter config --enable-linux-desktop
 
       - name: Get dependencies
-        working-directory: desktop
+        working-directory: client
         run: flutter pub get
 
       - name: Build Linux app
-        working-directory: desktop
+        working-directory: client
         run: flutter build linux --release
 
       - name: Package Linux app
         run: |
-          cd desktop/build/linux/x64/release/bundle
+          cd client/build/linux/x64/release/bundle
           tar czf "$GITHUB_WORKSPACE/AgentCode-${{ inputs.version }}-linux-x86_64.tar.gz" .
 
       - uses: actions/upload-artifact@v7
@@ -166,16 +166,16 @@ jobs:
           channel: stable
 
       - name: Get dependencies
-        working-directory: desktop
+        working-directory: client
         run: flutter pub get
 
       - name: Build web WASM
-        working-directory: desktop
+        working-directory: client
         run: flutter build web --wasm
 
       - name: Package web build
         run: |
-          cd desktop/build/web
+          cd client/build/web
           tar czf "$GITHUB_WORKSPACE/AgentCode-${{ inputs.version }}-web.tar.gz" .
 
       - uses: actions/upload-artifact@v7
@@ -223,7 +223,7 @@ jobs:
 
           ### Linux Install
           1. Extract the tar.gz
-          2. Run the `agent_code_desktop` binary
+          2. Run the `agent_code_client_app` binary
           3. Requires GTK3
 
           ### Web

@@ -1,4 +1,4 @@
-name: agent_code_desktop
+name: agent_code_client_app
 description: Cross-platform desktop and web client for Agent Code
 version: 0.1.0
 publish_to: none

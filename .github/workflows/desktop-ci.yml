@@ -3,12 +3,12 @@ name: Desktop CI
 on:
   pull_request:
     paths:
-      - 'desktop/**'
+      - 'client/**'
       - 'packages/agent_code_client/**'
   push:
     branches: [main]
     paths:
-      - 'desktop/**'
+      - 'client/**'
       - 'packages/agent_code_client/**'
 
 jobs:
@@ -46,20 +46,20 @@ jobs:
           channel: stable
 
       - name: Generate macOS runner (if not committed)
-        working-directory: desktop
+        working-directory: client
         run: |
           if [ ! -d macos ]; then
-            flutter create --platforms=macos --project-name=agent_code_desktop .
+            flutter create --platforms=macos --project-name=agent_code_client_app .
           fi
 
       - name: Get dependencies
-        working-directory: desktop
+        working-directory: client
         run: flutter pub get
 
       - name: Analyze
-        working-directory: desktop
+        working-directory: client
         run: flutter analyze --no-fatal-infos || true
 
       - name: Build macOS (release)
-        working-directory: desktop
+        working-directory: client
         run: flutter build macos --release

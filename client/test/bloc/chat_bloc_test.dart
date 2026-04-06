@@ -3,9 +3,9 @@ import 'package:bloc_test/bloc_test.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mocktail/mocktail.dart';
 
-import 'package:agent_code_desktop/bloc/chat_bloc.dart';
-import 'package:agent_code_desktop/bloc/chat_event.dart';
-import 'package:agent_code_desktop/bloc/chat_state.dart';
+import 'package:agent_code_client_app/bloc/chat_bloc.dart';
+import 'package:agent_code_client_app/bloc/chat_event.dart';
+import 'package:agent_code_client_app/bloc/chat_state.dart';
 
 class MockWsClient extends Mock implements WsClient {}
 

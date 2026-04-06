@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - 'desktop/**'
+      - 'client/**'
       - 'packages/agent_code_client/**'
       - 'crates/cli/src/serve.rs'
 
