@@ -3,9 +3,9 @@ import 'package:bloc_test/bloc_test.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mocktail/mocktail.dart';
 
-import '../../lib/bloc/session_bloc.dart';
-import '../../lib/bloc/session_event.dart';
-import '../../lib/bloc/session_state.dart';
+import 'package:agent_code_desktop/bloc/session_bloc.dart';
+import 'package:agent_code_desktop/bloc/session_event.dart';
+import 'package:agent_code_desktop/bloc/session_state.dart';
 
 class MockWsClient extends Mock implements WsClient {}
 

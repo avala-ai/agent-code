@@ -1,5 +1,9 @@
 name: agent_code_client
-description: Shared client library for Agent Code desktop and mobile apps
+description: >
+  Cross-platform client library for Agent Code.
+  Provides JSON-RPC over WebSocket communication with agent-code serve instances.
+  Models, protocol types, and WebSocket client are platform-independent.
+  AgentManager and ConfigService require dart:io (native platforms only).
 version: 0.1.0
 publish_to: none
 

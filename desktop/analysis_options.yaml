@@ -5,3 +5,11 @@ linter:
     prefer_const_constructors: true
     prefer_const_declarations: true
     avoid_print: true
+    prefer_single_quotes: true
+    sort_child_properties_last: true
+    use_key_in_widget_constructors: true
+
+analyzer:
+  exclude:
+    - build/**
+    - .dart_tool/**

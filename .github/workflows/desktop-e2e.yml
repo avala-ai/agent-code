@@ -1,0 +1,37 @@
+name: Desktop E2E Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'packages/agent_code_client/**'
+      - 'crates/cli/src/serve.rs'
+
+jobs:
+  e2e:
+    name: E2E tests (agent + WebSocket + LLM)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-e2e')
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build agent binary
+        run: cargo build --release
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Get dependencies
+        working-directory: packages/agent_code_client
+        run: dart pub get
+
+      - name: Run E2E tests
+        working-directory: packages/agent_code_client
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AGENT_BINARY_PATH: ${{ github.workspace }}/target/release/agent
+        run: dart test --tags e2e --timeout 120s

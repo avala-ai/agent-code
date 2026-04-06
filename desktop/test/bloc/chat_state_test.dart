@@ -1,7 +1,7 @@
 import 'package:agent_code_client/agent_code_client.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import '../../lib/bloc/chat_state.dart';
+import 'package:agent_code_desktop/bloc/chat_state.dart';
 
 void main() {
   group('ChatState', () {
