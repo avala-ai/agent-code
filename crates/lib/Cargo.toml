@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "sync", "signal", "macros", "fs", "process"] }
 futures = "0.3"
 tokio-util = "0.7"
 
@@ -60,4 +60,8 @@ harness = false
 
 [[bench]]
 name = "token_estimation"
+harness = false
+
+[[bench]]
+name = "startup"
 harness = false

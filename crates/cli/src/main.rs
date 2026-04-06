@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     {
         config.api.base_url = default_url.to_string();
     }
-    let mut llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match provider_kind {
+    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match provider_kind {
         ProviderKind::AzureOpenAi => {
             Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
                 &config.api.base_url,
@@ -253,8 +253,11 @@ async fn main() -> anyhow::Result<()> {
         config.api.base_url
     );
 
-    // Validate API key with a quick curl check (skip for local/Ollama).
-    if !config.api.base_url.contains("localhost")
+    // Validate API key in background (non-blocking).
+    // The old approach used a synchronous curl subprocess with 5s timeout,
+    // blocking startup. Now we spawn it as a background task and only
+    // interrupt if the key is actually invalid.
+    let api_key_check_handle = if !config.api.base_url.contains("localhost")
         && !config.api.base_url.contains("127.0.0.1")
         && cli.prompt.is_none()
         && !cli.dump_system_prompt
@@ -262,62 +265,32 @@ async fn main() -> anyhow::Result<()> {
         && !cli.acp
     {
         let check_url = format!("{}/models", config.api.base_url);
-        let key_invalid = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--max-time",
-                "5",
-                "-H",
-                &format!("Authorization: Bearer {api_key}"),
-                "-H",
-                &format!("x-api-key: {api_key}"),
-                &check_url,
-            ])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .is_some_and(|code| code.trim() == "401" || code.trim() == "403");
-
-        if key_invalid {
-            eprintln!(
-                "\nAPI key rejected by {}. Let's update it.\n",
-                config.api.base_url
-            );
-            run_setup_wizard();
-            config = Config::load()?;
-            let api_key_new = config
-                .api
-                .api_key
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("API key required after setup."))?;
-            llm = match provider_kind {
-                ProviderKind::AzureOpenAi => {
-                    Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
-                        &config.api.base_url,
-                        api_key_new,
-                    ))
-                }
-                _ => match provider_kind.wire_format() {
-                    WireFormat::Anthropic => {
-                        Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
-                            &config.api.base_url,
-                            api_key_new,
-                        ))
-                    }
-                    WireFormat::OpenAiCompatible => {
-                        Arc::new(agent_code_lib::llm::openai::OpenAiProvider::new(
-                            &config.api.base_url,
-                            api_key_new,
-                        ))
-                    }
-                },
-            };
-        }
-    }
+        let check_key = api_key.to_string();
+        Some(tokio::spawn(async move {
+            tokio::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    "--max-time",
+                    "3",
+                    "-H",
+                    &format!("Authorization: Bearer {check_key}"),
+                    "-H",
+                    &format!("x-api-key: {check_key}"),
+                    &check_url,
+                ])
+                .output()
+                .await
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .is_some_and(|code| code.trim() == "401" || code.trim() == "403")
+        }))
+    } else {
+        None
+    };
 
     let mut tool_registry = ToolRegistry::default_tools();
     let permission_checker = PermissionChecker::from_config(&config.permissions);
@@ -407,6 +380,18 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
         });
+    }
+
+    // Check background API key validation result before entering interactive mode.
+    if let Some(handle) = api_key_check_handle
+        && let Ok(Ok(true)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), handle).await
+    {
+        eprintln!(
+            "\nWarning: API key may be invalid (rejected by {}). \
+             Run setup with `agent --api-key <key>` to update.\n",
+            config.api.base_url
+        );
     }
 
     // Install Ctrl+C handler for graceful cancellation.

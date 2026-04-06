@@ -216,4 +216,105 @@ mod tests {
         assert_eq!(state.consecutive_failures, 0);
         assert!(state.using_fallback); // Preserved.
     }
+
+    #[test]
+    fn test_backoff_increases_with_attempt() {
+        let initial = Duration::from_millis(1000);
+        let max = Duration::from_secs(60);
+        let multiplier = 2.0;
+
+        let _b1 = calculate_backoff(1, initial, max, multiplier);
+        let b2 = calculate_backoff(2, initial, max, multiplier);
+        let b3 = calculate_backoff(3, initial, max, multiplier);
+
+        // Each attempt should generally produce a larger backoff (before jitter caps).
+        // With multiplier 2.0: attempt 1 ~1s, attempt 2 ~2s, attempt 3 ~4s.
+        assert!(b2.as_millis() >= 1500, "b2 should be >= 1.5s, got {:?}", b2);
+        assert!(b3.as_millis() >= 3000, "b3 should be >= 3s, got {:?}", b3);
+    }
+
+    #[test]
+    fn test_reset_clears_rate_limit_retries() {
+        let mut state = RetryState {
+            consecutive_failures: 3,
+            rate_limit_retries: 5,
+            overload_retries: 2,
+            using_fallback: false,
+        };
+        state.reset();
+        assert_eq!(state.rate_limit_retries, 0);
+        assert_eq!(state.consecutive_failures, 0);
+        // overload_retries and using_fallback persist.
+        assert_eq!(state.overload_retries, 2);
+    }
+
+    #[test]
+    fn test_overloads_then_fallback_then_abort() {
+        let mut state = RetryState::default();
+        let config = RetryConfig {
+            max_overload_retries: 1,
+            ..Default::default()
+        };
+        let err = RetryableError::Overloaded;
+
+        // First overload: retry with backoff.
+        match state.next_action(&err, &config) {
+            RetryAction::Retry { .. } => {}
+            other => panic!("Expected Retry, got {other:?}"),
+        }
+
+        // Second overload: exceeds max_overload_retries, triggers fallback.
+        match state.next_action(&err, &config) {
+            RetryAction::FallbackModel => {}
+            other => panic!("Expected FallbackModel, got {other:?}"),
+        }
+        assert!(state.using_fallback);
+
+        // Now on fallback model, overload again: retry.
+        match state.next_action(&err, &config) {
+            RetryAction::Retry { .. } => {}
+            other => panic!("Expected Retry on fallback, got {other:?}"),
+        }
+
+        // Exceed overloads on fallback: abort.
+        match state.next_action(&err, &config) {
+            RetryAction::Abort(msg) => assert!(msg.contains("fallback")),
+            other => panic!("Expected Abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stream_interrupted_retries_then_aborts() {
+        let mut state = RetryState::default();
+        let config = RetryConfig {
+            max_retries: 2,
+            ..Default::default()
+        };
+        let err = RetryableError::StreamInterrupted;
+
+        // First two interruptions should retry.
+        match state.next_action(&err, &config) {
+            RetryAction::Retry { .. } => {}
+            other => panic!("Expected Retry, got {other:?}"),
+        }
+        match state.next_action(&err, &config) {
+            RetryAction::Retry { .. } => {}
+            other => panic!("Expected Retry, got {other:?}"),
+        }
+
+        // Third interruption exceeds max_retries => abort.
+        match state.next_action(&err, &config) {
+            RetryAction::Abort(msg) => assert!(msg.contains("Stream")),
+            other => panic!("Expected Abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_retry_state_default_values() {
+        let state = RetryState::default();
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.rate_limit_retries, 0);
+        assert_eq!(state.overload_retries, 0);
+        assert!(!state.using_fallback);
+    }
 }

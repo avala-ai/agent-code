@@ -481,4 +481,182 @@ mod tests {
             ProviderKind::OpenAi
         ));
     }
+
+    #[test]
+    fn test_wire_format_anthropic_family() {
+        assert_eq!(ProviderKind::Anthropic.wire_format(), WireFormat::Anthropic);
+        assert_eq!(ProviderKind::Bedrock.wire_format(), WireFormat::Anthropic);
+        assert_eq!(ProviderKind::Vertex.wire_format(), WireFormat::Anthropic);
+    }
+
+    #[test]
+    fn test_wire_format_openai_compatible_family() {
+        let openai_compat_providers = [
+            ProviderKind::OpenAi,
+            ProviderKind::Xai,
+            ProviderKind::Google,
+            ProviderKind::DeepSeek,
+            ProviderKind::Groq,
+            ProviderKind::Mistral,
+            ProviderKind::Together,
+            ProviderKind::Zhipu,
+            ProviderKind::OpenRouter,
+            ProviderKind::Cohere,
+            ProviderKind::Perplexity,
+            ProviderKind::OpenAiCompatible,
+        ];
+        for p in openai_compat_providers {
+            assert_eq!(
+                p.wire_format(),
+                WireFormat::OpenAiCompatible,
+                "{p:?} should use OpenAiCompatible wire format"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_base_url_returns_some_for_known_providers() {
+        let providers_with_urls = [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::Xai,
+            ProviderKind::Google,
+            ProviderKind::DeepSeek,
+            ProviderKind::Groq,
+            ProviderKind::Mistral,
+            ProviderKind::Together,
+            ProviderKind::Zhipu,
+            ProviderKind::OpenRouter,
+            ProviderKind::Cohere,
+            ProviderKind::Perplexity,
+        ];
+        for p in providers_with_urls {
+            assert!(
+                p.default_base_url().is_some(),
+                "{p:?} should have a default base URL"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_base_url_returns_none_for_user_configured() {
+        assert!(ProviderKind::Bedrock.default_base_url().is_none());
+        assert!(ProviderKind::Vertex.default_base_url().is_none());
+        assert!(ProviderKind::AzureOpenAi.default_base_url().is_none());
+        assert!(ProviderKind::OpenAiCompatible.default_base_url().is_none());
+    }
+
+    #[test]
+    fn test_env_var_name_all_variants() {
+        assert_eq!(ProviderKind::Anthropic.env_var_name(), "ANTHROPIC_API_KEY");
+        assert_eq!(ProviderKind::Bedrock.env_var_name(), "ANTHROPIC_API_KEY");
+        assert_eq!(ProviderKind::Vertex.env_var_name(), "ANTHROPIC_API_KEY");
+        assert_eq!(ProviderKind::OpenAi.env_var_name(), "OPENAI_API_KEY");
+        assert_eq!(
+            ProviderKind::AzureOpenAi.env_var_name(),
+            "AZURE_OPENAI_API_KEY"
+        );
+        assert_eq!(ProviderKind::Xai.env_var_name(), "XAI_API_KEY");
+        assert_eq!(ProviderKind::Google.env_var_name(), "GOOGLE_API_KEY");
+        assert_eq!(ProviderKind::DeepSeek.env_var_name(), "DEEPSEEK_API_KEY");
+        assert_eq!(ProviderKind::Groq.env_var_name(), "GROQ_API_KEY");
+        assert_eq!(ProviderKind::Mistral.env_var_name(), "MISTRAL_API_KEY");
+        assert_eq!(ProviderKind::Together.env_var_name(), "TOGETHER_API_KEY");
+        assert_eq!(ProviderKind::Zhipu.env_var_name(), "ZHIPU_API_KEY");
+        assert_eq!(
+            ProviderKind::OpenRouter.env_var_name(),
+            "OPENROUTER_API_KEY"
+        );
+        assert_eq!(ProviderKind::Cohere.env_var_name(), "COHERE_API_KEY");
+        assert_eq!(
+            ProviderKind::Perplexity.env_var_name(),
+            "PERPLEXITY_API_KEY"
+        );
+        assert_eq!(
+            ProviderKind::OpenAiCompatible.env_var_name(),
+            "OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn test_detect_from_url_zhipu_bigmodel() {
+        assert!(matches!(
+            detect_provider("any", "https://open.bigmodel.cn/api/paas/v4"),
+            ProviderKind::Zhipu
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_deepseek_chat() {
+        assert!(matches!(
+            detect_provider("deepseek-chat", ""),
+            ProviderKind::DeepSeek
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_mistral_large() {
+        assert!(matches!(
+            detect_provider("mistral-large", ""),
+            ProviderKind::Mistral
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_glm4() {
+        assert!(matches!(detect_provider("glm-4", ""), ProviderKind::Zhipu));
+    }
+
+    #[test]
+    fn test_detect_from_model_llama3_with_groq_url() {
+        assert!(matches!(
+            detect_provider("llama-3", "https://api.groq.com/openai/v1"),
+            ProviderKind::Groq
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_codestral() {
+        assert!(matches!(
+            detect_provider("codestral-latest", ""),
+            ProviderKind::Mistral
+        ));
+    }
+
+    #[test]
+    fn test_detect_from_model_pplx() {
+        assert!(matches!(
+            detect_provider("pplx-70b-online", ""),
+            ProviderKind::Perplexity
+        ));
+    }
+
+    #[test]
+    fn test_provider_error_display() {
+        let err = ProviderError::Auth("bad token".into());
+        assert_eq!(format!("{err}"), "auth: bad token");
+
+        let err = ProviderError::RateLimited {
+            retry_after_ms: 1000,
+        };
+        assert_eq!(format!("{err}"), "rate limited (retry in 1000ms)");
+
+        let err = ProviderError::Overloaded;
+        assert_eq!(format!("{err}"), "server overloaded");
+
+        let err = ProviderError::RequestTooLarge("4MB limit".into());
+        assert_eq!(format!("{err}"), "request too large: 4MB limit");
+
+        let err = ProviderError::Network("timeout".into());
+        assert_eq!(format!("{err}"), "network: timeout");
+
+        let err = ProviderError::InvalidResponse("missing field".into());
+        assert_eq!(format!("{err}"), "invalid response: missing field");
+    }
+
+    #[test]
+    fn test_tool_choice_default_is_auto() {
+        let tc = ToolChoice::default();
+        assert!(matches!(tc, ToolChoice::Auto));
+    }
 }

@@ -236,4 +236,132 @@ mod tests {
         assert_eq!(max_thinking_tokens_for_model("claude-sonnet"), 16_000);
         assert_eq!(max_thinking_tokens_for_model("claude-haiku"), 8_000);
     }
+
+    #[test]
+    fn test_estimate_tokens_empty_string() {
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn test_estimate_tokens_unicode() {
+        // Multi-byte chars: each char may be 2-4 bytes in UTF-8.
+        let text = "\u{1F600}\u{1F600}\u{1F600}"; // 3 emoji, 4 bytes each = 12 bytes
+        let tokens = estimate_tokens(text);
+        // 12 / 4 = 3
+        assert_eq!(tokens, 3);
+    }
+
+    #[test]
+    fn test_estimate_block_tokens_document() {
+        let block = ContentBlock::Document {
+            media_type: "application/pdf".into(),
+            data: "a".repeat(400), // 400 base64 chars -> ~300 decoded bytes -> 300/4 = 75 tokens
+            title: Some("test.pdf".into()),
+        };
+        let tokens = estimate_block_tokens(&block);
+        assert!(tokens > 0);
+        assert_eq!(tokens, 75);
+    }
+
+    #[test]
+    fn test_estimate_block_tokens_thinking() {
+        let block = ContentBlock::Thinking {
+            thinking: "a".repeat(200),
+            signature: Some("sig".into()),
+        };
+        let tokens = estimate_block_tokens(&block);
+        // 200 / 4 = 50
+        assert_eq!(tokens, 50);
+    }
+
+    #[test]
+    fn test_estimate_block_tokens_tool_result() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "a".repeat(80),
+            is_error: false,
+            extra_content: vec![],
+        };
+        let tokens = estimate_block_tokens(&block);
+        // 80 / 4 = 20
+        assert_eq!(tokens, 20);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_system() {
+        let msg = Message::System(crate::llm::message::SystemMessage {
+            uuid: uuid::Uuid::new_v4(),
+            timestamp: String::new(),
+            subtype: crate::llm::message::SystemMessageType::Informational,
+            content: "a".repeat(40),
+            level: crate::llm::message::MessageLevel::Info,
+        });
+        let tokens = estimate_message_tokens(&msg);
+        // 40/4 = 10 + 4 overhead = 14
+        assert_eq!(tokens, 14);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_assistant_with_tool_use() {
+        let msg = Message::Assistant(crate::llm::message::AssistantMessage {
+            uuid: uuid::Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "Let me run that.".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        });
+        let tokens = estimate_message_tokens(&msg);
+        // Should include overhead + text tokens + tool_use tokens
+        assert!(tokens > 4);
+    }
+
+    #[test]
+    fn test_estimate_context_tokens_only_user_messages() {
+        let messages = vec![
+            crate::llm::message::user_message("hello world"),
+            crate::llm::message::user_message("how are you"),
+        ];
+        let tokens = estimate_context_tokens(&messages);
+        // No usage data, so everything is estimated.
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn test_context_window_for_gpt35() {
+        assert_eq!(context_window_for_model("gpt-3.5-turbo"), 16_384);
+    }
+
+    #[test]
+    fn test_context_window_for_unknown_model() {
+        // Unknown models default to 128K.
+        assert_eq!(context_window_for_model("some-unknown-model"), 128_000);
+    }
+
+    #[test]
+    fn test_context_window_for_1000k_variant() {
+        assert_eq!(context_window_for_model("claude-sonnet-1000k"), 1_000_000);
+    }
+
+    #[test]
+    fn test_max_output_tokens_for_unknown_model() {
+        // Unknown models default to 16384.
+        assert_eq!(max_output_tokens_for_model("unknown-llm"), 16_384);
+    }
+
+    #[test]
+    fn test_max_thinking_tokens_for_unknown_model() {
+        // Unknown models default to 16000.
+        assert_eq!(max_thinking_tokens_for_model("unknown-llm"), 16_000);
+    }
 }

@@ -20,7 +20,7 @@ agent-code-lib = { path = "../lib", version = "0.13.1" }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "sync", "signal", "macros"] }
 anyhow = "1"
 
 # Terminal UI
@@ -51,3 +51,4 @@ chrono = "0.4"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+toml = "1.1"
