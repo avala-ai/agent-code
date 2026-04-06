@@ -7,10 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-04-06
+
 ### Added
 
-- **`/powerup` interactive tutorials**: 5 step-by-step lessons teaching core features (first conversation, editing files, shell & tools, skills & workflows, models & providers). Arrow-key lesson picker with persistent progress tracking. Aliases: `/tutorial`, `/learn`. Reset with `/powerup reset`.
-- **Homebrew tap auto-update**: release workflow now automatically updates `avala-ai/homebrew-tap` formula with new version and SHA256 checksums on every tagged release
+- **Cross-platform Flutter client** with WebSocket JSON-RPC backend: desktop app (macOS, Linux), web WASM build, bidirectional permission prompting, heartbeat-based dead client detection, auto-update checker. Shared Dart client library at `packages/agent_code_client/`
+- **Behavioral evaluation framework**: `crates/eval/` with `eval_test!` macro, `TestRig` with workspace setup and tool log capture, best-of-4 retry logic for LLM non-determinism, two policy tiers (`AlwaysPasses` / `UsuallyPasses`), breakpoint mechanism for model steering tests. Ships with 10 seed evals
+- **Shell passthrough context injection**: `!` prefix now streams output in real-time (piped subprocess instead of `.output()`) and injects captured output into conversation history as `is_meta` message. Agent can reference shell output in subsequent turns without copy-pasting. 50KB truncation prevents context bloat
+- **Prompt caching for tool definitions**: `cache_control: { type: "ephemeral" }` on the last tool in the tools array, caching the full prefix (system prompt + 32 tools). New `features.prompt_caching` config toggle (default: true)
+- **Scheduled agents**: `agent cron add` for recurring agent execution, `agent trigger --listen` for webhook-triggered runs, background daemon for unattended operation
+- **`/powerup` interactive tutorials**: 5 step-by-step lessons teaching core features. Arrow-key lesson picker with persistent progress tracking. Aliases: `/tutorial`, `/learn`
+- **Homebrew tap auto-update**: release workflow automatically updates `avala-ai/homebrew-tap` formula with new version and SHA256 checksums on every tagged release
+- **Shell passthrough test suite**: 40 tests across 3 layers (25 unit, 11 integration, 4 E2E bash). Extracted capture logic into `services/shell_passthrough.rs` for testability
+- **Detailed v1.1/v1.2 roadmap**: 15 feature specifications with architecture diagrams, config schemas, and implementation checklists
+
+### Changed
+
+- **Shell passthrough refactored**: `!` handler in `repl.rs` reduced from 92 lines to 19 lines by extracting into `services/shell_passthrough.rs` library module
+- **Prompt caching wired to config**: `enable_caching` in query loop now reads `features.prompt_caching` instead of hardcoded `true`
+
+### Fixed
+
+- **E2E D10 coding task**: made resilient to context overflow during long agent sessions
 
 ## [0.13.1] - 2026-04-05
 
