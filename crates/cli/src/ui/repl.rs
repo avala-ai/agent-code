@@ -605,100 +605,23 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 if input.starts_with('!') {
                     let cmd = input.strip_prefix('!').unwrap_or("").trim();
                     if !cmd.is_empty() {
-                        use std::io::{BufRead, BufReader};
-                        use std::process::Stdio;
+                        use agent_code_lib::services::shell_passthrough;
 
-                        const MAX_CAPTURE_BYTES: usize = 50 * 1024; // 50KB
-
-                        let child = std::process::Command::new("bash")
-                            .arg("-c")
-                            .arg(cmd)
-                            .current_dir(&engine.state().cwd)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn();
-
-                        match child {
-                            Ok(mut child) => {
-                                let mut captured = String::new();
-                                let mut truncated = false;
-
-                                // Read stdout and stderr line-by-line, streaming
-                                // to the terminal while capturing for context.
-                                let stdout = child.stdout.take();
-                                let stderr = child.stderr.take();
-
-                                if let Some(stdout) = stdout {
-                                    for line in BufReader::new(stdout).lines() {
-                                        match line {
-                                            Ok(line) => {
-                                                println!("{line}");
-                                                if !truncated {
-                                                    if captured.len() + line.len() + 1
-                                                        > MAX_CAPTURE_BYTES
-                                                    {
-                                                        truncated = true;
-                                                    } else {
-                                                        captured.push_str(&line);
-                                                        captured.push('\n');
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-
-                                if let Some(stderr) = stderr {
-                                    for line in BufReader::new(stderr).lines() {
-                                        match line {
-                                            Ok(line) => {
-                                                eprintln!("{line}");
-                                                if !truncated {
-                                                    if captured.len() + line.len() + 1
-                                                        > MAX_CAPTURE_BYTES
-                                                    {
-                                                        truncated = true;
-                                                    } else {
-                                                        captured.push_str(&line);
-                                                        captured.push('\n');
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-
-                                let _ = child.wait();
-
-                                // Inject captured output into conversation context.
-                                if !captured.is_empty() {
-                                    let suffix = if truncated {
-                                        "\n[output truncated at 50KB]"
-                                    } else {
-                                        ""
-                                    };
-                                    let context_text =
-                                        format!("[Shell output from: {cmd}]\n{captured}{suffix}");
-                                    engine.state_mut().push_message(
-                                        agent_code_lib::llm::message::Message::User(
-                                            agent_code_lib::llm::message::UserMessage {
-                                                uuid: uuid::Uuid::new_v4(),
-                                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                                content: vec![
-                                                agent_code_lib::llm::message::ContentBlock::Text {
-                                                    text: context_text,
-                                                },
-                                            ],
-                                                is_meta: true,
-                                                is_compact_summary: false,
-                                            },
-                                        ),
-                                    );
+                        let cwd = std::path::Path::new(&engine.state().cwd);
+                        match shell_passthrough::run_and_capture(
+                            cmd,
+                            cwd,
+                            |line| println!("{line}"),
+                            |line| eprintln!("{line}"),
+                        ) {
+                            Ok(output) => {
+                                if let Some(msg) =
+                                    shell_passthrough::build_context_message(cmd, &output)
+                                {
+                                    engine.state_mut().push_message(msg);
                                 }
                             }
-                            Err(e) => eprintln!("bash error: {e}"),
+                            Err(e) => eprintln!("{e}"),
                         }
                     }
                     continue;

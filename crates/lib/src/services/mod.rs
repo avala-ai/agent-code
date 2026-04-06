@@ -22,5 +22,6 @@ pub mod plugins;
 pub mod pricing;
 pub mod session;
 pub mod session_env;
+pub mod shell_passthrough;
 pub mod telemetry;
 pub mod tokens;

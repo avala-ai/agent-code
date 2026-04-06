@@ -41,6 +41,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-code-eval"
+version = "0.1.0"
+dependencies = [
+ "agent-code-lib",
+ "anyhow",
+ "chrono",
+ "clap",
+ "glob",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agent-code-lib"
 version = "0.13.1"
 dependencies = [
@@ -2849,6 +2868,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
