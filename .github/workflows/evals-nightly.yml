@@ -1,0 +1,64 @@
+name: Nightly Evals
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 2 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      policy:
+        description: 'Filter by policy (all, always_passes, usually_passes)'
+        required: false
+        default: 'all'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  evals:
+    name: Behavioral Evals
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: sudo apt-get install -y ripgrep jq
+
+      - name: Build agent binary
+        run: cargo build --release
+
+      - name: Build eval runner
+        run: cargo build --release -p agent-code-eval
+
+      - name: List evals
+        run: cargo run --release -p agent-code-eval -- --list
+
+      - name: Run evals
+        env:
+          AGENT_CODE_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AGENT_CODE_API_BASE_URL: https://openrouter.ai/api/v1
+          AGENT_CODE_MODEL: openai/gpt-5-nano
+        run: |
+          POLICY_ARG=""
+          if [ "${{ inputs.policy }}" != "all" ] && [ -n "${{ inputs.policy }}" ]; then
+            POLICY_ARG="--policy ${{ inputs.policy }}"
+          fi
+
+          cargo run --release -p agent-code-eval -- \
+            --agent target/release/agent \
+            --retries 4 \
+            --results evals/results/nightly.jsonl \
+            $POLICY_ARG
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-results-${{ github.run_id }}
+          path: evals/results/

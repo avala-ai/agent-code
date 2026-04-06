@@ -1,0 +1,64 @@
+name: Eval Promotion Check
+
+on:
+  schedule:
+    - cron: "0 10 * * 1" # Monday 10 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-promotions:
+    name: Check eval promotion/demotion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Analyze nightly results
+        run: |
+          RESULTS_FILE="evals/results/nightly.jsonl"
+
+          if [ ! -f "$RESULTS_FILE" ]; then
+            echo "No nightly results found. Skipping."
+            exit 0
+          fi
+
+          echo "═══════════════════════════════════════"
+          echo "  Eval Promotion Analysis"
+          echo "═══════════════════════════════════════"
+          echo ""
+
+          # Count results per eval in the last 7 days.
+          CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%S)
+
+          echo "Results since: $CUTOFF"
+          echo ""
+
+          # Group by eval name and check pass rates.
+          jq -r 'select(.timestamp >= "'"$CUTOFF"'") | "\(.name)\t\(.verdict)"' "$RESULTS_FILE" 2>/dev/null | \
+            sort | uniq -c | sort -rn | head -30
+
+          echo ""
+
+          # Promotion candidates: UsuallyPasses with 100% pass rate over 7 days.
+          echo "Promotion candidates (UsuallyPasses → AlwaysPasses):"
+          jq -r 'select(.timestamp >= "'"$CUTOFF"'" and .policy == "UsuallyPasses") | .name' "$RESULTS_FILE" 2>/dev/null | \
+            sort | uniq -c | while read count name; do
+              pass_count=$(jq -r "select(.timestamp >= \"$CUTOFF\" and .name == \"$name\" and .verdict == \"PASS\") | .name" "$RESULTS_FILE" 2>/dev/null | wc -l)
+              if [ "$pass_count" = "$count" ]; then
+                echo "  ✓ $name — $count/$count passed (promote)"
+              fi
+            done
+
+          echo ""
+
+          # Demotion candidates: AlwaysPasses with failures.
+          echo "Demotion candidates (AlwaysPasses → UsuallyPasses):"
+          jq -r 'select(.timestamp >= "'"$CUTOFF"'" and .policy == "AlwaysPasses" and .verdict != "PASS") | .name' "$RESULTS_FILE" 2>/dev/null | \
+            sort | uniq -c | while read count name; do
+              if [ "$count" -ge 2 ]; then
+                echo "  ✗ $name — $count failures (demote)"
+              fi
+            done

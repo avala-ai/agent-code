@@ -1,0 +1,35 @@
+[package]
+name = "agent-code-eval"
+version = "0.1.0"
+edition = "2024"
+description = "Behavioral evaluation framework for agent-code"
+publish = false
+
+[[bin]]
+name = "eval_runner"
+path = "src/main.rs"
+
+[dependencies]
+agent-code-lib = { path = "../lib", version = "0.13.1" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client (for serve mode interaction)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+chrono = "0.4"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+glob = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -2,6 +2,7 @@
 members = [
     "crates/lib",
     "crates/cli",
+    "crates/eval",
 ]
 resolver = "3"
 
