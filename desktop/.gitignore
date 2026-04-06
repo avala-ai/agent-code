@@ -1,0 +1,19 @@
+# Flutter
+build/
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+
+# macOS
+macos/Flutter/ephemeral/
+macos/Pods/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Leftover from Tauri migration
+node_modules/
