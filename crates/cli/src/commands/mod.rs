@@ -333,6 +333,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Show instructions to remove agent-code",
         hidden: false,
     },
+    Command {
+        name: "powerup",
+        aliases: &["tutorial", "learn"],
+        description: "Interactive tutorials to learn agent-code features",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1433,6 +1439,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
+        Some("powerup") => execute_powerup(args),
         _ => {
             // Check if it's a skill invocation.
             let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
@@ -1446,5 +1453,265 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 CommandResult::Passthrough(format!("/{input}"))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /powerup — interactive tutorial system
+// ---------------------------------------------------------------------------
+
+/// Lesson definition for the /powerup tutorial system.
+struct Lesson {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    prompt: &'static str,
+}
+
+/// The five built-in lessons that ship with agent-code.
+const LESSONS: &[Lesson] = &[
+    Lesson {
+        id: "01-first-conversation",
+        title: "Your First Conversation",
+        description: "Talk to the agent, ask questions, get answers",
+        prompt: r#"You are running an interactive tutorial lesson for the user.
+
+**Lesson 1: Your First Conversation**
+
+Walk the user through their first interaction with agent-code. Follow these steps:
+
+1. **Explain** (briefly): The agent reads your codebase and can answer questions about it. You just type naturally — no special syntax needed.
+
+2. **Try it**: Ask the user to type a question about their current project, like "what does this project do?" or "what language is this written in?" Then answer that question using the codebase tools (read files, search, etc.).
+
+3. **Verify**: After answering, confirm the user saw how the agent read files and provided context-aware answers. Explain that the agent always grounds its answers in the actual code.
+
+4. **Bonus tips**:
+   - Use `@filename` to attach a specific file to your prompt
+   - Use `\` + Enter for multi-line input
+   - Press `?` to see all keyboard shortcuts
+
+End with: "Lesson complete! Try `/powerup` to pick your next lesson."
+
+Keep your teaching style concise and practical — show, don't lecture."#,
+    },
+    Lesson {
+        id: "02-editing-files",
+        title: "Editing Files",
+        description: "Let the agent read, edit, and create files for you",
+        prompt: r#"You are running an interactive tutorial lesson for the user.
+
+**Lesson 2: Editing Files**
+
+Teach the user how the agent modifies code. Follow these steps:
+
+1. **Explain** (briefly): The agent can read, edit, and create files. It uses dedicated tools (Read, Edit, Write) rather than shell commands, so changes are precise and reviewable.
+
+2. **Try it**: Ask the user to request a small, safe change in their project. Good examples:
+   - "Add a comment at the top of [file] explaining what it does"
+   - "Rename variable X to something more descriptive in [file]"
+   If the user isn't sure, pick a file and suggest adding a doc comment. Make the edit.
+
+3. **Verify**: After making the edit, show the user the change with `git diff`. Explain that every edit is reviewable and reversible with `/rewind` or `git checkout`.
+
+4. **Bonus tips**:
+   - The agent reads files before editing to avoid blind changes
+   - Use `/diff` to see all pending changes
+   - Use `/commit` to commit when you're happy with the changes
+   - Permission mode controls whether edits need approval
+
+End with: "Lesson complete! Try `/powerup` to pick your next lesson."
+
+Keep it hands-on. Make a real edit in the user's project."#,
+    },
+    Lesson {
+        id: "03-shell-and-tools",
+        title: "Shell Commands & Tools",
+        description: "Run commands, search code, and use the 32 built-in tools",
+        prompt: r#"You are running an interactive tutorial lesson for the user.
+
+**Lesson 3: Shell Commands & Tools**
+
+Teach the user about the agent's tool system. Follow these steps:
+
+1. **Explain** (briefly): The agent has 32 built-in tools: file ops, code search (grep/glob), shell execution, git, web search, and more. It picks the right tool automatically based on your request. You can also run shell commands directly with the `!` prefix.
+
+2. **Try it**: Walk through three examples:
+   a) Ask the user to try `!git status` (direct shell — output lands in the conversation)
+   b) Have the user ask "find all TODO comments in this project" (agent uses Grep tool)
+   c) Have the user ask "what tests exist in this project?" (agent uses Glob + Read)
+
+3. **Verify**: Point out how the agent chose different tools for each task. Explain the tool output is visible in the conversation.
+
+4. **Bonus tips**:
+   - `!command` runs a shell command directly in your terminal
+   - `&prompt` runs a prompt in the background
+   - The agent parallelizes independent tool calls for speed
+   - Use `/permissions` to see which tools need approval
+
+End with: "Lesson complete! Try `/powerup` to pick your next lesson."
+
+Be practical — use the user's actual project for demonstrations."#,
+    },
+    Lesson {
+        id: "04-skills-and-workflows",
+        title: "Skills & Workflows",
+        description: "Use /commit, /review, /test, and create custom skills",
+        prompt: r#"You are running an interactive tutorial lesson for the user.
+
+**Lesson 4: Skills & Workflows**
+
+Teach the user about the skill system. Follow these steps:
+
+1. **Explain** (briefly): Skills are reusable workflows invoked with `/name`. There are 12 bundled skills for common tasks: `/commit`, `/review`, `/test`, `/debug`, `/explain`, `/pr`, `/refactor`, `/init`, `/security-review`, `/advisor`, `/bughunter`, `/plan`. You can also create custom skills.
+
+2. **Try it**: Walk through two examples:
+   a) Run `/explain` on a file in the user's project — show how it provides a structured explanation
+   b) Show the user how to see all available skills with `/skills`
+
+3. **Explain custom skills**: Tell the user they can create their own:
+   - Create a `.agent/skills/` directory in their project
+   - Add a markdown file with YAML frontmatter and a prompt template
+   - Example: a `deploy-check.md` skill that verifies pre-deploy conditions
+   - Use `/skill search` to find community skills, `/skill install <name>` to install them
+
+4. **Bonus tips**:
+   - Skills are just prompt templates with `{{arg}}` substitution
+   - Project skills override bundled skills with the same name
+   - `/skill help` shows all skill management commands
+
+End with: "Lesson complete! Try `/powerup` to pick your next lesson."
+
+Focus on the practical value of each skill."#,
+    },
+    Lesson {
+        id: "05-multi-provider",
+        title: "Models & Providers",
+        description: "Switch models, compare providers, manage costs",
+        prompt: r#"You are running an interactive tutorial lesson for the user.
+
+**Lesson 5: Models & Providers**
+
+Teach the user about model and provider management. Follow these steps:
+
+1. **Explain** (briefly): agent-code works with 15+ LLM providers. You can switch models mid-session, compare outputs, and control costs. The agent normalizes different API formats so all tools work with any provider.
+
+2. **Try it**: Walk through two examples:
+   a) Show the current model with `/model` — let the user see the interactive selector
+   b) Show session cost so far with `/cost` — explain token breakdown and cache hits
+
+3. **Explain configuration**: Tell the user about:
+   - `~/.config/agent-code/config.toml` for default model and provider
+   - `--model <name>` flag to start with a specific model
+   - `--api-base-url` for any OpenAI-compatible endpoint (local models, proxies)
+   - Setting max cost with `max_cost_usd` in config to prevent runaway spending
+
+4. **Bonus tips**:
+   - Use `/context` to see how much of the context window is used
+   - `/compact` frees context space when running long sessions
+   - `/doctor` checks your provider connection health
+   - Smaller models (mini/nano) are great for simple tasks and cost less
+
+End with: "All 5 lessons complete! You're ready to use agent-code like a pro. Run `/powerup` anytime to revisit a lesson."
+
+Celebrate the user finishing all lessons."#,
+    },
+];
+
+/// Load completed lesson IDs from the progress file.
+fn load_progress() -> Vec<String> {
+    let path = match dirs::data_local_dir() {
+        Some(d) => d.join("agent-code/powerup-progress.json"),
+        None => return Vec::new(),
+    };
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Save a lesson ID to the progress file.
+fn save_progress(lesson_id: &str) {
+    let dir = match dirs::data_local_dir() {
+        Some(d) => d.join("agent-code"),
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("powerup-progress.json");
+    let mut completed = load_progress();
+    if !completed.contains(&lesson_id.to_string()) {
+        completed.push(lesson_id.to_string());
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&completed).unwrap_or_default(),
+    );
+}
+
+/// Execute the /powerup command.
+fn execute_powerup(args: Option<&str>) -> CommandResult {
+    let completed = load_progress();
+
+    // Direct lesson selection: /powerup 1, /powerup 3, etc.
+    if let Some(arg) = args {
+        let arg = arg.trim();
+        // Accept "1"-"5" or "reset".
+        if arg == "reset" {
+            if let Some(d) = dirs::data_local_dir() {
+                let _ = std::fs::remove_file(d.join("agent-code/powerup-progress.json"));
+            }
+            println!("Tutorial progress reset.");
+            return CommandResult::Handled;
+        }
+        if let Ok(num) = arg.parse::<usize>()
+            && num >= 1
+            && num <= LESSONS.len()
+        {
+            let lesson = &LESSONS[num - 1];
+            save_progress(lesson.id);
+            return CommandResult::Prompt(lesson.prompt.to_string());
+        }
+        println!("Usage: /powerup [1-5 | reset]");
+        return CommandResult::Handled;
+    }
+
+    // Show interactive lesson picker.
+    let total = LESSONS.len();
+    let done = completed.len().min(total);
+
+    println!();
+    println!("  ⚡ Interactive Tutorials ({done}/{total} completed)");
+    println!();
+
+    let options: Vec<crate::ui::selector::SelectOption> = LESSONS
+        .iter()
+        .enumerate()
+        .map(|(i, lesson)| {
+            let check = if completed.contains(&lesson.id.to_string()) {
+                " ✔"
+            } else {
+                ""
+            };
+            crate::ui::selector::SelectOption {
+                label: format!("{}. {}{check}", i + 1, lesson.title),
+                description: lesson.description.to_string(),
+                value: lesson.id.to_string(),
+                preview: None,
+            }
+        })
+        .collect();
+
+    let chosen = crate::ui::selector::select(&options);
+
+    if chosen.is_empty() {
+        return CommandResult::Handled;
+    }
+
+    // Find the chosen lesson and run it.
+    if let Some(lesson) = LESSONS.iter().find(|l| l.id == chosen) {
+        save_progress(lesson.id);
+        CommandResult::Prompt(lesson.prompt.to_string())
+    } else {
+        CommandResult::Handled
     }
 }

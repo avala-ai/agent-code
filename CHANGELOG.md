@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **`/powerup` interactive tutorials**: 5 step-by-step lessons teaching core features (first conversation, editing files, shell & tools, skills & workflows, models & providers). Arrow-key lesson picker with persistent progress tracking. Aliases: `/tutorial`, `/learn`. Reset with `/powerup reset`.
 
 ## [0.13.1] - 2026-04-05
 

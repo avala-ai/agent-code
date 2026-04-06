@@ -276,11 +276,11 @@ These are tracked for future exploration. Not committed to a timeline.
 - [x] `create_team()` / `list_teams()` for team management
 - [x] Shared `build_agent_command()` helper for subprocess spawning
 
-### 7.3 Interactive Tutorial System
+### 7.3 Interactive Tutorial System — Done
 
-- [ ] `/powerup` command with step-by-step interactive lessons
-- [ ] Lesson structure: explanation, try-it prompt, success verification
-- [ ] Ship 5 lessons covering core features
+- [x] `/powerup` command with step-by-step interactive lessons
+- [x] Lesson structure: explanation, try-it prompt, success verification
+- [x] Ship 5 lessons covering core features
 
 ### 7.4 Voice Mode
 
