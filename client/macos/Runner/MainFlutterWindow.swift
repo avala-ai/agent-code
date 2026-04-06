@@ -8,7 +8,7 @@ class MainFlutterWindow: NSWindow {
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)
 
-    // Set window properties for Agent Code desktop.
+    // Set window properties for Agent Code.
     self.title = "Agent Code"
     self.minSize = NSSize(width: 640, height: 480)
     self.setContentSize(NSSize(width: 960, height: 700))
