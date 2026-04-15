@@ -1146,6 +1146,103 @@ mod tests {
         }
 
         assert!(cancelled, "Loop should have been cancelled");
-        assert_eq!(events_received, 1, "Should have received exactly one event before cancel");
+        assert_eq!(
+            events_received, 1,
+            "Should have received exactly one event before cancel"
+        );
+    }
+
+    /// End-to-end regression test for #103: verifies that cancelling a
+    /// QueryEngine turn mid-stream actually interrupts the loop.
+    ///
+    /// Builds a mock provider whose stream hangs forever after one event,
+    /// starts a real turn, then calls `engine.cancel()` and asserts the
+    /// turn returns quickly. Without the tokio::select! fix, this would
+    /// hang until the test timeout.
+    #[tokio::test]
+    async fn run_turn_with_sink_interrupts_on_cancel() {
+        use crate::config::Config;
+        use crate::llm::provider::{Provider, ProviderError, ProviderRequest};
+        use crate::permissions::PermissionChecker;
+        use crate::state::AppState;
+        use crate::tools::registry::ToolRegistry;
+
+        /// A provider whose stream yields one TextDelta and then hangs forever.
+        struct HangingProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for HangingProvider {
+            fn name(&self) -> &str {
+                "hanging-mock"
+            }
+
+            async fn stream(
+                &self,
+                _request: &ProviderRequest,
+            ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, ProviderError> {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                tokio::spawn(async move {
+                    let _ = tx.send(StreamEvent::TextDelta("thinking...".into())).await;
+                    // Hang forever without closing the channel or sending Done.
+                    // This simulates the real bug: a slow LLM response that
+                    // the user wants to interrupt.
+                    let _tx_holder = tx;
+                    std::future::pending::<()>().await;
+                });
+                Ok(rx)
+            }
+        }
+
+        let llm = Arc::new(HangingProvider);
+        let tools = ToolRegistry::default_tools();
+        let config = Config::default();
+        let permissions = PermissionChecker::from_config(&config.permissions);
+        let state = AppState::new(config);
+
+        let mut engine = QueryEngine::new(
+            llm,
+            tools,
+            permissions,
+            state,
+            QueryEngineConfig {
+                max_turns: Some(1),
+                verbose: false,
+                unattended: true,
+            },
+        );
+
+        // Clone the shared handle so the background task can cancel the
+        // *current* turn's token (the same path the signal handler uses).
+        // Cloning cancel_token() directly would capture the pre-turn token,
+        // which gets replaced when run_turn_with_sink starts.
+        let shared = engine.cancel_shared.clone();
+
+        // Cancel the engine after a short delay so the stream has time
+        // to produce its first event and the loop is blocked on rx.recv().
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            shared.lock().unwrap().cancel();
+        });
+
+        // Run the turn. Without the fix, this hangs forever; with the fix,
+        // it returns Ok(()) once cancellation is detected.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.run_turn_with_sink("test input", &NullSink),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_turn_with_sink should return promptly on cancel, not hang"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "cancelled turn should return Ok(()), not an error"
+        );
+        assert!(
+            !engine.state().is_query_active,
+            "is_query_active should be reset after cancel"
+        );
     }
 }

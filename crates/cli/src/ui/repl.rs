@@ -289,23 +289,22 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
 
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
             // Poll with a short timeout to check the stop flag frequently.
-            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(KeyEvent {
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
+                && let Ok(Event::Key(KeyEvent {
                     code, modifiers, ..
                 })) = event::read()
-                {
-                    match code {
-                        KeyCode::Esc => {
-                            cancel_token.cancel();
-                            break;
-                        }
-                        // Also handle Ctrl+C here since raw mode intercepts it.
-                        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                            cancel_token.cancel();
-                            break;
-                        }
-                        _ => {}
+            {
+                match code {
+                    KeyCode::Esc => {
+                        cancel_token.cancel();
+                        break;
                     }
+                    // Also handle Ctrl+C here since raw mode intercepts it.
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        cancel_token.cancel();
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -327,8 +326,7 @@ struct EscapeWatcherGuard {
 
 impl Drop for EscapeWatcherGuard {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
