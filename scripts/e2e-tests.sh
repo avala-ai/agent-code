@@ -1049,6 +1049,130 @@ else
     pass "K7: --attach flag recognized (exited cleanly)"
 fi
 
+# K8: --no-sandbox flag accepted (no crash)
+if "${AGENT}" --no-sandbox --dump-system-prompt > /dev/null 2>&1; then
+    pass "K8: --no-sandbox flag accepted"
+else
+    fail "K8: --no-sandbox" "Flag rejected or crash"
+fi
+
+# ══════════════════════════════════════════════════════════════════
+#  M: Process-Level Sandbox
+# ══════════════════════════════════════════════════════════════════
+#
+# These tests verify the §7.4 sandbox vertical slice: the SandboxConfig
+# schema is accepted, the --no-sandbox flag round-trips through config,
+# and on macOS a real Seatbelt-wrapped bash command is denied when it
+# tries to write outside the project directory. Linux/Windows runners
+# exercise only the config and flag tests until bwrap/Low-Integrity
+# strategies land.
+
+section "M: Process-Level Sandbox"
+
+# M1: Binary accepts [sandbox] config section without error.
+# Write a minimal project config that flips sandbox.enabled and verify
+# the binary starts (dump-system-prompt is a no-LLM code path).
+M_CONFIG_DIR=$(mktemp -d)
+mkdir -p "${M_CONFIG_DIR}/.agent"
+cat > "${M_CONFIG_DIR}/.agent/settings.toml" <<'TOML'
+[sandbox]
+enabled = false
+strategy = "auto"
+allowed_write_paths = ["/tmp"]
+forbidden_paths = ["~/.ssh"]
+allow_network = true
+TOML
+if (cd "${M_CONFIG_DIR}" && "${AGENT}" --dump-system-prompt > /dev/null 2>&1); then
+    pass "M1: [sandbox] config section accepted by parser"
+else
+    fail "M1: sandbox config parse" "Binary failed to start with [sandbox] present"
+fi
+rm -rf "${M_CONFIG_DIR}"
+
+# M2: --no-sandbox is honored on a fresh invocation.
+# There is no externally visible state to inspect without a full session,
+# so this test checks that the flag is recognized and the binary still
+# starts. The Rust integration tests (crates/lib/tests/sandbox_integration.rs)
+# cover the real runtime behavior.
+if "${AGENT}" --no-sandbox --dump-system-prompt > /dev/null 2>&1; then
+    pass "M2: --no-sandbox accepted alongside --dump-system-prompt"
+else
+    fail "M2: --no-sandbox" "Flag rejected or crash"
+fi
+
+# M3: Unknown sandbox strategy does not crash the binary (warns + falls back).
+M_CONFIG_DIR=$(mktemp -d)
+mkdir -p "${M_CONFIG_DIR}/.agent"
+cat > "${M_CONFIG_DIR}/.agent/settings.toml" <<'TOML'
+[sandbox]
+enabled = true
+strategy = "mars-rover-mode"
+TOML
+if (cd "${M_CONFIG_DIR}" && "${AGENT}" --dump-system-prompt > /dev/null 2>&1); then
+    pass "M3: unknown sandbox strategy gracefully falls back (no crash)"
+else
+    fail "M3: unknown strategy" "Binary crashed on unknown sandbox strategy"
+fi
+rm -rf "${M_CONFIG_DIR}"
+
+# M4: On macOS, verify that an enabled seatbelt sandbox denies /etc writes
+# by running the bash tool through serve mode. On Linux/Windows this is
+# a no-op pass (no strategy available yet).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    M_WORKDIR=$(mktemp -d)
+    git init "${M_WORKDIR}" --quiet
+    mkdir -p "${M_WORKDIR}/.agent"
+    cat > "${M_WORKDIR}/.agent/settings.toml" <<'TOML'
+[sandbox]
+enabled = true
+strategy = "seatbelt"
+allowed_write_paths = []
+forbidden_paths = []
+allow_network = false
+TOML
+
+    # Start a fresh serve instance pointed at the sandboxed workdir.
+    M_SERVE_PORT=14097
+    "${AGENT}" --serve --port "${M_SERVE_PORT}" --model "${MODEL}" \
+        --dangerously-skip-permissions -C "${M_WORKDIR}" \
+        > /tmp/agent-serve-sandbox-m.log 2>&1 &
+    M_SERVE_PID=$!
+
+    m_ready=0
+    for _ in $(seq 1 30); do
+        if curl -sf "http://127.0.0.1:${M_SERVE_PORT}/health" > /dev/null 2>&1; then
+            m_ready=1
+            break
+        fi
+        if ! kill -0 "${M_SERVE_PID}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [[ "${m_ready}" == "1" ]]; then
+        marker="/etc/agent-code-e2e-sandbox-m4-marker"
+        curl -s -o /dev/null --max-time "${API_TIMEOUT}" \
+            -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"Use the Bash tool to run: echo test > ${marker}. Report whether it succeeded.\"}" \
+            "http://127.0.0.1:${M_SERVE_PORT}/message" || true
+        if [[ ! -f "${marker}" ]]; then
+            pass "M4: seatbelt blocks bash write to /etc (marker not created)"
+        else
+            fail "M4: sandbox escape" "Marker file was created at ${marker}"
+            rm -f "${marker}" 2>/dev/null || true
+        fi
+    else
+        fail "M4: sandbox serve" "serve failed to start for sandbox test"
+    fi
+
+    kill "${M_SERVE_PID}" 2>/dev/null || true
+    wait "${M_SERVE_PID}" 2>/dev/null || true
+    rm -rf "${M_WORKDIR}"
+else
+    pass "M4: seatbelt deny test (skipped: not macOS)"
+fi
+
     # ══════════════════════════════════════════════════════════════
     #  L: Shell Passthrough Context Injection
     # ══════════════════════════════════════════════════════════════

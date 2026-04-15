@@ -267,12 +267,17 @@ impl Tool for BashTool {
             .unwrap_or(false);
 
         let mut cmd = if let Some(ref sandbox) = ctx.sandbox {
-            if disable_sandbox_requested {
+            if disable_sandbox_requested && sandbox.allow_bypass() {
                 tracing::warn!(
                     "bash call set dangerouslyDisableSandbox; wrapping skipped for this call"
                 );
                 base
             } else {
+                if disable_sandbox_requested && !sandbox.allow_bypass() {
+                    tracing::warn!(
+                        "dangerouslyDisableSandbox ignored: security.disable_bypass_permissions is set"
+                    );
+                }
                 sandbox.wrap(base)
             }
         } else {

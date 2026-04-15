@@ -795,7 +795,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         Some("sandbox") => {
             let cwd = std::path::PathBuf::from(&engine.state().cwd);
             let cfg = &engine.state().config.sandbox;
-            let exec = agent_code_lib::sandbox::SandboxExecutor::from_config(cfg, &cwd);
+            let exec = agent_code_lib::sandbox::SandboxExecutor::from_session_config(
+                &engine.state().config,
+                &cwd,
+            );
             let policy = exec.policy();
 
             println!("Process-level sandbox:");

@@ -684,7 +684,7 @@ impl QueryEngine {
                 session_allows: Some(self.session_allows.clone()),
                 permission_prompter: self.permission_prompter.clone(),
                 sandbox: Some(std::sync::Arc::new(
-                    crate::sandbox::SandboxExecutor::from_config(&self.state.config.sandbox, &cwd),
+                    crate::sandbox::SandboxExecutor::from_session_config(&self.state.config, &cwd),
                 )),
             };
 

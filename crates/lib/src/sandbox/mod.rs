@@ -73,6 +73,10 @@ pub struct SandboxExecutor {
     strategy: Arc<dyn SandboxStrategy>,
     policy: SandboxPolicy,
     enabled: bool,
+    /// Whether per-tool-call bypass (e.g. the `dangerouslyDisableSandbox`
+    /// Bash tool parameter) is permitted. Derived from
+    /// `security.disable_bypass_permissions == false`.
+    allow_bypass: bool,
 }
 
 impl SandboxExecutor {
@@ -84,6 +88,19 @@ impl SandboxExecutor {
     /// and logs a warning — the caller should still treat this as enabled
     /// for `/sandbox` reporting so the degradation is visible.
     pub fn from_config(config: &SandboxConfig, project_dir: &Path) -> Self {
+        Self::from_config_with_bypass(config, project_dir, true)
+    }
+
+    /// Build an executor, explicitly setting whether per-call bypass is allowed.
+    ///
+    /// Call sites with access to the full [`crate::config::Config`] should
+    /// prefer [`SandboxExecutor::from_session_config`], which reads the
+    /// bypass flag from `security.disable_bypass_permissions`.
+    pub fn from_config_with_bypass(
+        config: &SandboxConfig,
+        project_dir: &Path,
+        allow_bypass: bool,
+    ) -> Self {
         let policy = SandboxPolicy::from_config(config, project_dir);
         let strategy = pick_strategy(&config.strategy);
 
@@ -98,7 +115,18 @@ impl SandboxExecutor {
             strategy,
             policy,
             enabled: config.enabled,
+            allow_bypass,
         }
+    }
+
+    /// Build an executor from the top-level [`crate::config::Config`],
+    /// honoring the enterprise `security.disable_bypass_permissions` flag.
+    pub fn from_session_config(config: &crate::config::Config, project_dir: &Path) -> Self {
+        Self::from_config_with_bypass(
+            &config.sandbox,
+            project_dir,
+            !config.security.disable_bypass_permissions,
+        )
     }
 
     /// Strategy name for diagnostics (e.g. `/sandbox` command output).
@@ -114,6 +142,14 @@ impl SandboxExecutor {
     /// Access the resolved policy for diagnostics.
     pub fn policy(&self) -> &SandboxPolicy {
         &self.policy
+    }
+
+    /// Whether a tool call may request per-call bypass (e.g. the Bash tool's
+    /// `dangerouslyDisableSandbox` parameter).
+    ///
+    /// Returns `false` when `security.disable_bypass_permissions = true`.
+    pub fn allow_bypass(&self) -> bool {
+        self.allow_bypass
     }
 
     /// Wrap `cmd` with the active strategy, reapplying piped stdio.
@@ -151,6 +187,7 @@ impl SandboxExecutor {
                 allow_network: true,
             },
             enabled: false,
+            allow_bypass: true,
         }
     }
 }
@@ -202,9 +239,30 @@ fn sandbox_exec_available() -> bool {
 mod tests {
     use super::*;
 
+    fn sample_config(enabled: bool, strategy: &str) -> SandboxConfig {
+        SandboxConfig {
+            enabled,
+            strategy: strategy.to_string(),
+            allowed_write_paths: vec![],
+            forbidden_paths: vec![],
+            allow_network: false,
+        }
+    }
+
     #[test]
     fn pick_strategy_none_is_noop() {
         assert_eq!(pick_strategy("none").name(), "noop");
+    }
+
+    #[test]
+    fn pick_strategy_empty_is_auto() {
+        // Empty string should behave the same as "auto".
+        assert_eq!(pick_strategy("").name(), auto_detect().name());
+    }
+
+    #[test]
+    fn pick_strategy_auto_matches_auto_detect() {
+        assert_eq!(pick_strategy("auto").name(), auto_detect().name());
     }
 
     #[test]
@@ -219,10 +277,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn auto_detect_on_macos_picks_seatbelt() {
+        // macOS CI and dev machines always have sandbox-exec on $PATH.
+        assert_eq!(auto_detect().name(), "seatbelt");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pick_strategy_seatbelt_matches_make_seatbelt() {
+        assert_eq!(pick_strategy("seatbelt").name(), "seatbelt");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn pick_strategy_seatbelt_off_macos_is_noop() {
+        // Selecting seatbelt on Linux should silently degrade to noop
+        // rather than crashing at config-load time.
+        assert_eq!(pick_strategy("seatbelt").name(), "noop");
+    }
+
+    #[test]
     fn disabled_executor_is_inactive() {
         let exec = SandboxExecutor::disabled();
         assert!(!exec.is_active());
         assert_eq!(exec.strategy_name(), "noop");
+        assert!(exec.allow_bypass());
     }
 
     #[test]
@@ -235,5 +315,91 @@ mod tests {
         let wrapped = exec.wrap(cmd);
         let program = wrapped.as_std().get_program();
         assert_eq!(program, "echo");
+    }
+
+    #[test]
+    fn from_config_disabled_is_inactive_regardless_of_strategy() {
+        let cfg = sample_config(false, "seatbelt");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(!exec.is_active());
+    }
+
+    #[test]
+    fn from_config_strategy_none_is_inactive_even_when_enabled() {
+        let cfg = sample_config(true, "none");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(!exec.is_active());
+        assert_eq!(exec.strategy_name(), "noop");
+    }
+
+    #[test]
+    fn from_config_policy_contains_project_dir() {
+        let cfg = sample_config(false, "auto");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/work/repo"));
+        assert_eq!(exec.policy().project_dir, PathBuf::from("/work/repo"));
+    }
+
+    #[test]
+    fn from_config_with_bypass_respects_flag() {
+        let cfg = sample_config(true, "auto");
+        let allowed =
+            SandboxExecutor::from_config_with_bypass(&cfg, std::path::Path::new("/tmp"), true);
+        let denied =
+            SandboxExecutor::from_config_with_bypass(&cfg, std::path::Path::new("/tmp"), false);
+        assert!(allowed.allow_bypass());
+        assert!(!denied.allow_bypass());
+    }
+
+    #[test]
+    fn from_session_config_honors_disable_bypass_permissions() {
+        let base = crate::config::Config {
+            sandbox: sample_config(true, "none"),
+            ..Default::default()
+        };
+
+        let mut denied_cfg = base.clone();
+        denied_cfg.security.disable_bypass_permissions = true;
+        let denied =
+            SandboxExecutor::from_session_config(&denied_cfg, std::path::Path::new("/tmp"));
+        assert!(!denied.allow_bypass());
+
+        let mut allowed_cfg = base;
+        allowed_cfg.security.disable_bypass_permissions = false;
+        let allowed =
+            SandboxExecutor::from_session_config(&allowed_cfg, std::path::Path::new("/tmp"));
+        assert!(allowed.allow_bypass());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn active_seatbelt_wrap_replaces_program() {
+        let cfg = sample_config(true, "seatbelt");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        if !exec.is_active() {
+            eprintln!("skipping: seatbelt unavailable");
+            return;
+        }
+        let wrapped = exec.wrap(Command::new("echo"));
+        let std_cmd = wrapped.as_std();
+        assert_eq!(std_cmd.get_program(), "sandbox-exec");
+        // After `-p <profile>`, the original program is argv[3].
+        let args: Vec<_> = std_cmd.get_args().collect();
+        assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-p"));
+        // "echo" appears after the profile string.
+        assert!(args.iter().any(|a| a.to_str() == Some("echo")));
+    }
+
+    #[test]
+    fn noop_strategy_returns_command_untouched() {
+        // Guard against accidental NoopStrategy behavior changes.
+        let cmd = Command::new("cat");
+        let policy = SandboxPolicy {
+            project_dir: PathBuf::from("/tmp"),
+            allowed_write_paths: vec![],
+            forbidden_paths: vec![],
+            allow_network: false,
+        };
+        let wrapped = NoopStrategy.wrap_command(cmd, &policy);
+        assert_eq!(wrapped.as_std().get_program(), "cat");
     }
 }

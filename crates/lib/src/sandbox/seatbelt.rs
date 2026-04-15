@@ -210,4 +210,135 @@ mod tests {
         let p = build_profile(&policy);
         assert!(p.contains("\"/weird\\\"path\""));
     }
+
+    #[test]
+    fn profile_empty_allow_and_forbid_lists_still_builds() {
+        let policy = SandboxPolicy {
+            project_dir: PathBuf::from("/work/repo"),
+            allowed_write_paths: vec![],
+            forbidden_paths: vec![],
+            allow_network: false,
+        };
+        let p = build_profile(&policy);
+        // Must still allow project-dir writes even with empty extra lists.
+        assert!(p.contains("(allow file-write* (subpath \"/work/repo\"))"));
+        // And still deny default.
+        assert!(p.contains("(deny default)"));
+    }
+
+    #[test]
+    fn profile_multiple_forbidden_paths_all_appear() {
+        let policy = SandboxPolicy {
+            project_dir: PathBuf::from("/work/repo"),
+            allowed_write_paths: vec![],
+            forbidden_paths: vec![
+                PathBuf::from("/Users/test/.ssh"),
+                PathBuf::from("/Users/test/.aws"),
+                PathBuf::from("/Users/test/.gnupg"),
+            ],
+            allow_network: false,
+        };
+        let p = build_profile(&policy);
+        assert!(p.contains("/Users/test/.ssh"));
+        assert!(p.contains("/Users/test/.aws"));
+        assert!(p.contains("/Users/test/.gnupg"));
+    }
+
+    #[test]
+    fn profile_contains_process_and_signal_allows() {
+        // Regression guard: subprocess execution inside the sandbox
+        // requires these rules to be present. Breaking them would make
+        // bash unable to fork/exec/signal its children.
+        let p = build_profile(&test_policy());
+        assert!(p.contains("(allow process-fork)"));
+        assert!(p.contains("(allow process-exec*)"));
+        assert!(p.contains("(allow signal)"));
+    }
+
+    #[test]
+    fn profile_imports_system_sb() {
+        let p = build_profile(&test_policy());
+        assert!(p.contains("(import \"system.sb\")"));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  SeatbeltStrategy argv / cwd / env preservation
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_command_sets_sandbox_exec_as_program() {
+        let policy = test_policy();
+        let cmd = Command::new("bash");
+        let wrapped = SeatbeltStrategy.wrap_command(cmd, &policy);
+        assert_eq!(wrapped.as_std().get_program(), "sandbox-exec");
+    }
+
+    #[test]
+    fn wrap_command_prepends_profile_flag() {
+        let policy = test_policy();
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo hi");
+        let wrapped = SeatbeltStrategy.wrap_command(cmd, &policy);
+        let args: Vec<_> = wrapped
+            .as_std()
+            .get_args()
+            .map(|a| a.to_os_string())
+            .collect();
+        // argv: -p, <profile>, bash, -c, "echo hi"
+        assert_eq!(args[0], "-p");
+        assert!(args[1].to_str().unwrap().contains("(deny default)"));
+        assert_eq!(args[2], "bash");
+        assert_eq!(args[3], "-c");
+        assert_eq!(args[4], "echo hi");
+    }
+
+    #[test]
+    fn wrap_command_preserves_current_dir() {
+        let policy = test_policy();
+        let mut cmd = Command::new("bash");
+        cmd.current_dir("/work/repo");
+        let wrapped = SeatbeltStrategy.wrap_command(cmd, &policy);
+        assert_eq!(
+            wrapped.as_std().get_current_dir(),
+            Some(std::path::Path::new("/work/repo"))
+        );
+    }
+
+    #[test]
+    fn wrap_command_preserves_env_vars() {
+        let policy = test_policy();
+        let mut cmd = Command::new("bash");
+        cmd.env("MY_VAR", "hello").env("OTHER_VAR", "world");
+        let wrapped = SeatbeltStrategy.wrap_command(cmd, &policy);
+        let envs: std::collections::HashMap<_, _> = wrapped
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            envs.get(&std::ffi::OsString::from("MY_VAR"))
+                .and_then(|v| v.clone()),
+            Some("hello".into())
+        );
+        assert_eq!(
+            envs.get(&std::ffi::OsString::from("OTHER_VAR"))
+                .and_then(|v| v.clone()),
+            Some("world".into())
+        );
+    }
+
+    #[test]
+    fn wrap_command_preserves_env_removals() {
+        let policy = test_policy();
+        let mut cmd = Command::new("bash");
+        cmd.env_remove("SECRET");
+        let wrapped = SeatbeltStrategy.wrap_command(cmd, &policy);
+        let envs: std::collections::HashMap<_, _> = wrapped
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        // env_remove stores a None value under the key.
+        assert_eq!(envs.get(&std::ffi::OsString::from("SECRET")), Some(&None));
+    }
 }
