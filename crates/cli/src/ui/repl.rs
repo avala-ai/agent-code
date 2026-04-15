@@ -22,6 +22,28 @@ use agent_code_lib::llm::message::Usage;
 use agent_code_lib::query::{QueryEngine, StreamSink};
 use agent_code_lib::tools::ToolResult;
 
+/// Write to stdout with LF → CRLF translation. Needed because the escape-key
+/// watcher (`spawn_escape_watcher`) holds the terminal in raw mode for the
+/// entire duration of a streaming turn, and in raw mode a bare `\n` moves the
+/// cursor down one row without returning to column 0 — causing subsequent
+/// lines to drift right by the column of the previous line. Any code path
+/// that prints during a turn must go through this helper (or the tui
+/// renderer, which already uses `\r\n` internally).
+fn raw_print(text: &str) {
+    let translated = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(translated.as_bytes());
+    let _ = out.flush();
+}
+
+/// Like `raw_print`, but for stderr.
+fn raw_eprint(text: &str) {
+    let translated = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(translated.as_bytes());
+    let _ = err.flush();
+}
+
 /// Tab-completion helper for slash commands.
 struct CommandCompleter;
 
@@ -119,7 +141,7 @@ impl TerminalSink {
     fn ensure_newline(&self) {
         let mut mid = self.mid_line.lock().unwrap();
         if *mid {
-            println!();
+            raw_print("\n");
             *mid = false;
         }
     }
@@ -146,8 +168,7 @@ impl StreamSink for TerminalSink {
         // First text token: stop the activity indicator.
         self.stop_indicator();
 
-        print!("{text}");
-        let _ = std::io::stdout().flush();
+        raw_print(text);
         *self.mid_line.lock().unwrap() = !text.ends_with('\n');
 
         // Buffer for potential post-processing (markdown render of full blocks).
@@ -180,7 +201,11 @@ impl StreamSink for TerminalSink {
         let t = super::theme::current();
         if result.is_error {
             let first_line = result.content.lines().next().unwrap_or("");
-            eprintln!("  {} {}", "✗".with(t.error), first_line.with(t.error));
+            raw_eprint(&format!(
+                "  {} {}\n",
+                "✗".with(t.error),
+                first_line.with(t.error)
+            ));
         } else {
             let preview: String = result
                 .content
@@ -198,12 +223,12 @@ impl StreamSink for TerminalSink {
             } else {
                 String::new()
             };
-            eprintln!(
-                "  {} {}{}",
+            raw_eprint(&format!(
+                "  {} {}{}\n",
                 "✓".with(t.success),
                 preview.with(t.muted),
                 suffix
-            );
+            ));
         }
         self.restart_indicator();
     }
@@ -235,10 +260,10 @@ impl StreamSink for TerminalSink {
         self.stop_indicator();
         self.ensure_newline();
         let t = super::theme::current();
-        eprintln!(
-            "{} {error}",
+        raw_eprint(&format!(
+            "{} {error}\n",
             super::theme::label(" ERROR ", t.error, crossterm::style::Color::White)
-        );
+        ));
     }
 
     fn on_usage(&self, usage: &Usage) {
@@ -254,19 +279,19 @@ impl StreamSink for TerminalSink {
 
     fn on_compact(&self, freed_tokens: u64) {
         let t = super::theme::current();
-        eprintln!(
-            "  {} {}",
+        raw_eprint(&format!(
+            "  {} {}\n",
             "↻".with(t.accent),
             format!("compacted ~{freed_tokens} tokens").with(t.muted),
-        );
+        ));
     }
 
     fn on_warning(&self, msg: &str) {
         let t = super::theme::current();
-        eprintln!(
-            "{} {msg}",
+        raw_eprint(&format!(
+            "{} {msg}\n",
             super::theme::label(" WARN ", t.warning, crossterm::style::Color::Black)
-        );
+        ));
     }
 }
 
@@ -709,10 +734,10 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 if let Err(e) = engine.run_turn_with_sink(input, &sink).await {
                     {
                         let t = super::theme::current();
-                        eprintln!(
-                            "{} {e}",
+                        raw_eprint(&format!(
+                            "{} {e}\n",
                             super::theme::label(" ERROR ", t.error, crossterm::style::Color::White)
-                        );
+                        ));
                     }
                 }
                 drop(_esc_guard);
@@ -923,4 +948,61 @@ fn expand_file_references(input: &str, cwd: &str) -> String {
     let remaining: String = chars[last_end..].iter().collect();
     result.push_str(&remaining);
     result
+}
+
+#[cfg(test)]
+mod raw_print_tests {
+    //! The translation used by `raw_print` / `raw_eprint` is extracted here as
+    //! a pure function so we can test it without touching stdout. The bug
+    //! these guard against: during a streaming turn the escape watcher holds
+    //! the terminal in raw mode, where a bare `\n` moves the cursor down one
+    //! row without returning to column 0. Every newline emitted by the
+    //! streaming sink must therefore be `\r\n`.
+
+    fn translate(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    #[test]
+    fn bare_lf_becomes_crlf() {
+        assert_eq!(translate("a\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn existing_crlf_is_preserved_not_doubled() {
+        // Must not produce `\r\r\n`.
+        assert_eq!(translate("a\r\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn multiple_newlines_all_translated() {
+        assert_eq!(translate("a\nb\nc\n"), "a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn text_without_newlines_is_unchanged() {
+        assert_eq!(translate("hello world"), "hello world");
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(translate(""), "");
+    }
+
+    #[test]
+    fn mixed_lf_and_crlf() {
+        assert_eq!(translate("a\nb\r\nc\n"), "a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn lone_cr_is_not_touched() {
+        // Activity indicator and other helpers use bare `\r` to rewrite the
+        // current line; that must survive translation intact.
+        assert_eq!(translate("\rstatus"), "\rstatus");
+    }
+
+    #[test]
+    fn cr_followed_by_text_then_lf() {
+        assert_eq!(translate("\rstatus\n"), "\rstatus\r\n");
+    }
 }
