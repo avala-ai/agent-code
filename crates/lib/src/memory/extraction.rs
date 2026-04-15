@@ -229,6 +229,8 @@ pub async fn extract_memories_background(
         enable_caching: false,
         tool_choice: Default::default(),
         metadata: None,
+        // Background extraction: not user-cancellable, passes a fresh token.
+        cancel: tokio_util::sync::CancellationToken::new(),
     };
 
     let result = match llm.stream(&request).await {

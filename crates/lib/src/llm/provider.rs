@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::message::Message;
 use super::stream::StreamEvent;
@@ -55,6 +56,13 @@ pub struct ProviderRequest {
     pub tool_choice: ToolChoice,
     /// Metadata to send with the request (e.g., user_id for Anthropic).
     pub metadata: Option<serde_json::Value>,
+    /// Cancellation token for interrupting the in-flight streaming HTTP read.
+    /// Providers must race `byte_stream.next().await` against
+    /// `cancel.cancelled()` so that the spawned streaming task exits
+    /// promptly when the user presses Escape or Ctrl+C. Background callers
+    /// (memory extraction, consolidation) can pass `CancellationToken::new()`
+    /// for an uncancellable request.
+    pub cancel: CancellationToken,
 }
 
 /// Provider-level errors.

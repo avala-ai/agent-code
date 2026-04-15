@@ -268,6 +268,7 @@ pub async fn compact_with_llm(
     messages: &mut Vec<Message>,
     llm: &dyn crate::llm::provider::Provider,
     model: &str,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Option<usize> {
     if messages.len() < 4 {
         return None; // Not enough messages to compact.
@@ -300,6 +301,7 @@ pub async fn compact_with_llm(
         enable_caching: false,
         tool_choice: Default::default(),
         metadata: None,
+        cancel,
     };
 
     let mut rx = match llm.stream(&request).await {

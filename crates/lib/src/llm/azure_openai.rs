@@ -260,6 +260,7 @@ impl Provider for AzureOpenAiProvider {
 
         // Parse SSE stream — identical to OpenAI format.
         let (tx, rx) = mpsc::channel(64);
+        let cancel = request.cancel.clone();
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
@@ -269,7 +270,18 @@ impl Provider for AzureOpenAiProvider {
             let mut usage = Usage::default();
             let mut stop_reason: Option<StopReason> = None;
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            loop {
+                // Race the next SSE chunk against cancellation. On cancel,
+                // drop the byte_stream (and therefore the reqwest::Response),
+                // which aborts the underlying HTTP connection immediately.
+                let chunk_result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    chunk = byte_stream.next() => match chunk {
+                        Some(c) => c,
+                        None => break,
+                    },
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {

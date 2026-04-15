@@ -245,8 +245,13 @@ impl QueryEngine {
                 if post_mc_tokens >= threshold {
                     // Full LLM-based compaction: summarize older messages.
                     info!("Microcompact insufficient, attempting LLM compaction");
-                    match compact::compact_with_llm(&mut self.state.messages, &*self.llm, &model)
-                        .await
+                    match compact::compact_with_llm(
+                        &mut self.state.messages,
+                        &*self.llm,
+                        &model,
+                        self.cancel.clone(),
+                    )
+                    .await
                     {
                         Some(removed) => {
                             info!("LLM compaction removed {removed} messages");
@@ -345,6 +350,7 @@ impl QueryEngine {
                 enable_caching: self.state.config.features.prompt_caching,
                 tool_choice: Default::default(),
                 metadata: None,
+                cancel: self.cancel.clone(),
             };
 
             let mut rx = match self.llm.stream(&request).await {
@@ -1192,6 +1198,45 @@ mod tests {
         }
     }
 
+    /// A provider whose spawned streaming task honors `ProviderRequest::cancel`.
+    /// When it exits cleanly via cancellation it flips `exit_flag` to true.
+    /// Used to prove that the cancel token reaches the provider's own task
+    /// (the anthropic/openai/azure SSE loops), not just the query engine's
+    /// outer select.
+    struct CancelAwareHangingProvider {
+        exit_flag: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CancelAwareHangingProvider {
+        fn name(&self) -> &str {
+            "cancel-aware-mock"
+        }
+
+        async fn stream(
+            &self,
+            request: &ProviderRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, ProviderError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let cancel = request.cancel.clone();
+            let exit_flag = self.exit_flag.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(StreamEvent::TextDelta("thinking...".into())).await;
+                // Mirror the real provider pattern: race the "next SSE chunk"
+                // future against the cancel token. A real provider's
+                // `byte_stream.next().await` would sit where `pending` does.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        exit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ = std::future::pending::<()>() => unreachable!(),
+                }
+            });
+            Ok(rx)
+        }
+    }
+
     /// A provider that completes a turn normally: emits text and a Done event.
     struct CompletingProvider;
 
@@ -1432,6 +1477,47 @@ mod tests {
             warnings.iter().any(|w| w.contains("Cancelled")),
             "expected 'Cancelled' warning in sink, got: {:?}",
             *warnings
+        );
+    }
+
+    /// Regression test for the #125-followup: the cancellation token must
+    /// reach the *provider's own spawned streaming task*, not just the query
+    /// engine's outer select loop. This is what was broken — the existing
+    /// `HangingProvider` test above passed even while Escape-interrupt was
+    /// completely dead in production, because that provider ignores the
+    /// token and the query loop exits cleanly on its own. This test fails
+    /// if `ProviderRequest::cancel` is dropped on the floor anywhere between
+    /// `query::mod.rs` and the provider's spawn.
+    #[tokio::test]
+    async fn provider_stream_task_observes_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let exit_flag = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        });
+        let mut engine = build_engine(provider);
+        schedule_cancel(&engine, 50);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.run_turn_with_sink("test input", &NullSink),
+        )
+        .await;
+        assert!(result.is_ok(), "engine should exit promptly on cancel");
+
+        // Give the provider's spawned task a moment to observe the cancel
+        // after the engine returns. In release builds this is effectively
+        // instantaneous; the sleep just makes the test tolerant of scheduler
+        // variance on slow CI runners.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            exit_flag.load(Ordering::SeqCst),
+            "provider's streaming task should have observed cancel via \
+             ProviderRequest::cancel and exited; if this flag is false, \
+             the token is being dropped somewhere in query::mod.rs or the \
+             provider is ignoring it"
         );
     }
 }
