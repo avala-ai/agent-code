@@ -88,6 +88,25 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 - [x] Add `///` doc comments to all key public structs, enums, and traits
 - [x] Publish rustdoc via CI (GitHub Pages at `/api/`)
 
+### 1.10 Compatibility Matrix
+
+Living document comparing agent-code feature coverage against the broader terminal coding-agent landscape. Helps prospective users understand tradeoffs and gives us an honest internal gap tracker.
+
+- [ ] Create `docs/compat-matrix.mdx` with rows for features (tools, sandboxing, MCP, LSP, multi-agent, providers, platforms, session resume, image input, profiles, etc.) and columns for agent-code plus 3–5 peer projects
+- [ ] Wire into Mintlify nav under "Reference"
+- [ ] Add a CI check that fails if a new `feature:` tag is added to source without a matching row in the matrix
+- [ ] Refresh per release as part of the CHANGELOG workflow
+
+### 1.11 Public SDK Documentation
+
+`crates/lib` is already a reusable library, but it is not marketed or documented as a stable embedding surface. Give it a first-class SDK story so third-party Rust apps can embed the agent loop.
+
+- [ ] Introduce a top-level `agent_code::sdk` facade module re-exporting the minimal public types (session, tool trait, provider trait, config)
+- [ ] Publish a `docs/sdk.mdx` quickstart with an end-to-end embedding example
+- [ ] Add an `examples/embed-agent/` crate in the workspace that builds in CI
+- [ ] Declare a semver contract for the `sdk` module (separate from internal types)
+- [ ] Annotate non-SDK modules with `#[doc(hidden)]` where appropriate
+
 ---
 
 ## Phase 2: Skills and Extensibility
@@ -228,6 +247,15 @@ terminal_on_quota = true
 - [ ] Notify cache strategy on model switch (see 7.13) to track cache invalidation cost
 - [ ] Add `/routing` slash command showing current model health states
 - [ ] Tests: unit tests for state machine transitions, integration tests for chain traversal
+
+**Reasoning-Effort Controls:**
+
+Providers increasingly expose a reasoning/thinking budget knob (Anthropic `thinking.budget_tokens`, OpenAI `reasoning.effort`, xAI reasoning modes). Wire this into the routing layer so it can be set per-mode and per-turn.
+
+- [ ] Add `reasoning_effort: low | medium | high | none` to `ConfigSchema` with provider-specific mapping
+- [ ] Per-mode defaults: plan mode → `high`, build mode → `medium`, one-shot headless → `low`
+- [ ] `--effort <level>` flag for single-shot invocations; `/effort <level>` slash command for mid-session override
+- [ ] Report the active effort level in `/cost` alongside token usage so users can correlate cost spikes with deep reasoning
 
 ---
 
@@ -1365,6 +1393,99 @@ test billing::test_charge ... FAILED
 - [ ] Use JSON-RPC over WebSocket for bidirectional IPC between Flutter client and agent-code backend (per prior architectural decision: HTTP+SSE fails at bidirectional permission prompting; stdio fails at reconnection)
 - [ ] All clients share the same backend
 
+**Phased delivery:**
+
+- [ ] Phase A — headless `--serve` (already available) hardened with auth tokens and reconnection semantics
+- [ ] Phase B — thin desktop shell wrapping the TUI over a local WebSocket, reusing the same session protocol as the CLI
+- [ ] Phase C — static web client served from the daemon, gated behind signed-token auth
+- [ ] Security default: bind to `127.0.0.1` only; LAN exposure requires an explicit `--listen` flag plus a generated bearer token stored in the OS keychain
+- [ ] Document the session protocol as a stable contract so third-party clients can be built against it
+
+### 7.22 Reversible Edit History
+
+Every file-mutating tool call is recorded to a per-session edit log so the user can roll back or replay changes without leaving the REPL. Complements git worktree isolation for in-flight experimentation.
+
+- [ ] Append-only edit journal under `.agent-code/edits/<session-id>.log` capturing `{tool_call_id, path, pre_hash, post_hash, patch}`
+- [ ] `/undo [n]` reverts the last `n` tool-call groups (default 1); `/redo [n]` re-applies them
+- [ ] Grouping boundary = one assistant turn, so a single `/undo` rolls back a multi-file edit atomically
+- [ ] Persisted across `--resume`; truncated on explicit `/reset`
+- [ ] Refuse to undo past a git commit made during the session (print guidance to use `git revert` instead)
+- [ ] Open question: interaction with external edits between tool calls — detect via pre-edit hash and prompt before overwriting
+
+### 7.23 Multimodal Input in TUI
+
+Vision-capable providers already accept image content blocks. Expose that in the REPL so users can drop in screenshots, design specs, or error screenshots without leaving the terminal.
+
+- [ ] Clipboard paste of images (`Ctrl+V` when an image is on the system clipboard) attached to the next user turn
+- [ ] Drag-and-drop of image files onto the terminal window on platforms that support `TERM_PROGRAM` file drops
+- [ ] Inline `/image <path>` command as a universal fallback
+- [ ] Rendered as an ASCII thumbnail in the transcript with the filename; full image shipped as a content block
+- [ ] Graceful degradation for text-only providers: replace the image block with `[image: <filename>, <dimensions>]` and surface a one-time warning
+- [ ] Token accounting in `/cost` reflects image tokens per provider pricing
+
+### 7.24 Configuration Profiles
+
+A profile is a named bundle of `{model, provider, sandbox policy, permission set, reasoning effort, tool allowlist, skills}` that can be activated at launch or mid-session. Distinct from agents (runtime personas) — profiles are launch-time execution contexts.
+
+- [ ] `~/.config/agent-code/profiles.toml` with `[profiles.<name>]` tables
+- [ ] `--profile <name>` CLI flag and `/profile <name>` slash command
+- [ ] Profile inheritance: `extends = "base"` for shared defaults
+- [ ] Built-in profiles: `safe` (read-only, cheap model), `dev` (full permissions, premium model), `ci` (headless, strict sandbox, low reasoning)
+- [ ] `/profile` with no argument prints the active profile and its effective settings
+- [ ] Interaction with 7.4 sandboxing: profile pins a sandbox policy id; profile switches re-enter the sandbox
+
+### 7.25 Enterprise TLS and Proxy Support
+
+Corporate environments require custom root CAs and forward proxies. Add first-class support so enterprise users do not have to monkey-patch `reqwest`.
+
+- [ ] Honor `AGENT_CODE_CA_CERTIFICATE` and the standard `SSL_CERT_FILE` env vars, loading a PEM bundle into the HTTP client
+- [ ] Respect `http_proxy`, `https_proxy`, `no_proxy` (already partially true via `reqwest`, but verified end-to-end and documented)
+- [ ] Config-file equivalents: `[network] ca_certificate = "..."` and `[network] proxy = "..."`
+- [ ] `/doctor` reports the resolved CA bundle path and active proxy, masking credentials
+- [ ] Docs: enterprise setup page covering ZScaler, Netskope, and self-signed internal gateways
+
+### 7.26 SQLite Session Store
+
+Session history currently lives as on-disk JSON blobs. Moving to SQLite unlocks fast resume, full-text search, and cross-session analytics without reading every file.
+
+- [ ] `sessions.db` at `~/.local/state/agent-code/` with tables for sessions, turns, tool_calls, and artifacts
+- [ ] FTS5 virtual table indexing user prompts and assistant responses for `/history search <query>`
+- [ ] `/history list`, `/history show <id>`, `/history export <id> --format json`
+- [ ] Migration tool reading existing JSON blobs and backfilling the database
+- [ ] Gated behind a feature flag until migration has shipped for at least one release
+- [ ] Size management: auto-vacuum, retention policy configurable (`sessions.retain_days`)
+
+### 7.27 `@`-Mention File Picker
+
+Typing `@` in the REPL opens an inline fuzzy finder over workspace files. Selecting a file inlines its path into the prompt and pre-reads it into context, removing the "ask the agent to read X" round-trip.
+
+- [ ] Fuzzy picker component in the TUI, backed by a ripgrep-powered file walker respecting `.gitignore`
+- [ ] Selected paths rendered as chips in the input line; submission inlines them as `@path/to/file`
+- [ ] Agent loop pre-reads `@`-mentioned files into the next user turn as tool-free context
+- [ ] Supports directories (reads a shallow listing) and glob patterns (`@src/**/*.rs` reads matching files up to a size cap)
+- [ ] Configurable size cap and file-count cap to prevent context blowout
+
+### 7.28 Turn-Lifecycle Hooks
+
+User-configured hooks that execute on agent lifecycle events, enabling OS notifications, Slack pings, metrics emission, and arbitrary automation. Complements existing hook support by standardizing the event surface.
+
+- [ ] Event set: `turn_start`, `turn_end`, `tool_call_start`, `tool_call_end`, `error`, `permission_prompt`
+- [ ] Hooks configured in `settings.json` under `hooks.lifecycle` with a shell command and filter predicates
+- [ ] JSON payload delivered on stdin with `event`, `session_id`, `turn_id`, `tool_name`, `duration_ms`, `exit_code`
+- [ ] Built-in recipes page: macOS `terminal-notifier`, Linux `notify-send`, Slack webhook, Prometheus pushgateway
+- [ ] Hooks run with a strict timeout; failures logged but do not block the agent loop
+
+### 7.29 Project Rules
+
+Plain-text per-project steering notes injected as high-priority system instructions. Distinct from `CLAUDE.md` (long-form documentation) and Skills (code + prompts) — rules are short, composable, and turn-scoped.
+
+- [ ] `.agent-code/rules/*.md` directory with one rule per file, YAML frontmatter for metadata (title, priority, `glob:` activation)
+- [ ] Glob-matched activation: a rule with `glob: "crates/lib/**/*.rs"` is injected only when the turn references a matching file
+- [ ] `/rules list`, `/rules enable <name>`, `/rules disable <name>` for ad-hoc toggling
+- [ ] Ordering: rules are injected after `CLAUDE.md` but before the user turn, with priority-based ordering inside that block
+- [ ] Rules count against a configurable token budget; overflow is reported in `/cost`
+- [ ] Open question: promotion path from a rule that proves useful to a full Skill
+
 ---
 
 ## Performance Targets — In Progress
@@ -1414,4 +1535,4 @@ Priority areas where contributions are most welcome:
 
 ---
 
-*Last updated: 2026-04-06*
+*Last updated: 2026-04-14*
