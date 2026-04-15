@@ -1,4 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, UserMessage};
 use agent_code_lib::services::tokens::{estimate_context_tokens, estimate_tokens};
