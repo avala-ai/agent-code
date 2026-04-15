@@ -18,7 +18,9 @@ on:
           - openai/gpt-5-mini              # recommended default: reliable + cheap
           - openai/gpt-5                   # full gpt-5, higher cost
           - anthropic/claude-haiku-4.5     # reliable tool-use, cheap
-          - anthropic/claude-sonnet-4.5    # strongest tool-use, more expensive
+          - anthropic/claude-sonnet-4.5    # strong tool-use, mid cost
+          - anthropic/claude-opus-4.6      # strongest tool-use, highest cost
+          - x-ai/grok-4                    # xAI flagship, tool-use capable
           - google/gemini-2.5-flash        # fast, good tool-use
           - deepseek/deepseek-v3.1         # open-weight alternative
 
