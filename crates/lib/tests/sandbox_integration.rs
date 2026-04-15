@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use agent_code_lib::config::SandboxConfig;
 use agent_code_lib::permissions::PermissionChecker;
 use agent_code_lib::sandbox::SandboxExecutor;
@@ -329,6 +329,219 @@ async fn sandboxed_bash_can_write_to_allowed_path() {
         "target file should exist at {}",
         target.display()
     );
+}
+
+// ──────────────────────────────────────────────────────────────────
+//  Linux bwrap regression tests
+// ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn bwrap_cfg(allowed_write_paths: Vec<String>) -> SandboxConfig {
+    SandboxConfig {
+        enabled: true,
+        strategy: "bwrap".to_string(),
+        allowed_write_paths,
+        forbidden_paths: vec![],
+        // Leave network on so package-manager-style commands in bash
+        // do not appear to hang while CI runs these tests.
+        allow_network: true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_blocks_writes_outside_project_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = Arc::new(SandboxExecutor::from_config(&bwrap_cfg(vec![]), tmp.path()));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available on this runner");
+        return;
+    }
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let marker = "/etc/agent-code-bwrap-test-marker";
+    let result = bash
+        .call(
+            serde_json::json!({
+                "command": format!("echo test > {marker} 2>&1; echo exit=$?"),
+            }),
+            &ctx,
+        )
+        .await
+        .expect("bash tool call should return a ToolResult");
+
+    // The ro-bind / / mount means /etc is read-only inside the namespace;
+    // the write will fail with Permission denied / Read-only file system.
+    assert!(
+        result.content.contains("denied")
+            || result.content.contains("Read-only")
+            || result.content.contains("exit=1"),
+        "expected denial, got: {}",
+        result.content
+    );
+    assert!(
+        !std::path::Path::new(marker).exists(),
+        "marker file must not have leaked onto the host at {marker}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_allows_writes_inside_project_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = Arc::new(SandboxExecutor::from_config(&bwrap_cfg(vec![]), tmp.path()));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available");
+        return;
+    }
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let result = bash
+        .call(
+            serde_json::json!({
+                "command": "echo sandboxed > inside.txt && cat inside.txt",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("bash call should succeed");
+    assert!(
+        !result.is_error,
+        "inside-project write failed: {}",
+        result.content
+    );
+    assert!(result.content.contains("sandboxed"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_honors_allowed_write_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let extra_path = extra.path().display().to_string();
+    let exec = Arc::new(SandboxExecutor::from_config(
+        &bwrap_cfg(vec![extra_path.clone()]),
+        tmp.path(),
+    ));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available");
+        return;
+    }
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let target = extra.path().join("probe.txt");
+    let result = bash
+        .call(
+            serde_json::json!({
+                "command": format!("echo allowed > {}", target.display()),
+            }),
+            &ctx,
+        )
+        .await
+        .expect("bash call should succeed");
+    assert!(
+        !result.is_error,
+        "write to allowed_write_paths entry should succeed: {}",
+        result.content
+    );
+    assert!(
+        target.exists(),
+        "target file should exist at {}",
+        target.display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_preserves_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = Arc::new(SandboxExecutor::from_config(&bwrap_cfg(vec![]), tmp.path()));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available");
+        return;
+    }
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let result = bash
+        .call(serde_json::json!({"command": "pwd"}), &ctx)
+        .await
+        .expect("pwd should succeed");
+    assert!(!result.is_error, "pwd failed: {}", result.content);
+    let expected = std::fs::canonicalize(tmp.path()).unwrap();
+    assert!(
+        result.content.contains(&*expected.display().to_string())
+            || result.content.contains(&*tmp.path().display().to_string()),
+        "pwd output did not match temp dir: {}",
+        result.content
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_dangerously_disable_sandbox_bypasses_when_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = Arc::new(SandboxExecutor::from_config(&bwrap_cfg(vec![]), tmp.path()));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available");
+        return;
+    }
+    assert!(exec.allow_bypass());
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let probe = format!("/tmp/agent-code-bwrap-bypass-{}", std::process::id());
+    let result = bash
+        .call(
+            serde_json::json!({
+                "command": format!("echo bypass > {probe} && rm {probe} && echo ok"),
+                "dangerouslyDisableSandbox": true,
+            }),
+            &ctx,
+        )
+        .await
+        .expect("bash call should succeed");
+    assert!(
+        !result.is_error,
+        "bypass path should succeed; got: {}",
+        result.content
+    );
+    assert!(result.content.contains("ok"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_dangerously_disable_sandbox_is_ignored_when_bypass_denied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = Arc::new(SandboxExecutor::from_config_with_bypass(
+        &bwrap_cfg(vec![]),
+        tmp.path(),
+        false,
+    ));
+    if !exec.is_active() {
+        eprintln!("skipping: bwrap not available");
+        return;
+    }
+    assert!(!exec.allow_bypass());
+    let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
+    let bash = BashTool;
+    let marker = "/etc/agent-code-bwrap-bypass-denied-marker";
+    let result = bash
+        .call(
+            serde_json::json!({
+                "command": format!("echo test > {marker} 2>&1; echo exit=$?"),
+                "dangerouslyDisableSandbox": true,
+            }),
+            &ctx,
+        )
+        .await
+        .expect("bash call should return a ToolResult");
+    assert!(
+        result.content.contains("denied")
+            || result.content.contains("Read-only")
+            || result.content.contains("exit=1"),
+        "write should have been blocked despite bypass flag, got: {}",
+        result.content
+    );
+    assert!(!std::path::Path::new(marker).exists());
 }
 
 #[cfg(target_os = "macos")]

@@ -9,9 +9,9 @@
 //!
 //! # Platform support
 //!
-//! This first slice ships **macOS only** using `sandbox-exec` (Seatbelt).
-//! Linux `bwrap` and Windows Low Integrity strategies will land as
-//! follow-up PRs behind the same [`SandboxStrategy`] trait.
+//! - **macOS**: `sandbox-exec` (Seatbelt) via [`seatbelt::SeatbeltStrategy`]
+//! - **Linux**: `bwrap` (bubblewrap) via [`bwrap::BwrapStrategy`]
+//! - **Windows**: deferred to a follow-up PR; falls back to [`NoopStrategy`]
 //!
 //! # Wiring
 //!
@@ -22,6 +22,7 @@
 //! `Command` before `.spawn()`. When sandboxing is disabled or the
 //! platform has no strategy, `wrap` returns the command unchanged.
 
+pub mod bwrap;
 pub mod policy;
 pub mod seatbelt;
 
@@ -196,6 +197,7 @@ fn pick_strategy(requested: &str) -> Arc<dyn SandboxStrategy> {
     match requested {
         "none" => Arc::new(NoopStrategy),
         "seatbelt" => make_seatbelt_or_noop(),
+        "bwrap" => make_bwrap_or_noop(),
         "auto" | "" => auto_detect(),
         other => {
             warn!("unknown sandbox strategy {other:?}; falling back to noop");
@@ -207,28 +209,38 @@ fn pick_strategy(requested: &str) -> Arc<dyn SandboxStrategy> {
 fn auto_detect() -> Arc<dyn SandboxStrategy> {
     if cfg!(target_os = "macos") {
         make_seatbelt_or_noop()
+    } else if cfg!(target_os = "linux") {
+        make_bwrap_or_noop()
     } else {
         Arc::new(NoopStrategy)
     }
 }
 
 fn make_seatbelt_or_noop() -> Arc<dyn SandboxStrategy> {
-    if cfg!(target_os = "macos") && sandbox_exec_available() {
+    if cfg!(target_os = "macos") && binary_on_path("sandbox-exec") {
         Arc::new(seatbelt::SeatbeltStrategy)
     } else {
         Arc::new(NoopStrategy)
     }
 }
 
-/// True if `sandbox-exec` is resolvable on `$PATH`.
-fn sandbox_exec_available() -> bool {
-    // Probe via `which`-style $PATH walk. We avoid `std::process::Command`
+fn make_bwrap_or_noop() -> Arc<dyn SandboxStrategy> {
+    if cfg!(target_os = "linux") && binary_on_path("bwrap") {
+        Arc::new(bwrap::BwrapStrategy)
+    } else {
+        Arc::new(NoopStrategy)
+    }
+}
+
+/// True if the named binary is resolvable on `$PATH`.
+fn binary_on_path(name: &str) -> bool {
+    // Probe via a `which`-style $PATH walk. We avoid `std::process::Command`
     // here to keep this synchronous and not spawn a child at detect time.
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
     for dir in std::env::split_paths(&path) {
-        if dir.join("sandbox-exec").is_file() {
+        if dir.join(name).is_file() {
             return true;
         }
     }
@@ -284,6 +296,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn auto_detect_on_linux_picks_bwrap_or_noop() {
+        // CI may or may not have bwrap installed; accept either outcome
+        // but forbid accidentally picking seatbelt on Linux.
+        let name = auto_detect().name();
+        assert!(
+            name == "bwrap" || name == "noop",
+            "expected bwrap or noop on Linux, got {name}"
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn pick_strategy_seatbelt_matches_make_seatbelt() {
         assert_eq!(pick_strategy("seatbelt").name(), "seatbelt");
@@ -295,6 +319,24 @@ mod tests {
         // Selecting seatbelt on Linux should silently degrade to noop
         // rather than crashing at config-load time.
         assert_eq!(pick_strategy("seatbelt").name(), "noop");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pick_strategy_bwrap_on_linux_matches_make_bwrap() {
+        let name = pick_strategy("bwrap").name();
+        assert!(
+            name == "bwrap" || name == "noop",
+            "expected bwrap or noop on Linux, got {name}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn pick_strategy_bwrap_off_linux_is_noop() {
+        // Selecting bwrap on macOS/Windows silently degrades rather
+        // than crashing the session.
+        assert_eq!(pick_strategy("bwrap").name(), "noop");
     }
 
     #[test]
