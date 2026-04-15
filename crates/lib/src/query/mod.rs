@@ -53,6 +53,9 @@ pub struct QueryEngine {
     permissions: Arc<PermissionChecker>,
     state: AppState,
     config: QueryEngineConfig,
+    /// Shared handle so the signal handler always cancels the current token.
+    cancel_shared: Arc<std::sync::Mutex<CancellationToken>>,
+    /// Per-turn cancellation token (cloned from cancel_shared at turn start).
     cancel: CancellationToken,
     hooks: HookRegistry,
     cache_tracker: crate::services::cache_tracking::CacheTracker,
@@ -94,6 +97,8 @@ impl QueryEngine {
         state: AppState,
         config: QueryEngineConfig,
     ) -> Self {
+        let cancel = CancellationToken::new();
+        let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
         Self {
             llm,
             tools,
@@ -103,7 +108,8 @@ impl QueryEngine {
             permissions: Arc::new(permissions),
             state,
             config,
-            cancel: CancellationToken::new(),
+            cancel,
+            cancel_shared,
             hooks: HookRegistry::new(),
             cache_tracker: crate::services::cache_tracking::CacheTracker::new(),
             denial_tracker: Arc::new(tokio::sync::Mutex::new(
@@ -142,15 +148,18 @@ impl QueryEngine {
     /// Call this once at startup. Subsequent Ctrl+C signals during a
     /// turn will cancel the active operation instead of killing the process.
     pub fn install_signal_handler(&self) {
-        let cancel = self.cancel.clone();
+        let shared = self.cancel_shared.clone();
         tokio::spawn(async move {
+            let mut pending = false;
             loop {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    if cancel.is_cancelled() {
-                        // Second Ctrl+C — hard exit.
+                    let token = shared.lock().unwrap().clone();
+                    if token.is_cancelled() && pending {
+                        // Second Ctrl+C after cancel — hard exit.
                         std::process::exit(130);
                     }
-                    cancel.cancel();
+                    token.cancel();
+                    pending = true;
                 }
             }
         });
@@ -167,8 +176,10 @@ impl QueryEngine {
         user_input: &str,
         sink: &dyn StreamSink,
     ) -> crate::error::Result<()> {
-        // Reset cancellation token for this turn.
+        // Reset cancellation token for this turn. The shared handle is
+        // updated so the signal handler always cancels the current token.
         self.cancel = CancellationToken::new();
+        *self.cancel_shared.lock().unwrap() = self.cancel.clone();
 
         // Add the user message to history.
         let user_msg = user_message(user_input);
@@ -437,80 +448,101 @@ impl QueryEngine {
                 tokio::task::JoinHandle<crate::tools::ToolResult>,
             )> = Vec::new();
 
-            while let Some(event) = rx.recv().await {
-                match event {
-                    StreamEvent::TextDelta(text) => {
-                        sink.on_text(&text);
-                    }
-                    StreamEvent::ContentBlockComplete(block) => {
-                        if let ContentBlock::ToolUse {
-                            ref id,
-                            ref name,
-                            ref input,
-                        } = block
-                        {
-                            sink.on_tool_start(name, input);
-
-                            // Start read-only tools immediately during streaming.
-                            if let Some(tool) = self.tools.get(name)
-                                && tool.is_read_only()
-                                && tool.is_concurrency_safe()
-                            {
-                                let tool = tool.clone();
-                                let input = input.clone();
-                                let cwd = std::path::PathBuf::from(&self.state.cwd);
-                                let cancel = self.cancel.clone();
-                                let perm = self.permissions.clone();
-                                let tool_id = id.clone();
-                                let tool_name = name.clone();
-
-                                let handle = tokio::spawn(async move {
-                                    match tool
-                                        .call(
-                                            input,
-                                            &ToolContext {
-                                                cwd,
-                                                cancel,
-                                                permission_checker: perm.clone(),
-                                                verbose: false,
-                                                plan_mode: false,
-                                                file_cache: None,
-                                                denial_tracker: None,
-                                                task_manager: None,
-                                                session_allows: None,
-                                                permission_prompter: None,
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        Ok(r) => r,
-                                        Err(e) => crate::tools::ToolResult::error(e.to_string()),
-                                    }
-                                });
-
-                                streaming_tool_handles.push((tool_id, tool_name, handle));
+            let mut cancelled = false;
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Some(StreamEvent::TextDelta(text)) => {
+                                sink.on_text(&text);
                             }
+                            Some(StreamEvent::ContentBlockComplete(block)) => {
+                                if let ContentBlock::ToolUse {
+                                    ref id,
+                                    ref name,
+                                    ref input,
+                                } = block
+                                {
+                                    sink.on_tool_start(name, input);
+
+                                    // Start read-only tools immediately during streaming.
+                                    if let Some(tool) = self.tools.get(name)
+                                        && tool.is_read_only()
+                                        && tool.is_concurrency_safe()
+                                    {
+                                        let tool = tool.clone();
+                                        let input = input.clone();
+                                        let cwd = std::path::PathBuf::from(&self.state.cwd);
+                                        let cancel = self.cancel.clone();
+                                        let perm = self.permissions.clone();
+                                        let tool_id = id.clone();
+                                        let tool_name = name.clone();
+
+                                        let handle = tokio::spawn(async move {
+                                            match tool
+                                                .call(
+                                                    input,
+                                                    &ToolContext {
+                                                        cwd,
+                                                        cancel,
+                                                        permission_checker: perm.clone(),
+                                                        verbose: false,
+                                                        plan_mode: false,
+                                                        file_cache: None,
+                                                        denial_tracker: None,
+                                                        task_manager: None,
+                                                        session_allows: None,
+                                                        permission_prompter: None,
+                                                    },
+                                                )
+                                                .await
+                                            {
+                                                Ok(r) => r,
+                                                Err(e) => crate::tools::ToolResult::error(e.to_string()),
+                                            }
+                                        });
+
+                                        streaming_tool_handles.push((tool_id, tool_name, handle));
+                                    }
+                                }
+                                if let ContentBlock::Thinking { ref thinking, .. } = block {
+                                    sink.on_thinking(thinking);
+                                }
+                                content_blocks.push(block);
+                            }
+                            Some(StreamEvent::Done {
+                                usage: u,
+                                stop_reason: sr,
+                            }) => {
+                                usage = u;
+                                stop_reason = sr;
+                                sink.on_usage(&usage);
+                            }
+                            Some(StreamEvent::Error(msg)) => {
+                                got_error = true;
+                                error_text = msg.clone();
+                                sink.on_error(&msg);
+                            }
+                            Some(_) => {}
+                            None => break,
                         }
-                        if let ContentBlock::Thinking { ref thinking, .. } = block {
-                            sink.on_thinking(thinking);
+                    }
+                    _ = self.cancel.cancelled() => {
+                        warn!("Turn cancelled by user");
+                        cancelled = true;
+                        // Abort any in-flight streaming tool handles.
+                        for (_, _, handle) in streaming_tool_handles.drain(..) {
+                            handle.abort();
                         }
-                        content_blocks.push(block);
+                        break;
                     }
-                    StreamEvent::Done {
-                        usage: u,
-                        stop_reason: sr,
-                    } => {
-                        usage = u;
-                        stop_reason = sr;
-                        sink.on_usage(&usage);
-                    }
-                    StreamEvent::Error(msg) => {
-                        got_error = true;
-                        error_text = msg.clone();
-                        sink.on_error(&msg);
-                    }
-                    _ => {}
                 }
+            }
+
+            if cancelled {
+                sink.on_warning("Cancelled");
+                self.state.is_query_active = false;
+                return Ok(());
             }
 
             // Step 5: Record the assistant message.
@@ -1044,4 +1076,173 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
     );
 
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that cancelling via the shared handle cancels the current
+    /// turn's token (regression: the signal handler previously held a
+    /// stale clone that couldn't cancel subsequent turns).
+    #[test]
+    fn cancel_shared_propagates_to_current_token() {
+        let root = CancellationToken::new();
+        let shared = Arc::new(std::sync::Mutex::new(root.clone()));
+
+        // Simulate turn reset: create a new token and update the shared handle.
+        let turn1 = CancellationToken::new();
+        *shared.lock().unwrap() = turn1.clone();
+
+        // Cancelling via the shared handle should cancel turn1.
+        shared.lock().unwrap().cancel();
+        assert!(turn1.is_cancelled());
+
+        // New turn: replace the token. The old cancellation shouldn't affect it.
+        let turn2 = CancellationToken::new();
+        *shared.lock().unwrap() = turn2.clone();
+        assert!(!turn2.is_cancelled());
+
+        // Cancelling via shared should cancel turn2.
+        shared.lock().unwrap().cancel();
+        assert!(turn2.is_cancelled());
+    }
+
+    /// Verify that the streaming loop breaks on cancellation by simulating
+    /// the select pattern used in run_turn_with_sink.
+    #[tokio::test]
+    async fn stream_loop_responds_to_cancellation() {
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(10);
+
+        // Simulate a slow stream: send one event, then cancel before more arrive.
+        tx.send(StreamEvent::TextDelta("hello".into()))
+            .await
+            .unwrap();
+
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            // Small delay, then cancel.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel2.cancel();
+        });
+
+        let mut events_received = 0u32;
+        let mut cancelled = false;
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(_) => events_received += 1,
+                        None => break,
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(cancelled, "Loop should have been cancelled");
+        assert_eq!(
+            events_received, 1,
+            "Should have received exactly one event before cancel"
+        );
+    }
+
+    /// End-to-end regression test for #103: verifies that cancelling a
+    /// QueryEngine turn mid-stream actually interrupts the loop.
+    ///
+    /// Builds a mock provider whose stream hangs forever after one event,
+    /// starts a real turn, then calls `engine.cancel()` and asserts the
+    /// turn returns quickly. Without the tokio::select! fix, this would
+    /// hang until the test timeout.
+    #[tokio::test]
+    async fn run_turn_with_sink_interrupts_on_cancel() {
+        use crate::config::Config;
+        use crate::llm::provider::{Provider, ProviderError, ProviderRequest};
+        use crate::permissions::PermissionChecker;
+        use crate::state::AppState;
+        use crate::tools::registry::ToolRegistry;
+
+        /// A provider whose stream yields one TextDelta and then hangs forever.
+        struct HangingProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for HangingProvider {
+            fn name(&self) -> &str {
+                "hanging-mock"
+            }
+
+            async fn stream(
+                &self,
+                _request: &ProviderRequest,
+            ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, ProviderError> {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                tokio::spawn(async move {
+                    let _ = tx.send(StreamEvent::TextDelta("thinking...".into())).await;
+                    // Hang forever without closing the channel or sending Done.
+                    // This simulates the real bug: a slow LLM response that
+                    // the user wants to interrupt.
+                    let _tx_holder = tx;
+                    std::future::pending::<()>().await;
+                });
+                Ok(rx)
+            }
+        }
+
+        let llm = Arc::new(HangingProvider);
+        let tools = ToolRegistry::default_tools();
+        let config = Config::default();
+        let permissions = PermissionChecker::from_config(&config.permissions);
+        let state = AppState::new(config);
+
+        let mut engine = QueryEngine::new(
+            llm,
+            tools,
+            permissions,
+            state,
+            QueryEngineConfig {
+                max_turns: Some(1),
+                verbose: false,
+                unattended: true,
+            },
+        );
+
+        // Clone the shared handle so the background task can cancel the
+        // *current* turn's token (the same path the signal handler uses).
+        // Cloning cancel_token() directly would capture the pre-turn token,
+        // which gets replaced when run_turn_with_sink starts.
+        let shared = engine.cancel_shared.clone();
+
+        // Cancel the engine after a short delay so the stream has time
+        // to produce its first event and the loop is blocked on rx.recv().
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            shared.lock().unwrap().cancel();
+        });
+
+        // Run the turn. Without the fix, this hangs forever; with the fix,
+        // it returns Ok(()) once cancellation is detected.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.run_turn_with_sink("test input", &NullSink),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_turn_with_sink should return promptly on cancel, not hang"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "cancelled turn should return Ok(()), not an error"
+        );
+        assert!(
+            !engine.state().is_query_active,
+            "is_query_active should be reset after cancel"
+        );
+    }
 }

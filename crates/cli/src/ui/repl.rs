@@ -270,8 +270,70 @@ impl StreamSink for TerminalSink {
     }
 }
 
-// Escape key watcher removed — it competed with rustyline for stdin,
-// causing dropped keystrokes. Use Ctrl+C to cancel streaming instead.
+/// Spawn a background task that watches for the Escape key during streaming.
+/// Returns a guard that stops the watcher on drop (restoring terminal state).
+/// Uses crossterm raw mode only while actively polling, and yields quickly
+/// to avoid competing with rustyline for stdin.
+fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
+    let cancel_token = engine.cancel_token();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+
+    let handle = std::thread::spawn(move || {
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // Enable raw mode so we can capture individual keypresses.
+        if crossterm::terminal::enable_raw_mode().is_err() {
+            return;
+        }
+
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            // Poll with a short timeout to check the stop flag frequently.
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
+                && let Ok(Event::Key(KeyEvent {
+                    code, modifiers, ..
+                })) = event::read()
+            {
+                match code {
+                    KeyCode::Esc => {
+                        cancel_token.cancel();
+                        break;
+                    }
+                    // Also handle Ctrl+C here since raw mode intercepts it.
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        cancel_token.cancel();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let _ = crossterm::terminal::disable_raw_mode();
+    });
+
+    EscapeWatcherGuard {
+        stop,
+        handle: Some(handle),
+    }
+}
+
+/// RAII guard that stops the escape watcher thread and restores terminal state.
+struct EscapeWatcherGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for EscapeWatcherGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        // Ensure raw mode is off even if thread panicked.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
 
 /// Run the interactive REPL loop.
 pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
@@ -481,8 +543,8 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                     );
                     println!(
                         "  {}  {}",
-                        "Ctrl+C".with(t.text),
-                        "cancel (twice to exit)".with(t.muted),
+                        "Esc / Ctrl+C".with(t.text),
+                        "cancel (Ctrl+C twice to exit)".with(t.muted),
                     );
                     println!(
                         "  {}  {}",
@@ -673,6 +735,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 }
 
                 // Run the agent turn with Escape key watcher for cancellation.
+                let _esc_guard = spawn_escape_watcher(engine);
                 sink.start_indicator();
                 if let Err(e) = engine.run_turn_with_sink(input, &sink).await {
                     {
@@ -683,6 +746,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                         );
                     }
                 }
+                drop(_esc_guard);
                 sink.ensure_newline();
                 println!();
 
