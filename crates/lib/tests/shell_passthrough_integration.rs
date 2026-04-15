@@ -103,6 +103,7 @@ fn shell_message_serialization_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "requires bash")]
 fn subprocess_respects_working_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let marker_path = tmp.path().join("cwd_test.txt");
@@ -115,6 +116,7 @@ fn subprocess_respects_working_directory() {
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "requires bash")]
 fn subprocess_captures_exit_codes() {
     let dir = std::env::temp_dir();
 
@@ -132,6 +134,7 @@ fn subprocess_captures_exit_codes() {
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "requires bash")]
 fn subprocess_handles_binary_output_gracefully() {
     let dir = std::env::temp_dir();
     // printf with null bytes — BufReader should handle this without panic.
@@ -142,6 +145,7 @@ fn subprocess_handles_binary_output_gracefully() {
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "requires bash")]
 fn subprocess_captures_long_running_output() {
     let dir = std::env::temp_dir();
     // 500 lines — should all be captured (well under 50KB).
@@ -155,6 +159,7 @@ fn subprocess_captures_long_running_output() {
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore = "requires bash")]
 fn subprocess_truncation_preserves_complete_lines() {
     let dir = std::env::temp_dir();
     // Generate 60KB of output (>50KB limit).
