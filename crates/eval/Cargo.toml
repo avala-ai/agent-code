@@ -10,7 +10,7 @@ name = "eval_runner"
 path = "src/main.rs"
 
 [dependencies]
-agent-code-lib = { path = "../lib", version = "0.14.0" }
+agent-code-lib = { path = "../lib", version = "0.15.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
