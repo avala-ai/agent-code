@@ -154,10 +154,10 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 - [x] **`agent --attach [session-id]`** — Reconnect by session ID prefix or interactive selection
 - [x] SSE event stream for real-time updates (GET /events with 10 event types)
 
-### 3.5 Self-Management Commands — Partially Done
+### 3.5 Self-Management Commands — Done
 
 - [x] **`/update`** — Check GitHub releases API, notify if newer version
-- [ ] **`/uninstall`** — Remove binary, config, and data directories with confirmation
+- [x] **`/uninstall`** — Remove binary, config, and data directories with confirmation
 
 ---
 
