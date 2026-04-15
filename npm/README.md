@@ -7,7 +7,7 @@ This is the npm wrapper package — it downloads the correct prebuilt binary for
 ## Install
 
 ```bash
-npm install -g agent-code
+npm install -g @avala-ai/agent-code
 ```
 
 ## Usage
