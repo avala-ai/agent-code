@@ -32,9 +32,15 @@ fn detect_install_method() -> InstallMethod {
 
     if path_str.contains(".cargo") {
         InstallMethod::Cargo
-    } else if path_str.contains("homebrew") || path_str.contains("Cellar") || path_str.contains("linuxbrew") {
+    } else if path_str.contains("homebrew")
+        || path_str.contains("Cellar")
+        || path_str.contains("linuxbrew")
+    {
         InstallMethod::Homebrew
-    } else if path_str.contains("node_modules") || path_str.contains("npm") || path_str.contains("npx") {
+    } else if path_str.contains("node_modules")
+        || path_str.contains("npm")
+        || path_str.contains("npx")
+    {
         InstallMethod::Npm
     } else {
         InstallMethod::Manual(exe)
@@ -140,20 +146,20 @@ pub fn run(args: Option<&str>) {
     let binary_ok = match &method {
         InstallMethod::Cargo => run_package_manager("cargo", &["uninstall", "agent-code"]),
         InstallMethod::Homebrew => run_package_manager("brew", &["uninstall", "agent-code"]),
-        InstallMethod::Npm => run_package_manager("npm", &["uninstall", "-g", "@avala-ai/agent-code"]),
-        InstallMethod::Manual(path) => {
-            match std::fs::remove_file(path) {
-                Ok(()) => {
-                    println!("  Removed binary: {}", path.display());
-                    true
-                }
-                Err(e) => {
-                    eprintln!("  Failed to remove binary: {e}");
-                    eprintln!("  Try manually: sudo rm {}", path.display());
-                    false
-                }
-            }
+        InstallMethod::Npm => {
+            run_package_manager("npm", &["uninstall", "-g", "@avala-ai/agent-code"])
         }
+        InstallMethod::Manual(path) => match std::fs::remove_file(path) {
+            Ok(()) => {
+                println!("  Removed binary: {}", path.display());
+                true
+            }
+            Err(e) => {
+                eprintln!("  Failed to remove binary: {e}");
+                eprintln!("  Try manually: sudo rm {}", path.display());
+                false
+            }
+        },
     };
 
     println!();
