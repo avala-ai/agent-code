@@ -269,6 +269,73 @@ impl SkillRegistry {
                  Present the plan as an ordered checklist the user can approve before \
                  implementation begins.",
             ),
+            (
+                "changelog",
+                "Update CHANGELOG.md from the current diff",
+                true,
+                "Read CHANGELOG.md to learn the project's format (Keep a Changelog is \
+                 common). Inspect the current git diff and recent commits since the last \
+                 release entry. Classify changes into Added / Changed / Fixed / Removed / \
+                 Security. Draft entries that describe user-visible impact, not internal \
+                 refactors. Insert them under an Unreleased section, preserving existing \
+                 formatting. Do not invent changes that aren't in the diff.",
+            ),
+            (
+                "release",
+                "Orchestrate a version release",
+                true,
+                "Follow the project's RELEASING.md if present. Determine the next version \
+                 (patch / minor / major) from the nature of the changes since the last tag. \
+                 Bump version numbers in all manifest files (Cargo.toml, package.json, \
+                 pyproject.toml, etc.) consistently. Stamp CHANGELOG.md with the new version \
+                 and today's date. Run the full test and lint gate before tagging. Create \
+                 the release branch, open a PR, and on merge create the git tag. Never push \
+                 tags without user confirmation.",
+            ),
+            (
+                "benchmark",
+                "Run benchmarks and compare results",
+                true,
+                "Locate the project's benchmark suite (cargo bench, pytest-benchmark, \
+                 criterion, etc.). Run it on the current branch and capture results. If a \
+                 baseline exists (from main or a stored snapshot), compare and report \
+                 regressions and improvements as percentages. Flag any metric that \
+                 regressed more than 5% with file:line context for the likely cause. \
+                 Do not claim a speedup without a baseline to compare against.",
+            ),
+            (
+                "coverage",
+                "Produce a test coverage report and narrative",
+                true,
+                "Run the project's coverage tool (cargo llvm-cov, pytest --cov, c8, etc.). \
+                 Summarize overall coverage and identify the lowest-covered modules. For \
+                 each gap, classify: (a) untested happy path, (b) untested error path, \
+                 (c) untestable boilerplate. Recommend 3-5 high-value tests to add, with \
+                 specific function names. Do not propose tests for generated code or \
+                 trivial getters.",
+            ),
+            (
+                "migrate",
+                "Analyze a dependency upgrade or breaking API migration",
+                true,
+                "Given a target dependency version or API change, read the dependency's \
+                 release notes or migration guide. Grep the codebase for every call site \
+                 affected by the change. Produce a migration plan listing each call site \
+                 with file:line, the old pattern, the new pattern, and whether the change \
+                 is mechanical or requires judgement. Flag any ambiguous call sites for \
+                 human review. Do not perform the migration without an approved plan.",
+            ),
+            (
+                "docs",
+                "Sync documentation with code changes",
+                true,
+                "Inspect the current diff. For every public API that changed (function \
+                 signatures, config keys, CLI flags, tool contracts), find the corresponding \
+                 documentation (rustdoc comments, README sections, docs/ pages, Mintlify \
+                 mdx files) and update it to match. Flag any documented behavior that the \
+                 diff silently breaks. Do not add documentation for code that isn't part \
+                 of the public surface.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {

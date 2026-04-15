@@ -768,6 +768,22 @@ agent --prompt "review this PR" --output-format json 2>/dev/null | process_resul
 - [ ] Add permission auto-denial in JSON mode (with `permission_request` event)
 - [ ] Tests: verify JSONL output parses correctly, verify exit codes, verify stderr/stdout separation
 
+**`--bare` hermetic mode:**
+
+For fully scripted `-p`/`--prompt` invocations in CI, a hermetic mode that disables every user-configurable surface so the run is reproducible across machines.
+
+- [ ] `--bare` flag that skips loading: hooks, LSP, plugins, skills from user/project dirs, MCP servers
+- [ ] Refuses to launch without an explicit API key in env (no interactive auth fallback)
+- [ ] Implies `--output-format json` unless overridden
+- [ ] Document the exact set of disabled surfaces in `docs/reference/bare-mode.mdx`
+
+**`defer` permission decision:**
+
+- [ ] Extend the permission decision enum with `Defer` in addition to `Allow`/`Deny`/`Ask`
+- [ ] In headless mode, a `Defer` decision pauses the session, serializes state, and exits with a new exit code (8) signaling "resumable pause"
+- [ ] `agent --resume <session-id>` picks up where a deferred session left off, replaying the pending tool call
+- [ ] Useful for CI that wants a human to approve a destructive step mid-pipeline
+
 ### 7.8 Remote Agent Protocol
 
 **Priority: Medium** | **Target: v1.2**
@@ -1443,6 +1459,8 @@ Corporate environments require custom root CAs and forward proxies. Add first-cl
 - [ ] Config-file equivalents: `[network] ca_certificate = "..."` and `[network] proxy = "..."`
 - [ ] `/doctor` reports the resolved CA bundle path and active proxy, masking credentials
 - [ ] Docs: enterprise setup page covering ZScaler, Netskope, and self-signed internal gateways
+- [ ] `managed-settings.d/` drop-in policy directory: admin config fragments merged alphabetically, sitting above user config in the precedence chain so org policy cannot be accidentally overridden
+- [ ] `AGENT_CODE_SUBPROCESS_ENV_SCRUB` env var (and config equivalent): strip known credential env vars (`*_API_KEY`, `*_TOKEN`, `AWS_*`) from the environment inherited by bash-tool and plugin subprocesses
 
 ### 7.26 SQLite Session Store
 
@@ -1469,9 +1487,14 @@ Typing `@` in the REPL opens an inline fuzzy finder over workspace files. Select
 
 User-configured hooks that execute on agent lifecycle events, enabling OS notifications, Slack pings, metrics emission, and arbitrary automation. Complements existing hook support by standardizing the event surface.
 
-- [ ] Event set: `turn_start`, `turn_end`, `tool_call_start`, `tool_call_end`, `error`, `permission_prompt`
+- [ ] Event set: `turn_start`, `turn_end`, `tool_call_start`, `tool_call_end`, `error`, `permission_prompt`, `cwd_changed`, `file_changed`, `instructions_loaded`, `task_created`, `stop_failure`, `permission_denied`, `post_compact`
+- [ ] `cwd_changed` / `file_changed` enable reactive env management (direnv-style auto-reload) and targeted context refresh after external edits
+- [ ] `instructions_loaded` fires when `CLAUDE.md`, `AGENTS.md`, or project rules enter context — useful for attaching provenance telemetry
+- [ ] `post_compact` fires after compaction and lets hooks re-inject pinned context the compactor dropped
+- [ ] `stop_failure` fires on terminal API errors (rate limit, auth) so external supervisors can retry or page
 - [ ] Hooks configured in `settings.json` under `hooks.lifecycle` with a shell command and filter predicates
-- [ ] JSON payload delivered on stdin with `event`, `session_id`, `turn_id`, `tool_name`, `duration_ms`, `exit_code`
+- [ ] JSON payload delivered on stdin with `event`, `session_id`, `turn_id`, `tool_name`, `duration_ms`, `exit_code`, plus `agent_id` / `agent_type` for subagent events
+- [ ] Conditional `if` field on hooks (permission-rule syntax) for fine-grained filtering
 - [ ] Built-in recipes page: macOS `terminal-notifier`, Linux `notify-send`, Slack webhook, Prometheus pushgateway
 - [ ] Hooks run with a strict timeout; failures logged but do not block the agent loop
 
@@ -1485,6 +1508,45 @@ Plain-text per-project steering notes injected as high-priority system instructi
 - [ ] Ordering: rules are injected after `CLAUDE.md` but before the user turn, with priority-based ordering inside that block
 - [ ] Rules count against a configurable token budget; overflow is reported in `/cost`
 - [ ] Open question: promotion path from a rule that proves useful to a full Skill
+
+### 7.30 MCP Elicitation
+
+MCP servers sometimes need to ask the user for structured input mid-task (a form field, a confirmation, a browser URL to complete OAuth). Today our MCP client can only receive tool results — it has no surface for the server to request input.
+
+- [ ] Implement the MCP `elicitation/create` request on the client side, matching the current MCP spec shape
+- [ ] TUI elicitation modal: render form fields (text, boolean, choice) with validation and a cancel path
+- [ ] Non-interactive mode: elicitation requests emit a `permission_request`-style event in the JSON stream (§7.7) and auto-cancel unless `--auto-elicit` is set
+- [ ] Browser-flow elicitation: servers may request `{type: "open_url"}` — we open the URL locally, collect the result token on a loopback callback, and return it
+- [ ] Per-server `elicitation.allowed: bool` setting so admins can disable the surface
+
+### 7.31 Skill and Plugin Validator
+
+A first-class `agent plugin validate` CLI that schema-checks every extension-point frontmatter before load, so authors catch mistakes at write time instead of session start.
+
+- [ ] `agent plugin validate [path]` subcommand that walks a plugin directory and validates each file
+- [ ] Validates: skill `SKILL.md` frontmatter, agent frontmatter, slash-command frontmatter, `hooks.json` schema, `manifest.json`
+- [ ] Schema-level checks (required fields, enum values) plus semantic checks (referenced tool names exist, glob patterns parse, permission rules are well-formed)
+- [ ] Machine-readable output (`--format json`) for editor integration
+- [ ] CI recipe: a GitHub Action template that runs `agent plugin validate` on every PR touching a plugin repo
+- [ ] Plugin authors get a `manifest.userConfig` option system: typed config declarations with optional OS-keychain storage for sensitive values (API tokens the plugin needs)
+
+### 7.32 TUI Rendering and Transcript Search
+
+The existing TUI re-renders from scratch on most events, causing flicker in long sessions and making it hard to navigate back through a transcript. Ship a virtualized, flicker-free renderer and an in-transcript search.
+
+- [ ] Alt-screen rendering with a virtualized scrollback buffer (only the visible window is redrawn)
+- [ ] `NO_FLICKER=1` env var or `tui.no_flicker` setting to opt in while the mode bakes
+- [ ] `/` in the REPL enters transcript-search mode; `n` and `N` navigate matches; `Esc` exits
+- [ ] `Ctrl+O` toggles a "focus view" that hides system messages and tool results, leaving only user and assistant turns
+- [ ] `/recap` slash command: re-reads recent transcript, summarizes what happened, and re-injects the summary at the top of context — useful when returning to a resumed session
+- [ ] Status line `refreshInterval` setting so users can run a command periodically (git status, cost, clock) without full re-render
+- [ ] Interop with §7.26 SQLite store: search scope can be widened from "this session" to "all sessions"
+
+**Ergonomic additions (small):**
+
+- [ ] Agent `initialPrompt` frontmatter: launches an agent that auto-submits a first user turn (useful for preset research or review agents)
+- [ ] `effort: low | medium | high` frontmatter on skills and agents, overriding the session-level reasoning effort from §4.3
+- [ ] Bash permission rules support wildcard matching (`Bash(git log:*)`, `Bash(cargo test:*)`) tolerant of leading whitespace and multi-space arguments — verify current matcher and harden if needed
 
 ---
 
