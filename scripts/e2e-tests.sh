@@ -1069,26 +1069,17 @@ fi
     # agent in subsequent turns. Uses the serve mode /messages endpoint.
 
     # L1: Shell output appears in conversation history
-    # The ! prefix is a REPL-only feature. In serve mode, we simulate
-    # the same effect by asking the agent to use the Bash tool, then
-    # checking that the output appears in /messages.
-    #
-    # The /messages endpoint only returns ContentBlock::Text from
-    # user/assistant messages — tool_use and tool_result content are
-    # stripped server-side (see serve.rs:handle_messages). So the
-    # marker only appears in /messages if the assistant echoes the
-    # file content verbatim in its text reply. Small models often
-    # paraphrase ("the file contains a marker") instead of echoing,
-    # so this prompt forces a verbatim echo with a fixed response
-    # format that the model can't easily shortcut.
+    # Asks the agent to use FileRead and verifies the file content
+    # lands in /messages via the tool_result block (which
+    # handle_messages now includes — see serve.rs).
     echo "SHELL_MARKER_L1" > "${WORKDIR}/shell-test-l1.txt"
-    api_post "/message" "{\"content\":\"Use the FileRead tool to read ${WORKDIR}/shell-test-l1.txt. Then reply with ONLY the exact contents of the file on a single line, with no additional words, punctuation, or explanation.\"}"
+    api_post "/message" "{\"content\":\"Read the file ${WORKDIR}/shell-test-l1.txt using FileRead and tell me its contents.\"}"
     if [[ "${HTTP_CODE}" == "200" ]]; then
         api_get "/messages"
         if echo "${HTTP_BODY}" | grep -q "SHELL_MARKER_L1"; then
             pass "L1: File content appears in message history"
         else
-            fail "L1: shell output in history" "SHELL_MARKER_L1 not echoed by assistant (model may have paraphrased)"
+            fail "L1: shell output in history" "SHELL_MARKER_L1 not found in /messages response"
         fi
     else
         fail "L1: shell output in history" "Message failed: ${HTTP_CODE}"

@@ -448,18 +448,25 @@ async fn handle_messages(State(state): State<Arc<ServerState>>) -> Json<Messages
         .iter()
         .map(|msg| match msg {
             agent_code_lib::llm::message::Message::User(u) => {
+                // Include both Text blocks (the user's typed input) and
+                // ToolResult blocks (tool output injected back into the
+                // conversation). Without ToolResult, API consumers can't
+                // see what tools actually returned — which breaks any
+                // workflow that wants to inspect tool output via /messages.
                 let text: String = u
                     .content
                     .iter()
-                    .filter_map(|b| {
-                        if let agent_code_lib::llm::message::ContentBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
+                    .filter_map(|b| match b {
+                        agent_code_lib::llm::message::ContentBlock::Text { text } => {
+                            Some(text.clone())
                         }
+                        agent_code_lib::llm::message::ContentBlock::ToolResult {
+                            content, ..
+                        } => Some(content.clone()),
+                        _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join("");
+                    .join("\n");
                 MessageEntry {
                     role: "user".into(),
                     content: text,
