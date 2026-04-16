@@ -120,7 +120,7 @@ impl Tool for ToolSearchTool {
             }
         }
 
-        matches.sort_by(|a, b| b.2.cmp(&a.2));
+        matches.sort_by_key(|m| std::cmp::Reverse(m.2));
         matches.truncate(max_results);
 
         if matches.is_empty() {

@@ -85,7 +85,7 @@ impl Tool for GlobTool {
             })
             .collect();
 
-        entries_with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+        entries_with_mtime.sort_by_key(|e| std::cmp::Reverse(e.1));
 
         let total = entries_with_mtime.len();
         let max_results = 500;

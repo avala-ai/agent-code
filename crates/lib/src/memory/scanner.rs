@@ -60,7 +60,7 @@ pub fn scan_memory_files(memory_dir: &Path) -> Vec<MemoryHeader> {
         .collect();
 
     // Sort newest first.
-    headers.sort_by(|a, b| b.modified.cmp(&a.modified));
+    headers.sort_by_key(|h| std::cmp::Reverse(h.modified));
 
     // Cap at max.
     headers.truncate(MAX_MEMORY_FILES);
@@ -170,7 +170,7 @@ pub fn select_relevant(
         .filter(|(_, score)| *score > 0)
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.truncate(MAX_RELEVANT_PER_TURN);
 
     scored.iter().map(|(h, _)| h.path.clone()).collect()
