@@ -28,6 +28,15 @@ set -uo pipefail
 # ── Configuration ──────────────────────────────────────────────────
 
 AGENT="${AGENT_BINARY:-./target/release/agent}"
+# Resolve AGENT to an absolute path so tests that `cd` into a tempdir
+# (e.g. M1/M3 sandbox config parse) can still invoke the binary.
+if [[ "${AGENT}" != /* ]]; then
+    if [[ "${AGENT}" == */* ]]; then
+        AGENT="$(cd "$(dirname "${AGENT}")" && pwd)/$(basename "${AGENT}")"
+    elif _resolved=$(command -v "${AGENT}" 2>/dev/null); then
+        AGENT="${_resolved}"
+    fi
+fi
 MODEL="${AGENT_CODE_MODEL:-openai/gpt-5-nano}"
 SERVE_PORT=14096
 SERVE_URL="http://127.0.0.1:${SERVE_PORT}"
