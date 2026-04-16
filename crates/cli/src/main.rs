@@ -210,6 +210,17 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // Validate output format early — fail fast on bad values before
+    // touching config, API keys, or the setup wizard.
+    let output_fmt: output::OutputFormat = cli
+        .output_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
+    if output_fmt == output::OutputFormat::Json && cli.prompt.is_none() {
+        anyhow::bail!("--output-format json requires --prompt (non-interactive mode)");
+    }
+
     // Set working directory if specified.
     if let Some(ref cwd) = cli.cwd {
         std::env::set_current_dir(cwd)?;
@@ -553,12 +564,6 @@ async fn main() -> anyhow::Result<()> {
         return acp::run_acp(engine).await;
     }
 
-    // Parse output format early so we fail fast on bad values.
-    let output_fmt: output::OutputFormat = cli
-        .output_format
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-
     // One-shot or interactive mode.
     match cli.prompt {
         Some(prompt) => {
@@ -620,10 +625,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         None => {
-            if output_fmt == output::OutputFormat::Json {
-                anyhow::bail!("--output-format json requires --prompt (non-interactive mode)");
-            }
-
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 
