@@ -52,6 +52,16 @@ fn sessions_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("agent-code").join("sessions"))
 }
 
+/// Serialize session data to pretty JSON and apply the secret masker.
+///
+/// Extracted so wire-up tests can verify the persistence boundary
+/// without touching the real filesystem.
+pub(crate) fn serialize_masked(data: &SessionData) -> Result<String, String> {
+    let json = serde_json::to_string_pretty(data)
+        .map_err(|e| format!("Failed to serialize session: {e}"))?;
+    Ok(secret_masker::mask(&json))
+}
+
 /// Save the current session to disk.
 pub fn save_session(
     session_id: &str,
@@ -108,14 +118,11 @@ pub fn save_session_full(
         plan_mode,
     };
 
-    let json = serde_json::to_string_pretty(&data)
-        .map_err(|e| format!("Failed to serialize session: {e}"))?;
-
     // Mask secrets at the persistence boundary. Applied to the fully
     // serialized JSON so the same regex set covers every text-bearing
     // field (tool results, user messages, metadata). Escaped JSON
     // strings still match the same patterns at the byte level.
-    let json = secret_masker::mask(&json);
+    let json = serialize_masked(&data)?;
 
     std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {e}"))?;
 
@@ -276,6 +283,77 @@ mod tests {
         assert_eq!(loaded.id, data.id);
         assert_eq!(loaded.model, data.model);
         assert_eq!(loaded.turn_count, data.turn_count);
+    }
+
+    #[test]
+    fn serialize_masked_redacts_secrets_in_messages() {
+        // A tool result leaked an AWS access key into the message history.
+        // When the session is serialized for disk, the secret must not
+        // survive the persistence boundary.
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let data = SessionData {
+            id: "sess-1".to_string(),
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+            updated_at: "2026-04-15T00:00:00Z".to_string(),
+            cwd: "/work".to_string(),
+            model: "test-model".to_string(),
+            messages: vec![user_message(format!("here is my key {aws_key}"))],
+            turn_count: 1,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            plan_mode: false,
+        };
+        let out = serialize_masked(&data).unwrap();
+        assert!(
+            !out.contains(aws_key),
+            "raw AWS key survived serialization: {out}",
+        );
+        assert!(out.contains("[REDACTED:aws_access_key]"));
+        // Non-secret metadata must still be present.
+        assert!(out.contains("\"cwd\": \"/work\""));
+        assert!(out.contains("\"model\": \"test-model\""));
+    }
+
+    #[test]
+    fn serialize_masked_redacts_generic_credential_assignments() {
+        let secret_line = "api_key=verylongprovidersecret1234567890";
+        let data = SessionData {
+            id: "sess-2".to_string(),
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+            updated_at: "2026-04-15T00:00:00Z".to_string(),
+            cwd: "/work".to_string(),
+            model: "test-model".to_string(),
+            messages: vec![user_message(secret_line)],
+            turn_count: 1,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            plan_mode: false,
+        };
+        let out = serialize_masked(&data).unwrap();
+        assert!(!out.contains("verylongprovidersecret1234567890"));
+        assert!(out.contains("[REDACTED:credential]"));
+    }
+
+    #[test]
+    fn serialize_masked_leaves_innocuous_content_intact() {
+        let data = SessionData {
+            id: "sess-3".to_string(),
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+            updated_at: "2026-04-15T00:00:00Z".to_string(),
+            cwd: "/work".to_string(),
+            model: "test-model".to_string(),
+            messages: vec![user_message("fn main() { println!(\"hello\"); }")],
+            turn_count: 1,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            plan_mode: false,
+        };
+        let out = serialize_masked(&data).unwrap();
+        assert!(!out.contains("REDACTED"));
+        assert!(out.contains("fn main()"));
     }
 
     #[test]

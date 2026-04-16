@@ -63,10 +63,9 @@ pub fn mask(input: &str) -> String {
     for p in PATTERNS.iter() {
         // For the generic credential rule, keep the key name visible.
         if p.kind == "credential" {
-            out = p
-                .re
-                .replace_all(&out, "${1}=[REDACTED:credential]")
-                .into_owned();
+            out =
+                p.re.replace_all(&out, "${1}=[REDACTED:credential]")
+                    .into_owned();
         } else {
             let replacement = format!("[REDACTED:{}]", p.kind);
             out = p.re.replace_all(&out, replacement.as_str()).into_owned();

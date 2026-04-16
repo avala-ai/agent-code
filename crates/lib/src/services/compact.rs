@@ -856,6 +856,41 @@ mod tests {
     }
 
     #[test]
+    fn build_compact_summary_prompt_masks_secrets_in_user_messages() {
+        use crate::llm::message::*;
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let messages = vec![user_message(format!(
+            "I pasted my AWS key {aws_key} into the file"
+        ))];
+        let prompt = build_compact_summary_prompt(&messages);
+        assert!(
+            !prompt.contains(aws_key),
+            "raw AWS key survived compaction prompt: {prompt}",
+        );
+        assert!(prompt.contains("[REDACTED:aws_access_key]"));
+    }
+
+    #[test]
+    fn build_compact_summary_prompt_masks_secrets_in_assistant_messages() {
+        use crate::llm::message::*;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let messages = vec![Message::Assistant(AssistantMessage {
+            uuid: uuid::Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![ContentBlock::Text {
+                text: format!("I used this token: {secret}"),
+            }],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })];
+        let prompt = build_compact_summary_prompt(&messages);
+        assert!(!prompt.contains(secret));
+        assert!(prompt.contains("REDACTED"));
+    }
+
+    #[test]
     fn test_max_output_recovery_message_is_meta() {
         let msg = max_output_recovery_message();
         if let Message::User(u) = &msg {
