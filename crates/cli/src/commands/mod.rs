@@ -384,6 +384,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Set a human-readable label on the current session (or clear it)",
         hidden: false,
     },
+    Command {
+        name: "usage",
+        aliases: &[],
+        description: "Per-turn token usage timeline (input / output / cache)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1520,6 +1526,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("powerup") => execute_powerup(args),
+        Some("usage") => {
+            execute_usage(engine);
+            CommandResult::Handled
+        }
         Some("effort") => {
             let task = args.unwrap_or("").trim();
             let prompt = if task.is_empty() {
@@ -2013,6 +2023,137 @@ fn truncate_to_words(text: &str, max_chars: usize) -> String {
     format!("{}…", text[..cutoff].trim_end())
 }
 
+/// Row of per-turn token usage for display.
+struct UsageRow {
+    turn: usize,
+    model: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+/// Pull per-turn usage from assistant messages that carry a Usage payload.
+/// Messages without `usage` (older history, streaming failures) are skipped.
+fn collect_usage_rows(
+    messages: &[agent_code_lib::llm::message::Message],
+    default_model: &str,
+) -> Vec<UsageRow> {
+    use agent_code_lib::llm::message::Message;
+    let mut rows = Vec::new();
+    let mut turn = 0usize;
+    for msg in messages {
+        if let Message::Assistant(a) = msg
+            && let Some(u) = &a.usage
+        {
+            turn += 1;
+            rows.push(UsageRow {
+                turn,
+                model: a.model.clone().unwrap_or_else(|| default_model.to_string()),
+                input: u.input_tokens,
+                output: u.output_tokens,
+                cache_read: u.cache_read_input_tokens,
+                cache_write: u.cache_creation_input_tokens,
+            });
+        }
+    }
+    rows
+}
+
+/// Execute /usage — print a per-turn token timeline.
+fn execute_usage(engine: &QueryEngine) {
+    let rows = collect_usage_rows(&engine.state().messages, &engine.state().config.api.model);
+
+    if rows.is_empty() {
+        println!("No completed turns with usage data yet.");
+        return;
+    }
+
+    // Model column width: longest model name, capped at 24.
+    let model_w = rows
+        .iter()
+        .map(|r| r.model.len())
+        .max()
+        .unwrap_or(5)
+        .min(24);
+
+    println!();
+    println!(
+        "  {:>3}  {:<width$}  {:>8}  {:>8}  {:>10}  {:>10}",
+        "#",
+        "model",
+        "input",
+        "output",
+        "cache read",
+        "cache write",
+        width = model_w,
+    );
+    println!(
+        "  {}  {}  {}  {}  {}  {}",
+        "-".repeat(3),
+        "-".repeat(model_w),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(10),
+    );
+
+    let mut tot_in = 0u64;
+    let mut tot_out = 0u64;
+    let mut tot_cr = 0u64;
+    let mut tot_cw = 0u64;
+    for r in &rows {
+        let model_display = if r.model.len() > model_w {
+            // Keep the tail — model family tokens live at the end.
+            let start = r.model.len() - model_w;
+            &r.model[start..]
+        } else {
+            r.model.as_str()
+        };
+        println!(
+            "  {:>3}  {:<width$}  {:>8}  {:>8}  {:>10}  {:>10}",
+            r.turn,
+            model_display,
+            r.input,
+            r.output,
+            r.cache_read,
+            r.cache_write,
+            width = model_w,
+        );
+        tot_in += r.input;
+        tot_out += r.output;
+        tot_cr += r.cache_read;
+        tot_cw += r.cache_write;
+    }
+    println!(
+        "  {}  {}  {}  {}  {}  {}",
+        "-".repeat(3),
+        "-".repeat(model_w),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(10),
+    );
+    println!(
+        "  {:>3}  {:<width$}  {:>8}  {:>8}  {:>10}  {:>10}",
+        "∑",
+        "",
+        tot_in,
+        tot_out,
+        tot_cr,
+        tot_cw,
+        width = model_w,
+    );
+
+    // Cache hit rate hint — a quick read on whether caching is effective.
+    let cached_input = tot_cr + tot_cw;
+    let total_input = tot_in + cached_input;
+    if total_input > 0 {
+        let hit_pct = (tot_cr as f64 / total_input as f64 * 100.0).round() as u64;
+        println!("\n  Cache hit rate: {hit_pct}%  (use /cost for cost summary)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2055,5 +2196,64 @@ mod tests {
         let out = truncate_to_words(text, 20);
         assert!(out.ends_with('…'));
         assert!(!out.contains("quickb")); // Did not split mid-word.
+    }
+
+    #[test]
+    fn usage_rows_skip_messages_without_usage() {
+        use agent_code_lib::llm::message::{
+            AssistantMessage, ContentBlock, Message, Usage, user_message,
+        };
+        use uuid::Uuid;
+
+        let mk_assistant = |usage: Option<Usage>, model: Option<&str>| {
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+                model: model.map(String::from),
+                usage,
+                stop_reason: None,
+                request_id: None,
+            })
+        };
+
+        let messages = vec![
+            user_message("first"),
+            mk_assistant(
+                Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+                Some("model-a"),
+            ),
+            user_message("second"),
+            // No usage — should be skipped (counted as 0 assistant turns for
+            // the table; streaming failures, etc.).
+            mk_assistant(None, Some("model-b")),
+            user_message("third"),
+            mk_assistant(
+                Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_creation_input_tokens: 80,
+                    cache_read_input_tokens: 20,
+                }),
+                None, // falls back to default model
+            ),
+        ];
+
+        let rows = collect_usage_rows(&messages, "default-model");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].turn, 1);
+        assert_eq!(rows[0].model, "model-a");
+        assert_eq!(rows[0].input, 100);
+        assert_eq!(rows[1].turn, 2);
+        assert_eq!(rows[1].model, "default-model");
+        assert_eq!(rows[1].cache_read, 20);
+        assert_eq!(rows[1].cache_write, 80);
     }
 }
