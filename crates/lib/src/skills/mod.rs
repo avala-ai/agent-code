@@ -373,6 +373,19 @@ impl SkillRegistry {
                  diff silently breaks. Do not add documentation for code that isn't part \
                  of the public surface.",
             ),
+            (
+                "stuck",
+                "Step back and try a different angle when looping",
+                true,
+                "You are stuck. Stop the current approach. Read the last 10 messages of this \
+                 conversation and identify: (1) what you tried, (2) why each attempt failed, \
+                 (3) the assumption every attempt shares. That shared assumption is usually \
+                 the thing that's wrong. List at least two different approaches that don't \
+                 rely on it — e.g. a different file to read, a different tool to reach for, \
+                 a different abstraction level (add logs instead of reading code, or rebuild \
+                 instead of patch-fixing). Pick the most plausible one and take a single \
+                 concrete step. Do not retry anything you've already tried.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
