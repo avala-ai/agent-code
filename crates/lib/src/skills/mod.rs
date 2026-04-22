@@ -373,6 +373,22 @@ impl SkillRegistry {
                  diff silently breaks. Do not add documentation for code that isn't part \
                  of the public surface.",
             ),
+            (
+                "simplify",
+                "Run a review-then-simplify pass on recent changes",
+                true,
+                "Inspect the current git diff. Flag anything that can go without changing \
+                 behavior: unused imports and variables, dead branches, redundant helpers \
+                 and wrappers, premature abstractions (a single-caller generic, a trait \
+                 with one impl), speculative error handling (try/catch around infallible \
+                 code, validation for invariants the type system already guarantees), \
+                 defensive copies of immutable data, overly verbose names, comments that \
+                 restate the code. For each finding, cite file:line, explain why it's dead \
+                 weight, and propose the concrete deletion or rewrite. Do not invent new \
+                 abstractions. Do not refactor beyond the diff. Do not touch anything \
+                 whose behavior is load-bearing in a way that isn't obvious from reading \
+                 the code — call that out instead of changing it.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
