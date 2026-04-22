@@ -378,6 +378,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Track an additional directory alongside the cwd (or list/remove)",
         hidden: false,
     },
+    Command {
+        name: "rename",
+        aliases: &[],
+        description: "Set a human-readable label on the current session (or clear it)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -621,8 +627,13 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             } else {
                 println!("Recent sessions:\n");
                 for s in &sessions {
+                    let label = s
+                        .label
+                        .as_deref()
+                        .map(|l| format!(" [{l}]"))
+                        .unwrap_or_default();
                     println!(
-                        "  {} — {} ({} turns, {} msgs, {})",
+                        "  {}{label} — {} ({} turns, {} msgs, {})",
                         s.id, s.cwd, s.turn_count, s.message_count, s.updated_at,
                     );
                 }
@@ -1558,6 +1569,29 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("add-dir") => {
             execute_add_dir(args, engine);
+            CommandResult::Handled
+        }
+        Some("rename") => {
+            let session_id = engine.state().session_id.clone();
+            let label = args.map(|s| s.trim()).filter(|s| !s.is_empty());
+            match agent_code_lib::services::session::set_session_label(
+                &session_id,
+                label.map(|s| s.to_string()),
+            ) {
+                Ok(_) => match label {
+                    Some(name) => println!("Session labelled: {name}"),
+                    None => println!("Session label cleared."),
+                },
+                Err(e) => {
+                    // If the session hasn't been saved yet (first turn not
+                    // taken), there's no file to label.
+                    eprintln!("Failed to rename session: {e}");
+                    eprintln!(
+                        "Note: the session file is created after the first turn; \
+                         try /rename again once you've sent a message."
+                    );
+                }
+            }
             CommandResult::Handled
         }
         _ => {

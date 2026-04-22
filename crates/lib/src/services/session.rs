@@ -45,6 +45,11 @@ pub struct SessionData {
     /// Whether plan mode was active.
     #[serde(default)]
     pub plan_mode: bool,
+    /// Optional human-readable label set via `/rename`. Not used for
+    /// lookup — the session ID is still the primary key — but shown
+    /// in `/sessions` and the resume picker.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// Sessions directory path.
@@ -93,15 +98,17 @@ pub fn save_session_full(
 
     let path = dir.join(format!("{session_id}.json"));
 
-    // Preserve original created_at if file exists.
-    let created_at = if path.exists() {
+    // Preserve original created_at and label if file exists. Both are
+    // orthogonal to the per-turn save path, so re-read rather than
+    // thread them through every call site.
+    let (created_at, label) = if path.exists() {
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|c| serde_json::from_str::<SessionData>(&c).ok())
-            .map(|d| d.created_at)
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339())
+            .map(|d| (d.created_at, d.label))
+            .unwrap_or_else(|| (chrono::Utc::now().to_rfc3339(), None))
     } else {
-        chrono::Utc::now().to_rfc3339()
+        (chrono::Utc::now().to_rfc3339(), None)
     };
 
     let data = SessionData {
@@ -116,6 +123,7 @@ pub fn save_session_full(
         total_input_tokens,
         total_output_tokens,
         plan_mode,
+        label,
     };
 
     // Mask secrets at the persistence boundary. Applied to the fully
@@ -176,6 +184,7 @@ pub fn list_sessions(limit: usize) -> Vec<SessionSummary> {
                 turn_count: data.turn_count,
                 message_count: data.messages.len(),
                 updated_at: data.updated_at,
+                label: data.label,
             })
         })
         .collect();
@@ -194,6 +203,24 @@ pub struct SessionSummary {
     pub turn_count: usize,
     pub message_count: usize,
     pub updated_at: String,
+    pub label: Option<String>,
+}
+
+/// Set (or clear) the human-readable label on a session. Pass `None`
+/// to clear. Returns the path of the written file.
+///
+/// Implemented as load-modify-save so callers don't need to thread the
+/// label through the per-turn persistence path.
+pub fn set_session_label(session_id: &str, label: Option<String>) -> Result<PathBuf, String> {
+    let mut data = load_session(session_id)?;
+    data.label = label;
+    data.updated_at = chrono::Utc::now().to_rfc3339();
+
+    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
+    let path = dir.join(format!("{session_id}.json"));
+    let json = serialize_masked(&data)?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {e}"))?;
+    Ok(path)
 }
 
 /// Generate a new session ID.
@@ -226,6 +253,7 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         }
     }
 
@@ -283,6 +311,7 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         };
         let json = serde_json::to_string_pretty(&data).unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
@@ -311,6 +340,7 @@ mod tests {
             total_input_tokens: 1000,
             total_output_tokens: 500,
             plan_mode: false,
+            label: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();
@@ -338,6 +368,7 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(
@@ -365,6 +396,7 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(!out.contains("verylongprovidersecret1234567890"));
@@ -389,6 +421,7 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         };
         let out = serialize_masked(&data).unwrap();
         // Must still parse back as a SessionData.
@@ -425,6 +458,7 @@ mod tests {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 plan_mode: false,
+                label: None,
             };
             let out = serialize_masked(&data).unwrap();
             let parsed: Result<SessionData, _> = serde_json::from_str(&out);
@@ -528,10 +562,48 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             plan_mode: false,
+            label: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(!out.contains("REDACTED"));
         assert!(out.contains("fn main()"));
+    }
+
+    #[test]
+    fn label_round_trips_through_serde() {
+        let data = SessionData {
+            id: "id".into(),
+            created_at: "2026-04-15T00:00:00Z".into(),
+            updated_at: "2026-04-15T00:00:00Z".into(),
+            cwd: "/work".into(),
+            model: "m".into(),
+            messages: vec![],
+            turn_count: 1,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            plan_mode: false,
+            label: Some("refactor pass".into()),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SessionData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.label.as_deref(), Some("refactor pass"));
+    }
+
+    #[test]
+    fn label_missing_from_old_json_defaults_to_none() {
+        // Simulate an older session file written before the label field existed.
+        let json = serde_json::json!({
+            "id": "old",
+            "created_at": "2026-04-15T00:00:00Z",
+            "updated_at": "2026-04-15T00:00:00Z",
+            "cwd": "/work",
+            "model": "m",
+            "messages": [],
+            "turn_count": 1,
+        });
+        let data: SessionData = serde_json::from_value(json).unwrap();
+        assert!(data.label.is_none());
     }
 
     #[test]
@@ -543,6 +615,7 @@ mod tests {
             turn_count: 10,
             message_count: 20,
             updated_at: "2026-03-31".to_string(),
+            label: None,
         };
         assert_eq!(summary.id, "xyz");
         assert_eq!(summary.turn_count, 10);
