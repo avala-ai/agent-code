@@ -418,6 +418,27 @@ impl SkillRegistry {
                  whose behavior is load-bearing in a way that isn't obvious from reading \
                  the code — call that out instead of changing it.",
             ),
+            (
+                "batch",
+                "Apply the same change across multiple git worktrees",
+                true,
+                "Apply the requested change to every branch or worktree the user named, \
+                 one at a time, in isolated worktrees so the changes don't contaminate \
+                 each other. For each target:\n\n\
+                 1. Use the worktree tool to enter a fresh worktree for the target branch. \
+                 Do not mutate the current working tree.\n\
+                 2. Apply the change. If the diff differs from other targets (e.g. \
+                 filenames moved, imports named differently), adapt per target — do not \
+                 force-paste the same patch blindly.\n\
+                 3. Run the project's test and lint gate for the target's language.\n\
+                 4. If checks pass, commit and note the commit SHA. If checks fail, stop \
+                 on that target and record what broke — do NOT keep pushing if one fails; \
+                 surface the first failure so the user can decide.\n\
+                 5. Leave the worktree in place so the user can inspect.\n\n\
+                 At the end, print a summary table: target | commit or failure | files changed. \
+                 Never force-push, never skip tests, never assume a diff that worked on one \
+                 branch applies cleanly to the next.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
