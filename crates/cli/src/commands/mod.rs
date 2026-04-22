@@ -355,6 +355,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "btw",
+        aliases: &[],
+        description: "Append a quick note to user memory (e.g. /btw always prefer X over Y)",
+        hidden: false,
+    },
+    Command {
         name: "heapdump",
         aliases: &[],
         description: "Write a process memory snapshot to disk for debugging",
@@ -1509,6 +1515,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             };
             CommandResult::Prompt(prompt)
         }
+        Some("btw") => {
+            execute_btw(args);
+            CommandResult::Handled
+        }
         Some("heapdump") => {
             heapdump::run();
             CommandResult::Handled
@@ -1786,5 +1796,124 @@ fn execute_powerup(args: Option<&str>) -> CommandResult {
         CommandResult::Prompt(lesson.prompt.to_string())
     } else {
         CommandResult::Handled
+    }
+}
+
+/// Execute the /btw command: save a free-form note to user memory.
+fn execute_btw(args: Option<&str>) {
+    let text = args.map(|s| s.trim()).unwrap_or("");
+    if text.is_empty() {
+        println!("Usage: /btw <note>");
+        println!("Example: /btw prefers short, direct commit messages");
+        return;
+    }
+
+    let dir = match agent_code_lib::memory::ensure_memory_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!("Could not resolve user memory directory.");
+            return;
+        }
+    };
+
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let slug = slugify_note(text);
+    let filename = if slug.is_empty() {
+        format!("btw-{stamp}.md")
+    } else {
+        format!("btw-{stamp}-{slug}.md")
+    };
+
+    // Short description for the index line.
+    let description = truncate_to_words(text, 120);
+    let name = format!("Note ({stamp})");
+
+    let meta = agent_code_lib::memory::types::MemoryMeta {
+        name: name.clone(),
+        description,
+        memory_type: Some(agent_code_lib::memory::types::MemoryType::User),
+    };
+
+    match agent_code_lib::memory::writer::write_memory(&dir, &filename, &meta, text) {
+        Ok(path) => println!("Noted. Saved to {}", path.display()),
+        Err(e) => eprintln!("Failed to save note: {e}"),
+    }
+}
+
+/// Slugify a note for use in a filename (ASCII lowercase, hyphen-separated,
+/// max 40 chars). Returns an empty string if nothing slugifiable remains.
+fn slugify_note(text: &str) -> String {
+    let mut out = String::with_capacity(40);
+    let mut prev_dash = true;
+    for ch in text.chars() {
+        if out.len() >= 40 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Truncate a free-form note to approximately `max_chars` characters,
+/// ending at a word boundary when possible.
+fn truncate_to_words(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let cutoff = text[..max_chars].rfind(' ').unwrap_or(max_chars);
+    format!("{}…", text[..cutoff].trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(slugify_note("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_punctuation_collapses() {
+        assert_eq!(slugify_note("foo---bar!!!baz"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn slugify_trims_leading_trailing_dashes() {
+        assert_eq!(slugify_note("!!!hello!!!"), "hello");
+    }
+
+    #[test]
+    fn slugify_truncates_to_40_chars() {
+        let long = "a".repeat(100);
+        let slug = slugify_note(&long);
+        assert!(slug.len() <= 40);
+    }
+
+    #[test]
+    fn slugify_empty_for_no_alnum() {
+        assert_eq!(slugify_note("---!!!"), "");
+    }
+
+    #[test]
+    fn truncate_short_passthrough() {
+        assert_eq!(truncate_to_words("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        let out = truncate_to_words(text, 20);
+        assert!(out.ends_with('…'));
+        assert!(!out.contains("quickb")); // Did not split mid-word.
     }
 }
