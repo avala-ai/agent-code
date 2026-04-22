@@ -390,6 +390,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Per-turn token usage timeline (input / output / cache)",
         hidden: false,
     },
+    Command {
+        name: "thinkback",
+        aliases: &[],
+        description: "Show the model's thinking blocks from a recent turn",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1530,6 +1536,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             execute_usage(engine);
             CommandResult::Handled
         }
+        Some("thinkback") => {
+            execute_thinkback(args, engine);
+            CommandResult::Handled
+        }
         Some("effort") => {
             let task = args.unwrap_or("").trim();
             let prompt = if task.is_empty() {
@@ -2023,6 +2033,68 @@ fn truncate_to_words(text: &str, max_chars: usize) -> String {
     format!("{}…", text[..cutoff].trim_end())
 }
 
+/// Walk the conversation and collect the thinking blocks attached to
+/// each assistant message. Returned Vec is in chronological order, so
+/// `last()` is the most recent turn's thinking.
+fn collect_thinking_turns(messages: &[agent_code_lib::llm::message::Message]) -> Vec<Vec<String>> {
+    use agent_code_lib::llm::message::{ContentBlock, Message};
+    let mut turns: Vec<Vec<String>> = Vec::new();
+    for msg in messages {
+        if let Message::Assistant(a) = msg {
+            let blocks: Vec<String> = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !blocks.is_empty() {
+                turns.push(blocks);
+            }
+        }
+    }
+    turns
+}
+
+/// Execute `/thinkback [n]`. With no arg, shows the most recent turn's
+/// thinking blocks. With `n`, shows the nth most recent (1 = latest).
+fn execute_thinkback(args: Option<&str>, engine: &QueryEngine) {
+    let turns = collect_thinking_turns(&engine.state().messages);
+    if turns.is_empty() {
+        println!("No thinking blocks in this session yet.");
+        return;
+    }
+
+    let n: usize = args
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1);
+
+    if n > turns.len() {
+        println!(
+            "Only {} turn(s) with thinking blocks in this session; asked for #{n}.",
+            turns.len()
+        );
+        return;
+    }
+
+    // Index from the end so 1 = latest.
+    let idx = turns.len() - n;
+    let blocks = &turns[idx];
+    println!(
+        "\nThinking blocks from turn {} of {} (most recent is #1):\n",
+        n,
+        turns.len()
+    );
+    for (i, block) in blocks.iter().enumerate() {
+        if blocks.len() > 1 {
+            println!("--- block {} ---", i + 1);
+        }
+        println!("{block}\n");
+    }
+}
+
 /// Row of per-turn token usage for display.
 struct UsageRow {
     turn: usize,
@@ -2196,6 +2268,47 @@ mod tests {
         let out = truncate_to_words(text, 20);
         assert!(out.ends_with('…'));
         assert!(!out.contains("quickb")); // Did not split mid-word.
+    }
+
+    #[test]
+    fn thinking_walker_skips_user_messages_and_non_thinking_blocks() {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, user_message};
+        use uuid::Uuid;
+
+        let mk_assistant = |content| {
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".to_string(),
+                content,
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            })
+        };
+
+        let assistant_with_thinking = mk_assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "first thought".to_string(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "user-facing reply".to_string(),
+            },
+        ]);
+        let assistant_without_thinking = mk_assistant(vec![ContentBlock::Text {
+            text: "plain reply".to_string(),
+        }]);
+        let messages = vec![
+            user_message("hi"),
+            assistant_with_thinking,
+            user_message("next"),
+            assistant_without_thinking,
+        ];
+
+        let turns = collect_thinking_turns(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0], vec!["first thought".to_string()]);
     }
 
     #[test]
