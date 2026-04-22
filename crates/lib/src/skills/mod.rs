@@ -386,6 +386,22 @@ impl SkillRegistry {
                  instead of patch-fixing). Pick the most plausible one and take a single \
                  concrete step. Do not retry anything you've already tried.",
             ),
+            (
+                "remember",
+                "Save a specific insight to user memory",
+                true,
+                "Extract the insight or preference the user just shared and save it as a \
+                 memory following the two-step write discipline. First classify the memory \
+                 type: `user` for role/preference/knowledge, `feedback` for rules about how \
+                 to approach work, `project` for in-flight context, `reference` for pointers \
+                 to external systems. Pick a short kebab-case filename and write the memory \
+                 file with the required frontmatter (name, description, type). Then add a \
+                 single index line to MEMORY.md under ~150 chars: \
+                 `- [Title](file.md) — one-line hook`. Do not dump content into the index, \
+                 do not duplicate an existing memory, and do not save anything already \
+                 derivable from the codebase (architecture, file paths, git history, debug \
+                 fixes). Finish with one line confirming what was saved.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
