@@ -47,7 +47,7 @@ jobs:
           sleep 2
           curl -sf http://localhost:9090/ > /dev/null
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
 
