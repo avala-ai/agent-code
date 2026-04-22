@@ -347,6 +347,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Interactive tutorials to learn agent-code features",
         hidden: false,
     },
+    Command {
+        name: "effort",
+        aliases: &[],
+        description: "Rate the effort required for a task (XS/S/M/L/XL)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1469,6 +1475,33 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("powerup") => execute_powerup(args),
+        Some("effort") => {
+            let task = args.unwrap_or("").trim();
+            let prompt = if task.is_empty() {
+                "Rate the effort required to complete the task we are discussing \
+                 in this conversation. Pick one: XS (< 15 min, single file, \
+                 trivial), S (< 1 hr, 1-3 files, straightforward), M (half day, \
+                 multiple files or a new module, some design), L (1-2 days, \
+                 cross-cutting or new subsystem, real design work), XL (3+ days \
+                 or architectural, multiple teams/subsystems, real risk). \
+                 Respond with: the rating, a one-line justification, and the \
+                 top 2 risks or unknowns. Be blunt. Do not hedge."
+                    .to_string()
+            } else {
+                format!(
+                    "Rate the effort required for the following task. Pick one: \
+                     XS (< 15 min, single file, trivial), S (< 1 hr, 1-3 files, \
+                     straightforward), M (half day, multiple files or a new \
+                     module, some design), L (1-2 days, cross-cutting or new \
+                     subsystem, real design work), XL (3+ days or architectural, \
+                     multiple teams/subsystems, real risk). Respond with: the \
+                     rating, a one-line justification, and the top 2 risks or \
+                     unknowns. Be blunt. Do not hedge.\n\n\
+                     Task: {task}"
+                )
+            };
+            CommandResult::Prompt(prompt)
+        }
         _ => {
             // Check if it's a skill invocation.
             let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
