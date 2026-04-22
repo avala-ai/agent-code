@@ -40,7 +40,10 @@ fn collect_samples() -> (Vec<Sample>, Option<&'static str>) {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        (Vec::new(), Some("heapdump is not supported on this platform"))
+        (
+            Vec::new(),
+            Some("heapdump is not supported on this platform"),
+        )
     }
 }
 
@@ -167,11 +170,12 @@ pub fn run() {
     }
 }
 
-#[cfg(test)]
+// Tests exist only for the Linux parser; gate the whole module so
+// Windows/macOS builds don't complain about the unused `super::*`.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn parses_proc_status_fields() {
         let input = "Name:\tagent\n\
@@ -192,7 +196,6 @@ mod tests {
         assert_eq!(rss.value, "9876 kB");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn parses_proc_status_handles_empty() {
         let samples = parse_proc_status("");
