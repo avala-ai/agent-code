@@ -848,11 +848,20 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
          - Working directory: {}\n\
          - Platform: {}\n\
          - Shell: {shell}\n\
-         - Git repository: {}\n\n",
+         - Git repository: {}\n",
         state.cwd,
         std::env::consts::OS,
         if is_git { "yes" } else { "no" },
     ));
+    // User-added directories via /add-dir. Listed so the agent knows
+    // it can read/edit files there without re-asking for permission.
+    if !state.additional_dirs.is_empty() {
+        prompt.push_str("- Additional tracked directories:\n");
+        for d in &state.additional_dirs {
+            prompt.push_str(&format!("    - {d}\n"));
+        }
+    }
+    prompt.push('\n');
 
     // Inject memory context (project + user + on-demand relevant).
     let mut memory = crate::memory::MemoryContext::load(Some(std::path::Path::new(&state.cwd)));
@@ -1101,6 +1110,28 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// System prompt omits the additional-dirs block when none are tracked.
+    #[test]
+    fn system_prompt_omits_additional_dirs_when_empty() {
+        let state = AppState::new(crate::config::Config::default());
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt(&tools, &state);
+        assert!(!prompt.contains("Additional tracked directories"));
+    }
+
+    /// System prompt lists /add-dir entries so the agent knows they're in-scope.
+    #[test]
+    fn system_prompt_lists_additional_dirs() {
+        let mut state = AppState::new(crate::config::Config::default());
+        state.additional_dirs.push("/tmp/alpha".to_string());
+        state.additional_dirs.push("/tmp/beta".to_string());
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt(&tools, &state);
+        assert!(prompt.contains("Additional tracked directories"));
+        assert!(prompt.contains("/tmp/alpha"));
+        assert!(prompt.contains("/tmp/beta"));
+    }
 
     /// Verify that cancelling via the shared handle cancels the current
     /// turn's token (regression: the signal handler previously held a
