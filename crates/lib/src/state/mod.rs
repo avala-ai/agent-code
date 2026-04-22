@@ -36,6 +36,11 @@ pub struct AppState {
     pub task_manager: std::sync::Arc<crate::services::background::TaskManager>,
     /// Session ID for persistence.
     pub session_id: String,
+    /// Extra directories the user has explicitly added to the working
+    /// set with `/add-dir`. Surfaced in the system prompt so the agent
+    /// knows it's allowed to read/edit files outside `cwd` without
+    /// re-asking. Cleared on session exit — not persisted.
+    pub additional_dirs: Vec<String>,
 }
 
 impl AppState {
@@ -56,6 +61,7 @@ impl AppState {
             plan_mode: false,
             task_manager: std::sync::Arc::new(crate::services::background::TaskManager::new()),
             session_id: crate::services::session::new_session_id(),
+            additional_dirs: Vec::new(),
         }
     }
 
@@ -102,6 +108,7 @@ mod tests {
         assert_eq!(state.turn_count, 0);
         assert_eq!(state.total_cost_usd, 0.0);
         assert!(state.messages.is_empty());
+        assert!(state.additional_dirs.is_empty());
     }
 
     #[test]
