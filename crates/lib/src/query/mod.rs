@@ -357,8 +357,7 @@ impl QueryEngine {
                 model: model.clone(),
                 max_tokens: effective_tokens,
                 temperature: None,
-                enable_caching: self.state.config.features.prompt_caching
-                    && !cache_suppressed,
+                enable_caching: self.state.config.features.prompt_caching && !cache_suppressed,
                 tool_choice: Default::default(),
                 metadata: None,
                 cancel: self.cancel.clone(),
