@@ -75,7 +75,11 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Run coverage
-        run: cargo tarpaulin --all-targets --out xml --output-dir coverage/
+        # Use the LLVM engine (source-based coverage). The default ptrace
+        # engine races with tokio's child-process reaper on cancellation
+        # tests and intermittently fails with "ECHILD: No child processes"
+        # and a spurious multi-terabyte memory allocation panic.
+        run: cargo tarpaulin --engine llvm --all-targets --out xml --output-dir coverage/
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
         with:
