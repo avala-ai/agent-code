@@ -1791,17 +1791,16 @@ fn execute_add_dir(args: Option<&str>, engine: &mut QueryEngine) {
     if raw == "--clear" {
         let n = engine.state().additional_dirs.len();
         engine.state_mut().additional_dirs.clear();
-        println!("Cleared {n} tracked director{}.", if n == 1 { "y" } else { "ies" });
+        println!(
+            "Cleared {n} tracked director{}.",
+            if n == 1 { "y" } else { "ies" }
+        );
         return;
     }
 
     if let Some(rest) = raw.strip_prefix("--remove ") {
         let target = rest.trim();
-        let existed = engine
-            .state()
-            .additional_dirs
-            .iter()
-            .any(|d| d == target);
+        let existed = engine.state().additional_dirs.iter().any(|d| d == target);
         engine.state_mut().additional_dirs.retain(|d| d != target);
         if existed {
             println!("Removed: {target}");
