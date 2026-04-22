@@ -9,6 +9,7 @@
 //! Commands have access to the query engine state and can modify
 //! the conversation, change settings, or execute side effects.
 
+mod heapdump;
 mod uninstall;
 
 use agent_code_lib::query::QueryEngine;
@@ -346,6 +347,12 @@ pub const COMMANDS: &[Command] = &[
         aliases: &["tutorial", "learn"],
         description: "Interactive tutorials to learn agent-code features",
         hidden: false,
+    },
+    Command {
+        name: "heapdump",
+        aliases: &[],
+        description: "Write a process memory snapshot to disk for debugging",
+        hidden: true,
     },
 ];
 
@@ -1469,6 +1476,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("powerup") => execute_powerup(args),
+        Some("heapdump") => {
+            heapdump::run();
+            CommandResult::Handled
+        }
         _ => {
             // Check if it's a skill invocation.
             let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
