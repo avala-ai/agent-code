@@ -343,6 +343,13 @@ impl QueryEngine {
                 base_tokens
             };
 
+            // `/break-cache` sets break_cache_next to force one uncached
+            // request so the cache prefix is rebuilt. The flag is consumed
+            // here so subsequent requests cache normally.
+            let cache_suppressed = self.state.break_cache_next;
+            if cache_suppressed {
+                self.state.break_cache_next = false;
+            }
             let request = ProviderRequest {
                 messages: self.state.history().to_vec(),
                 system_prompt: system_prompt.clone(),
@@ -350,7 +357,8 @@ impl QueryEngine {
                 model: model.clone(),
                 max_tokens: effective_tokens,
                 temperature: None,
-                enable_caching: self.state.config.features.prompt_caching,
+                enable_caching: self.state.config.features.prompt_caching
+                    && !cache_suppressed,
                 tool_choice: Default::default(),
                 metadata: None,
                 cancel: self.cancel.clone(),

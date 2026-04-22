@@ -347,6 +347,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Interactive tutorials to learn agent-code features",
         hidden: false,
     },
+    Command {
+        name: "break-cache",
+        aliases: &[],
+        description: "Force the next request to skip the prompt cache",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1469,6 +1475,18 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("powerup") => execute_powerup(args),
+        Some("break-cache") => {
+            if engine.state().break_cache_next {
+                println!("Cache bust already armed for the next request.");
+            } else {
+                engine.state_mut().break_cache_next = true;
+                println!(
+                    "Next request will skip the prompt cache. \
+                     Subsequent requests will cache normally."
+                );
+            }
+            CommandResult::Handled
+        }
         _ => {
             // Check if it's a skill invocation.
             let skills = agent_code_lib::skills::SkillRegistry::load_all(Some(
