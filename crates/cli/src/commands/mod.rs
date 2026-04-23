@@ -546,6 +546,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Grep the current session for a substring (try /search error)",
         hidden: false,
     },
+    Command {
+        name: "info",
+        aliases: &[],
+        description: "One-page snapshot of session state (model, cost, modes, cwd)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -2088,6 +2094,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         },
         Some("search") | Some("find") => {
             execute_search(args, engine);
+            CommandResult::Handled
+        }
+        Some("info") => {
+            execute_info(engine);
             CommandResult::Handled
         }
         Some("install-github-app") => {
@@ -4158,6 +4168,107 @@ fn execute_search(args: Option<&str>, engine: &QueryEngine) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /info — one-page session snapshot
+// ---------------------------------------------------------------------------
+
+/// Render a human-readable mode descriptor from the current `AppState`
+/// flags. Kept pure so the test suite can cover formatting without
+/// standing up a whole `QueryEngine`.
+fn info_modes_line(plan: bool, brief: bool, style_name: &str, sandbox: bool, fast: bool) -> String {
+    let mut flags: Vec<String> = Vec::new();
+    if plan {
+        flags.push("plan".into());
+    }
+    if brief {
+        flags.push("brief".into());
+    }
+    if style_name != "default" {
+        flags.push(format!("style={style_name}"));
+    }
+    if fast {
+        flags.push("fast".into());
+    }
+    flags.push(if sandbox {
+        "sandbox=on".into()
+    } else {
+        "sandbox=off".into()
+    });
+    flags.join(", ")
+}
+
+fn execute_info(engine: &QueryEngine) {
+    let state = engine.state();
+    let cfg = &state.config;
+    let usage = &state.total_usage;
+
+    println!("Session");
+    // Print only the leading portion of the session id — enough for users
+    // to correlate with /resume <id> but short enough that CodeQL doesn't
+    // flag this as sensitive-token logging.
+    let short_id: String = state.session_id.chars().take(12).collect();
+    println!("  id       : {short_id}…");
+    println!("  cwd      : {}", state.cwd);
+    if !state.additional_dirs.is_empty() {
+        for (i, d) in state.additional_dirs.iter().enumerate() {
+            let tag = if i == 0 { "added    " } else { "         " };
+            println!("  {tag}: {d}");
+        }
+    }
+
+    println!("Model");
+    println!("  current  : {}", cfg.api.model);
+    if let Some(prev) = &state.pre_fast_model {
+        println!("  (/fast on; main model paused: {prev})");
+    } else if let Some(fast) = &cfg.api.fast_model {
+        println!("  fast     : {fast} (configured; toggle with /fast)");
+    }
+    if !cfg.api.base_url.is_empty() {
+        println!("  base_url : {}", cfg.api.base_url);
+    }
+
+    println!("Usage");
+    println!("  turns    : {}", state.turn_count);
+    println!(
+        "  tokens   : {} total (in: {}, out: {}, cache_read: {}, cache_write: {})",
+        usage.total(),
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    println!("  cost     : ${:.4}", state.total_cost_usd);
+    println!("  messages : {}", state.messages.len());
+
+    println!("Modes");
+    println!(
+        "  {}",
+        info_modes_line(
+            state.plan_mode,
+            state.brief_mode,
+            state.response_style.name(),
+            cfg.sandbox.enabled,
+            state.pre_fast_model.is_some(),
+        )
+    );
+
+    println!("Environment");
+    println!("  os       : {}", std::env::consts::OS);
+    println!("  arch     : {}", std::env::consts::ARCH);
+    if let Ok(shell) = std::env::var("SHELL") {
+        println!("  shell    : {shell}");
+    }
+    if !cfg.mcp_servers.is_empty() {
+        println!(
+            "  mcp      : {} server(s) configured",
+            cfg.mcp_servers.len()
+        );
+    }
+    if !cfg.hooks.is_empty() {
+        println!("  hooks    : {} configured", cfg.hooks.len());
+    }
+}
+
 /// Pick an editor. Returns the binary name/path to spawn.
 fn resolve_editor() -> Option<String> {
     if let Ok(v) = std::env::var("VISUAL")
@@ -5614,5 +5725,59 @@ mod tests {
         assert_eq!(message_tag(&tool), "tool");
         let asst = test_assistant_with_tool_use("t2", "Bash", serde_json::json!({}));
         assert_eq!(message_tag(&asst), "asst");
+    }
+
+    // ---- /info helpers ----
+
+    #[test]
+    fn info_modes_line_shows_sandbox_on_by_default() {
+        let line = info_modes_line(false, false, "default", true, false);
+        assert_eq!(line, "sandbox=on");
+    }
+
+    #[test]
+    fn info_modes_line_shows_sandbox_off() {
+        let line = info_modes_line(false, false, "default", false, false);
+        assert_eq!(line, "sandbox=off");
+    }
+
+    #[test]
+    fn info_modes_line_lists_plan_and_brief() {
+        let line = info_modes_line(true, true, "default", true, false);
+        assert!(line.contains("plan"));
+        assert!(line.contains("brief"));
+        assert!(line.contains("sandbox=on"));
+    }
+
+    #[test]
+    fn info_modes_line_shows_non_default_style() {
+        let line = info_modes_line(false, false, "concise", true, false);
+        assert!(line.contains("style=concise"));
+    }
+
+    #[test]
+    fn info_modes_line_omits_default_style() {
+        let line = info_modes_line(false, false, "default", true, false);
+        assert!(!line.contains("style="));
+    }
+
+    #[test]
+    fn info_modes_line_marks_fast_mode() {
+        let line = info_modes_line(false, false, "default", true, true);
+        assert!(line.contains("fast"));
+    }
+
+    #[test]
+    fn info_modes_line_orders_flags_then_sandbox() {
+        // plan + brief + non-default style + fast should all come before sandbox.
+        let line = info_modes_line(true, true, "concise", true, true);
+        let sandbox_idx = line.find("sandbox").unwrap();
+        for flag in ["plan", "brief", "style=concise", "fast"] {
+            let idx = line.find(flag).unwrap();
+            assert!(
+                idx < sandbox_idx,
+                "flag {flag} should come before sandbox in {line:?}"
+            );
+        }
     }
 }
