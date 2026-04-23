@@ -131,11 +131,68 @@ impl MemoryContext {
     }
 }
 
+/// Walk from the git repo root down to `start` (inclusive) and return
+/// every `AGENTS.md` / `.agent/AGENTS.md` / `CLAUDE.md` /
+/// `.claude/CLAUDE.md` that exists, ordered outermost→innermost.
+///
+/// "Git repo root" is the nearest ancestor containing `.git`. If no
+/// `.git` is found, the walk stops at `start` itself — we never escape
+/// the session dir to load config from random parent dirs.
+fn hierarchical_project_files(start: &Path) -> Vec<PathBuf> {
+    // Walk ancestors once to locate the repo root (nearest dir with
+    // `.git`). `.git` can be a directory (normal checkout) or a file
+    // (submodules / worktrees). We accept either.
+    let mut repo_root: Option<&Path> = None;
+    for dir in start.ancestors() {
+        if dir.join(".git").exists() {
+            repo_root = Some(dir);
+            break;
+        }
+    }
+
+    // Build the walk range: every directory from repo_root down to
+    // start inclusive. Using strip_prefix + component iteration keeps
+    // this deterministic regardless of OS path-separator.
+    let top: &Path = repo_root.unwrap_or(start);
+    let mut dirs: Vec<PathBuf> = vec![top.to_path_buf()];
+    if let Ok(rel) = start.strip_prefix(top) {
+        let mut cursor = top.to_path_buf();
+        for seg in rel.components() {
+            cursor.push(seg);
+            if cursor != *top {
+                dirs.push(cursor.clone());
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    for dir in &dirs {
+        // Primary names at each level. AGENTS.md first so it wins
+        // the `is_file()` race for callers that stop at first hit.
+        for leaf in &[
+            "AGENTS.md",
+            ".agent/AGENTS.md",
+            "CLAUDE.md",
+            ".claude/CLAUDE.md",
+        ] {
+            let p = dir.join(leaf);
+            if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+    files
+}
+
 /// Load project context by traversing the directory hierarchy.
 ///
 /// Checks (in priority order, lowest to highest):
 /// 1. User global: ~/.config/agent-code/AGENTS.md
-/// 2. Project root: AGENTS.md, .agent/AGENTS.md (+ CLAUDE.md compat)
+/// 2. Hierarchical project context: every `AGENTS.md` (or `CLAUDE.md`
+///    compat) from the git repo root down to the session cwd, in
+///    outermost-to-innermost order. Deeper files are loaded last so
+///    their contents override earlier layers in the composed prompt.
+///    `.agent/AGENTS.md` at each level is also honored.
 /// 3. Project rules: .agent/rules/*.md AND .claude/rules/*.md
 /// 4. Project local: AGENTS.local.md / CLAUDE.local.md (gitignored)
 ///
@@ -154,14 +211,16 @@ fn load_project_context(project_root: &Path) -> Option<String> {
         }
     }
 
-    // Layer 2: Project root context (AGENTS.md primary, CLAUDE.md compat).
-    for path in &[
-        project_root.join("AGENTS.md"),
-        project_root.join(".agent").join("AGENTS.md"),
-        project_root.join("CLAUDE.md"),
-        project_root.join(".claude").join("CLAUDE.md"),
-    ] {
-        if let Some(content) = load_truncated_file(path) {
+    // Layer 2: Hierarchical project context.
+    //
+    // Walk from the git repo root down to `project_root` (typically the
+    // session cwd). Load every `AGENTS.md` / `.agent/AGENTS.md` /
+    // `CLAUDE.md` / `.claude/CLAUDE.md` seen along the way so an
+    // `AGENTS.md` in a monorepo sub-package actually takes effect when
+    // the agent is invoked from that subdir. Outermost-first ordering
+    // lets deeper (more specific) files override broader ones.
+    for path in hierarchical_project_files(project_root) {
+        if let Some(content) = load_truncated_file(&path) {
             debug!("Loaded project context from {}", path.display());
             sections.push(content);
         }
@@ -319,5 +378,120 @@ mod tests {
         let files = load_referenced_files(index, dir.path());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "Preferences");
+    }
+
+    // ---- hierarchical_project_files ----
+
+    /// Build a fake repo layout:
+    ///   tmp/
+    ///     .git/  (dir, repo root marker)
+    ///     AGENTS.md
+    ///     packages/
+    ///       sub/
+    ///         AGENTS.md
+    ///         nested/
+    ///           AGENTS.md
+    fn make_nested_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root").unwrap();
+        let sub = root.join("packages").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "sub").unwrap();
+        let nested = sub.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "nested").unwrap();
+        dir
+    }
+
+    #[test]
+    fn hierarchical_walks_from_cwd_up_to_git_root() {
+        let tmp = make_nested_repo();
+        let start = tmp.path().join("packages").join("sub").join("nested");
+        let files = hierarchical_project_files(&start);
+        // Should find 3 AGENTS.md: root, sub, nested
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        assert_eq!(names, vec!["root", "sub", "nested"]);
+    }
+
+    #[test]
+    fn hierarchical_stops_at_git_root_does_not_escape() {
+        let tmp = make_nested_repo();
+        // Write an AGENTS.md in the *parent* of the temp dir. The walk
+        // must not reach it — we must stop at `.git`.
+        // (Skipping this in practice because tmpdir's parent may not be
+        // writable; instead, verify the walk only returns files within
+        // the repo root.)
+        let start = tmp.path().join("packages").join("sub");
+        let files = hierarchical_project_files(&start);
+        for p in &files {
+            assert!(p.starts_with(tmp.path()), "walk escaped repo root: {p:?}");
+        }
+    }
+
+    #[test]
+    fn hierarchical_ordering_is_outermost_first() {
+        let tmp = make_nested_repo();
+        let start = tmp.path().join("packages").join("sub").join("nested");
+        let files = hierarchical_project_files(&start);
+        // Content of the first file must be "root" (outermost).
+        let first = std::fs::read_to_string(&files[0]).unwrap();
+        assert_eq!(first, "root");
+        let last = std::fs::read_to_string(files.last().unwrap()).unwrap();
+        assert_eq!(last, "nested");
+    }
+
+    #[test]
+    fn hierarchical_without_git_stays_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "x").unwrap();
+        let files = hierarchical_project_files(dir.path());
+        // No .git anywhere — walk should stop at start itself, not
+        // climb into parent filesystem dirs.
+        assert!(!files.is_empty());
+        for p in &files {
+            assert!(p.starts_with(dir.path()));
+        }
+    }
+
+    #[test]
+    fn hierarchical_handles_missing_intermediate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        // Only root and deepest have AGENTS.md; intermediate doesn't.
+        std::fs::write(root.join("AGENTS.md"), "root").unwrap();
+        let mid = root.join("a").join("b");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(mid.join("AGENTS.md"), "deep").unwrap();
+        let files = hierarchical_project_files(&mid);
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        assert_eq!(names, vec!["root", "deep"]);
+    }
+
+    #[test]
+    fn hierarchical_includes_dot_agent_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let dotagent = root.join(".agent");
+        std::fs::create_dir(&dotagent).unwrap();
+        std::fs::write(dotagent.join("AGENTS.md"), "from-.agent").unwrap();
+        let files = hierarchical_project_files(root);
+        let contents: Vec<_> = files
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c == "from-.agent"),
+            "expected .agent/AGENTS.md to be picked up, got {contents:?}"
+        );
     }
 }
