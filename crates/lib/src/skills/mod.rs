@@ -549,6 +549,26 @@ impl SkillRegistry {
                  remediation. If the diff is genuinely clean after all seven \
                  passes, say so — do not invent findings to justify the review.",
             ),
+            (
+                "verify",
+                "Double-check a claim or output before acting on it",
+                true,
+                "A claim was made that you are about to act on. Before acting, verify \
+                 it independently. Steps:\n\n\
+                 1. State the claim in one sentence, as you understand it.\n\
+                 2. Identify ONE authoritative source of truth for that claim — \
+                 the code itself (not an AI summary of the code), a test result, \
+                 a command's exit code, a file's contents, or a runtime check. \
+                 Never verify one AI-generated claim with another AI-generated \
+                 claim; that's circular.\n\
+                 3. Check the source. Show what you checked and what you found.\n\
+                 4. If the claim holds: say so and proceed. If it doesn't: \
+                 state the discrepancy, do NOT proceed with the original plan, \
+                 and ask the user how to reconcile.\n\n\
+                 Skip verification only when the cost of being wrong is lower \
+                 than the cost of the check itself. For anything that writes, \
+                 deletes, deploys, or sends — verify.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
