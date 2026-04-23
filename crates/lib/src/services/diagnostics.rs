@@ -142,13 +142,41 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 5. Config file locations.
-    let user_config = dirs::config_dir().map(|d| d.join("agent-code").join("config.toml"));
+    //
+    // User-level config is always a fixed path. Project configs
+    // are resolved via the same walk-up logic the loader uses, so
+    // a sub-crate shelled into a monorepo sees the repo-root
+    // settings.toml (not just files sitting in the cwd).
+    let user_config = crate::config::user_config_path();
     if let Some(ref path) = user_config {
         if path.exists() {
-            checks.push(Check::pass(
-                "config:user_file",
-                &format!("User config: {}", path.display()),
-            ));
+            match toml::from_str::<toml::Value>(&std::fs::read_to_string(path).unwrap_or_default())
+            {
+                Ok(value) => {
+                    let unknown = collect_unknown_config_keys(&value);
+                    if unknown.is_empty() {
+                        checks.push(Check::pass(
+                            "config:user_file",
+                            &format!("User config: {}", path.display()),
+                        ));
+                    } else {
+                        checks.push(Check::warn(
+                            "config:user_file",
+                            &format!(
+                                "User config {} has unknown key(s): {}",
+                                path.display(),
+                                unknown.join(", ")
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    checks.push(Check::fail(
+                        "config:user_file",
+                        &format!("User config {} failed to parse: {e}", path.display()),
+                    ));
+                }
+            }
         } else {
             checks.push(Check::warn(
                 "config:user_file",
@@ -157,11 +185,101 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
         }
     }
 
-    let project_config = cwd.join(".agent").join("settings.toml");
-    if project_config.exists() {
-        checks.push(Check::pass(
-            "config:project_file",
-            &format!("Project config: {}", project_config.display()),
+    if let Some(project_config) = crate::config::find_project_config() {
+        match toml::from_str::<toml::Value>(
+            &std::fs::read_to_string(&project_config).unwrap_or_default(),
+        ) {
+            Ok(value) => {
+                let unknown = collect_unknown_config_keys(&value);
+                if unknown.is_empty() {
+                    checks.push(Check::pass(
+                        "config:project_file",
+                        &format!("Project config: {}", project_config.display()),
+                    ));
+                } else {
+                    checks.push(Check::warn(
+                        "config:project_file",
+                        &format!(
+                            "Project config {} has unknown key(s): {}",
+                            project_config.display(),
+                            unknown.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                checks.push(Check::fail(
+                    "config:project_file",
+                    &format!(
+                        "Project config {} failed to parse: {e}",
+                        project_config.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(local_config) = crate::config::find_project_local_config() {
+        match toml::from_str::<toml::Value>(
+            &std::fs::read_to_string(&local_config).unwrap_or_default(),
+        ) {
+            Ok(value) => {
+                let unknown = collect_unknown_config_keys(&value);
+                if unknown.is_empty() {
+                    checks.push(Check::pass(
+                        "config:project_local_file",
+                        &format!("Project local overrides: {}", local_config.display()),
+                    ));
+                } else {
+                    checks.push(Check::warn(
+                        "config:project_local_file",
+                        &format!(
+                            "Project local overrides {} has unknown key(s): {}",
+                            local_config.display(),
+                            unknown.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                checks.push(Check::fail(
+                    "config:project_local_file",
+                    &format!(
+                        "Project local overrides {} failed to parse: {e}",
+                        local_config.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Warn when multiple provider API keys are set — the resolver
+    // picks the highest-priority one deterministically but the user
+    // might not realize the others are being ignored.
+    let present_keys = [
+        "AGENT_CODE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "TOGETHER_API_KEY",
+        "OPENROUTER_API_KEY",
+        "COHERE_API_KEY",
+        "PERPLEXITY_API_KEY",
+    ]
+    .into_iter()
+    .filter(|k| std::env::var(k).is_ok())
+    .collect::<Vec<_>>();
+    if present_keys.len() > 1 {
+        checks.push(Check::warn(
+            "env:api_key_precedence",
+            &format!(
+                "Multiple API-key env vars set: {}. Resolver uses the first — others ignored.",
+                present_keys.join(", ")
+            ),
         ));
     }
 
@@ -414,6 +532,38 @@ fn is_valid_http_method(m: &str) -> bool {
         m.to_ascii_uppercase().as_str(),
         "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
     )
+}
+
+/// Top-level TOML table names that the config loader actually reads.
+///
+/// The loader's struct uses `#[serde(default)]` which silently ignores
+/// unknown fields. That's the right choice at runtime (forwards-compat
+/// with newer tools writing a shared file), but it turns typos into
+/// silent no-ops. `/doctor` uses this allow-list to call them out.
+const KNOWN_CONFIG_SECTIONS: &[&str] = &[
+    "api",
+    "ui",
+    "permissions",
+    "features",
+    "security",
+    "sandbox",
+    "mcp_servers",
+    "hooks",
+    "subagents",
+    "allowed_project_dirs",
+];
+
+fn collect_unknown_config_keys(value: &toml::Value) -> Vec<String> {
+    let toml::Value::Table(root) = value else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = root
+        .keys()
+        .filter(|k| !KNOWN_CONFIG_SECTIONS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 #[cfg(test)]
@@ -671,5 +821,80 @@ mod tests {
         assert!(mcp_check.is_some());
         // The binary won't exist, so it should fail.
         assert_eq!(mcp_check.unwrap().status, CheckStatus::Fail);
+    }
+
+    // ---- collect_unknown_config_keys ----
+
+    fn parse(body: &str) -> toml::Value {
+        toml::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn unknown_config_keys_empty_when_all_sections_known() {
+        let v = parse(
+            r#"
+[api]
+model = "x"
+[ui]
+theme = "dark"
+[permissions]
+default_mode = "ask"
+"#,
+        );
+        assert!(collect_unknown_config_keys(&v).is_empty());
+    }
+
+    #[test]
+    fn unknown_config_keys_flags_typo_section() {
+        let v = parse(
+            r#"
+[api]
+model = "x"
+[permisions]    # typo: should be `permissions`
+default_mode = "ask"
+"#,
+        );
+        let unknown = collect_unknown_config_keys(&v);
+        assert_eq!(unknown, vec!["permisions".to_string()]);
+    }
+
+    #[test]
+    fn unknown_config_keys_are_sorted_and_complete() {
+        let v = parse(
+            r#"
+[api]
+model = "x"
+[zzz_nope]
+a = 1
+[aaa_nope]
+b = 2
+"#,
+        );
+        let unknown = collect_unknown_config_keys(&v);
+        assert_eq!(unknown, vec!["aaa_nope", "zzz_nope"]);
+    }
+
+    #[test]
+    fn unknown_config_keys_accepts_all_sections_the_loader_reads() {
+        // Build a TOML body that declares every section in the
+        // known-sections list so this test will fail the moment the
+        // loader grows a new section and we forget to teach /doctor
+        // about it.
+        let body = KNOWN_CONFIG_SECTIONS
+            .iter()
+            .map(|s| format!("[{s}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let v = parse(&body);
+        assert!(
+            collect_unknown_config_keys(&v).is_empty(),
+            "a section in the allow-list is being reported as unknown"
+        );
+    }
+
+    #[test]
+    fn unknown_config_keys_noop_on_non_table_root() {
+        let v: toml::Value = "42".parse().unwrap();
+        assert!(collect_unknown_config_keys(&v).is_empty());
     }
 }

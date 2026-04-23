@@ -182,12 +182,12 @@ fn resolve_api_key_from_env() -> Option<String> {
 }
 
 /// Returns the user-level config file path.
-fn user_config_path() -> Option<PathBuf> {
+pub(crate) fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("agent-code").join("config.toml"))
 }
 
 /// Walk up from the current directory to find `.agent/settings.toml`.
-fn find_project_config() -> Option<PathBuf> {
+pub(crate) fn find_project_config() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     find_config_in_ancestors(&cwd)
 }
@@ -200,7 +200,7 @@ fn find_project_config() -> Option<PathBuf> {
 /// `settings.local.toml` at a different ancestor level than the
 /// committed settings — for example, a repo-root `settings.toml` plus
 /// a crate-local `settings.local.toml` overriding just one field.
-fn find_project_local_config() -> Option<PathBuf> {
+pub(crate) fn find_project_local_config() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     find_local_config_in_ancestors(&cwd)
 }
