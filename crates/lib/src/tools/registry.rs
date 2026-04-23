@@ -42,6 +42,7 @@ impl ToolRegistry {
         registry.register(Arc::new(super::tasks::TaskListTool));
         registry.register(Arc::new(super::tasks::TaskStopTool));
         registry.register(Arc::new(super::tasks::TaskOutputTool));
+        registry.register(Arc::new(super::monitor::MonitorTool));
         registry.register(Arc::new(super::todo_write::TodoWriteTool));
         registry.register(Arc::new(super::tool_search::ToolSearchTool));
         registry.register(Arc::new(super::worktree::EnterWorktreeTool));
