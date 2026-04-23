@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`/pentest` bundled skill**: five-phase white-box penetration test workflow (recon → slice → vuln analysis → exploit-or-discard → report) with a proof-of-concept gating policy — findings without a reproducible PoC are demoted to INFO or dropped. Runs entirely in-session against a target directory and writes a severity-grouped markdown report.
+- **`/effort` command** (#150): rates task complexity XS/S/M/L/XL with a one-line justification and top 2 risks. No-arg form rates the task currently being discussed; `/effort <task>` rates a supplied description.
+- **`/break-cache` command** (#151): forces the next outgoing request to skip the prompt cache so the cache prefix is rebuilt. One-shot flag on `AppState`, consumed after the next request. Useful for mid-session config changes or debugging cache behavior.
+- **`/heapdump` command** (#152, hidden from `/help`): writes a best-effort process memory snapshot (VmRSS / VmSize / VmPeak / per-segment on Linux; `ps -o rss,vsz` on macOS) to a timestamped file under the data directory.
+- **`/btw` command** (#153): quick-capture note to user memory without going through the model. Writes a timestamped markdown file with slugified filename and updates `MEMORY.md` index.
+- **`/rename` command** (#154): attaches a human-readable label to the current session. Surfaced in `/sessions` listings; empty arg clears the label. New `label: Option<String>` on `SessionData`, serde-defaulted for backward compat.
+- **`/add-dir` command** (#155): tracks additional directories alongside cwd in the session's working set. Injected into the system prompt under `# Environment`. Paths are canonicalized on add. Forms: list, add, `--remove <path>`, `--clear`. Session-scoped (not persisted).
+- **`remember` bundled skill** (#156): saves an insight to user memory using the two-step write discipline (file + MEMORY.md index) with correct type classification.
+- **`stuck` bundled skill** (#157): forces the agent to name the shared assumption behind failed attempts, propose two different approaches, and take one concrete step without retrying what already failed.
+- **`simplify` bundled skill** (#158): review-then-simplify pass on the current diff — flags dead weight (unused imports, premature abstractions, speculative error handling, defensive copies, comments restating code).
+- **`/thinkback` command** (#159): surfaces the model's extended-thinking blocks from a recent assistant turn. `/thinkback` shows the latest; `/thinkback <n>` walks back N turns (1 = latest).
+- **`/usage` command** (#160): per-turn token timeline table (model, input, output, cache read, cache write) plus a cache-hit-rate hint. Complements `/cost` which aggregates.
+- **`batch` bundled skill** (#162): applies the same change across multiple git worktrees — one worktree per target, test+lint gate per target, first failure stops the run.
+- **`skillify` bundled skill** (#163): extracts the productive workflow from the current session into a reusable `.agent/skills/<name>.md` file with YAML frontmatter and imperative numbered steps.
+- **`/pr-comments` command** (#164): fetches inline + issue comments on a PR via `gh`, groups them into (unresolved / action-requested / resolved), and produces a triage list with file:line, author quote, and suggested response or fix per item.
+- **`/autofix-pr` command** (#165): checks out a PR in an isolated worktree, detects the toolchain, runs the lint + test gate, applies minimal fixes with re-verification after each, commits, and pushes back. Never force-pushes, never skips hooks, never modifies tests to make them pass.
+- **`/perf-issue` command** (#166): report-only performance regression audit on the current diff (or named target). Looks for N+1 queries, missing indexes, sync I/O on hot paths, allocation hotspots, quadratic algorithms, cache invalidation bugs, unbounded growth, and sync-in-async patterns.
+
+### Fixed
+
+- **Tarpaulin coverage flake** (#161): switched `cargo tarpaulin` to `--engine llvm` in CI. The default ptrace engine raced with tokio's child-process reaper on cancellation tests, producing spurious ECHILD / multi-terabyte allocation failures. LLVM engine uses source-based coverage with no ptrace.
 
 ## [0.16.1] - 2026-04-18
 

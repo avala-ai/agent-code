@@ -76,7 +76,7 @@ Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080
 
 File ops, search, shell, git, web, LSP, MCP, notebooks, tasks, and more. Tools execute during LLM streaming for faster turns. [Full list →](docs/reference/tools.mdx)
 
-## 18 Bundled Skills
+## 24 Bundled Skills
 
 | Skill | Purpose |
 |-------|---------|
@@ -99,6 +99,11 @@ File ops, search, shell, git, web, LSP, MCP, notebooks, tasks, and more. Tools e
 | `/coverage` | Measure and report test coverage |
 | `/migrate` | Apply codebase-wide migrations |
 | `/docs` | Generate or update documentation |
+| `/remember` | Save a specific insight to user memory (two-step write discipline) |
+| `/stuck` | Step back and try a different angle when the agent is looping |
+| `/simplify` | Review-then-simplify pass: flag dead weight in the current diff |
+| `/batch` | Apply the same change across multiple git worktrees |
+| `/skillify` | Extract the successful workflow from this session into a reusable skill |
 
 Add custom skills as markdown files in `.agent/skills/` or `~/.config/agent-code/skills/`.
 
@@ -139,11 +144,11 @@ client/                    Cross-platform Flutter desktop/web GUI (see client/RE
 
 The engine is a reusable library. The CLI binary is a thin wrapper. The Flutter client in `client/` is a separate front-end that talks to the engine via the `agent_code_client` package.
 
-## 52 Slash Commands
+## 63 Slash Commands
 
 Session management, context control, git operations, agent coordination, configuration, diagnostics, and more. [Full list →](docs/reference/commands.mdx)
 
-Highlights: `/release-notes`, `/summary`, `/feedback`, `/share`, `/update`, `/uninstall`, `/doctor`, `/plan`, `/model`, `/cost`, `/scroll`, `/rewind`, `/fork`
+Highlights: `/release-notes`, `/summary`, `/feedback`, `/share`, `/update`, `/uninstall`, `/doctor`, `/plan`, `/model`, `/cost`, `/usage`, `/scroll`, `/rewind`, `/fork`, `/rename`, `/add-dir`, `/btw`, `/effort`, `/thinkback`, `/break-cache`, `/pr-comments`, `/autofix-pr`, `/perf-issue`
 
 ## Security
 

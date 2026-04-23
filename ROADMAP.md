@@ -119,6 +119,11 @@ Living document comparing agent-code feature coverage against the broader termin
 - [x] **`advisor`** — Architecture and dependency health analysis
 - [x] **`bughunter`** — Systematic bug search with reproduction steps
 - [x] **`plan`** — Structured implementation planning with risk flags
+- [x] **`remember`** — Save insights to user memory with correct two-step write discipline
+- [x] **`stuck`** — Step back and try a different angle when the agent is looping
+- [x] **`simplify`** — Review-then-simplify pass flagging dead weight in the current diff
+- [x] **`batch`** — Apply the same change across multiple git worktrees
+- [x] **`skillify`** — Extract a productive session into a reusable skill file
 
 ### 2.2 Skill Safety Setting — Done
 
@@ -177,6 +182,23 @@ All commands are added to `crates/cli/src/commands/mod.rs`.
 
 - [x] **`/update`** — Check GitHub releases API, notify if newer version
 - [x] **`/uninstall`** — Remove binary, config, and data directories with confirmation
+
+### 3.6 Productivity Commands — Done
+
+- [x] **`/effort`** — Rate task complexity XS/S/M/L/XL with risks
+- [x] **`/break-cache`** — Force next request to skip the prompt cache
+- [x] **`/heapdump`** — Process memory snapshot (hidden, for bug reports)
+- [x] **`/btw`** — Quick-capture notes to user memory without a turn
+- [x] **`/rename`** — Label the current session; shown in `/sessions`
+- [x] **`/add-dir`** — Track additional directories alongside cwd
+- [x] **`/thinkback`** — View extended-thinking blocks from a recent turn
+- [x] **`/usage`** — Per-turn token timeline with cache-hit rate
+
+### 3.7 PR-Workflow Commands — Done
+
+- [x] **`/pr-comments`** — Fetch + triage PR review comments via `gh`
+- [x] **`/autofix-pr`** — Checkout PR → lint/test → fix → push, worktree-isolated
+- [x] **`/perf-issue`** — Report-only perf regression audit on the current diff
 
 ---
 

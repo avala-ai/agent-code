@@ -95,7 +95,7 @@ For complex skills with supporting files, use a directory:
 
 ## Bundled skills
 
-agent-code ships with 12 built-in skills. These are always available and can be overridden by placing a skill with the same name in your project or user skills directory.
+agent-code ships with 24 built-in skills. These are always available and can be overridden by placing a skill with the same name in your project or user skills directory.
 
 | Skill | Purpose |
 |-------|---------|
@@ -108,9 +108,21 @@ agent-code ships with 12 built-in skills. These are always available and can be 
 | `/refactor` | Refactor code for quality |
 | `/init` | Initialize project configuration |
 | `/security-review` | OWASP-oriented vulnerability scan |
+| `/pentest` | White-box penetration test with proof-of-concept gating |
 | `/advisor` | Architecture and dependency health analysis |
 | `/bughunter` | Systematic bug search |
 | `/plan` | Structured implementation planning |
+| `/changelog` | Generate changelog entries from commit history |
+| `/release` | Cut a versioned release |
+| `/benchmark` | Run and compare benchmarks |
+| `/coverage` | Measure and report test coverage |
+| `/migrate` | Apply codebase-wide migrations |
+| `/docs` | Generate or update documentation |
+| `/remember` | Save a specific insight to user memory (two-step write discipline) |
+| `/stuck` | Step back and try a different angle when the agent is looping |
+| `/simplify` | Review-then-simplify pass: flag dead weight in the current diff |
+| `/batch` | Apply the same change across multiple git worktrees |
+| `/skillify` | Extract the successful workflow from this session into a reusable skill |
 
 ## Commands
 

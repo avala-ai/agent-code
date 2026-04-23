@@ -9,7 +9,8 @@ Type `/` followed by a command name in the REPL. Unknown commands are passed to 
 | `/exit` | Exit the REPL |
 | `/clear` | Reset conversation history |
 | `/resume <id>` | Restore a previous session by ID |
-| `/sessions` | List recent saved sessions |
+| `/sessions` | List recent saved sessions (shows labels from `/rename`) |
+| `/rename <name>` | Set a human-readable label on the current session (empty clears it) |
 | `/export` | Export conversation to markdown file |
 | `/share` | Export session as shareable markdown with metadata |
 | `/summary` | Ask the agent to summarize the session |
@@ -20,10 +21,14 @@ Type `/` followed by a command name in the REPL. Unknown commands are passed to 
 | Command | Description |
 |---------|-------------|
 | `/cost` | Token usage and estimated session cost |
+| `/usage` | Per-turn token timeline (input / output / cache read / cache write) |
 | `/context` | Context window usage and auto-compact threshold |
 | `/compact` | Free context by clearing stale tool results |
+| `/break-cache` | Force the next request to skip the prompt cache |
+| `/add-dir <path>` | Track an additional directory alongside cwd (list / `--remove <path>` / `--clear`) |
 | `/model [name]` | Show or switch the active model (interactive picker) |
 | `/verbose` | Toggle verbose output (shows token counts) |
+| `/thinkback [n]` | Show the model's thinking blocks from the nth most recent turn (1 = latest) |
 
 ## Git
 
@@ -35,6 +40,9 @@ Type `/` followed by a command name in the REPL. Unknown commands are passed to 
 | `/review` | Analyze diff for bugs and issues |
 | `/branch [name]` | Show or switch git branch |
 | `/log` | Show recent git history |
+| `/pr-comments [n]` | Triage review comments on the current (or specified) PR |
+| `/autofix-pr [n]` | Check out a PR in a worktree, fix lint/test failures, push back |
+| `/perf-issue [scope]` | Audit the current diff (or named target) for perf regressions |
 
 ## Agent Control
 
@@ -80,6 +88,15 @@ Type `/` followed by a command name in the REPL. Unknown commands are passed to 
 | `/release-notes` | Show release notes for the current version |
 | `/feedback <msg>` | Submit feedback or suggestions |
 | `/bug` | Report a bug (opens GitHub issues link) |
+| `/heapdump` | Write a process memory snapshot to disk (hidden from `/help`) |
+| `/effort [task]` | Rate task complexity XS / S / M / L / XL with risks |
+
+## Memory
+
+| Command | Description |
+|---------|-------------|
+| `/memory` | Show loaded memory context |
+| `/btw <note>` | Append a quick note to user memory (creates a timestamped file) |
 
 ## Editing
 
