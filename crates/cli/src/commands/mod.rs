@@ -438,6 +438,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Estimate the token count of arbitrary text (e.g. /tokens hello world)",
         hidden: false,
     },
+    Command {
+        name: "thinkback-play",
+        aliases: &[],
+        description: "Replay every turn's thinking blocks in order with a short pause between",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1593,6 +1599,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             execute_thinkback(args, engine);
             CommandResult::Handled
         }
+        Some("thinkback-play") => {
+            execute_thinkback_play(engine);
+            CommandResult::Handled
+        }
         Some("pr-comments") => {
             let target = args.map(|s| s.trim()).unwrap_or("");
             let selector = if target.is_empty() {
@@ -2275,6 +2285,44 @@ fn collect_thinking_turns(messages: &[agent_code_lib::llm::message::Message]) ->
 
 /// Execute `/thinkback [n]`. With no arg, shows the most recent turn's
 /// thinking blocks. With `n`, shows the nth most recent (1 = latest).
+/// Execute `/thinkback-play` — replay every turn's thinking blocks in
+/// chronological order with a short pause between turns so the reader
+/// can follow. Ctrl-C interrupts (the repl signal handler handles
+/// that; this function just blocks in `thread::sleep`).
+fn execute_thinkback_play(engine: &QueryEngine) {
+    let turns = collect_thinking_turns(&engine.state().messages);
+    if turns.is_empty() {
+        println!("No thinking blocks in this session yet.");
+        return;
+    }
+
+    println!();
+    println!(
+        "  Replaying {} turn(s) of thinking. Ctrl-C to stop.",
+        turns.len()
+    );
+    println!();
+
+    for (i, blocks) in turns.iter().enumerate() {
+        let turn_num = i + 1;
+        println!("  ─── turn {turn_num} / {} ───", turns.len());
+        for (j, block) in blocks.iter().enumerate() {
+            if blocks.len() > 1 {
+                println!("  · block {} ·", j + 1);
+            }
+            println!("{block}");
+            // Pause proportional to content length: ~15ms per char,
+            // clamped to 0.3s–4s per block so tiny turns don't feel
+            // instant and long turns don't wait forever.
+            let chars = block.chars().count() as u64;
+            let ms = (chars * 15).clamp(300, 4000);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        println!();
+    }
+    println!("  Done.");
+}
+
 fn execute_thinkback(args: Option<&str>, engine: &QueryEngine) {
     let turns = collect_thinking_turns(&engine.state().messages);
     if turns.is_empty() {
