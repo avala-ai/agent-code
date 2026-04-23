@@ -13,6 +13,7 @@
 //! Agents are defined as configurations that customize the tool
 //! set, system prompt, and permission mode.
 
+use crate::config::{PermissionMode, PermissionRule, PermissionsConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +40,13 @@ pub struct AgentDefinition {
     pub read_only: bool,
     /// Maximum turns for this agent type.
     pub max_turns: Option<usize>,
+    /// Per-agent permission overlay. When `Some`, this is serialised to
+    /// a temp TOML file and passed to the spawned subagent via
+    /// `--permissions-overlay`, replacing its effective permissions for
+    /// the run. When `None`, the subagent inherits the parent's
+    /// permission config (or falls back to `read_only` → `--permission-mode plan`).
+    #[serde(default)]
+    pub permissions: Option<PermissionsConfig>,
 }
 
 /// Registry of available agent types.
@@ -62,6 +70,7 @@ impl AgentRegistry {
                 exclude_tools: Vec::new(),
                 read_only: false,
                 max_turns: None,
+                permissions: None,
             },
         );
 
@@ -88,6 +97,7 @@ impl AgentRegistry {
                 exclude_tools: Vec::new(),
                 read_only: true,
                 max_turns: Some(20),
+                permissions: None,
             },
         );
 
@@ -112,6 +122,7 @@ impl AgentRegistry {
                 exclude_tools: Vec::new(),
                 read_only: true,
                 max_turns: Some(30),
+                permissions: None,
             },
         );
 
@@ -180,6 +191,10 @@ impl AgentRegistry {
 /// max_turns: 20
 /// include_tools: [FileRead, Grep, Glob]
 /// exclude_tools: [Bash]
+/// permission_mode: ask
+/// allow: ["Bash(git *)", "FileRead"]
+/// deny: ["Bash(rm *)"]
+/// ask: ["Bash(npm *)"]
 /// ---
 ///
 /// System prompt additions go here...
@@ -206,6 +221,10 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
     let mut max_turns = None;
     let mut include_tools = Vec::new();
     let mut exclude_tools = Vec::new();
+    let mut perm_mode: Option<PermissionMode> = None;
+    let mut allow_list: Vec<String> = Vec::new();
+    let mut deny_list: Vec<String> = Vec::new();
+    let mut ask_list: Vec<String> = Vec::new();
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -218,22 +237,12 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
                 "model" => model = Some(value.to_string()),
                 "read_only" => read_only = value == "true",
                 "max_turns" => max_turns = value.parse().ok(),
-                "include_tools" => {
-                    include_tools = value
-                        .trim_matches(|c| c == '[' || c == ']')
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                "exclude_tools" => {
-                    exclude_tools = value
-                        .trim_matches(|c| c == '[' || c == ']')
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+                "include_tools" => include_tools = parse_list_literal(value),
+                "exclude_tools" => exclude_tools = parse_list_literal(value),
+                "permission_mode" => perm_mode = parse_permission_mode(value),
+                "allow" => allow_list = parse_list_literal(value),
+                "deny" => deny_list = parse_list_literal(value),
+                "ask" => ask_list = parse_list_literal(value),
                 _ => {}
             }
         }
@@ -245,6 +254,8 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
         Some(body.to_string())
     };
 
+    let permissions = build_permissions_config(perm_mode, &allow_list, &deny_list, &ask_list);
+
     Some(AgentDefinition {
         name,
         description,
@@ -254,7 +265,105 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
         exclude_tools,
         read_only,
         max_turns,
+        permissions,
     })
+}
+
+/// Split a YAML-ish inline list value like `[a, b, "c d"]` into items.
+/// Trims brackets, splits on commas, strips surrounding quotes.
+fn parse_list_literal(value: &str) -> Vec<String> {
+    value
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Parse a permission mode keyword (`ask`, `allow`, `deny`, `plan`,
+/// `accept_edits`). Returns `None` for unrecognised values.
+fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
+    match value.trim().trim_matches(|c| c == '"' || c == '\'') {
+        "allow" => Some(PermissionMode::Allow),
+        "deny" => Some(PermissionMode::Deny),
+        "ask" => Some(PermissionMode::Ask),
+        "plan" => Some(PermissionMode::Plan),
+        "accept_edits" => Some(PermissionMode::AcceptEdits),
+        _ => None,
+    }
+}
+
+/// Parse a single permission entry like `Bash(git *)` into a tool name
+/// plus optional pattern. Bare tool names like `Grep` yield `(Grep, None)`.
+fn parse_permission_entry(entry: &str) -> (String, Option<String>) {
+    let trimmed = entry.trim();
+    if let Some(open) = trimmed.find('(')
+        && let Some(close) = trimmed.rfind(')')
+        && close > open
+    {
+        let tool = trimmed[..open].trim().to_string();
+        let pattern = trimmed[open + 1..close].trim().to_string();
+        let pattern = if pattern.is_empty() {
+            None
+        } else {
+            Some(pattern)
+        };
+        return (tool, pattern);
+    }
+    (trimmed.to_string(), None)
+}
+
+/// Build a `PermissionsConfig` from the parts collected out of an agent
+/// file's frontmatter. Returns `None` when the agent file specified no
+/// permission-related fields — callers can then leave the subagent to
+/// inherit the parent's config.
+fn build_permissions_config(
+    mode: Option<PermissionMode>,
+    allow: &[String],
+    deny: &[String],
+    ask: &[String],
+) -> Option<PermissionsConfig> {
+    if mode.is_none() && allow.is_empty() && deny.is_empty() && ask.is_empty() {
+        return None;
+    }
+    let mut rules: Vec<PermissionRule> = Vec::new();
+    for entry in allow {
+        let (tool, pattern) = parse_permission_entry(entry);
+        rules.push(PermissionRule {
+            tool,
+            pattern,
+            action: PermissionMode::Allow,
+        });
+    }
+    for entry in deny {
+        let (tool, pattern) = parse_permission_entry(entry);
+        rules.push(PermissionRule {
+            tool,
+            pattern,
+            action: PermissionMode::Deny,
+        });
+    }
+    for entry in ask {
+        let (tool, pattern) = parse_permission_entry(entry);
+        rules.push(PermissionRule {
+            tool,
+            pattern,
+            action: PermissionMode::Ask,
+        });
+    }
+    Some(PermissionsConfig {
+        default_mode: mode.unwrap_or(PermissionMode::Ask),
+        rules,
+    })
+}
+
+/// Serialise a `PermissionsConfig` to a TOML snippet suitable for use
+/// as the body of a `--permissions-overlay` file.
+pub fn permissions_to_toml(perms: &PermissionsConfig) -> Result<String, String> {
+    let mut root = toml::value::Table::new();
+    let perm_value = toml::Value::try_from(perms).map_err(|e| e.to_string())?;
+    root.insert("permissions".to_string(), perm_value);
+    toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())
 }
 
 // ---- Coordinator Runtime ----
@@ -370,6 +479,32 @@ fn build_agent_command(
     }
     if definition.read_only {
         cmd.arg("--permission-mode").arg("plan");
+    }
+
+    // Per-agent permissions overlay. When the agent definition carries
+    // its own PermissionsConfig, serialise it to a temp TOML file and
+    // pass the path to the child. The child loads the file via
+    // `--permissions-overlay` and replaces its own permissions with it.
+    // We intentionally leak the temp file: the file is tiny, the OS
+    // cleans `/tmp` on reboot, and cleaning it up early would race the
+    // child process's read.
+    if let Some(ref perms) = definition.permissions
+        && let Ok(toml_body) = permissions_to_toml(perms)
+    {
+        let filename = format!(
+            "agent-code-perms-{}.toml",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("overlay")
+        );
+        let path = std::env::temp_dir().join(filename);
+        if std::fs::write(&path, toml_body).is_ok() {
+            cmd.arg("--permissions-overlay").arg(&path);
+        } else {
+            warn!("Failed to write permissions overlay; subagent will inherit parent permissions");
+        }
     }
 
     // Pass through API keys so subagents use the same provider.
@@ -758,5 +893,136 @@ mod coordinator_tests {
 
         let agents = coord.list_agents().await;
         assert_eq!(agents.len(), 2);
+    }
+
+    // ---- Per-agent permissions ----
+
+    #[test]
+    fn parse_permission_entry_bare_tool() {
+        let (tool, pat) = parse_permission_entry("Grep");
+        assert_eq!(tool, "Grep");
+        assert!(pat.is_none());
+    }
+
+    #[test]
+    fn parse_permission_entry_with_pattern() {
+        let (tool, pat) = parse_permission_entry("Bash(git *)");
+        assert_eq!(tool, "Bash");
+        assert_eq!(pat.as_deref(), Some("git *"));
+    }
+
+    #[test]
+    fn parse_permission_entry_strips_surrounding_whitespace() {
+        let (tool, pat) = parse_permission_entry("  FileRead(src/**)  ");
+        assert_eq!(tool, "FileRead");
+        assert_eq!(pat.as_deref(), Some("src/**"));
+    }
+
+    #[test]
+    fn build_permissions_returns_none_when_empty() {
+        let p = build_permissions_config(None, &[], &[], &[]);
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn build_permissions_default_mode_falls_back_to_ask() {
+        let allow = vec!["Grep".to_string()];
+        let p = build_permissions_config(None, &allow, &[], &[]).unwrap();
+        assert_eq!(p.default_mode, PermissionMode::Ask);
+        assert_eq!(p.rules.len(), 1);
+        assert_eq!(p.rules[0].tool, "Grep");
+        assert_eq!(p.rules[0].action, PermissionMode::Allow);
+    }
+
+    #[test]
+    fn build_permissions_orders_allow_deny_ask() {
+        let allow = vec!["Bash(git *)".to_string()];
+        let deny = vec!["Bash(rm *)".to_string()];
+        let ask = vec!["FileRead".to_string()];
+        let p = build_permissions_config(Some(PermissionMode::Deny), &allow, &deny, &ask).unwrap();
+        assert_eq!(p.default_mode, PermissionMode::Deny);
+        assert_eq!(p.rules.len(), 3);
+        assert_eq!(p.rules[0].action, PermissionMode::Allow);
+        assert_eq!(p.rules[0].pattern.as_deref(), Some("git *"));
+        assert_eq!(p.rules[1].action, PermissionMode::Deny);
+        assert_eq!(p.rules[1].pattern.as_deref(), Some("rm *"));
+        assert_eq!(p.rules[2].action, PermissionMode::Ask);
+        assert!(p.rules[2].pattern.is_none());
+    }
+
+    #[test]
+    fn parse_agent_file_reads_permission_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("my-agent.md");
+        let content = "---\n\
+             name: my-agent\n\
+             description: test\n\
+             permission_mode: deny\n\
+             allow: [\"Bash(git *)\", \"FileRead\"]\n\
+             deny: [\"Bash(rm *)\"]\n\
+             ---\n\
+             \n\
+             System prompt body.\n";
+        std::fs::write(&path, content).unwrap();
+
+        let def = parse_agent_file(&path).unwrap();
+        assert_eq!(def.name, "my-agent");
+        let perms = def.permissions.expect("permissions should be parsed");
+        assert_eq!(perms.default_mode, PermissionMode::Deny);
+        assert_eq!(perms.rules.len(), 3);
+        assert_eq!(perms.rules[0].tool, "Bash");
+        assert_eq!(perms.rules[0].pattern.as_deref(), Some("git *"));
+        assert_eq!(perms.rules[0].action, PermissionMode::Allow);
+        assert_eq!(perms.rules[1].tool, "FileRead");
+        assert!(perms.rules[1].pattern.is_none());
+        assert_eq!(perms.rules[2].tool, "Bash");
+        assert_eq!(perms.rules[2].pattern.as_deref(), Some("rm *"));
+        assert_eq!(perms.rules[2].action, PermissionMode::Deny);
+    }
+
+    #[test]
+    fn parse_agent_file_without_permissions_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("basic.md");
+        let content = "---\n\
+             name: basic\n\
+             description: no perms\n\
+             ---\n\
+             \n\
+             body\n";
+        std::fs::write(&path, content).unwrap();
+
+        let def = parse_agent_file(&path).unwrap();
+        assert!(def.permissions.is_none());
+    }
+
+    #[test]
+    fn permissions_to_toml_round_trip() {
+        let perms = PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![
+                PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: Some("git *".into()),
+                    action: PermissionMode::Allow,
+                },
+                PermissionRule {
+                    tool: "FileRead".into(),
+                    pattern: None,
+                    action: PermissionMode::Allow,
+                },
+            ],
+        };
+        let s = permissions_to_toml(&perms).unwrap();
+        assert!(s.contains("[permissions]"));
+        let value: toml::Value = toml::from_str(&s).unwrap();
+        let parsed: PermissionsConfig = value
+            .get("permissions")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(parsed.default_mode, PermissionMode::Deny);
+        assert_eq!(parsed.rules.len(), 2);
     }
 }

@@ -82,6 +82,15 @@ struct Cli {
     #[arg(long)]
     dangerously_skip_permissions: bool,
 
+    /// Path to a TOML file containing a `[permissions]` section. When set,
+    /// the file's permissions block *replaces* the effective permissions
+    /// for this run (default mode + rules). Used by the parent process to
+    /// hand a spawned subagent its own permission set without mutating
+    /// global config. Ignored when `security.disable_bypass_permissions`
+    /// is set.
+    #[arg(long)]
+    permissions_overlay: Option<String>,
+
     /// Disable process-level sandboxing for this session. Ignored when
     /// `security.disable_bypass_permissions = true` in config.
     #[arg(long)]
@@ -328,6 +337,52 @@ async fn main() -> anyhow::Result<()> {
             "accept_edits" => agent_code_lib::config::PermissionMode::AcceptEdits,
             _ => agent_code_lib::config::PermissionMode::Ask,
         };
+    }
+
+    // Apply --permissions-overlay. Parsed as a TOML document whose
+    // `[permissions]` section wholesale replaces `config.permissions`.
+    // The overlay is gated by `security.disable_bypass_permissions` so a
+    // locked-down host cannot be loosened by passing a file path.
+    if let Some(ref overlay_path) = cli.permissions_overlay {
+        if config.security.disable_bypass_permissions {
+            tracing::warn!(
+                "--permissions-overlay ignored: security.disable_bypass_permissions is set"
+            );
+        } else {
+            match std::fs::read_to_string(overlay_path) {
+                Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+                    Ok(value) => {
+                        if let Some(perms_value) = value.get("permissions") {
+                            match perms_value
+                                .clone()
+                                .try_into::<agent_code_lib::config::PermissionsConfig>()
+                            {
+                                Ok(perms) => {
+                                    config.permissions = perms;
+                                    tracing::debug!(
+                                        "Applied permissions overlay from {overlay_path}"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    "--permissions-overlay {overlay_path} has invalid \
+                                     [permissions] section: {e}"
+                                ),
+                            }
+                        } else {
+                            tracing::warn!(
+                                "--permissions-overlay {overlay_path} has no [permissions] section"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "--permissions-overlay {overlay_path} is not valid TOML: {e}"
+                    ),
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read --permissions-overlay {overlay_path}: {e}")
+                }
+            }
+        }
     }
 
     // Determine the effective API key: CLI flag > env var (in config) > config file.

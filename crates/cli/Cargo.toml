@@ -46,9 +46,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+toml = "1.1"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
-toml = "1.1"

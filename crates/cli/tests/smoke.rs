@@ -38,3 +38,12 @@ fn unknown_flag_fails() {
         .failure()
         .stderr(predicate::str::contains("error").or(predicate::str::contains("unexpected")));
 }
+
+#[test]
+fn permissions_overlay_flag_appears_in_help() {
+    agent()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--permissions-overlay"));
+}
