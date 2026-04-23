@@ -291,7 +291,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "rewind",
         aliases: &["undo"],
-        description: "Undo the last assistant turn (removes last assistant + tool messages)",
+        description: "Undo the last N turns (default 1) — removes the user prompt + all replies that followed",
         hidden: false,
     },
     Command {
@@ -1428,40 +1428,8 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
-        Some("rewind") => {
-            let messages = &mut engine.state_mut().messages;
-            // Remove messages from the end until we've removed the last assistant turn.
-            let mut removed = 0;
-            let mut found_assistant = false;
-            while let Some(msg) = messages.last() {
-                match msg {
-                    agent_code_lib::llm::message::Message::Assistant(_) => {
-                        messages.pop();
-                        removed += 1;
-                        found_assistant = true;
-                    }
-                    agent_code_lib::llm::message::Message::User(u) if found_assistant => {
-                        // Also remove the user message that triggered the turn.
-                        if !u.is_compact_summary {
-                            messages.pop();
-                            removed += 1;
-                        }
-                        break;
-                    }
-                    _ => {
-                        if found_assistant {
-                            break;
-                        }
-                        messages.pop();
-                        removed += 1;
-                    }
-                }
-            }
-            if removed > 0 {
-                println!("Rewound {removed} message(s). Last turn undone.");
-            } else {
-                println!("Nothing to rewind.");
-            }
+        Some("rewind") | Some("undo") => {
+            execute_rewind(args, engine);
             CommandResult::Handled
         }
         Some("color") => {
@@ -4046,6 +4014,87 @@ fn last_user_prompt(messages: &[agent_code_lib::llm::message::Message]) -> Optio
 }
 
 // ---------------------------------------------------------------------------
+// /rewind — undo the last N turns
+// ---------------------------------------------------------------------------
+
+/// Parse the optional turn count from `/rewind <N>`. Empty / missing means 1.
+/// Returns `Err` on anything non-numeric so callers can show a usage hint
+/// instead of silently doing nothing.
+fn parse_rewind_count(args: Option<&str>) -> Result<usize, String> {
+    let raw = args.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return Ok(1);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => Err("rewind count must be at least 1".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("'{raw}' is not a valid turn count")),
+    }
+}
+
+/// Undo a single turn in place. A "turn" is defined as the most recent real
+/// user prompt (not a tool result or compact summary) plus every message
+/// that came after it. Returns the number of messages removed, or 0 if
+/// there was no real prompt left to unwind.
+fn rewind_one_turn(messages: &mut Vec<agent_code_lib::llm::message::Message>) -> usize {
+    use agent_code_lib::llm::message::Message;
+    // Walk from the end to find the last non-meta, non-summary user message —
+    // that's the turn boundary. We do this in a single pass so we stop at
+    // the FIRST hit (which is the most recent prompt when iterating rev).
+    let mut boundary: Option<usize> = None;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        if let Message::User(u) = msg
+            && !u.is_meta
+            && !u.is_compact_summary
+        {
+            boundary = Some(i);
+            break;
+        }
+    }
+    match boundary {
+        Some(idx) => {
+            let removed = messages.len() - idx;
+            messages.truncate(idx);
+            removed
+        }
+        None => 0,
+    }
+}
+
+fn execute_rewind(args: Option<&str>, engine: &mut QueryEngine) {
+    let count = match parse_rewind_count(args) {
+        Ok(n) => n,
+        Err(msg) => {
+            println!("{msg}. Usage: /rewind [N]");
+            return;
+        }
+    };
+
+    let messages = &mut engine.state_mut().messages;
+    let mut total_removed = 0usize;
+    let mut turns_undone = 0usize;
+    for _ in 0..count {
+        let removed = rewind_one_turn(messages);
+        if removed == 0 {
+            break;
+        }
+        total_removed += removed;
+        turns_undone += 1;
+    }
+
+    if turns_undone == 0 {
+        println!("Nothing to rewind.");
+    } else if turns_undone < count {
+        println!(
+            "Rewound {turns_undone} turn(s) ({total_removed} message(s)); \
+             stopped early — no earlier user prompt to undo."
+        );
+    } else {
+        println!("Rewound {turns_undone} turn(s) ({total_removed} message(s)).");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /search — grep the current session for a substring
 // ---------------------------------------------------------------------------
 
@@ -5779,5 +5828,107 @@ mod tests {
                 "flag {flag} should come before sandbox in {line:?}"
             );
         }
+    }
+
+    // ---- /rewind helpers ----
+
+    fn mk_assistant_text(text: &str) -> agent_code_lib::llm::message::Message {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message};
+        use uuid::Uuid;
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: None,
+            usage: Default::default(),
+            model: None,
+            request_id: None,
+        })
+    }
+
+    #[test]
+    fn parse_rewind_count_defaults_to_one() {
+        assert_eq!(parse_rewind_count(None), Ok(1));
+        assert_eq!(parse_rewind_count(Some("")), Ok(1));
+        assert_eq!(parse_rewind_count(Some("   ")), Ok(1));
+    }
+
+    #[test]
+    fn parse_rewind_count_parses_positive_integer() {
+        assert_eq!(parse_rewind_count(Some("3")), Ok(3));
+        assert_eq!(parse_rewind_count(Some("  7 ")), Ok(7));
+    }
+
+    #[test]
+    fn parse_rewind_count_rejects_zero_and_garbage() {
+        assert!(parse_rewind_count(Some("0")).is_err());
+        assert!(parse_rewind_count(Some("-1")).is_err());
+        assert!(parse_rewind_count(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn rewind_one_turn_removes_prompt_and_everything_after() {
+        // [user, asst, tool-result, asst] — one turn with a tool round-trip.
+        let mut msgs = vec![
+            mk_user_text("hello"),
+            mk_assistant_text("thinking"),
+            mk_tool_result("t1"),
+            mk_assistant_text("done"),
+        ];
+        let removed = rewind_one_turn(&mut msgs);
+        assert_eq!(removed, 4);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn rewind_one_turn_peels_only_the_last_turn() {
+        // Two turns: [U1, A1, U2, A2]. Rewind once should leave [U1, A1].
+        let mut msgs = vec![
+            mk_user_text("first"),
+            mk_assistant_text("reply 1"),
+            mk_user_text("second"),
+            mk_assistant_text("reply 2"),
+        ];
+        let removed = rewind_one_turn(&mut msgs);
+        assert_eq!(removed, 2);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn rewind_one_turn_skips_compact_summary_as_boundary() {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        // A compact summary must not be treated as a user prompt — rewind
+        // should walk past it and not truncate the summary itself.
+        let compact = Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::Text {
+                text: "compacted...".into(),
+            }],
+            is_meta: false,
+            is_compact_summary: true,
+        });
+        let mut msgs = vec![compact, mk_assistant_text("post-compact reply")];
+        let removed = rewind_one_turn(&mut msgs);
+        // No real user prompt exists, so nothing should be rewindable.
+        assert_eq!(removed, 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn rewind_one_turn_returns_zero_on_empty_history() {
+        let mut msgs: Vec<agent_code_lib::llm::message::Message> = vec![];
+        assert_eq!(rewind_one_turn(&mut msgs), 0);
+    }
+
+    #[test]
+    fn rewind_one_turn_treats_tool_result_as_not_a_prompt() {
+        // Tail is a User with is_meta=true (tool result). No real prompt
+        // exists, so we must NOT chew through the history.
+        let mut msgs = vec![mk_tool_result("t1")];
+        let removed = rewind_one_turn(&mut msgs);
+        assert_eq!(removed, 0);
+        assert_eq!(msgs.len(), 1);
     }
 }
