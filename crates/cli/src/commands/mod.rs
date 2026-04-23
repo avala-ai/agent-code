@@ -427,6 +427,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "cd",
+        aliases: &["chdir"],
+        description: "Change the session's working directory (accepts ~ and relative paths)",
+        hidden: false,
+    },
+    Command {
         name: "rename",
         aliases: &[],
         description: "Set a human-readable label on the current session (or clear it)",
@@ -2154,6 +2160,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             execute_add_dir(args, engine);
             CommandResult::Handled
         }
+        Some("cd") | Some("chdir") => {
+            execute_cd(args, engine);
+            CommandResult::Handled
+        }
         Some("rename") => {
             let session_id = engine.state().session_id.clone();
             let label = args.map(|s| s.trim()).filter(|s| !s.is_empty());
@@ -2724,6 +2734,92 @@ fn execute_add_dir(args: Option<&str>, engine: &mut QueryEngine) {
     }
     engine.state_mut().additional_dirs.push(s.clone());
     println!("Tracking: {s}");
+}
+
+/// Resolve a user-typed path fragment into a canonical directory path,
+/// expanding a leading `~` against `$HOME` and resolving relative paths
+/// against `base`. Returns `Err` with a user-readable message when the
+/// path doesn't exist, isn't a directory, or resolution fails.
+fn resolve_cd_target(raw: &str, base: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Usage: /cd <path>".into());
+    }
+
+    // `~` expansion — only at the start of the path, matching shell
+    // semantics. `~user` is not supported (that would require NSS
+    // lookups and isn't portable).
+    let expanded: std::path::PathBuf = if let Some(rest) = trimmed.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => return Err("$HOME is not set; cannot expand ~".into()),
+        }
+    } else if trimmed == "~" {
+        match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home),
+            None => return Err("$HOME is not set; cannot expand ~".into()),
+        }
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    // Relative paths resolve against the current session cwd, not
+    // the process cwd — the session cwd is what the agent sees.
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+
+    let canonical = absolute
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve {raw}: {e}"))?;
+
+    if !canonical.is_dir() {
+        return Err(format!("Not a directory: {}", canonical.display()));
+    }
+
+    Ok(canonical)
+}
+
+/// Execute `/cd <path>` — change the session's working directory.
+/// Accepts absolute paths, paths relative to the current cwd, and
+/// `~`-prefixed paths. Also updates the process cwd so subsequent
+/// tool invocations (Bash, FileRead, Grep, etc.) see the new
+/// directory. The cached system prompt is invalidated so the next
+/// turn's `# Environment` block reflects the new cwd.
+fn execute_cd(args: Option<&str>, engine: &mut QueryEngine) {
+    let raw = args.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        println!("{}", engine.state().cwd);
+        println!("Usage: /cd <path>   (accepts ~, absolute, or relative paths)");
+        return;
+    }
+
+    let current = std::path::PathBuf::from(&engine.state().cwd);
+    let canonical = match resolve_cd_target(raw, &current) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return;
+        }
+    };
+
+    // Keep the process cwd in lockstep with the session cwd so tools
+    // that shell out (Bash, PowerShell, REPL) land in the same dir.
+    // set_current_dir can fail on permission or vanished-dir races;
+    // surface the error without rolling back the session cwd — at
+    // worst the agent sees a stale process cwd for one turn.
+    if let Err(e) = std::env::set_current_dir(&canonical) {
+        eprintln!("Warning: failed to update process cwd: {e}");
+    }
+
+    let new_cwd = canonical.display().to_string();
+    engine.state_mut().cwd = new_cwd.clone();
+    // Invalidate the system-prompt cache — the cwd is baked in and
+    // the agent would otherwise keep believing it's in the old dir.
+    engine.reset_system_prompt_cache();
+    println!("cwd: {new_cwd}");
 }
 
 /// Execute the /btw command: save a free-form note to user memory.
@@ -4943,6 +5039,71 @@ mod tests {
     // Serialize tests that mutate the global VISUAL/EDITOR env vars so
     // parallel test execution on Windows doesn't see each other's writes.
     static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ---- /cd helpers ----
+
+    #[test]
+    fn resolve_cd_target_rejects_empty_input() {
+        let base = std::env::temp_dir();
+        assert!(resolve_cd_target("", &base).is_err());
+        assert!(resolve_cd_target("   ", &base).is_err());
+    }
+
+    #[test]
+    fn resolve_cd_target_resolves_absolute_directory() {
+        let tmp = std::env::temp_dir();
+        let raw = tmp.display().to_string();
+        let got = resolve_cd_target(&raw, std::path::Path::new("/")).unwrap();
+        // Canonicalize the expected path too so symlink-expanded tmpdirs
+        // (e.g. /tmp -> /private/tmp on macOS) still compare equal.
+        assert_eq!(got, tmp.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_cd_target_resolves_relative_against_base() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        // Create a child dir inside tmp to resolve against.
+        let child = tmp.join(format!("agent-code-cd-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&child);
+        let child_name = child.file_name().unwrap().to_string_lossy().to_string();
+        let got = resolve_cd_target(&child_name, &tmp).unwrap();
+        assert_eq!(got, child.canonicalize().unwrap());
+        let _ = std::fs::remove_dir(&child);
+    }
+
+    #[test]
+    fn resolve_cd_target_rejects_nonexistent_path() {
+        let base = std::env::temp_dir();
+        let result = resolve_cd_target("this-directory-absolutely-does-not-exist-42xyz", &base);
+        assert!(result.is_err(), "nonexistent path should error");
+    }
+
+    #[test]
+    fn resolve_cd_target_rejects_file_not_directory() {
+        // Make a tempfile, point /cd at it, expect error.
+        let tmp = std::env::temp_dir();
+        let file_path = tmp.join(format!("agent-code-cd-file-{}.tmp", std::process::id()));
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        let raw = file_path.display().to_string();
+        let result = resolve_cd_target(&raw, std::path::Path::new("/"));
+        assert!(result.is_err(), "file path should not resolve as dir");
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn resolve_cd_target_expands_tilde_to_home() {
+        // Only run if HOME is set and resolvable; otherwise skip.
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home_canonical = std::path::PathBuf::from(home).canonicalize();
+        if home_canonical.is_err() {
+            return;
+        }
+        let base = std::env::temp_dir();
+        let got = resolve_cd_target("~", &base).unwrap();
+        assert_eq!(got, home_canonical.unwrap());
+    }
 
     #[test]
     fn slugify_basic() {
