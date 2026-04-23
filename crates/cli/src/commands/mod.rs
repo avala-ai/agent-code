@@ -516,6 +516,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Walk through `gh` CLI setup and verify scopes for PR commands",
         hidden: false,
     },
+    Command {
+        name: "open",
+        aliases: &[],
+        description: "Open an existing file in $EDITOR/$VISUAL (try /open src/main.rs)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -2023,6 +2029,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("tag") => {
             execute_tag(args, engine);
+            CommandResult::Handled
+        }
+        Some("open") => {
+            execute_open(args, engine);
             CommandResult::Handled
         }
         Some("install-github-app") => {
@@ -3626,6 +3636,102 @@ fn execute_editor(args: Option<&str>) -> Result<Option<String>, String> {
     }
 }
 
+/// Parsed `/open` arguments.
+struct OpenArgs<'a> {
+    path: &'a str,
+    create: bool,
+}
+
+fn parse_open_args(raw: &str) -> Option<OpenArgs<'_>> {
+    let mut create = false;
+    let mut path: Option<&str> = None;
+    for token in raw.split_whitespace() {
+        match token {
+            "--create" | "-c" => create = true,
+            other => {
+                if path.is_some() {
+                    // `/open a b` — multi-word paths aren't supported.
+                    return None;
+                }
+                path = Some(other);
+            }
+        }
+    }
+    path.map(|p| OpenArgs { path: p, create })
+}
+
+/// Resolve `input_path` against `cwd` using `.canonicalize()` where
+/// possible, falling back to the joined path. Keeps relative-paths
+/// rooted in the project instead of the user's home.
+fn resolve_path_against_cwd(cwd: &std::path::Path, input_path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(input_path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Execute `/open <path>` — open an existing file in the user's editor.
+/// Reuses the same editor-discovery logic as `/editor`.
+fn execute_open(args: Option<&str>, engine: &QueryEngine) {
+    let raw = args.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        println!("Usage: /open <path> [--create]");
+        return;
+    }
+    let Some(parsed) = parse_open_args(raw) else {
+        println!("Could not parse /open args. Use /open <path> [--create] with a single path.");
+        return;
+    };
+    let cwd = std::path::Path::new(&engine.state().cwd);
+    let target = resolve_path_against_cwd(cwd, parsed.path);
+
+    if !target.exists() {
+        if !parsed.create {
+            println!("File does not exist: {}", target.display());
+            println!("  append --create to make a new empty file and open it.");
+            return;
+        }
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            println!("Failed to create parent dir {}: {e}", parent.display());
+            return;
+        }
+        if let Err(e) = std::fs::write(&target, "") {
+            println!("Failed to create {}: {e}", target.display());
+            return;
+        }
+    } else if target.is_dir() {
+        println!("{} is a directory, not a file.", target.display());
+        return;
+    }
+
+    let Some(editor) = resolve_editor() else {
+        println!("No editor found. Set $EDITOR or $VISUAL, or install vim / nano.");
+        return;
+    };
+
+    let status = std::process::Command::new(&editor).arg(&target).status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("Closed {} in {editor}.", target.display());
+        }
+        Ok(s) => {
+            println!(
+                "{editor} exited with {s} while editing {}.",
+                target.display()
+            );
+        }
+        Err(e) => {
+            println!("Failed to spawn {editor}: {e}");
+        }
+    }
+}
+
 /// Pick an editor. Returns the binary name/path to spawn.
 fn resolve_editor() -> Option<String> {
     if let Ok(v) = std::env::var("VISUAL")
@@ -4456,5 +4562,53 @@ mod tests {
         let tags: Vec<_> = files[0].1.iter().map(|s| s.tag()).collect();
         assert_eq!(tags, vec!["@", "read"]);
         assert_eq!(files[0].2, 2);
+    }
+
+    // ---- /open helpers ----
+
+    #[test]
+    fn parse_open_args_accepts_bare_path() {
+        let a = parse_open_args("src/main.rs").unwrap();
+        assert_eq!(a.path, "src/main.rs");
+        assert!(!a.create);
+    }
+
+    #[test]
+    fn parse_open_args_recognizes_create_before_path() {
+        let a = parse_open_args("--create notes/new.md").unwrap();
+        assert_eq!(a.path, "notes/new.md");
+        assert!(a.create);
+    }
+
+    #[test]
+    fn parse_open_args_recognizes_create_after_path() {
+        let a = parse_open_args("notes/new.md --create").unwrap();
+        assert_eq!(a.path, "notes/new.md");
+        assert!(a.create);
+    }
+
+    #[test]
+    fn parse_open_args_rejects_multiple_paths() {
+        assert!(parse_open_args("a.rs b.rs").is_none());
+    }
+
+    #[test]
+    fn parse_open_args_returns_none_for_empty_flags_only() {
+        // All tokens are flags — no path.
+        assert!(parse_open_args("--create").is_none());
+    }
+
+    #[test]
+    fn resolve_path_against_cwd_joins_relative() {
+        let cwd = std::path::Path::new("/tmp/project");
+        let p = resolve_path_against_cwd(cwd, "src/main.rs");
+        assert_eq!(p, std::path::Path::new("/tmp/project/src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_path_against_cwd_preserves_absolute() {
+        let cwd = std::path::Path::new("/tmp/project");
+        let p = resolve_path_against_cwd(cwd, "/etc/hosts");
+        assert_eq!(p, std::path::Path::new("/etc/hosts"));
     }
 }
