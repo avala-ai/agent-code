@@ -339,6 +339,11 @@ impl QueryEngine {
                 self.state.cwd.hash(&mut h);
                 self.state.config.mcp_servers.len().hash(&mut h);
                 self.tools.all().len().hash(&mut h);
+                // Include response_style so the cache invalidates
+                // when the user flips `/output-style`. Without this
+                // the style change would only take effect on the
+                // next "real" cache bust (e.g. cwd or model change).
+                (self.state.response_style as u8).hash(&mut h);
                 h.finish()
             };
             let system_prompt = if let Some((cached_hash, ref cached)) = self.cached_system_prompt
@@ -898,7 +903,7 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
 
     // Brief mode: user has opted into terse responses. The instruction
     // lives near the top so it stays highly salient across long
-    // contexts.
+    // contexts. Takes precedence over /output-style — brief wins.
     if state.brief_mode {
         prompt.push_str(
             "# Response style\n\n\
@@ -908,6 +913,17 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
              and restating the question. Report tool output concisely and end with a \
              short decision or next step.\n\n",
         );
+    } else {
+        // Active response style (/output-style). Placed near the top so
+        // voice instructions stay salient across long contexts. Uses a
+        // distinct heading from the static `# Response style` guideline
+        // block lower down so they don't collide in tests or docs.
+        let style_fragment = state.response_style.prompt_fragment();
+        if !style_fragment.is_empty() {
+            prompt.push_str("# Active response style\n\n");
+            prompt.push_str(style_fragment);
+            prompt.push_str("\n\n");
+        }
     }
 
     // Inject memory context (project + user + on-demand relevant).
@@ -1216,6 +1232,58 @@ mod tests {
             brief_idx < tools_idx,
             "brief block should come before Available Tools"
         );
+    }
+
+    /// Default response style: no "# Active response style" block.
+    #[test]
+    fn system_prompt_omits_style_block_for_default() {
+        let state = AppState::new(crate::config::Config::default());
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt(&tools, &state);
+        assert!(!prompt.contains("# Active response style"));
+    }
+
+    /// Non-default response style: prompt gains a "# Active response
+    /// style" block before "# Available Tools" with the style's fragment.
+    #[test]
+    fn system_prompt_injects_non_default_style_fragment() {
+        for style in [
+            crate::state::ResponseStyle::Concise,
+            crate::state::ResponseStyle::Explanatory,
+            crate::state::ResponseStyle::Learning,
+        ] {
+            let mut state = AppState::new(crate::config::Config::default());
+            state.response_style = style;
+            let tools = ToolRegistry::new();
+            let prompt = build_system_prompt(&tools, &state);
+            assert!(
+                prompt.contains("# Active response style"),
+                "style {style:?} should inject a block"
+            );
+            assert!(
+                prompt.contains(style.prompt_fragment()),
+                "style {style:?} fragment must appear"
+            );
+            let style_idx = prompt.find("# Active response style").unwrap();
+            let tools_idx = prompt.find("# Available Tools").unwrap();
+            assert!(
+                style_idx < tools_idx,
+                "style {style:?} block should come before Available Tools"
+            );
+        }
+    }
+
+    /// When both brief and a non-default style are set, brief wins
+    /// (the style block is suppressed).
+    #[test]
+    fn system_prompt_brief_overrides_style() {
+        let mut state = AppState::new(crate::config::Config::default());
+        state.brief_mode = true;
+        state.response_style = crate::state::ResponseStyle::Explanatory;
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt(&tools, &state);
+        assert!(prompt.contains("Brief mode is enabled"));
+        assert!(!prompt.contains("# Active response style"));
     }
 
     /// Verify that cancelling via the shared handle cancels the current

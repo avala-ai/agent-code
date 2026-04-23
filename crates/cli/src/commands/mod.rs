@@ -163,6 +163,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "output-style",
+        aliases: &["style"],
+        description: "Set response style: default, concise, explanatory, learning",
+        hidden: false,
+    },
+    Command {
         name: "init",
         aliases: &[],
         description: "Initialize project config (.agent/settings.toml)",
@@ -1052,6 +1058,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             } else {
                 println!("Brief mode disabled. Response style restored.");
             }
+            CommandResult::Handled
+        }
+        Some("output-style") | Some("style") => {
+            execute_output_style(args, engine);
             CommandResult::Handled
         }
         Some("init") => {
@@ -3325,6 +3335,67 @@ fn execute_rules(args: Option<&str>, _engine: &mut QueryEngine) {
             println!("Try /rules help");
         }
     }
+}
+
+/// Execute `/output-style [name]`.
+///
+/// Without an argument, lists the available styles and the currently
+/// active one. With a name, switches to that style and prints a
+/// confirmation. Unknown names print usage.
+fn execute_output_style(args: Option<&str>, engine: &mut QueryEngine) {
+    let raw = args.map(|s| s.trim()).unwrap_or("");
+
+    if raw.is_empty() {
+        let current = engine.state().response_style;
+        println!("Available response styles:");
+        println!(
+            "  default       — no override{}",
+            if current == agent_code_lib::state::ResponseStyle::Default {
+                "  (active)"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "  concise       — shorter responses, fewer qualifiers{}",
+            if current == agent_code_lib::state::ResponseStyle::Concise {
+                "  (active)"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "  explanatory   — explain reasoning and trade-offs{}",
+            if current == agent_code_lib::state::ResponseStyle::Explanatory {
+                "  (active)"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "  learning      — narrate steps for new-to-codebase users{}",
+            if current == agent_code_lib::state::ResponseStyle::Learning {
+                "  (active)"
+            } else {
+                ""
+            }
+        );
+        println!();
+        println!("Usage: /output-style <name>   (alias: /style)");
+        return;
+    }
+
+    let Some(new_style) = agent_code_lib::state::ResponseStyle::from_name(raw) else {
+        eprintln!("Unknown style: {raw}");
+        println!("Valid names: default, concise, explanatory, learning.");
+        println!("Run /output-style with no argument to see details.");
+        return;
+    };
+
+    engine.state_mut().response_style = new_style;
+    // The prompt-hash calculation includes `response_style`, so the
+    // cache invalidates automatically on the next turn.
+    println!("Response style set to '{}'.", new_style.name());
 }
 
 #[cfg(test)]
