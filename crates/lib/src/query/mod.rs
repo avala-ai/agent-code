@@ -189,6 +189,29 @@ impl QueryEngine {
     /// of a compaction — before/after message counts plus actual tokens
     /// freed. Pair this with `fire_pre_compact_hooks` so audit hooks can
     /// record both the estimate and the ground truth.
+    /// Run any configured `Stop` hooks once the agent has finished
+    /// responding and is about to yield control back to the user.
+    /// Distinct from `PostTurn` (which fires every LLM round-trip in a
+    /// multi-step turn) — `Stop` only fires at the final "done, waiting
+    /// for input" moment so hooks like auto-commit, transcript
+    /// shipping, or desktop notifications fire exactly once per
+    /// response rather than once per tool call.
+    ///
+    /// `last_assistant_message` is the text content of the final
+    /// assistant message, if any, so hooks can act on it without
+    /// re-reading the transcript.
+    pub async fn fire_stop_hooks(
+        &self,
+        last_assistant_message: Option<&str>,
+    ) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "session_id": self.state.session_id,
+            "turn_count": self.state.turn_count,
+            "last_assistant_message": last_assistant_message,
+        });
+        self.hooks.run_hooks(&HookEvent::Stop, None, &ctx).await
+    }
+
     pub async fn fire_post_compact_hooks(
         &self,
         messages_before: usize,
@@ -842,6 +865,12 @@ impl QueryEngine {
                     )
                     .await;
 
+                // Stop fires exactly once per user response — right here,
+                // after the terminating assistant text has been appended
+                // and we're about to hand control back to the user.
+                let last_text = last_assistant_text(&self.state.messages);
+                let _stop_results = self.fire_stop_hooks(last_text.as_deref()).await;
+
                 // Fire background memory extraction (fire-and-forget).
                 // Only runs if feature enabled and memory directory exists.
                 if self.state.config.features.extract_memories
@@ -1003,6 +1032,32 @@ impl QueryEngine {
     pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancel.clone()
     }
+}
+
+/// Extract the text content of the most recent assistant message, if any.
+/// Used by the `Stop` hook so handlers can see the final reply without
+/// re-reading the full transcript. Returns `None` when the session has
+/// no assistant message yet (e.g. errored before the first response)
+/// or the last assistant turn has no text blocks (pure tool-use).
+fn last_assistant_text(messages: &[crate::llm::message::Message]) -> Option<String> {
+    use crate::llm::message::{ContentBlock, Message};
+    for msg in messages.iter().rev() {
+        if let Message::Assistant(a) = msg {
+            let text: String = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
 /// Get a fallback model (smaller/cheaper) for retry on overload.
@@ -1429,6 +1484,79 @@ mod tests {
             input: serde_json::json!({"file_path": 42}),
         }];
         assert!(extract_file_path(&calls, "t1").is_none());
+    }
+
+    // ---- last_assistant_text helper (for Stop hook context) ----
+
+    fn mk_assistant_with_text(parts: &[&str]) -> crate::llm::message::Message {
+        use crate::llm::message::{AssistantMessage, ContentBlock, Message};
+        use uuid::Uuid;
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: parts
+                .iter()
+                .map(|t| ContentBlock::Text {
+                    text: (*t).to_string(),
+                })
+                .collect(),
+            stop_reason: None,
+            usage: Default::default(),
+            model: None,
+            request_id: None,
+        })
+    }
+
+    fn mk_assistant_tool_use_only(name: &str) -> crate::llm::message::Message {
+        use crate::llm::message::{AssistantMessage, ContentBlock, Message};
+        use uuid::Uuid;
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: None,
+            usage: Default::default(),
+            model: None,
+            request_id: None,
+        })
+    }
+
+    #[test]
+    fn last_assistant_text_returns_none_for_empty_history() {
+        let msgs: Vec<crate::llm::message::Message> = vec![];
+        assert!(last_assistant_text(&msgs).is_none());
+    }
+
+    #[test]
+    fn last_assistant_text_returns_most_recent_assistant_text() {
+        let msgs = vec![
+            mk_assistant_with_text(&["first reply"]),
+            mk_assistant_with_text(&["second reply"]),
+        ];
+        assert_eq!(last_assistant_text(&msgs).as_deref(), Some("second reply"));
+    }
+
+    #[test]
+    fn last_assistant_text_joins_multiple_text_blocks() {
+        let msgs = vec![mk_assistant_with_text(&["hello ", "world"])];
+        assert_eq!(last_assistant_text(&msgs).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn last_assistant_text_skips_pure_tool_use_messages() {
+        // An assistant message with only tool_use blocks (no text) should
+        // be walked past so we find the earlier message with actual text.
+        // Stop hook consumers want the LAST USER-VISIBLE reply, not the
+        // internal "I'm about to call Bash" step.
+        let msgs = vec![
+            mk_assistant_with_text(&["real reply"]),
+            mk_assistant_tool_use_only("Bash"),
+        ];
+        assert_eq!(last_assistant_text(&msgs).as_deref(), Some("real reply"));
     }
 
     /// System prompt omits the additional-dirs block when none are tracked.

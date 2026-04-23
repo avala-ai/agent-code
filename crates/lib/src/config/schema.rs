@@ -404,6 +404,14 @@ pub enum HookEvent {
     /// pre-commit gates, and backup pipelines can listen here without
     /// having to enumerate every file-editing tool.
     FileChanged,
+    /// Fired once per agent response, right before control yields back
+    /// to the user. Distinct from `PostTurn`, which fires every
+    /// LLM round-trip in a multi-step turn — `Stop` only fires at the
+    /// final "I'm done, waiting for input" moment. The hook context
+    /// includes the text of the last assistant message so downstream
+    /// tooling (audit logs, auto-commit, summary mailers) can act on
+    /// it without re-reading the transcript.
+    Stop,
 }
 
 /// A configured hook action.
@@ -698,6 +706,14 @@ mod tests {
         assert_eq!(json, "\"file_changed\"");
         let back: HookEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, HookEvent::FileChanged);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_stop() {
+        let json = serde_json::to_string(&HookEvent::Stop).unwrap();
+        assert_eq!(json, "\"stop\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::Stop);
     }
 
     // ---- HookAction serde round-trip ----

@@ -2233,6 +2233,10 @@ const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
         "file_changed",
         "after FileWrite / FileEdit / MultiEdit / NotebookEdit (context: tool, path, is_error)",
     ),
+    (
+        "stop",
+        "agent finished responding; about to yield back to the user (fires once per response)",
+    ),
     ("session_stop", "when the session ends"),
 ];
 
@@ -2269,6 +2273,7 @@ fn format_hook_event(event: &agent_code_lib::config::HookEvent) -> &'static str 
         HookEvent::PreCompact => "pre_compact",
         HookEvent::PostCompact => "post_compact",
         HookEvent::FileChanged => "file_changed",
+        HookEvent::Stop => "stop",
     }
 }
 
@@ -2289,6 +2294,7 @@ fn parse_hook_event(raw: &str) -> Option<agent_code_lib::config::HookEvent> {
         "pre_compact" => HookEvent::PreCompact,
         "post_compact" => HookEvent::PostCompact,
         "file_changed" => HookEvent::FileChanged,
+        "stop" => HookEvent::Stop,
         _ => return None,
     })
 }
@@ -5461,6 +5467,14 @@ mod tests {
             parse_hook_event("file-changed"),
             Some(HookEvent::FileChanged)
         );
+    }
+
+    #[test]
+    fn parse_hook_event_accepts_stop() {
+        use agent_code_lib::config::HookEvent;
+        assert_eq!(parse_hook_event("stop"), Some(HookEvent::Stop));
+        assert_eq!(parse_hook_event("Stop"), Some(HookEvent::Stop));
+        assert_eq!(parse_hook_event("STOP"), Some(HookEvent::Stop));
     }
 
     #[test]
