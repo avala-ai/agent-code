@@ -1,6 +1,6 @@
 [package]
 name = "agent-code-lib"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 description = "Agent engine library: LLM providers, tools, query loop, memory"
 readme = "../../README.md"

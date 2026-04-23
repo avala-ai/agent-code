@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.18.0] - 2026-04-23
+
+### Added
+
+#### Session navigation commands
+
+- **`/history`** (#209): shows recent user prompts in the current session with turn numbers. `/history 20` expands the window; default is 10.
+- **`/redo`** (alias `/again`, #210): resubmits the most recent real user prompt as a new turn. Skips tool results and compact summaries so the resubmitted text is always something the user actually typed.
+- **`/rewind N`** (alias `/undo`, #213): undoes the last N turns (default 1). Replaced the ad-hoc pop loop with a per-turn truncation algorithm that defines a turn as *the most recent real user prompt + everything after it*. Tool results and compact summaries are no longer treated as prompt boundaries, so a session whose tail is a tool result can't be mis-truncated and a compacted session can't be rewound past its summary.
+- **`/info`** (#211): one-page snapshot of session state — session id prefix, cwd, additional tracked dirs, model (+ fast model if configured), base URL, turn count, token totals, cost, message count, mode flags (plan/brief/style/fast/sandbox), OS/arch/shell, MCP server count, hook count.
+- **`/search <substring>`** (alias `/find`, #212): greps the entire session (text, thinking, tool use, tool results) for a case-insensitive substring and prints up to 20 matches with ±40-char snippets. Character-boundary-aware so multi-byte glyphs don't panic.
+- **`/files`** (#201): shows files the session has touched.
+- **`/session`** (#204): interactive picker to resume a saved session.
+- **`/open <path>`** (#208): opens an existing file in `$VISUAL` or `$EDITOR` without leaving the REPL.
+- **`/debug-tool-call`** (aliases `/dtc`, `/last-tool`, #205): inspects the last tool call (or all of them with `list`) — name, input JSON, result text, error state.
+- **`/transcript`** (#199): alias for `/scroll` with in-viewer substring search.
+
+#### REPL productivity
+
+- **`/fast`** (#200): toggles between the main model and a configured cheaper/faster model for the rest of the session.
+- **`/sandbox on|off|toggle`** (#202): changes the process-level sandbox state at runtime without restarting.
+- **`/brief`** (#188): terse-response mode — injects a top-of-prompt directive capping assistant replies.
+- **`/output-style`** (#192): swaps preset response voices (concise, explanatory, learning).
+- **`/copy`** (#190): copies the last assistant reply to the system clipboard.
+- **`/editor`** (#194): composes a prompt in `$EDITOR` / `$VISUAL` — useful for multi-line prompts.
+- **`/reload`** (#189): rescans on-disk extensions (skills, rules, agents, hooks, MCP) and drops the cached system prompt so the next turn picks them up.
+- **`/tag`** (#180): multi-label filtering for saved sessions.
+- **`/keybindings`** (#183): lists REPL shortcuts and points at the override file path.
+- **`/ctxviz`** (#191): per-category context breakdown (system prompt, history, tool defs, etc.).
+- **`/tokens`** (#174): estimates token count for an arbitrary string.
+- **`/install-github-app`** (#181): walks the user through installing and authenticating the `gh` CLI so PR-related commands work.
+- **`/thinkback-play`** (#182): replays extended-thinking blocks in sequence from a recent assistant turn.
+- **`/skill validate`** (#175): lint-only pass on a skill file — catches malformed YAML frontmatter, missing fields, invalid invocation patterns.
+- **Fuzzy command completer** (#195): alias + substring matching in the tab-completion menu.
+- **`@path` tab-completion** in REPL input (#198).
+- **Richer `?` help panel** with current-session context (#197).
+- **User-facing warning registry + startup banner** (#196): surfaces config warnings users would otherwise never notice.
+
+#### Hook system
+
+- **`pre_compact` event** (#206): fires before `/compact` or auto-compaction mutates history, with message count + estimated tokens to be freed. Hooks can archive or snapshot before older messages are replaced.
+- **`post_compact` event** (#218): fires after compaction finishes with the *realized* outcome (messages before/after, actual tokens freed). Audit hooks can now pair the estimate with the ground truth across all three compaction paths (microcompact, LLM, context collapse).
+- **`session_start`, `session_stop`, `user_prompt_submit`** wired (#214): these events were declared in the schema, listed by `/hooks`, and documented — but never actually fired from the agent loop. Wired in the CLI one-shot path (including before `std::process::exit`), the REPL path, and the scheduled-task executor.
+- **`pre_turn`, `post_turn`** events (#185, roadmap 7.28).
+- **`/hooks preview <event>`** (#216): lists which configured hooks would fire for a given event. Catches misspelled event names in `settings.toml` — a misspelled event silently deserializes as a hook that never matches anything at runtime. Accepts both canonical `snake_case` and hyphenated/mixed-case forms.
+
+#### Structured JSONL output
+
+- **`turn_start` event** (#217): bookend matching `turn_complete`. Consumers can now render real-time turn progress without racing the first `text_delta` or `tool_call`.
+- **`warning`, `compact` events** (#215): previously only stderr plain text — now also emitted as structured JSONL on stdout so automation doesn't lose signal on budget warnings, rate-limit backoffs, and autocompaction.
+- **`permission_denied` event** (#219): first-class envelope for policy-blocked tool calls. Detects both shapes emitted by the executor (policy Deny with reason, user Deny at interactive prompt) so consumers no longer have to grep `tool_result.output` for a literal string to distinguish policy violations from genuine tool errors.
+
+#### Tools, agents, rules
+
+- **Monitor tool** (#184): polls background tasks (logs, progress, status) without busy-waiting.
+- **Project rules** from `.agent/rules/*.md` (#186): per-project behavioral rules auto-loaded into the system prompt.
+- **Per-subagent permission sets** (#187): subagents can be spawned with a scoped permission overlay instead of inheriting the parent's full permissions.
+
+#### Bundled skills
+
+- **`/passes`** (#203): multi-pass planning loop.
+- **`loop` skill** (#177): idiomatic iterate-until-done recipe.
+- **`verify` skill** (#176): run-the-lint-and-test-gate recipe.
+- **`ultrareview` skill** (#178): multi-agent cloud review of the current branch.
+- **`commit-push-pr` skill** (#173): safe commit + push + PR-create workflow.
+
+### Changed
+
+- **Compatibility matrix added** (#179, roadmap 1.10): explicit matrix of supported platforms, Rust versions, and feature flags in the docs reference.
+
+### Fixed
+
+- **Windows CI Test job** (#193): unblocked on every PR — previously failed intermittently due to a platform-specific issue.
+
 ## [0.17.0] - 2026-04-22
 
 ### Added
@@ -192,7 +266,9 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/avala-ai/agent-code/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/avala-ai/agent-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/avala-ai/agent-code/compare/v0.16.0...v0.16.1
 [0.13.1]: https://github.com/avala-ai/agent-code/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/avala-ai/agent-code/compare/v0.12.0...v0.13.0
