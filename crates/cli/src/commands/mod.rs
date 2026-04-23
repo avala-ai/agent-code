@@ -415,6 +415,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "env",
+        aliases: &[],
+        description: "Show agent-code-relevant environment variables (API keys masked)",
+        hidden: false,
+    },
+    Command {
         name: "issue",
         aliases: &[],
         description: "Open a GitHub issue prefilled with session context (title optional)",
@@ -1665,6 +1671,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             );
             CommandResult::Prompt(prompt)
         }
+        Some("env") => {
+            execute_env();
+            CommandResult::Handled
+        }
         Some("issue") => {
             let title_hint = args.map(|s| s.trim()).filter(|s| !s.is_empty());
             let title_clause = match title_hint {
@@ -2386,6 +2396,91 @@ fn execute_usage(engine: &QueryEngine) {
     }
 }
 
+/// Variables agent-code actually reads. Kept in a single const so it's
+/// obvious which ones are wired up — stale entries are a lie to the user.
+const ENV_VARS: &[&str] = &[
+    // Config overrides (plaintext).
+    "AGENT_CODE_API_BASE_URL",
+    "AGENT_CODE_MODEL",
+    "AGENT_CODE_CONFIG",
+    // API keys (masked).
+    "AGENT_CODE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "ZHIPU_API_KEY",
+    "TOGETHER_API_KEY",
+    "OPENROUTER_API_KEY",
+    "COHERE_API_KEY",
+    "PERPLEXITY_API_KEY",
+    // Runtime / logging.
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "NO_COLOR",
+    "CLICOLOR_FORCE",
+    // Shell and PATH context.
+    "SHELL",
+    "TERM",
+    "EDITOR",
+];
+
+/// Returns true if the variable name indicates a secret that must be
+/// masked before printing. Error-side-safe: unknown variables are
+/// treated as non-secret — callers only pass names from ENV_VARS.
+fn is_secret_var(name: &str) -> bool {
+    name.ends_with("_API_KEY") || name.ends_with("_TOKEN") || name.ends_with("_SECRET")
+}
+
+/// Mask a secret value so it's useful for "is it set?" checks without
+/// leaking the secret itself. Shows length and last 4 chars.
+fn mask_secret(value: &str) -> String {
+    if value.is_empty() {
+        return "(empty)".to_string();
+    }
+    let len = value.len();
+    if len <= 4 {
+        return format!("({len} chars, masked)");
+    }
+    let tail = &value[len - 4..];
+    format!("({len} chars, ends in …{tail})")
+}
+
+/// Execute `/env` — print the environment vars agent-code actually reads,
+/// with secrets masked. Omits any variable that isn't set.
+fn execute_env() {
+    println!();
+    println!("  agent-code environment:");
+    println!();
+
+    let mut shown = 0;
+    for name in ENV_VARS {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        let display = if is_secret_var(name) {
+            mask_secret(&value)
+        } else {
+            value
+        };
+        println!("  {name}={display}");
+        shown += 1;
+    }
+
+    if shown == 0 {
+        println!("  (none of the tracked variables are set)");
+    }
+
+    println!();
+    println!(
+        "  {} tracked variables total; set but not listed variables are not read by agent-code.",
+        ENV_VARS.len()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2528,5 +2623,32 @@ mod tests {
         assert_eq!(rows[1].model, "default-model");
         assert_eq!(rows[1].cache_read, 20);
         assert_eq!(rows[1].cache_write, 80);
+    }
+
+    #[test]
+    fn is_secret_var_classifies_api_keys_and_tokens() {
+        assert!(is_secret_var("ANTHROPIC_API_KEY"));
+        assert!(is_secret_var("OPENAI_API_KEY"));
+        assert!(is_secret_var("GITHUB_TOKEN"));
+        assert!(is_secret_var("STRIPE_SECRET"));
+        assert!(!is_secret_var("RUST_LOG"));
+        assert!(!is_secret_var("AGENT_CODE_MODEL"));
+        assert!(!is_secret_var("AGENT_CODE_API_BASE_URL"));
+    }
+
+    #[test]
+    fn mask_secret_preserves_length_and_tail_for_long_values() {
+        let masked = mask_secret("sk-ant-api03-abcdef1234567890");
+        assert!(masked.contains("29 chars"));
+        assert!(masked.contains("ends in …7890"));
+        // The secret itself is NOT in the masked output (sanity-check the guarantee).
+        assert!(!masked.contains("abcdef"));
+    }
+
+    #[test]
+    fn mask_secret_handles_short_values_without_leaking_tail() {
+        assert_eq!(mask_secret("x"), "(1 chars, masked)");
+        assert_eq!(mask_secret("abc"), "(3 chars, masked)");
+        assert_eq!(mask_secret(""), "(empty)");
     }
 }

@@ -462,6 +462,36 @@ impl SkillRegistry {
                  5. Show the final skill file to the user before writing, so they can \
                  edit. After writing, tell them: `/<name>` now invokes it.",
             ),
+            (
+                "backport",
+                "Cherry-pick a commit or PR onto one or more release branches",
+                true,
+                "Backport the named commit(s) or PR to each release branch the user \
+                 specified. Work one branch at a time in isolated worktrees so failures \
+                 don't contaminate each other.\n\n\
+                 1. Identify the source. If the user gave a PR number, resolve it to the \
+                 merge commit (or the list of commits if it was merge-commit-preserved). \
+                 If they gave SHAs, use those directly. If they gave neither, ask.\n\
+                 2. For each target branch:\n   \
+                 a. Create a fresh worktree for the target branch — do not mutate the \
+                 current working tree.\n   \
+                 b. `git cherry-pick` the source commit(s) in order. On conflict: show \
+                 the conflict files, attempt the resolution ONLY when it's mechanical \
+                 (textually-local rename, trivial import reorder). If the resolution \
+                 needs real judgment, STOP on this branch with the conflict surfaced — \
+                 do not guess.\n   \
+                 c. Run the project's test and lint gate on the target branch. Do not \
+                 skip — the fix may depend on code that only exists on newer branches.\n   \
+                 d. If checks pass, push to a backport branch named \
+                 `backport/<source-sha-or-pr>-onto-<target>` and open a PR with a body \
+                 that links back to the original PR and notes any resolution you made.\n   \
+                 e. If anything fails, leave the worktree in place and record the \
+                 failure in the summary.\n\
+                 3. End with a table: target branch | backport PR (or failure reason) | \
+                 whether resolution was clean or had conflicts.\n\n\
+                 Never force-push. Never squash-merge the backport without the \
+                 reviewer's go-ahead. Never mark a backport complete if tests failed.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
