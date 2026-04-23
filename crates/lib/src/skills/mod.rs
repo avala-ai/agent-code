@@ -569,6 +569,31 @@ impl SkillRegistry {
                  than the cost of the check itself. For anything that writes, \
                  deletes, deploys, or sends — verify.",
             ),
+            (
+                "loop",
+                "Poll or retry until a condition is met (with backoff and ceiling)",
+                true,
+                "Loop on the condition the user described. Before starting:\n\n\
+                 1. State the exit condition in one sentence — what is true when \
+                 we're done.\n\
+                 2. State the check — the exact command or call used to test the \
+                 condition.\n\
+                 3. State the interval (default: 10s) and the ceiling (default: \
+                 60 iterations). Exit early if the ceiling is reached.\n\n\
+                 Then loop:\n   \
+                 a. Run the check.\n   \
+                 b. If the condition holds, stop and report success with the final \
+                 state.\n   \
+                 c. If it doesn't, print one compact line (iteration N, what the \
+                 check returned), sleep, and continue.\n\
+                 On a transient error (network, 5xx), back off exponentially \
+                 (cap 60s) and keep counting; do not reset the counter. On a \
+                 non-transient error (auth, 4xx, permission), stop — a loop won't \
+                 fix it.\n\n\
+                 At the end, print a one-line summary: \"condition met in N \
+                 iterations\" or \"ceiling reached, last state was X\". Never \
+                 loop past the ceiling without user approval.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
