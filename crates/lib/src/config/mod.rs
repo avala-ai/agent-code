@@ -4,10 +4,14 @@
 //! priority (highest to lowest):
 //!
 //! 1. CLI flags and environment variables
-//! 2. Project-local settings (`.agent/settings.toml`)
-//! 3. User settings (`~/.config/agent-code/config.toml`)
+//! 2. Project-local overrides (`.agent/settings.local.toml`) — gitignored
+//! 3. Project settings (`.agent/settings.toml`)
+//! 4. User settings (`~/.config/agent-code/config.toml`)
 //!
-//! Each layer is merged into the final `Config` struct.
+//! Each layer is merged into the final `Config` struct. The `.local.toml`
+//! tier is intended for machine-specific or developer-specific overrides
+//! that shouldn't be committed (e.g. a personal API base URL while keeping
+//! the team's shared `settings.toml` intact).
 
 mod schema;
 
@@ -46,6 +50,18 @@ impl Config {
 
         // Layer 2: Project-level config (overrides user config).
         if let Some(path) = find_project_config() {
+            layers.push(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| ConfigError::FileError(format!("{path:?}: {e}")))?,
+            );
+        }
+
+        // Layer 2.5: Project-local overrides (gitignored, overrides
+        // committed project settings). Sits next to `settings.toml` as
+        // `settings.local.toml` in the same `.agent/` directory; only
+        // the one closest to cwd is used, matching the project-config
+        // walk so sub-packages inherit the repo-root settings.local.
+        if let Some(path) = find_project_local_config() {
             layers.push(
                 std::fs::read_to_string(&path)
                     .map_err(|e| ConfigError::FileError(format!("{path:?}: {e}")))?,
@@ -176,6 +192,19 @@ fn find_project_config() -> Option<PathBuf> {
     find_config_in_ancestors(&cwd)
 }
 
+/// Walk up from the current directory to find `.agent/settings.local.toml`.
+///
+/// This is the gitignored overlay that sits on top of the shared
+/// `settings.toml`. Kept as a separate walk (not just a sibling lookup
+/// next to the resolved `settings.toml`) so a developer can place a
+/// `settings.local.toml` at a different ancestor level than the
+/// committed settings — for example, a repo-root `settings.toml` plus
+/// a crate-local `settings.local.toml` overriding just one field.
+fn find_project_local_config() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    find_local_config_in_ancestors(&cwd)
+}
+
 /// Watch config files for changes and reload when modified.
 /// Returns a handle that can be dropped to stop watching.
 pub fn watch_config(
@@ -183,6 +212,7 @@ pub fn watch_config(
 ) -> Option<std::thread::JoinHandle<()>> {
     let user_path = user_config_path()?;
     let project_path = find_project_config();
+    let local_path = find_project_local_config();
 
     // Get initial mtimes.
     let user_mtime = std::fs::metadata(&user_path)
@@ -192,10 +222,15 @@ pub fn watch_config(
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
+    let local_mtime = local_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
 
     Some(std::thread::spawn(move || {
         let mut last_user = user_mtime;
         let mut last_project = project_mtime;
+        let mut last_local = local_mtime;
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -207,8 +242,13 @@ pub fn watch_config(
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
                 .and_then(|m| m.modified().ok());
+            let cur_local = local_path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
 
-            let changed = cur_user != last_user || cur_project != last_project;
+            let changed =
+                cur_user != last_user || cur_project != last_project || cur_local != last_local;
 
             if changed {
                 if let Ok(config) = Config::load() {
@@ -217,6 +257,7 @@ pub fn watch_config(
                 }
                 last_user = cur_user;
                 last_project = cur_project;
+                last_local = cur_local;
             }
         }
     }))
@@ -226,6 +267,19 @@ fn find_config_in_ancestors(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let candidate = dir.join(".agent").join("settings.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn find_local_config_in_ancestors(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join(".agent").join("settings.local.toml");
         if candidate.exists() {
             return Some(candidate);
         }
@@ -424,6 +478,16 @@ mod e2e_tests {
     /// Write user + project files and drive the full load pipeline the way
     /// `load_inner` does: read each file to a String, then merge.
     fn load_from_files(user_toml: Option<&str>, project_toml: Option<&str>) -> Config {
+        load_from_files_full(user_toml, project_toml, None)
+    }
+
+    /// Same as `load_from_files` but with an optional `.local.toml` layer
+    /// appended last so it overrides the project layer.
+    fn load_from_files_full(
+        user_toml: Option<&str>,
+        project_toml: Option<&str>,
+        local_toml: Option<&str>,
+    ) -> Config {
         let dir = TempDir::new().unwrap();
         let mut layers: Vec<String> = Vec::new();
 
@@ -434,6 +498,11 @@ mod e2e_tests {
         }
         if let Some(body) = project_toml {
             let path = dir.path().join("project.toml");
+            fs::write(&path, body).unwrap();
+            layers.push(fs::read_to_string(&path).unwrap());
+        }
+        if let Some(body) = local_toml {
+            let path = dir.path().join("local.toml");
             fs::write(&path, body).unwrap();
             layers.push(fs::read_to_string(&path).unwrap());
         }
@@ -669,5 +738,148 @@ token_budget = true
 
         let found = find_config_in_ancestors(&inner).unwrap();
         assert_eq!(found, inner_settings);
+    }
+
+    // ---- settings.local.toml: gitignored project-local overrides ----
+
+    #[test]
+    fn local_layer_overrides_project_layer() {
+        let user = r#"
+[api]
+model = "user-model"
+"#;
+        let project = r#"
+[api]
+model = "project-model"
+base_url = "https://shared.example.com/v1"
+"#;
+        let local = r#"
+[api]
+model = "local-dev-model"
+"#;
+        let cfg = load_from_files_full(Some(user), Some(project), Some(local));
+        // Local wins over project wins over user.
+        assert_eq!(cfg.api.model, "local-dev-model");
+        // base_url comes from project (local didn't set it).
+        assert_eq!(cfg.api.base_url, "https://shared.example.com/v1");
+    }
+
+    #[test]
+    fn local_layer_partial_override_leaves_other_fields_intact() {
+        let project = r#"
+[api]
+model = "gpt-5"
+base_url = "https://team.example.com/v1"
+api_key = "team-key"
+"#;
+        // Dev overrides only the base URL to point at a local proxy.
+        let local = r#"
+[api]
+base_url = "http://localhost:11434/v1"
+"#;
+        let cfg = load_from_files_full(None, Some(project), Some(local));
+        assert_eq!(cfg.api.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.api.model, "gpt-5");
+        assert_eq!(cfg.api.api_key.as_deref(), Some("team-key"));
+    }
+
+    #[test]
+    fn local_layer_without_project_still_overlays_on_user() {
+        let user = r#"
+[api]
+model = "user-model"
+base_url = "https://example.com/v1"
+"#;
+        let local = r#"
+[api]
+model = "local-model"
+"#;
+        let cfg = load_from_files_full(Some(user), None, Some(local));
+        assert_eq!(cfg.api.model, "local-model");
+        assert_eq!(cfg.api.base_url, "https://example.com/v1");
+    }
+
+    #[test]
+    fn local_layer_permission_rules_extend_across_all_layers() {
+        // `permissions.rules` uses extend-semantics across every layer,
+        // including the new local layer. Verify the concat order is
+        // user → project → local so local rules apply last.
+        let user = r#"
+[[permissions.rules]]
+tool = "Read"
+action = "allow"
+"#;
+        let project = r#"
+[[permissions.rules]]
+tool = "Bash"
+pattern = "rm -rf /"
+action = "deny"
+"#;
+        let local = r#"
+[[permissions.rules]]
+tool = "Write"
+action = "ask"
+"#;
+        let cfg = load_from_files_full(Some(user), Some(project), Some(local));
+        assert_eq!(cfg.permissions.rules.len(), 3);
+        let tools: Vec<&str> = cfg
+            .permissions
+            .rules
+            .iter()
+            .map(|r| r.tool.as_str())
+            .collect();
+        assert_eq!(tools, vec!["Read", "Bash", "Write"]);
+    }
+
+    #[test]
+    fn e2e_find_local_config_walks_up_from_nested_dir() {
+        let root = TempDir::new().unwrap();
+        let project_root = root.path().join("myproj");
+        let nested = project_root.join("crates").join("deep").join("src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(project_root.join(".agent")).unwrap();
+        let local = project_root.join(".agent").join("settings.local.toml");
+        fs::write(&local, "[api]\nmodel = \"local\"\n").unwrap();
+
+        let found = find_local_config_in_ancestors(&nested).unwrap();
+        assert_eq!(found, local);
+    }
+
+    #[test]
+    fn e2e_find_local_config_is_independent_from_settings_toml() {
+        // settings.toml present but NO settings.local.toml — local walk
+        // should return None even though settings.toml exists nearby.
+        let root = TempDir::new().unwrap();
+        let project_root = root.path().join("proj");
+        fs::create_dir_all(project_root.join(".agent")).unwrap();
+        fs::write(
+            project_root.join(".agent").join("settings.toml"),
+            "[api]\nmodel = \"committed\"\n",
+        )
+        .unwrap();
+
+        if let Some(path) = find_local_config_in_ancestors(&project_root) {
+            assert!(
+                !path.starts_with(root.path()),
+                "unexpected settings.local.toml inside tempdir: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_find_local_config_stops_at_first_match() {
+        // Two levels, both with settings.local.toml — inner wins.
+        let root = TempDir::new().unwrap();
+        let outer = root.path().join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(inner.join(".agent")).unwrap();
+        fs::create_dir_all(outer.join(".agent")).unwrap();
+        let inner_local = inner.join(".agent").join("settings.local.toml");
+        let outer_local = outer.join(".agent").join("settings.local.toml");
+        fs::write(&inner_local, "[api]\nmodel = \"inner\"\n").unwrap();
+        fs::write(&outer_local, "[api]\nmodel = \"outer\"\n").unwrap();
+
+        let found = find_local_config_in_ancestors(&inner).unwrap();
+        assert_eq!(found, inner_local);
     }
 }
