@@ -949,6 +949,16 @@ pub fn build_system_prompt(tools: &ToolRegistry, state: &AppState) -> String {
         }
     }
 
+    // Project rules — short, imperative constraints from .agent/rules/*.md.
+    // Placed after memory but before tool docs so they have higher
+    // salience than the tool descriptions without displacing the
+    // user's conversation content.
+    let rules = crate::services::rules::load_project_rules(std::path::Path::new(&state.cwd));
+    let rules_block = crate::services::rules::rules_prompt_block(&rules);
+    if !rules_block.is_empty() {
+        prompt.push_str(&rules_block);
+    }
+
     // Available skills.
     let skills = crate::skills::SkillRegistry::load_all(Some(std::path::Path::new(&state.cwd)));
     let invocable = skills.user_invocable();

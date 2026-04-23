@@ -21,6 +21,7 @@ pub mod output_store;
 pub mod plugins;
 pub mod pricing;
 pub mod profiles;
+pub mod rules;
 pub mod secret_masker;
 pub mod session;
 pub mod session_env;

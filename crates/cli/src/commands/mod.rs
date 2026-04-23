@@ -474,6 +474,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Tag the current session for filtering (list / add <tag> / --remove <tag>)",
         hidden: false,
     },
+    Command {
+        name: "rules",
+        aliases: &[],
+        description: "List / enable / disable project rules (.agent/rules/*.md)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1871,6 +1877,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
+        Some("rules") => {
+            execute_rules(args, engine);
+            CommandResult::Handled
+        }
         Some("tokens") => {
             let text = args.unwrap_or("").trim();
             if text.is_empty() {
@@ -3202,13 +3212,10 @@ fn execute_tag(args: Option<&str>, engine: &QueryEngine) {
     }
 
     if raw == "--clear" {
-        // Load, empty, save.
         match agent_code_lib::services::session::load_session(&session_id) {
             Ok(mut data) => {
                 let n = data.tags.len();
                 data.tags.clear();
-                // Use remove_session_tag API's underlying write path via one
-                // remove call per tag would be O(n²); simpler here:
                 let dir = dirs::config_dir()
                     .map(|d| d.join("agent-code").join("sessions"))
                     .expect("config dir");
@@ -3239,11 +3246,84 @@ fn execute_tag(args: Option<&str>, engine: &QueryEngine) {
         return;
     }
 
-    // Default: add tag.
     match agent_code_lib::services::session::add_session_tag(&session_id, raw) {
         Ok(true) => println!("Added tag: {raw}"),
         Ok(false) => println!("Already tagged: {raw}"),
         Err(e) => eprintln!("Failed to add tag: {e}"),
+    }
+}
+
+/// Execute `/rules` — list, enable, or disable project rules loaded
+/// from `.agent/rules/*.md` and injected into the system prompt.
+fn execute_rules(args: Option<&str>, _engine: &mut QueryEngine) {
+    let raw = args.map(|s| s.trim()).unwrap_or("");
+    let (subcmd, rest) = raw
+        .split_once(char::is_whitespace)
+        .map(|(a, b)| (a.trim(), b.trim()))
+        .unwrap_or((raw, ""));
+
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            return;
+        }
+    };
+
+    match subcmd {
+        "" | "list" => {
+            let rules = agent_code_lib::services::rules::load_project_rules(&cwd);
+            if rules.is_empty() {
+                println!("No project rules found under .agent/rules/.");
+                println!("Create .agent/rules/<name>.md to add one.");
+                return;
+            }
+            println!("Project rules (.agent/rules/):");
+            for r in &rules {
+                let status = if r.enabled { "on " } else { "off" };
+                println!("  [{status}] {:<24} p{:<3} {}", r.name, r.priority, r.title);
+            }
+        }
+        "enable" => {
+            if rest.is_empty() {
+                println!("Usage: /rules enable <name>");
+                return;
+            }
+            match agent_code_lib::services::rules::set_rule_enabled(&cwd, rest, true) {
+                Ok(true) => println!("Enabled rule '{rest}'."),
+                Ok(false) => println!("Rule '{rest}' was already enabled."),
+                Err(e) => eprintln!("Failed to enable rule: {e}"),
+            }
+        }
+        "disable" => {
+            if rest.is_empty() {
+                println!("Usage: /rules disable <name>");
+                return;
+            }
+            match agent_code_lib::services::rules::set_rule_enabled(&cwd, rest, false) {
+                Ok(true) => println!("Disabled rule '{rest}'."),
+                Ok(false) => println!("Rule '{rest}' was already disabled."),
+                Err(e) => eprintln!("Failed to disable rule: {e}"),
+            }
+        }
+        "help" => {
+            println!("Usage:");
+            println!("  /rules                     list project rules with on/off status");
+            println!("  /rules list                (same as above)");
+            println!("  /rules enable <name>       turn rule <name> on");
+            println!("  /rules disable <name>      turn rule <name> off");
+            println!();
+            println!(
+                "Rules are plain markdown files at .agent/rules/<name>.md. \
+                 Optional YAML frontmatter: title, priority (lower = earlier), \
+                 enabled (bool). Enabled rules are injected into the system \
+                 prompt every turn."
+            );
+        }
+        other => {
+            eprintln!("Unknown subcommand: {other}");
+            println!("Try /rules help");
+        }
     }
 }
 
