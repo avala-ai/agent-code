@@ -104,3 +104,87 @@ pub struct HookResult {
     pub success: bool,
     pub output: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HookAction, HookDefinition, HookEvent};
+
+    /// Build a shell hook that appends a single line to a temp file.
+    /// Used to verify run_hooks() actually dispatches for a given event.
+    fn touch_file_hook(event: HookEvent, path: &std::path::Path) -> HookDefinition {
+        // Quote the path so spaces don't break the shell command. The
+        // test can then read the file and assert the event fired.
+        let cmd = format!("echo fired >> {:?}", path);
+        HookDefinition {
+            event,
+            tool_name: None,
+            action: HookAction::Shell { command: cmd },
+        }
+    }
+
+    async fn run_and_read(event: HookEvent) -> String {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Truncate to start from an empty file.
+        std::fs::write(&path, "").unwrap();
+
+        let mut reg = HookRegistry::new();
+        reg.register(touch_file_hook(event.clone(), &path));
+
+        let ctx = serde_json::json!({ "probe": true });
+        let results = reg.run_hooks(&event, None, &ctx).await;
+        assert_eq!(results.len(), 1, "exactly one hook should have fired");
+        assert!(
+            results[0].success,
+            "hook should succeed; output was {:?}",
+            results[0].output
+        );
+
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// Regression guard: SessionStart is declared in the enum and
+    /// historically was never wired to fire. Confirm the dispatcher
+    /// actually matches hooks registered for it.
+    #[tokio::test]
+    async fn run_hooks_fires_session_start() {
+        let body = run_and_read(HookEvent::SessionStart).await;
+        assert!(body.contains("fired"), "SessionStart hook did not run");
+    }
+
+    #[tokio::test]
+    async fn run_hooks_fires_session_stop() {
+        let body = run_and_read(HookEvent::SessionStop).await;
+        assert!(body.contains("fired"), "SessionStop hook did not run");
+    }
+
+    #[tokio::test]
+    async fn run_hooks_fires_user_prompt_submit() {
+        let body = run_and_read(HookEvent::UserPromptSubmit).await;
+        assert!(body.contains("fired"), "UserPromptSubmit hook did not run");
+    }
+
+    /// Registering a hook for one event must NOT cause it to fire when
+    /// a different event is dispatched. This protects the event-match
+    /// contract callers of fire_session_start_hooks rely on.
+    #[tokio::test]
+    async fn run_hooks_does_not_cross_fire_between_events() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut reg = HookRegistry::new();
+        reg.register(touch_file_hook(HookEvent::SessionStart, &path));
+
+        let ctx = serde_json::json!({ "probe": true });
+        // Dispatch a different event — the file must stay empty.
+        let _ = reg.run_hooks(&HookEvent::SessionStop, None, &ctx).await;
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.is_empty(),
+            "dispatching SessionStop must not fire a SessionStart hook; got {body:?}"
+        );
+    }
+}

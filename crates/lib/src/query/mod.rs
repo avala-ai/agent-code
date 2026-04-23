@@ -164,6 +164,41 @@ impl QueryEngine {
             .await
     }
 
+    /// Run any configured `SessionStart` hooks. The session id and working
+    /// directory are passed in the JSON context so hooks can tag logs,
+    /// spin up watchers, or load per-project secrets.
+    ///
+    /// Call this exactly once per session, right after `load_hooks`.
+    /// The `SessionStart` event is documented as firing "when a session
+    /// begins" — without this hook being invoked, user-configured
+    /// session_start hooks would silently never run.
+    pub async fn fire_session_start_hooks(&self) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "session_id": self.state.session_id,
+            "cwd": self.state.cwd,
+            "model": self.state.config.api.model,
+        });
+        self.hooks
+            .run_hooks(&HookEvent::SessionStart, None, &ctx)
+            .await
+    }
+
+    /// Run any configured `SessionStop` hooks with a summary of what the
+    /// session did (turns, cost, total tokens). Call this once when the
+    /// session is about to end — from the CLI shutdown path or after
+    /// the scheduled-task one-shot finishes.
+    pub async fn fire_session_stop_hooks(&self) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "session_id": self.state.session_id,
+            "turn_count": self.state.turn_count,
+            "total_cost_usd": self.state.total_cost_usd,
+            "total_tokens": self.state.total_usage.total(),
+        });
+        self.hooks
+            .run_hooks(&HookEvent::SessionStop, None, &ctx)
+            .await
+    }
+
     /// Drop the cached system prompt so it's rebuilt on the next turn.
     ///
     /// Called from `/reload` after the caller has done whatever it
@@ -215,6 +250,22 @@ impl QueryEngine {
         // Add the user message to history.
         let user_msg = user_message(user_input);
         self.state.push_message(user_msg);
+
+        // UserPromptSubmit fires once per user turn, as soon as the
+        // prompt is in history and before any PreTurn / LLM work. Hooks
+        // at this event see the FULL prompt (no truncation) so they can
+        // do content scanning, redaction logging, or compliance audits.
+        let _user_prompt_submit_results = self
+            .hooks
+            .run_hooks(
+                &HookEvent::UserPromptSubmit,
+                None,
+                &serde_json::json!({
+                    "user_input": user_input,
+                    "turn": self.state.turn_count + 1,
+                }),
+            )
+            .await;
 
         // PreTurn hooks fire after user input is in history, before the
         // LLM is called. Gives hooks a chance to reject input (e.g. a

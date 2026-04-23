@@ -587,6 +587,11 @@ async fn main() -> anyhow::Result<()> {
     // Load hooks from config.
     engine.load_hooks(&config.hooks);
 
+    // Fire the SessionStart event now that hooks are registered. Any
+    // session_start hooks users have configured (audit log, warm-up,
+    // environment capture) would otherwise never run.
+    let _ = engine.fire_session_start_hooks().await;
+
     // Run memory consolidation in the background if due and feature enabled.
     if config.features.extract_memories
         && let Some(memory_dir) = agent_code_lib::memory::ensure_memory_dir()
@@ -700,6 +705,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // Fire SessionStop BEFORE the early exit so one-shot runs
+            // that end with a non-zero code still invoke user hooks.
+            let _ = engine.fire_session_stop_hooks().await;
+
             if exit_code != 0 {
                 std::process::exit(exit_code as i32);
             }
@@ -709,6 +718,11 @@ async fn main() -> anyhow::Result<()> {
             let update_handle = tokio::spawn(update::check_for_update());
 
             ui::repl::run_repl(&mut engine).await?;
+
+            // Fire SessionStop once the REPL returns. This is the only
+            // normal exit path from interactive mode; abrupt Ctrl+C
+            // won't reach here, but any clean `/exit` or EOF will.
+            let _ = engine.fire_session_stop_hooks().await;
 
             // Show update notification after session ends.
             if let Ok(Some(check)) = update_handle.await {

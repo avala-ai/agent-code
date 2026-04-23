@@ -93,7 +93,16 @@ impl ScheduleExecutor {
 
         engine.load_hooks(&config.hooks);
 
+        // Fire SessionStart so scheduled runs invoke the same session
+        // lifecycle hooks that interactive sessions do.
+        let _ = engine.fire_session_start_hooks().await;
+
         let result = engine.run_turn_with_sink(&schedule.prompt, sink).await;
+
+        // Fire SessionStop before returning, regardless of whether the
+        // turn succeeded. Scheduled runs are one-shot, so this is the
+        // only place the end-of-session event can fire.
+        let _ = engine.fire_session_stop_hooks().await;
 
         // Restore cwd.
         if let Some(prev) = prev_dir {
