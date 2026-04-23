@@ -3,6 +3,20 @@
 //! These tests validate the full schedule lifecycle via the compiled
 //! binary. No API key required — only tests CRUD operations that
 //! don't invoke the LLM.
+//!
+//! # Windows isolation
+//!
+//! Several tests that assert empty state or per-test counts are
+//! `#[cfg_attr(target_os = "windows", ignore)]` because the `dirs`
+//! crate on Windows resolves `config_dir()` via the
+//! `SHGetKnownFolderPath` API (`FOLDERID_RoamingAppData`) rather than
+//! reading `$HOME` / `$XDG_CONFIG_HOME`. That means `agent_with_home`
+//! cannot redirect the schedules directory on Windows, so parallel
+//! test processes share the real user profile and clobber each
+//! other's schedules. Proper fix is an `AGENT_CODE_CONFIG_DIR`
+//! override plumbed through every `dirs::config_dir()` call — tracked
+//! separately. Until then, these tests still run on Linux CI where
+//! they are the source of truth.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -53,6 +67,10 @@ fn daemon_help() {
 // ---- CRUD lifecycle ----
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_list_empty() {
     let home = TempDir::new().unwrap();
     agent_with_home(&home)
@@ -63,6 +81,10 @@ fn schedule_list_empty() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_add_and_list() {
     let home = TempDir::new().unwrap();
 
@@ -161,6 +183,10 @@ fn schedule_add_invalid_cron() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_remove() {
     let home = TempDir::new().unwrap();
 
@@ -276,6 +302,10 @@ fn schedule_rm_alias() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_ls_alias() {
     let home = TempDir::new().unwrap();
 
@@ -287,6 +317,10 @@ fn schedule_ls_alias() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_multiple_entries() {
     let home = TempDir::new().unwrap();
 
@@ -314,6 +348,10 @@ fn schedule_multiple_entries() {
 // ---- Run without API key should fail gracefully ----
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "dirs::config_dir doesn't honor $HOME on Windows — see module docs"
+)]
 fn schedule_run_no_api_key() {
     let home = TempDir::new().unwrap();
 

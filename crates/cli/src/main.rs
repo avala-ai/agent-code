@@ -389,7 +389,21 @@ async fn main() -> anyhow::Result<()> {
     // If nothing found and interactive, run the setup wizard.
     let has_key = cli.api_key.is_some() || config.api.api_key.is_some();
 
-    if !has_key && cli.prompt.is_none() && !cli.dump_system_prompt && !cli.serve && !cli.acp {
+    // The setup wizard reads from stdin via arrow-key prompts. Run it
+    // only when we're actually in an interactive REPL context — i.e.
+    // no -p prompt, no --dump-system-prompt, no --serve, no --acp, AND
+    // no schedule/daemon subcommand (those are headless by design and
+    // hang indefinitely on Windows CI where stdin is not a TTY; see
+    // the 15-minute Windows test timeout on every PR before this fix).
+    let is_headless_subcommand = cli.command.is_some();
+
+    if !has_key
+        && cli.prompt.is_none()
+        && !cli.dump_system_prompt
+        && !cli.serve
+        && !cli.acp
+        && !is_headless_subcommand
+    {
         eprintln!("No API key found. Starting setup...\n");
         run_setup_wizard();
         config = Config::load()?;
