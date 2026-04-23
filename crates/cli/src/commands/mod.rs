@@ -414,6 +414,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Check out a PR, run lint + tests, fix failures, push back",
         hidden: false,
     },
+    Command {
+        name: "issue",
+        aliases: &[],
+        description: "Open a GitHub issue prefilled with session context (title optional)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1656,6 +1662,41 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                  Never touch workflow files (.github/workflows/**) as part of an autofix. \
                  Never modify tests to make them pass — fix the code they test, or flag \
                  that the test is wrong."
+            );
+            CommandResult::Prompt(prompt)
+        }
+        Some("issue") => {
+            let title_hint = args.map(|s| s.trim()).filter(|s| !s.is_empty());
+            let title_clause = match title_hint {
+                Some(t) => format!(
+                    "The user suggested a title: \"{t}\". Refine it to be \
+                                    specific and action-oriented (under 70 chars)."
+                ),
+                None => "Derive the title yourself from the top user-reported symptom in \
+                         this session. Keep it specific and action-oriented (under 70 \
+                         chars)."
+                    .to_string(),
+            };
+            let prompt = format!(
+                "Open a GitHub issue with context from this session. Steps:\n\n\
+                 1. Title: {title_clause}\n\
+                 2. Body (markdown), with these sections:\n   \
+                 **What happened** — one paragraph describing the symptom or ask, from \
+                 the user's perspective. Do not dump transcript; summarize.\n   \
+                 **Reproduction** — the minimal steps or command that triggers it. If \
+                 it's environmental, note the OS / agent-code version / model.\n   \
+                 **Expected vs actual** — one line each.\n   \
+                 **Context** — anything load-bearing the agent discovered while \
+                 investigating (relevant file:line references, error messages, commit \
+                 SHAs). Use fenced code blocks for logs or stack traces.\n   \
+                 **Environment** — agent-code version (from env!(\"CARGO_PKG_VERSION\") \
+                 equivalent via /version), OS, model, relevant env vars (mask secrets).\n\
+                 3. Show the draft to the user and wait for approval before opening.\n\
+                 4. On approval, run `gh issue create --title <title> --body-file <file>` \
+                 to open it in the current repository. Print the issue URL.\n\n\
+                 Never include API keys, tokens, passwords, or session transcripts with \
+                 personal data. If the session contains credentials, strip them before \
+                 including any log excerpt."
             );
             CommandResult::Prompt(prompt)
         }
