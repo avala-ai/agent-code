@@ -522,6 +522,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Open an existing file in $EDITOR/$VISUAL (try /open src/main.rs)",
         hidden: false,
     },
+    Command {
+        name: "history",
+        aliases: &["hist"],
+        description: "Show recent user prompts in this session (try /history 20 or /history all)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -2033,6 +2039,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("open") => {
             execute_open(args, engine);
+            CommandResult::Handled
+        }
+        Some("history") | Some("hist") => {
+            execute_history(args, engine);
             CommandResult::Handled
         }
         Some("install-github-app") => {
@@ -3732,6 +3742,101 @@ fn execute_open(args: Option<&str>, engine: &QueryEngine) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /history — show recent user prompts in this session
+// ---------------------------------------------------------------------------
+
+/// Extract a compact, single-line preview of a user prompt.
+///
+/// Strips leading whitespace, collapses internal whitespace runs,
+/// and truncates to `max_chars` with a trailing ellipsis. Character-
+/// count based so multi-byte input (emoji, CJK) doesn't split mid-glyph.
+fn preview_user_prompt(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "(empty)".to_string();
+    }
+    let count = collapsed.chars().count();
+    if count <= max_chars {
+        collapsed
+    } else {
+        let prefix: String = collapsed.chars().take(max_chars).collect();
+        format!("{prefix}…")
+    }
+}
+
+/// Collect real user prompts (not tool results, not compaction summaries).
+///
+/// Walks the conversation and returns each user-authored text block in
+/// chronological order, paired with the overall message index (useful if
+/// we later add indexing into other commands).
+fn collect_user_prompts(
+    messages: &[agent_code_lib::llm::message::Message],
+) -> Vec<(usize, String)> {
+    use agent_code_lib::llm::message::{ContentBlock, Message};
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if let Message::User(u) = msg {
+            if u.is_meta || u.is_compact_summary {
+                continue; // tool results / compact boundary — not user input
+            }
+            for block in &u.content {
+                if let ContentBlock::Text { text } = block {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        out.push((i, trimmed.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse the `/history` argument. Returns `None` for "show all";
+/// `Some(n)` caps the output to the last `n` entries. Defaults to 10.
+fn parse_history_limit(raw: &str) -> Option<usize> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Some(10);
+    }
+    if t.eq_ignore_ascii_case("all") || t == "*" {
+        return None;
+    }
+    // Accept "20", "-20", "20 entries", "last 20".
+    let n = t
+        .split_whitespace()
+        .find_map(|tok| tok.trim_start_matches('-').parse::<usize>().ok())
+        .unwrap_or(10);
+    Some(n.max(1))
+}
+
+fn execute_history(args: Option<&str>, engine: &QueryEngine) {
+    let limit = parse_history_limit(args.unwrap_or(""));
+    let prompts = collect_user_prompts(&engine.state().messages);
+    if prompts.is_empty() {
+        println!("No user prompts in this session yet.");
+        return;
+    }
+    let total = prompts.len();
+    let start = match limit {
+        None => 0,
+        Some(n) => total.saturating_sub(n),
+    };
+    let shown = total - start;
+    if limit.is_none() || shown >= total {
+        println!("Showing all {total} user prompt(s):");
+    } else {
+        println!("Showing last {shown} of {total} user prompt(s):");
+    }
+    // 1-indexed, oldest first within the window so the latest sits at the
+    // bottom where the user's cursor is.
+    for (rank, (_, text)) in prompts[start..].iter().enumerate() {
+        let n = rank + start + 1;
+        println!("  {n:>3}. {}", preview_user_prompt(text, 100));
+    }
+}
+
 /// Pick an editor. Returns the binary name/path to spawn.
 fn resolve_editor() -> Option<String> {
     if let Ok(v) = std::env::var("VISUAL")
@@ -4610,5 +4715,130 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/project");
         let p = resolve_path_against_cwd(cwd, "/etc/hosts");
         assert_eq!(p, std::path::Path::new("/etc/hosts"));
+    }
+
+    // ---- /history helpers ----
+
+    #[test]
+    fn preview_user_prompt_collapses_whitespace() {
+        let got = preview_user_prompt("  hello\n\nworld  ", 100);
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn preview_user_prompt_truncates_to_max_chars() {
+        let got = preview_user_prompt(&"x".repeat(150), 10);
+        let chars: Vec<char> = got.chars().collect();
+        assert_eq!(chars.len(), 11); // 10 x + ellipsis
+        assert_eq!(chars[10], '…');
+    }
+
+    #[test]
+    fn preview_user_prompt_returns_placeholder_for_empty() {
+        assert_eq!(preview_user_prompt("   \n\t ", 100), "(empty)");
+    }
+
+    #[test]
+    fn parse_history_limit_defaults_to_ten() {
+        assert_eq!(parse_history_limit(""), Some(10));
+        assert_eq!(parse_history_limit("   "), Some(10));
+    }
+
+    #[test]
+    fn parse_history_limit_parses_positive_number() {
+        assert_eq!(parse_history_limit("25"), Some(25));
+    }
+
+    #[test]
+    fn parse_history_limit_accepts_all() {
+        assert_eq!(parse_history_limit("all"), None);
+        assert_eq!(parse_history_limit("ALL"), None);
+        assert_eq!(parse_history_limit("*"), None);
+    }
+
+    #[test]
+    fn parse_history_limit_min_one() {
+        assert_eq!(parse_history_limit("0"), Some(1));
+    }
+
+    #[test]
+    fn collect_user_prompts_skips_tool_results_and_compaction() {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        let msgs = vec![
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".into(),
+                content: vec![ContentBlock::Text {
+                    text: "first prompt".into(),
+                }],
+                is_meta: false,
+                is_compact_summary: false,
+            }),
+            // Tool result — meta, should be skipped.
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".into(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    extra_content: vec![],
+                }],
+                is_meta: true,
+                is_compact_summary: false,
+            }),
+            // Compact summary — skipped.
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".into(),
+                content: vec![ContentBlock::Text {
+                    text: "compact summary".into(),
+                }],
+                is_meta: false,
+                is_compact_summary: true,
+            }),
+            // Assistant — skipped.
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".into(),
+                content: vec![ContentBlock::Text {
+                    text: "response".into(),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: "0".into(),
+                content: vec![ContentBlock::Text {
+                    text: "second prompt".into(),
+                }],
+                is_meta: false,
+                is_compact_summary: false,
+            }),
+        ];
+        let prompts = collect_user_prompts(&msgs);
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].1, "first prompt");
+        assert_eq!(prompts[1].1, "second prompt");
+    }
+
+    #[test]
+    fn collect_user_prompts_skips_whitespace_only() {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        let msgs = vec![Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::Text {
+                text: "   \n\n ".into(),
+            }],
+            is_meta: false,
+            is_compact_summary: false,
+        })];
+        assert!(collect_user_prompts(&msgs).is_empty());
     }
 }
