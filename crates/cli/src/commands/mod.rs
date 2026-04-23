@@ -397,6 +397,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "pr-comments",
+        aliases: &[],
+        description: "Fetch and review open review comments on the current or specified PR",
+        hidden: false,
+    },
+    Command {
         name: "perf-issue",
         aliases: &[],
         description: "Audit recent changes for performance regressions",
@@ -1545,6 +1551,33 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         Some("thinkback") => {
             execute_thinkback(args, engine);
             CommandResult::Handled
+        }
+        Some("pr-comments") => {
+            let target = args.map(|s| s.trim()).unwrap_or("");
+            let selector = if target.is_empty() {
+                "the current branch's PR".to_string()
+            } else {
+                format!("PR {target}")
+            };
+            let prompt = format!(
+                "Fetch review comments on {selector} and help me triage them. Steps:\n\n\
+                 1. Run `gh pr view` (or `gh pr view {target}` if a number was given) to \
+                 confirm the PR exists and is open. Abort with a clear message if it isn't.\n\
+                 2. Fetch review comments with `gh api repos/{{owner}}/{{repo}}/pulls/\
+                 <pr>/comments --paginate` — these are inline/line-level comments.\n\
+                 3. Fetch issue-style comments with `gh pr view <pr> --json comments`.\n\
+                 4. Group the results: (a) unresolved inline threads, (b) action-requested \
+                 items in issue comments (questions, change requests), (c) resolved threads \
+                 (skip — don't re-open the discussion).\n\
+                 5. For each unresolved item, print: file:line, author, short quote of the \
+                 comment, and a one-line suggested response OR concrete code fix. Do not \
+                 implement anything yet — just present the triage list.\n\
+                 6. End with a numbered action list ordered by importance (blocking review \
+                 first, then nits). Ask the user which items to address.\n\n\
+                 Never respond to reviewers without the user's go-ahead. Never mark threads \
+                 resolved — that's the reviewer's call."
+            );
+            CommandResult::Prompt(prompt)
         }
         Some("perf-issue") => {
             let scope = args.map(|s| s.trim()).filter(|s| !s.is_empty());
