@@ -385,6 +385,11 @@ pub enum HookEvent {
     /// and tool-call count via env vars. Not fired if the turn was
     /// cancelled or errored out.
     PostTurn,
+    /// Fired right before the conversation is about to be compacted,
+    /// whether by `/compact` or by the automatic compaction path. The
+    /// hook sees the current message count and an estimate of tokens
+    /// that will be freed, so users can archive/snapshot first.
+    PreCompact,
 }
 
 /// A configured hook action.
@@ -655,6 +660,14 @@ mod tests {
         assert_eq!(json, "\"post_turn\"");
         let back: HookEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, HookEvent::PostTurn);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_pre_compact() {
+        let json = serde_json::to_string(&HookEvent::PreCompact).unwrap();
+        assert_eq!(json, "\"pre_compact\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::PreCompact);
     }
 
     // ---- HookAction serde round-trip ----

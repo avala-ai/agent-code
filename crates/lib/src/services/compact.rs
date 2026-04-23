@@ -273,6 +273,41 @@ pub fn should_auto_compact(messages: &[Message], model: &str, tracking: &Compact
     state.should_compact
 }
 
+/// Estimate how many tokens a microcompact would free, without
+/// touching the history. Mirrors the traversal of `microcompact` so
+/// the number the user is told to expect matches what will happen.
+pub fn estimate_compactable_tokens(messages: &[Message], keep_recent: usize) -> u64 {
+    let keep_recent = keep_recent.max(1);
+    let mut compactable: Vec<(usize, usize)> = Vec::new();
+    for (msg_idx, msg) in messages.iter().enumerate() {
+        if let Message::User(u) = msg {
+            for (block_idx, block) in u.content.iter().enumerate() {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block
+                    && is_compactable_tool_result(messages, tool_use_id)
+                {
+                    compactable.push((msg_idx, block_idx));
+                }
+            }
+        }
+    }
+    if compactable.len() <= keep_recent {
+        return 0;
+    }
+    let clear_count = compactable.len() - keep_recent;
+    let placeholder = "[Old tool result cleared]";
+    let new_tokens = tokens::estimate_tokens(placeholder);
+    let mut freed = 0u64;
+    for &(msg_idx, block_idx) in &compactable[..clear_count] {
+        if let Message::User(u) = &messages[msg_idx]
+            && let ContentBlock::ToolResult { content, .. } = &u.content[block_idx]
+        {
+            let old_tokens = tokens::estimate_tokens(content);
+            freed += old_tokens.saturating_sub(new_tokens);
+        }
+    }
+    freed
+}
+
 /// Perform microcompact: clear stale tool results to free tokens.
 ///
 /// Replaces the content of old tool_result blocks with a placeholder,
@@ -777,6 +812,78 @@ mod tests {
         // keep_recent=5 means this single result should be kept.
         let freed = microcompact(&mut messages, 5);
         assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn estimate_compactable_tokens_matches_microcompact() {
+        use crate::llm::message::*;
+        // 5 compactable tool results; keep_recent=2 should free 3 of them.
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..5 {
+            msgs.push(Message::Assistant(AssistantMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("id_{i}"),
+                    name: "FileRead".into(),
+                    input: serde_json::json!({}),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }));
+            msgs.push(Message::User(UserMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("id_{i}"),
+                    content: "some file contents ".repeat(50),
+                    is_error: false,
+                    extra_content: vec![],
+                }],
+                is_meta: true,
+                is_compact_summary: false,
+            }));
+        }
+        let estimated = estimate_compactable_tokens(&msgs, 2);
+        let mut clone = msgs.clone();
+        let actual = microcompact(&mut clone, 2);
+        assert_eq!(estimated, actual);
+        assert!(estimated > 0);
+    }
+
+    #[test]
+    fn estimate_compactable_tokens_returns_zero_when_keep_covers_all() {
+        use crate::llm::message::*;
+        let msgs = vec![
+            Message::Assistant(AssistantMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "FileRead".into(),
+                    input: serde_json::json!({}),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+            Message::User(UserMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "big tool result".repeat(100),
+                    is_error: false,
+                    extra_content: vec![],
+                }],
+                is_meta: true,
+                is_compact_summary: false,
+            }),
+        ];
+        assert_eq!(estimate_compactable_tokens(&msgs, 5), 0);
     }
 
     #[test]

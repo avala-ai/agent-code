@@ -146,6 +146,24 @@ impl QueryEngine {
         &mut self.state
     }
 
+    /// Run any configured `PreCompact` hooks, passing a JSON context
+    /// describing the conversation about to be compacted (message count
+    /// and an estimate of tokens freed). Returns the per-hook results so
+    /// callers can surface stderr or a blocking status.
+    pub async fn fire_pre_compact_hooks(
+        &self,
+        message_count: usize,
+        estimated_freed_tokens: u64,
+    ) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "message_count": message_count,
+            "estimated_freed_tokens": estimated_freed_tokens,
+        });
+        self.hooks
+            .run_hooks(&HookEvent::PreCompact, None, &ctx)
+            .await
+    }
+
     /// Drop the cached system prompt so it's rebuilt on the next turn.
     ///
     /// Called from `/reload` after the caller has done whatever it
