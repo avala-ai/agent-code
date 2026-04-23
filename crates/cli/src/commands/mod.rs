@@ -157,6 +157,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "fast",
+        aliases: &[],
+        description: "Toggle between the main model and a cheaper fast model",
+        hidden: false,
+    },
+    Command {
         name: "ctxviz",
         aliases: &["context-viz"],
         description: "Per-category token breakdown of the current context",
@@ -1076,6 +1082,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             } else {
                 println!("Brief mode disabled. Response style restored.");
             }
+            CommandResult::Handled
+        }
+        Some("fast") => {
+            execute_fast(engine);
             CommandResult::Handled
         }
         Some("output-style") | Some("style") => {
@@ -3589,6 +3599,81 @@ fn which_in_path(name: &str) -> bool {
     false
 }
 
+/// Execute `/fast` — toggle between the main model and a cheaper /
+/// faster alternative for cost control.
+///
+/// First invocation saves the current `api.model` into
+/// `state.pre_fast_model` and swaps in `api.fast_model` (or a
+/// provider-aware fallback). Second invocation restores.
+fn execute_fast(engine: &mut QueryEngine) {
+    let state = engine.state_mut();
+    if let Some(prev) = state.pre_fast_model.take() {
+        // Restore.
+        let fast = std::mem::replace(&mut state.config.api.model, prev);
+        println!(
+            "Fast mode disabled. Model restored to '{}'.",
+            state.config.api.model
+        );
+        if let Some(configured) = &state.config.api.fast_model
+            && configured != &fast
+        {
+            // User's configured fast_model differs from what we had loaded —
+            // note it so they don't get confused on next toggle.
+            println!("  (last used fast model: '{fast}'; configured: '{configured}')");
+        }
+        return;
+    }
+
+    let fast = state
+        .config
+        .api
+        .fast_model
+        .clone()
+        .unwrap_or_else(|| default_fast_model(&state.config.api.model));
+
+    if fast == state.config.api.model {
+        println!(
+            "Already on '{}'. Configure a different `api.fast_model` in settings or \
+             switch your default model with /model first.",
+            state.config.api.model,
+        );
+        return;
+    }
+
+    let prev = std::mem::replace(&mut state.config.api.model, fast);
+    state.pre_fast_model = Some(prev.clone());
+    println!(
+        "Fast mode enabled. Model: '{prev}' → '{}'. Run /fast again to revert.",
+        state.config.api.model,
+    );
+}
+
+/// Pick a sensible fast-model default based on the current model's
+/// provider/family. Best-effort — users should configure
+/// `api.fast_model` explicitly for production use.
+fn default_fast_model(current: &str) -> String {
+    let lower = current.to_lowercase();
+    if lower.contains("opus") {
+        // Anthropic: opus → haiku.
+        "claude-haiku-4-5".to_string()
+    } else if lower.contains("sonnet") {
+        "claude-haiku-4-5".to_string()
+    } else if lower.contains("gpt-5") || lower.contains("gpt5") {
+        // OpenAI: GPT-5 → GPT-5-mini-like.
+        "gpt-5-mini".to_string()
+    } else if lower.contains("gpt-4") || lower.contains("gpt4") {
+        "gpt-4-mini".to_string()
+    } else if lower.contains("gemini") {
+        "gemini-flash".to_string()
+    } else if lower.contains("grok") {
+        "grok-mini".to_string()
+    } else {
+        // Generic fallback — the provider will error if the name is bad,
+        // which nudges the user to configure `fast_model` explicitly.
+        "haiku".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3948,5 +4033,38 @@ mod tests {
     #[test]
     fn which_in_path_rejects_missing() {
         assert!(!which_in_path("binary-that-cannot-possibly-exist-xyz-42"));
+    }
+
+    // ---- /fast helpers ----
+
+    #[test]
+    fn default_fast_model_picks_haiku_for_anthropic() {
+        assert_eq!(default_fast_model("claude-opus-4-7"), "claude-haiku-4-5");
+        assert_eq!(default_fast_model("claude-sonnet-4-6"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn default_fast_model_picks_mini_for_openai() {
+        assert_eq!(default_fast_model("gpt-5.4"), "gpt-5-mini");
+        assert_eq!(default_fast_model("gpt-4-turbo"), "gpt-4-mini");
+    }
+
+    #[test]
+    fn default_fast_model_picks_flash_for_gemini() {
+        assert_eq!(default_fast_model("gemini-pro"), "gemini-flash");
+    }
+
+    #[test]
+    fn default_fast_model_is_case_insensitive() {
+        assert_eq!(default_fast_model("GPT-5"), "gpt-5-mini");
+        assert_eq!(default_fast_model("Claude-Opus-4"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn default_fast_model_falls_back_to_haiku_literal() {
+        // Unknown providers get a generic fallback. Users should set
+        // api.fast_model explicitly for non-mainstream models.
+        assert_eq!(default_fast_model("deepseek-coder"), "haiku");
+        assert_eq!(default_fast_model(""), "haiku");
     }
 }

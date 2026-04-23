@@ -128,6 +128,11 @@ pub struct ApiConfig {
     pub base_url: String,
     /// Model identifier.
     pub model: String,
+    /// Optional cheaper / faster model used by `/fast`. When set, the
+    /// `/fast` command toggles `model` and `fast_model` for the
+    /// remainder of the session. Defaults to None — falls back to a
+    /// provider-aware sensible default when toggled.
+    pub fast_model: Option<String>,
     /// API key. Resolved from (in order): config, AGENT_CODE_API_KEY,
     /// ANTHROPIC_API_KEY, OPENAI_API_KEY env vars.
     #[serde(skip_serializing)]
@@ -221,6 +226,7 @@ impl Default for ApiConfig {
         Self {
             base_url,
             model: "gpt-5.4".to_string(),
+            fast_model: None,
             api_key,
             max_output_tokens: Some(16384),
             thinking: None,

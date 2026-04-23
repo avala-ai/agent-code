@@ -118,6 +118,10 @@ pub struct AppState {
     /// Selected response style. `/output-style <name>` flips it.
     /// `Default` emits no prompt override. Session-local.
     pub response_style: ResponseStyle,
+    /// Saved `config.api.model` before `/fast` swapped in the fast
+    /// alternative. `Some` ⇔ currently in fast mode. Restored on the
+    /// next `/fast` toggle. Session-local — not persisted.
+    pub pre_fast_model: Option<String>,
 }
 
 impl AppState {
@@ -142,6 +146,7 @@ impl AppState {
             additional_dirs: Vec::new(),
             brief_mode: false,
             response_style: ResponseStyle::default(),
+            pre_fast_model: None,
         }
     }
 
@@ -192,6 +197,7 @@ mod tests {
         assert!(state.additional_dirs.is_empty());
         assert!(!state.brief_mode);
         assert_eq!(state.response_style, ResponseStyle::Default);
+        assert!(state.pre_fast_model.is_none());
     }
 
     #[test]
