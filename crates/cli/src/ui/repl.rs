@@ -47,6 +47,58 @@ fn raw_eprint(text: &str) {
 /// Tab-completion helper for slash commands.
 struct CommandCompleter;
 
+/// Match score for a command candidate against a user-typed partial.
+///
+/// Higher is better. `None` means no match — candidate is excluded.
+/// Priority tiers (decreasing):
+///   * 1000 — exact prefix of the name
+///   * 500  — substring (contained, not at start) of the name
+///   * 100..250 — fuzzy subsequence match against the name (score = partial len scaled)
+///   * 50..150 — matches against an alias
+fn score_command(name: &str, aliases: &[&str], partial: &str) -> Option<i32> {
+    if partial.is_empty() {
+        return Some(1000); // surface everything when nothing typed yet
+    }
+    let p = partial.to_lowercase();
+    let n = name.to_lowercase();
+
+    if n.starts_with(&p) {
+        return Some(1000);
+    }
+    if n.contains(&p) {
+        return Some(500);
+    }
+    // Aliases: prefix > contains.
+    for a in aliases {
+        let al = a.to_lowercase();
+        if al.starts_with(&p) {
+            return Some(150);
+        }
+        if al.contains(&p) {
+            return Some(100);
+        }
+    }
+    if fuzzy_subsequence(&n, &p) {
+        // Reward shorter names (closer match) when scoring subsequences.
+        let bonus = 100i32.saturating_sub(n.len() as i32);
+        return Some(100 + bonus.max(0));
+    }
+    None
+}
+
+/// Return true if every char of `needle` appears in `haystack` in order
+/// (not necessarily contiguous). Used as the lowest-tier fuzzy match.
+fn fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    let mut it = haystack.chars();
+    for c in needle.chars() {
+        let found = it.by_ref().any(|h| h == c);
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
 impl Completer for CommandCompleter {
     type Candidate = Pair;
 
@@ -62,15 +114,34 @@ impl Completer for CommandCompleter {
         }
 
         let partial = &line[1..pos];
-        let matches: Vec<Pair> = crate::commands::COMMANDS
+
+        let mut scored: Vec<(i32, Pair)> = crate::commands::COMMANDS
             .iter()
             .filter(|c| !c.hidden)
-            .filter(|c| c.name.starts_with(partial))
-            .map(|c| Pair {
-                display: format!("/{} — {}", c.name, c.description),
-                replacement: format!("/{}", c.name),
+            .filter_map(|c| {
+                let score = score_command(c.name, c.aliases, partial)?;
+                let alias_hint = if c.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (alias: /{})", c.aliases.join(", /"))
+                };
+                Some((
+                    score,
+                    Pair {
+                        display: format!("/{} — {}{alias_hint}", c.name, c.description),
+                        replacement: format!("/{}", c.name),
+                    },
+                ))
             })
             .collect();
+
+        // Stable sort by score desc, then alphabetical by replacement for
+        // deterministic ordering across equal-scored matches.
+        scored.sort_by(|(sa, pa), (sb, pb)| {
+            sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement))
+        });
+
+        let matches: Vec<Pair> = scored.into_iter().map(|(_, p)| p).collect();
 
         // Start replacement from position 0 (replacing the whole /partial).
         Ok((0, matches))
@@ -1004,5 +1075,78 @@ mod raw_print_tests {
     #[test]
     fn cr_followed_by_text_then_lf() {
         assert_eq!(translate("\rstatus\n"), "\rstatus\r\n");
+    }
+}
+
+#[cfg(test)]
+mod completer_tests {
+    //! Scoring for the fuzzy command completer. The completer is tab-
+    //! triggered, so bad scoring means the wrong command floats to the top
+    //! of the suggestion list (or worse, a correct match gets filtered out).
+
+    use super::{fuzzy_subsequence, score_command};
+
+    #[test]
+    fn empty_partial_matches_everything_at_top_score() {
+        assert_eq!(score_command("commit", &[], ""), Some(1000));
+        assert_eq!(score_command("output-style", &["style"], ""), Some(1000));
+    }
+
+    #[test]
+    fn prefix_beats_substring() {
+        let prefix = score_command("review", &[], "rev").unwrap();
+        let substring = score_command("thinkback-play", &[], "kbk").unwrap();
+        assert!(
+            prefix > substring,
+            "prefix {prefix} should beat substring {substring}"
+        );
+    }
+
+    #[test]
+    fn substring_match_works() {
+        // `/install-github-app` when user types `github`
+        assert_eq!(
+            score_command("install-github-app", &["gh-setup"], "github"),
+            Some(500),
+        );
+    }
+
+    #[test]
+    fn alias_match_is_recognised() {
+        // User types `/gh-` — the real name is `install-github-app`, the
+        // alias is `gh-setup`.
+        let score = score_command("install-github-app", &["gh-setup"], "gh-").unwrap();
+        assert!(score >= 100, "alias match should score >= 100, got {score}");
+    }
+
+    #[test]
+    fn fuzzy_subsequence_basic() {
+        assert!(fuzzy_subsequence("review", "rvw"));
+        assert!(fuzzy_subsequence("output-style", "os"));
+        assert!(!fuzzy_subsequence("commit", "xyz"));
+        assert!(!fuzzy_subsequence("abc", "abcd"));
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        assert!(score_command("Review", &[], "rev").is_some());
+        assert!(score_command("review", &[], "REV").is_some());
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        assert_eq!(score_command("commit", &[], "xyz"), None);
+        assert_eq!(score_command("exit", &["quit"], "totally-different"), None);
+    }
+
+    #[test]
+    fn prefix_scores_higher_than_alias_prefix() {
+        // Name prefix (1000) beats alias prefix (150).
+        let name_prefix = score_command("style", &[], "sty").unwrap();
+        let alias_prefix = score_command("output-style", &["style"], "sty").unwrap();
+        assert!(
+            name_prefix > alias_prefix,
+            "name prefix {name_prefix} should beat alias prefix {alias_prefix}"
+        );
     }
 }
