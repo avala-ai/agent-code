@@ -70,6 +70,12 @@ enum Event<'a> {
         model: &'a str,
         timestamp: &'a str,
     },
+    /// A new agent turn has just begun. Fires BEFORE any text or tool
+    /// activity for this turn, so consumers can render a "turn N"
+    /// progress indicator without waiting for TurnComplete.
+    TurnStart {
+        turn: usize,
+    },
     TextDelta {
         content: &'a str,
         turn: usize,
@@ -171,6 +177,10 @@ impl JsonStreamSink {
 impl StreamSink for JsonStreamSink {
     fn on_turn_start(&self, turn: usize) {
         self.inner.lock().unwrap().turn = turn;
+        // Emit after updating state so downstream consumers see a
+        // turn_start line carrying the new turn number. TurnComplete
+        // already fires at the end; this is the matching bookend.
+        emit(&Event::TurnStart { turn });
     }
 
     fn on_text(&self, text: &str) {
@@ -354,6 +364,7 @@ mod tests {
                 timestamp: "t",
             })
             .unwrap(),
+            serde_json::to_value(Event::TurnStart { turn: 1 }).unwrap(),
             serde_json::to_value(Event::TextDelta {
                 content: "multi\nline\ncontent",
                 turn: 1,
@@ -380,6 +391,27 @@ mod tests {
             let line = serde_json::to_string(&val).unwrap();
             assert!(!line.contains('\n'), "event must be single-line: {line}",);
         }
+    }
+
+    #[test]
+    fn event_serialization_turn_start_uses_snake_case_type() {
+        let event = Event::TurnStart { turn: 5 };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"turn_start""#));
+        assert!(json.contains(r#""turn":5"#));
+    }
+
+    #[test]
+    fn turn_start_event_does_not_include_model_or_session_fields() {
+        // TurnStart is intentionally small — just the turn number. If
+        // a field accidentally slips in (e.g. model), JSONL consumers
+        // that snapshot the envelope shape will start silently failing.
+        let event = Event::TurnStart { turn: 1 };
+        let val = serde_json::to_value(event).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "expected only `type` and `turn`, got {obj:?}");
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("turn"));
     }
 
     #[test]
