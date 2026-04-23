@@ -103,6 +103,12 @@ pub const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
+        name: "session",
+        aliases: &["pick-session"],
+        description: "Interactively pick a recent session to resume",
+        hidden: false,
+    },
+    Command {
         name: "memory",
         aliases: &[],
         description: "Show loaded memory context",
@@ -744,6 +750,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 println!("Usage: /resume <session-id>");
                 println!("Use /sessions to list recent sessions.");
             }
+            CommandResult::Handled
+        }
+        Some("session") | Some("pick-session") => {
+            execute_session_picker(engine);
             CommandResult::Handled
         }
         Some("sessions") => {
@@ -3891,9 +3901,91 @@ fn execute_files(engine: &QueryEngine) {
     println!();
 }
 
+/// Execute `/session` — interactive picker over recent sessions.
+///
+/// Lists up to 20 most-recent sessions in an arrow-key menu. Enter
+/// resumes the selected session (same code path as `/resume <id>`).
+/// Esc/q leaves the current session untouched.
+fn execute_session_picker(engine: &mut QueryEngine) {
+    let sessions = agent_code_lib::services::session::list_sessions(20);
+    if sessions.is_empty() {
+        println!("No saved sessions to pick from.");
+        return;
+    }
+
+    let options: Vec<crate::ui::selector::SelectOption> = sessions
+        .iter()
+        .map(|s| {
+            let label_suffix = s
+                .label
+                .as_deref()
+                .map(|l| format!(" [{l}]"))
+                .unwrap_or_default();
+            let tag_suffix = if s.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" #{}", s.tags.join(" #"))
+            };
+            let label = format!("{}{label_suffix}{tag_suffix}", s.id);
+            let description = format!(
+                "{} · {} turns · {} msgs · {}",
+                s.cwd, s.turn_count, s.message_count, s.updated_at,
+            );
+            // Preview: cwd + model + cost, multi-line so it's readable.
+            let preview = format!(
+                "cwd      {}\n\
+                 model    {}\n\
+                 turns    {}\n\
+                 updated  {}",
+                s.cwd, s.model, s.turn_count, s.updated_at,
+            );
+            crate::ui::selector::SelectOption {
+                label,
+                description,
+                value: s.id.clone(),
+                preview: Some(preview),
+            }
+        })
+        .collect();
+
+    let chosen = crate::ui::selector::select(&options);
+    if chosen.is_empty() {
+        println!("(no session picked)");
+        return;
+    }
+
+    // Resume — same path as /resume <id>.
+    match agent_code_lib::services::session::load_session(&chosen) {
+        Ok(data) => {
+            let state = engine.state_mut();
+            state.messages = data.messages;
+            state.turn_count = data.turn_count;
+            state.total_cost_usd = data.total_cost_usd;
+            state.total_usage.input_tokens = data.total_input_tokens;
+            state.total_usage.output_tokens = data.total_output_tokens;
+            state.plan_mode = data.plan_mode;
+            if !data.model.is_empty() {
+                state.config.api.model = data.model.clone();
+            }
+            println!(
+                "Resumed session {} ({} messages, {} turns, ${:.4})",
+                chosen,
+                engine.state().messages.len(),
+                data.turn_count,
+                data.total_cost_usd,
+            );
+        }
+        Err(e) => eprintln!("Failed to resume session: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Serialize tests that mutate the global VISUAL/EDITOR env vars so
+    // parallel test execution on Windows doesn't see each other's writes.
+    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn slugify_basic() {
@@ -4169,7 +4261,7 @@ mod tests {
 
     #[test]
     fn resolve_editor_prefers_visual() {
-        // SAFETY: single-threaded test, restored before exit.
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_visual = std::env::var_os("VISUAL");
         let prev_editor = std::env::var_os("EDITOR");
         unsafe {
@@ -4192,6 +4284,7 @@ mod tests {
 
     #[test]
     fn resolve_editor_falls_back_to_editor_env() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_visual = std::env::var_os("VISUAL");
         let prev_editor = std::env::var_os("EDITOR");
         unsafe {
@@ -4214,6 +4307,7 @@ mod tests {
 
     #[test]
     fn resolve_editor_ignores_empty_env() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_visual = std::env::var_os("VISUAL");
         let prev_editor = std::env::var_os("EDITOR");
         unsafe {
