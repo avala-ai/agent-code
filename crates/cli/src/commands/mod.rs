@@ -134,8 +134,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "sandbox",
-        aliases: &[],
-        description: "Show process-level sandbox status and policy",
+        aliases: &["sandbox-toggle"],
+        description: "Sandbox status and policy (`/sandbox on|off|toggle` changes state)",
         hidden: false,
     },
     Command {
@@ -1002,6 +1002,65 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("sandbox") => {
+            // Optional subcommand: on, off, toggle — mutates config.sandbox.enabled.
+            if let Some(arg) = args {
+                let arg = arg.trim().to_lowercase();
+                match arg.as_str() {
+                    "on" | "off" | "toggle" => {
+                        let disable_guard =
+                            engine.state().config.security.disable_bypass_permissions;
+                        if disable_guard && arg == "off" {
+                            println!(
+                                "Sandbox cannot be disabled at runtime: \
+                                 security.disable_bypass_permissions is set."
+                            );
+                            return CommandResult::Handled;
+                        }
+                        let current = engine.state().config.sandbox.enabled;
+                        let next = match arg.as_str() {
+                            "on" => true,
+                            "off" => false,
+                            _ => !current,
+                        };
+                        if next == current {
+                            println!(
+                                "Sandbox already {}.",
+                                if current { "enabled" } else { "disabled" }
+                            );
+                        } else {
+                            engine.state_mut().config.sandbox.enabled = next;
+                            println!(
+                                "Sandbox {} → {}. New subprocess tool calls will use the updated setting.",
+                                if current { "enabled" } else { "disabled" },
+                                if next { "enabled" } else { "disabled" },
+                            );
+                            if next {
+                                // Nudge: user turned it on — surface a warning if
+                                // there's no working strategy on this host.
+                                let cwd = std::path::PathBuf::from(&engine.state().cwd);
+                                let exec =
+                                    agent_code_lib::sandbox::SandboxExecutor::from_session_config(
+                                        &engine.state().config,
+                                        &cwd,
+                                    );
+                                if !exec.is_active() {
+                                    println!(
+                                        "  ⚠ No working strategy on this host — tools will run unsandboxed."
+                                    );
+                                }
+                            }
+                        }
+                        return CommandResult::Handled;
+                    }
+                    other => {
+                        println!("Unknown sandbox subcommand: {other}");
+                        println!("Usage: /sandbox [on | off | toggle]");
+                        println!("       /sandbox  (no args) shows current status");
+                        return CommandResult::Handled;
+                    }
+                }
+            }
+
             let cwd = std::path::PathBuf::from(&engine.state().cwd);
             let cfg = &engine.state().config.sandbox;
             let exec = agent_code_lib::sandbox::SandboxExecutor::from_session_config(
