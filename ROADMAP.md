@@ -306,11 +306,11 @@ Providers increasingly expose a reasoning/thinking budget knob (Anthropic `think
 - [x] Codecov upload
 - [x] Coverage badge in README
 
-### 5.5 Per-Agent Permissions (Stretch)
+### 5.5 Per-Agent Permissions — Done
 
-- [ ] Extend permission system to support per-agent rule sets (not just global)
-- [ ] Plan mode gets its own permission model (read-only by default, configurable)
-- [ ] Subagents can have restricted tool access
+- [x] Extend permission system to support per-agent rule sets (not just global) — `AgentDefinition.permissions: Option<PermissionsConfig>`
+- [x] Plan mode gets its own permission model (read-only by default, configurable) — via `read_only: true` + optional `permissions` overlay in the agent markdown file
+- [x] Subagents can have restricted tool access — `--permissions-overlay <path>` CLI flag, temp TOML written by the coordinator on spawn, gated by `security.disable_bypass_permissions`
 
 ---
 
