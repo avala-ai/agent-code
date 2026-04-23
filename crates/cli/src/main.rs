@@ -319,9 +319,16 @@ async fn main() -> anyhow::Result<()> {
     if cli.no_sandbox {
         if config.security.disable_bypass_permissions {
             tracing::warn!("--no-sandbox ignored: security.disable_bypass_permissions is set");
+            agent_code_lib::services::warnings::warn(
+                "--no-sandbox ignored: security.disable_bypass_permissions is set in config",
+            );
         } else {
             config.sandbox.enabled = false;
             tracing::warn!("Process-level sandbox disabled for this session (--no-sandbox)");
+            agent_code_lib::services::warnings::warn(
+                "Process-level sandbox disabled for this session (--no-sandbox). Tool \
+                 calls are not isolated.",
+            );
         }
     }
 
@@ -329,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
     if cli.dangerously_skip_permissions {
         config.permissions.default_mode = agent_code_lib::config::PermissionMode::Allow;
         tracing::warn!("All permission checks disabled (--dangerously-skip-permissions)");
+        agent_code_lib::services::warnings::warn(
+            "All permission checks disabled (--dangerously-skip-permissions). The agent \
+             can run any tool without confirmation.",
+        );
     } else {
         config.permissions.default_mode = match cli.permission_mode.as_str() {
             "allow" => agent_code_lib::config::PermissionMode::Allow,

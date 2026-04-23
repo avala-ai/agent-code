@@ -514,6 +514,10 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     println!("  {}", "? for shortcuts".with(t.muted),);
     println!();
 
+    // Render any pending startup warnings (dangerous flags, missing
+    // dependencies, deprecations). No-op when the registry is empty.
+    super::tui::render_warnings_banner();
+
     let mut ctrl_c_pending = false;
 
     loop {

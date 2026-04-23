@@ -274,6 +274,57 @@ pub fn render_turn_summary(state: &TurnState, turn: usize) {
     let _ = io::stderr().flush();
 }
 
+/// Render the pending warnings as a bannered block on stderr.
+///
+/// No-op when the registry is empty, so this is safe to call on every
+/// REPL cycle. Styling: each line is prefixed with a `[WARN]` /
+/// `[INFO]` tag in yellow / muted cyan respectively. Written to
+/// stderr so the banner doesn't get piped into downstream tools when
+/// stdout is captured.
+pub fn render_warnings_banner() {
+    let warnings = agent_code_lib::services::warnings::snapshot();
+    if warnings.is_empty() {
+        return;
+    }
+
+    let t = super::theme::current();
+    let warn_tag = theme_to_ratatui(t.warning);
+    let info_tag = theme_to_ratatui(t.muted);
+    let border = theme_to_ratatui(t.muted);
+
+    let width = term_width();
+    let hr = "─".repeat(width.min(78));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        hr.clone(),
+        Style::default().fg(border),
+    )]));
+    for w in &warnings {
+        use agent_code_lib::services::warnings::WarningLevel;
+        let (tag_color, tag_label) = match w.level {
+            WarningLevel::Warn => (warn_tag, "[WARN]"),
+            WarningLevel::Info => (info_tag, "[INFO]"),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {tag_label} "),
+                Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(w.message.clone()),
+        ]));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        hr,
+        Style::default().fg(border),
+    )]));
+
+    let buf = render_lines_to_ansi(&lines);
+    eprint!("{buf}");
+    let _ = io::stderr().flush();
+}
+
 /// Render a status bar at the bottom of output.
 pub fn render_status_bar(model: &str, turn: usize, tokens: u64, cost: f64) {
     let t = super::theme::current();
