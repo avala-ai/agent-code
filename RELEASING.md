@@ -26,8 +26,11 @@ Update the version in these files:
 | File | Field |
 |------|-------|
 | `crates/lib/Cargo.toml` | `version = "X.Y.Z"` |
-| `crates/cli/Cargo.toml` | `version = "X.Y.Z"` (appears twice — package and dependency) |
+| `crates/cli/Cargo.toml` | `version = "X.Y.Z"` (appears twice — package and the `agent-code-lib` path-dependency) |
+| `crates/eval/Cargo.toml` | `agent-code-lib = { path = "...", version = "X.Y.Z" }` (path-dependency, not the eval package version) |
 | `npm/package.json` | `"version": "X.Y.Z"` |
+
+The eval crate is `publish = false` so its own package version doesn't need bumping, but its `agent-code-lib` dependency pin must match — otherwise `cargo check --all-targets` fails with `failed to select a version for the requirement agent-code-lib = "^OLD"`.
 
 ### 3. Stamp the CHANGELOG
 
