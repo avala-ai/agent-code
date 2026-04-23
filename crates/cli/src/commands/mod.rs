@@ -528,6 +528,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Show recent user prompts in this session (try /history 20 or /history all)",
         hidden: false,
     },
+    Command {
+        name: "debug-tool-call",
+        aliases: &["dtc", "last-tool"],
+        description: "Inspect the last tool call in this session (try /debug-tool-call list)",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -2052,6 +2058,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("history") | Some("hist") => {
             execute_history(args, engine);
+            CommandResult::Handled
+        }
+        Some("debug-tool-call") | Some("dtc") | Some("last-tool") => {
+            execute_debug_tool_call(args, engine);
             CommandResult::Handled
         }
         Some("install-github-app") => {
@@ -4318,6 +4328,178 @@ fn execute_session_picker(engine: &mut QueryEngine) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /debug-tool-call — inspect the last tool call in the session
+// ---------------------------------------------------------------------------
+
+/// A tool use plus its matching result, paired by `tool_use_id`.
+struct ToolCallRecord<'a> {
+    message_index: usize,
+    id: &'a str,
+    name: &'a str,
+    input: &'a serde_json::Value,
+    /// `None` if the call hasn't been answered yet (last turn, interrupted).
+    result_text: Option<&'a str>,
+    result_is_error: bool,
+}
+
+/// Extract the content blocks carried by a message, if any. System
+/// messages carry a plain string rather than structured blocks and are
+/// therefore skipped here.
+fn message_blocks(
+    msg: &agent_code_lib::llm::message::Message,
+) -> &[agent_code_lib::llm::message::ContentBlock] {
+    use agent_code_lib::llm::message::Message;
+    match msg {
+        Message::User(u) => &u.content,
+        Message::Assistant(a) => &a.content,
+        Message::System(_) => &[],
+    }
+}
+
+/// Walk the conversation collecting every tool_use + its tool_result in
+/// chronological order. The most recent call is last.
+fn collect_tool_calls(
+    messages: &[agent_code_lib::llm::message::Message],
+) -> Vec<ToolCallRecord<'_>> {
+    use agent_code_lib::llm::message::ContentBlock;
+    let mut calls: Vec<ToolCallRecord<'_>> = Vec::new();
+    // Two-pass: first collect tool_use blocks, then attach their results.
+    for (i, msg) in messages.iter().enumerate() {
+        for block in message_blocks(msg) {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                calls.push(ToolCallRecord {
+                    message_index: i,
+                    id: id.as_str(),
+                    name: name.as_str(),
+                    input,
+                    result_text: None,
+                    result_is_error: false,
+                });
+            }
+        }
+    }
+    for msg in messages {
+        for block in message_blocks(msg) {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } = block
+                && let Some(call) = calls.iter_mut().find(|c| c.id == tool_use_id.as_str())
+            {
+                call.result_text = Some(content.as_str());
+                call.result_is_error = *is_error;
+            }
+        }
+    }
+    calls
+}
+
+fn clip_for_display(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else {
+        let prefix: String = text.chars().take(max_chars).collect();
+        format!("{prefix}... [{} more chars]", count - max_chars)
+    }
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn render_tool_call(record: &ToolCallRecord<'_>, full: bool) {
+    println!("tool   : {}", record.name);
+    println!("id     : {}", record.id);
+    println!("turn   : message #{}", record.message_index);
+    let input_json = pretty_json(record.input);
+    let input_view = if full {
+        input_json
+    } else {
+        clip_for_display(&input_json, 600)
+    };
+    println!("input  :");
+    for line in input_view.lines() {
+        println!("  {line}");
+    }
+    match record.result_text {
+        None => println!("result : (pending — no tool_result recorded yet)"),
+        Some(text) => {
+            let tag = if record.result_is_error {
+                "error"
+            } else {
+                "ok"
+            };
+            let view = if full {
+                text.to_string()
+            } else {
+                clip_for_display(text, 800)
+            };
+            println!("result : ({tag})");
+            for line in view.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+}
+
+fn execute_debug_tool_call(args: Option<&str>, engine: &QueryEngine) {
+    let trimmed = args.map(str::trim).unwrap_or("");
+    let messages = &engine.state().messages;
+    let calls = collect_tool_calls(messages);
+    if calls.is_empty() {
+        println!("No tool calls have been made in this session yet.");
+        return;
+    }
+
+    // /debug-tool-call list — show the most recent ten.
+    if trimmed.eq_ignore_ascii_case("list") || trimmed == "--list" || trimmed == "-l" {
+        let total = calls.len();
+        let take = total.min(10);
+        println!("Last {take} tool call(s) (most recent last, {total} total):");
+        for (idx, call) in calls.iter().rev().take(take).enumerate() {
+            let n = idx + 1;
+            let status = match (call.result_text.is_some(), call.result_is_error) {
+                (false, _) => "pending",
+                (true, true) => "error",
+                (true, false) => "ok",
+            };
+            println!("  {n:>2}. [{status:>7}] {:<18} id={}", call.name, call.id,);
+        }
+        println!("Use `/debug-tool-call <N>` to inspect the Nth-most-recent call.");
+        return;
+    }
+
+    let full_flag = trimmed == "--full" || trimmed == "full";
+    let numeric_arg = trimmed
+        .split_whitespace()
+        .find_map(|t| t.parse::<usize>().ok());
+
+    let n = numeric_arg.unwrap_or(1);
+    if n == 0 {
+        println!("Index must be >= 1 (1 = most recent).");
+        return;
+    }
+    if n > calls.len() {
+        println!(
+            "Only {} tool call(s) in this session; can't show #{n}.",
+            calls.len()
+        );
+        return;
+    }
+
+    // n-th most recent, 1-indexed.
+    let record = &calls[calls.len() - n];
+    println!("── debug-tool-call #{n} ──");
+    render_tool_call(record, full_flag);
+    if !full_flag {
+        println!("(append `full` to show untrimmed input/result)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4992,5 +5174,96 @@ mod tests {
             is_compact_summary: false,
         })];
         assert!(collect_user_prompts(&msgs).is_empty());
+    }
+
+    // ---- /debug-tool-call helpers ----
+
+    fn test_assistant_with_tool_use(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> agent_code_lib::llm::message::Message {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message};
+        use uuid::Uuid;
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "2026-04-23T00:00:00Z".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })
+    }
+
+    fn test_user_with_tool_result(
+        id: &str,
+        content: &str,
+        is_error: bool,
+    ) -> agent_code_lib::llm::message::Message {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "2026-04-23T00:00:00Z".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: content.into(),
+                is_error,
+                extra_content: vec![],
+            }],
+            is_meta: true,
+            is_compact_summary: false,
+        })
+    }
+
+    #[test]
+    fn collect_tool_calls_pairs_use_with_result() {
+        let msgs = vec![
+            test_assistant_with_tool_use("t1", "Read", serde_json::json!({"path": "a.rs"})),
+            test_user_with_tool_result("t1", "file contents", false),
+            test_assistant_with_tool_use("t2", "Bash", serde_json::json!({"cmd": "ls"})),
+        ];
+        let calls = collect_tool_calls(&msgs);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].result_text, Some("file contents"));
+        assert!(!calls[0].result_is_error);
+        // The second call has no result yet — treated as pending.
+        assert_eq!(calls[1].name, "Bash");
+        assert!(calls[1].result_text.is_none());
+    }
+
+    #[test]
+    fn collect_tool_calls_empty_session_returns_empty() {
+        assert!(collect_tool_calls(&[]).is_empty());
+    }
+
+    #[test]
+    fn collect_tool_calls_marks_error_flag() {
+        let msgs = vec![
+            test_assistant_with_tool_use("t1", "Bash", serde_json::json!({"cmd": "false"})),
+            test_user_with_tool_result("t1", "command failed", true),
+        ];
+        let calls = collect_tool_calls(&msgs);
+        assert!(calls[0].result_is_error);
+        assert_eq!(calls[0].result_text, Some("command failed"));
+    }
+
+    #[test]
+    fn clip_for_display_shortens_long_text() {
+        let long = "a".repeat(100);
+        let clipped = clip_for_display(&long, 20);
+        assert!(clipped.starts_with(&"a".repeat(20)));
+        assert!(clipped.contains("80 more chars"));
+    }
+
+    #[test]
+    fn clip_for_display_passes_short_text_through() {
+        assert_eq!(clip_for_display("short", 100), "short");
     }
 }
