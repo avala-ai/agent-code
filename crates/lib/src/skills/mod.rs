@@ -492,6 +492,34 @@ impl SkillRegistry {
                  Never force-push. Never squash-merge the backport without the \
                  reviewer's go-ahead. Never mark a backport complete if tests failed.",
             ),
+            (
+                "commit-push-pr",
+                "Commit the current diff, push, and open a PR in one motion",
+                true,
+                "Ship the current work: commit → push → open PR. Do NOT collapse the \
+                 verification gates between steps — each one has to pass before the next.\n\n\
+                 1. Check `git status`. If the working tree is clean, stop and say so.\n\
+                 2. Check `git branch --show-current`. If on the base branch (main / \
+                 master / develop), stop — commits on the base branch shouldn't go \
+                 through this flow.\n\
+                 3. Run the project's lint + test gate (read AGENTS.md / CONTRIBUTING.md \
+                 for the canonical commands; fall back to sensible defaults per language). \
+                 If anything fails, stop and surface the failures — do not commit broken \
+                 code into a PR.\n\
+                 4. Stage specific files (never `git add -A` — that risks committing \
+                 `.env` or credentials). Review the staged diff one last time.\n\
+                 5. Commit with a conventional-commit message whose subject is under 70 \
+                 chars and whose body explains WHY (not WHAT — the diff already shows \
+                 what). Never add Co-Authored-By: Claude / 🤖 trailers.\n\
+                 6. Push with `-u` if the branch doesn't track a remote yet.\n\
+                 7. Open the PR with `gh pr create` — title under 70 chars, body with \
+                 Summary (1–3 bullets) and Test Plan (checklist). Link the issue if \
+                 there's one.\n\
+                 8. Print the PR URL.\n\n\
+                 Never force-push. Never push directly to the base branch. Never skip \
+                 hooks. If a step fails, stop and report — don't compensate by \
+                 skipping the next step.",
+            ),
         ];
 
         for (name, description, user_invocable, body) in bundled {
