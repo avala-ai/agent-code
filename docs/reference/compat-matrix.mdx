@@ -1,0 +1,154 @@
+---
+title: "Compatibility Matrix"
+description: "agent-code feature coverage vs peer terminal coding agents"
+---
+
+This matrix compares agent-code's feature surface against the broader terminal coding-agent landscape. It's a living document — when a feature lands in agent-code, it gets checked here; when a peer ships something we don't have, it gets listed as a gap.
+
+Last updated for agent-code v0.17.0.
+
+## Runtime and platform
+
+| Feature | agent-code | Peer A (Rust) | Peer B (TS) | Peer C (Python) |
+|---------|:---------:|:-------------:|:-----------:|:---------------:|
+| Single-binary install | ✅ | ✅ | ➖ (node runtime) | ➖ (python runtime) |
+| Linux x86_64 | ✅ | ✅ | ✅ | ✅ |
+| Linux aarch64 | ✅ | ➖ | ✅ | ✅ |
+| macOS x86_64 | ✅ | ✅ | ✅ | ✅ |
+| macOS aarch64 | ✅ | ✅ | ✅ | ✅ |
+| Windows x86_64 | ✅ | ➖ | ✅ | ✅ |
+| Docker image | ✅ | ➖ | ✅ | ➖ |
+| Homebrew tap | ✅ | ✅ | ✅ | ✅ |
+| npm package | ✅ | ➖ | ✅ | ➖ |
+| crates.io | ✅ | ✅ | ➖ | ➖ |
+
+## Providers
+
+| Provider | agent-code | Peer A | Peer B | Peer C |
+|----------|:---------:|:------:|:------:|:------:|
+| Anthropic | ✅ | ✅ | ✅ | ✅ |
+| OpenAI | ✅ | ✅ | ➖ | ✅ |
+| Azure OpenAI | ✅ | ✅ | ➖ | ✅ |
+| xAI | ✅ | ➖ | ➖ | ➖ |
+| Google (Gemini) | ✅ | ✅ | ➖ | ✅ |
+| DeepSeek | ✅ | ➖ | ➖ | ➖ |
+| Groq | ✅ | ➖ | ➖ | ➖ |
+| Mistral | ✅ | ➖ | ➖ | ➖ |
+| Together | ✅ | ➖ | ➖ | ➖ |
+| Zhipu | ✅ | ➖ | ➖ | ➖ |
+| OpenRouter | ✅ | ✅ | ➖ | ✅ |
+| Bedrock | ✅ | ➖ | ✅ | ✅ |
+| Vertex | ✅ | ➖ | ✅ | ✅ |
+| Ollama (local) | ✅ | ✅ | ➖ | ✅ |
+
+## Tools and extensibility
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Bash / shell | ✅ | ✅ | ✅ | ✅ |
+| FileRead / Write / Edit | ✅ | ✅ | ✅ | ✅ |
+| Multi-edit (atomic) | ✅ | ✅ | ✅ | ➖ |
+| Grep (ripgrep-backed) | ✅ | ✅ | ✅ | ✅ |
+| Glob | ✅ | ✅ | ✅ | ➖ |
+| WebFetch | ✅ | ✅ | ✅ | ✅ |
+| WebSearch | ✅ | ➖ | ✅ | ➖ |
+| NotebookEdit (Jupyter) | ✅ | ➖ | ✅ | ➖ |
+| PowerShell | ✅ | ➖ | ✅ | ➖ |
+| LSP integration (as tool) | ✅ | ➖ | ✅ | ➖ |
+| MCP client (stdio + SSE) | ✅ | ➖ | ✅ | ✅ |
+| Plugins (Rust/executable) | ✅ | ➖ | ✅ | ✅ |
+| Worktree isolation | ✅ | ➖ | ✅ | ➖ |
+| Sub-agent spawning | ✅ | ✅ | ✅ | ✅ |
+| REPL tool | ✅ | ➖ | ✅ | ➖ |
+
+## REPL and UX
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Slash commands | 69 | ~30 | 86 | ~20 |
+| Bundled skills | 27 | ➖ | 18 | ➖ |
+| Tab completion | ✅ | ✅ | ✅ | ➖ |
+| Shell passthrough (`!`) | ✅ | ➖ | ✅ | ➖ |
+| Background tasks (`&`) | ✅ | ➖ | ✅ | ➖ |
+| Session save/resume | ✅ | ✅ | ✅ | ✅ |
+| Session labels (`/rename`) | ✅ | ➖ | ✅ | ➖ |
+| Config profiles | ✅ | ➖ | ➖ | ➖ |
+| Extended thinking / reasoning | ✅ | ➖ | ✅ | ➖ |
+| Thinking replay (`/thinkback`) | ✅ | ➖ | ✅ | ➖ |
+| Vim / emacs edit modes | ✅ | ➖ | ✅ | ➖ |
+| Plan mode (read-only) | ✅ | ➖ | ✅ | ➖ |
+| Prompt caching | ✅ | ➖ | ✅ | ➖ |
+| Interactive tutorials | ✅ | ➖ | ➖ | ➖ |
+
+## Safety and sandboxing
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Protected directories | ✅ | ➖ | ➖ | ➖ |
+| Destructive command detection | ✅ | ➖ | ➖ | ➖ |
+| Permission tiers (ask/allow/deny) | ✅ | ✅ | ✅ | ➖ |
+| Permission rules (path / tool scoped) | ✅ | ➖ | ✅ | ➖ |
+| Process-level sandbox (bwrap / seatbelt) | ✅ | ➖ | ➖ | ➖ |
+| Secret masker at persistence boundary | ✅ | ➖ | ➖ | ➖ |
+| Skill shell-execution disable flag | ✅ | ➖ | ➖ | ➖ |
+
+## Observability
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Per-turn token usage (`/usage`) | ✅ | ➖ | ✅ | ➖ |
+| Aggregate cost (`/cost`) | ✅ | ✅ | ✅ | ➖ |
+| Per-model breakdown | ✅ | ➖ | ✅ | ➖ |
+| Cache-hit rate | ✅ | ➖ | ✅ | ➖ |
+| Session statistics (`/stats`) | ✅ | ➖ | ✅ | ➖ |
+| Heap snapshot (`/heapdump`) | ✅ | ➖ | ✅ | ➖ |
+| Structured JSON output (non-interactive) | ✅ | ➖ | ➖ | ➖ |
+
+## Multi-agent and integration
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Agent Client Protocol (ACP) server | ✅ | ➖ | ➖ | ➖ |
+| Coordinator / team orchestration | ✅ | ➖ | ✅ | ➖ |
+| Scheduled agents (cron) | ✅ | ➖ | ✅ | ➖ |
+| Webhook-triggered runs | ✅ | ➖ | ➖ | ➖ |
+| Remote agent spawning | ➖ | ➖ | ✅ | ➖ |
+| IDE bridge (IDE ↔ CLI sync) | ➖ | ➖ | ✅ | ➖ |
+| Voice mode | ➖ | ➖ | ✅ | ➖ |
+
+## Developer experience
+
+| Feature | agent-code | Peer A | Peer B | Peer C |
+|---------|:---------:|:------:|:------:|:------:|
+| Behavioral eval framework | ✅ | ➖ | ➖ | ➖ |
+| Benchmarks (startup / compaction / tokens) | ✅ | ➖ | ➖ | ➖ |
+| Self-update (`/update`) | ✅ | ➖ | ✅ | ➖ |
+| Self-uninstall (`/uninstall`) | ✅ | ➖ | ✅ | ➖ |
+| Skill validator (`/skill validate`) | ✅ | ➖ | ➖ | ➖ |
+| Coverage reporting (CI) | ✅ | ✅ | ✅ | ✅ |
+
+## Known gaps (on the roadmap)
+
+Items agent-code does not yet have. See [ROADMAP.md](https://github.com/avala-ai/agent-code/blob/main/ROADMAP.md) for status:
+
+| Feature | Roadmap item | Status |
+|---------|-------------|--------|
+| `@`-mention file picker | 7.27 | Planned |
+| SQLite session store | 7.26 | Planned |
+| Voice mode | 7.19 | Planned |
+| OAuth authentication | 7.11 | Planned |
+| Reversible edit history | 7.22 | Planned |
+| Multimodal input in TUI | 7.23 | Planned |
+| Enterprise TLS / proxy | 7.25 | Planned |
+| MCP elicitation | 7.30 | Planned |
+| TUI transcript search | 7.32 | Planned |
+| Local LLM auto-discovery | 7.14 | Partially done |
+| Conversation branching | 7.15 | Partially done |
+
+## How to read this
+
+- **✅** means the feature is present and wired up end-to-end
+- **➖** means the feature is absent or has no meaningful equivalent
+- Peer columns are anonymized on purpose — the point is gap coverage, not competitive ranking. Check individual projects' docs if you want specifics.
+
+If a feature lands in any column, open a PR against this file so the matrix stays honest. Stale comparison docs are worse than none — they mislead evaluators and hide real gaps from our own eyes.
