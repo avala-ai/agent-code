@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.17.0] - 2026-04-22
+
 ### Added
 
-- **`/pentest` bundled skill**: five-phase white-box penetration test workflow (recon → slice → vuln analysis → exploit-or-discard → report) with a proof-of-concept gating policy — findings without a reproducible PoC are demoted to INFO or dropped. Runs entirely in-session against a target directory and writes a severity-grouped markdown report.
+- **`/pentest` bundled skill** (#137): five-phase white-box penetration test workflow (recon → slice → vuln analysis → exploit-or-discard → report) with a proof-of-concept gating policy — findings without a reproducible PoC are demoted to INFO or dropped. Runs entirely in-session against a target directory and writes a severity-grouped markdown report.
 - **`/effort` command** (#150): rates task complexity XS/S/M/L/XL with a one-line justification and top 2 risks. No-arg form rates the task currently being discussed; `/effort <task>` rates a supplied description.
 - **`/break-cache` command** (#151): forces the next outgoing request to skip the prompt cache so the cache prefix is rebuilt. One-shot flag on `AppState`, consumed after the next request. Useful for mid-session config changes or debugging cache behavior.
 - **`/heapdump` command** (#152, hidden from `/help`): writes a best-effort process memory snapshot (VmRSS / VmSize / VmPeak / per-segment on Linux; `ps -o rss,vsz` on macOS) to a timestamped file under the data directory.
@@ -26,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/pr-comments` command** (#164): fetches inline + issue comments on a PR via `gh`, groups them into (unresolved / action-requested / resolved), and produces a triage list with file:line, author quote, and suggested response or fix per item.
 - **`/autofix-pr` command** (#165): checks out a PR in an isolated worktree, detects the toolchain, runs the lint + test gate, applies minimal fixes with re-verification after each, commits, and pushes back. Never force-pushes, never skips hooks, never modifies tests to make them pass.
 - **`/perf-issue` command** (#166): report-only performance regression audit on the current diff (or named target). Looks for N+1 queries, missing indexes, sync I/O on hot paths, allocation hotspots, quadratic algorithms, cache invalidation bugs, unbounded growth, and sync-in-async patterns.
+- **`/env` command** (#168): lists the environment variables agent-code actually reads — config overrides, 12 provider-native API keys, runtime/logging, shell context. Secrets (`*_API_KEY` / `*_TOKEN` / `*_SECRET`) displayed as `(N chars, ends in …xxxx)` so the user can confirm the right key is set without leaking it in a screenshare.
+- **`backport` bundled skill** (#169): cherry-picks a commit or PR onto one or more release branches, each in an isolated worktree. Mechanical conflict resolution only; anything requiring judgment stops on that branch. Pushes to `backport/<source>-onto-<target>` and opens linked PRs.
+- **`/issue` command** (#170): drafts a GitHub issue from session context — symptom, reproduction, expected/actual, environment, investigation findings — and opens it via `gh issue create` after user approval. Strips credentials from log excerpts before submission.
+- **Configuration profiles** (#171): new `services::profiles` module plus `/profile save|load|list|delete|help` command. Profiles are full `Config` snapshots stored as `<config_dir>/agent-code/profiles/<name>.toml`; loading replaces the runtime config wholesale (no merge). Name validation rejects path escapes, shell metachars, and oversize names so a malicious name can't write outside the profiles dir.
+
+### Changed
+
+- **Docs synced** (#167): README command count 52 → 65 and bundled skill count 18 → 25 (after all Wave 1-3 additions). `ROADMAP.md` §2.1 expanded with 5 new skills; new §3.6 Productivity Commands and §3.7 PR-Workflow Commands sections marked Done. `docs/reference/commands.mdx` (+ mdBook mirror) gained rows for 11 new commands across Session / Context / Git / Diagnostics / Memory sections. `docs/extending/skills.mdx` (+ mdBook mirror) updated with the full 25-skill table.
 
 ### Fixed
 
