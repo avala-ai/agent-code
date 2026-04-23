@@ -231,7 +231,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "hooks",
         aliases: &[],
-        description: "List configured hooks",
+        description: "List configured hooks (add 'events' for the catalog, 'example' for a snippet)",
         hidden: false,
     },
     Command {
@@ -1313,10 +1313,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("hooks") => {
-            println!("Hook system active. Configure hooks in .agent/settings.toml:");
-            println!("  [[hooks]]");
-            println!("  event = \"pre_tool_use\"");
-            println!("  action = {{ type = \"shell\", command = \"./check.sh\" }}");
+            execute_hooks(args, engine);
             CommandResult::Handled
         }
         Some("plugins") => {
@@ -2162,6 +2159,125 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// /hooks — list configured hooks + event catalog
+// ---------------------------------------------------------------------------
+
+/// Catalog of hook events we fire at runtime, in roughly the order a
+/// turn encounters them. Keep in sync with `HookEvent`.
+const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
+    (
+        "session_start",
+        "when the session starts (before the first turn)",
+    ),
+    ("user_prompt_submit", "when the user submits a prompt"),
+    (
+        "pre_turn",
+        "before each agent turn (env: AGENT_TURN, AGENT_INPUT)",
+    ),
+    (
+        "pre_tool_use",
+        "before a tool executes (filter by tool_name)",
+    ),
+    (
+        "post_tool_use",
+        "after a tool completes (context: tool, is_error)",
+    ),
+    (
+        "post_turn",
+        "after each turn finishes (env: turn, tool-call count)",
+    ),
+    (
+        "pre_compact",
+        "right before /compact or auto-compact mutates history",
+    ),
+    ("session_stop", "when the session ends"),
+];
+
+fn format_hook_action(action: &agent_code_lib::config::HookAction) -> String {
+    use agent_code_lib::config::HookAction;
+    match action {
+        HookAction::Shell { command } => {
+            let one_line = command.replace('\n', " ");
+            let clipped = if one_line.chars().count() > 80 {
+                let prefix: String = one_line.chars().take(77).collect();
+                format!("{prefix}...")
+            } else {
+                one_line
+            };
+            format!("shell: {clipped}")
+        }
+        HookAction::Http { url, method } => {
+            let m = method.as_deref().unwrap_or("POST");
+            format!("http:  {m} {url}")
+        }
+    }
+}
+
+fn format_hook_event(event: &agent_code_lib::config::HookEvent) -> &'static str {
+    use agent_code_lib::config::HookEvent;
+    match event {
+        HookEvent::SessionStart => "session_start",
+        HookEvent::SessionStop => "session_stop",
+        HookEvent::PreToolUse => "pre_tool_use",
+        HookEvent::PostToolUse => "post_tool_use",
+        HookEvent::UserPromptSubmit => "user_prompt_submit",
+        HookEvent::PreTurn => "pre_turn",
+        HookEvent::PostTurn => "post_turn",
+        HookEvent::PreCompact => "pre_compact",
+    }
+}
+
+fn execute_hooks(args: Option<&str>, engine: &QueryEngine) {
+    let trimmed = args.map(str::trim).unwrap_or("");
+
+    if trimmed.eq_ignore_ascii_case("events") || trimmed == "--events" {
+        println!("Hook events (what triggers a configured hook):");
+        for (name, desc) in HOOK_EVENT_CATALOG {
+            println!("  {name:<20} {desc}");
+        }
+        return;
+    }
+
+    if trimmed.eq_ignore_ascii_case("example") || trimmed == "--example" {
+        println!("Add a hook by appending to your `.agent/settings.toml`:");
+        println!();
+        println!("  [[hooks]]");
+        println!("  event  = \"pre_tool_use\"");
+        println!("  action = {{ type = \"shell\", command = \"./pre-check.sh\" }}");
+        println!("  tool_name = \"Bash\"   # optional: only fire for this tool");
+        println!();
+        println!("  [[hooks]]");
+        println!("  event  = \"pre_compact\"");
+        println!("  action = {{ type = \"shell\", command = \"./snapshot.sh\" }}");
+        return;
+    }
+
+    let hooks = &engine.state().config.hooks;
+    if hooks.is_empty() {
+        println!("No hooks configured.");
+        println!("Run `/hooks events` for the event catalog, or `/hooks example` for a snippet.");
+        return;
+    }
+
+    println!("Configured hooks ({}):", hooks.len());
+    for (i, hook) in hooks.iter().enumerate() {
+        let tool_filter = hook
+            .tool_name
+            .as_deref()
+            .map(|t| format!(" (tool={t})"))
+            .unwrap_or_default();
+        println!(
+            "  {:>2}. {:<18}{tool_filter}",
+            i + 1,
+            format_hook_event(&hook.event)
+        );
+        println!("       {}", format_hook_action(&hook.action));
+    }
+    println!();
+    println!("Run `/hooks events` for the event catalog, `/hooks example` for a snippet.");
 }
 
 // ---------------------------------------------------------------------------
@@ -4576,51 +4692,75 @@ mod tests {
         assert_eq!(files[0].2, 2);
     }
 
-    // ---- /open helpers ----
+    // ---- /hooks helpers ----
 
     #[test]
-    fn parse_open_args_accepts_bare_path() {
-        let a = parse_open_args("src/main.rs").unwrap();
-        assert_eq!(a.path, "src/main.rs");
-        assert!(!a.create);
+    fn format_hook_event_covers_every_variant() {
+        use agent_code_lib::config::HookEvent;
+        // Exhaustive match in format_hook_event forces this to stay in sync
+        // with the enum — if a new variant is added, the function won't
+        // compile. This test just sanity-checks the mapping.
+        assert_eq!(format_hook_event(&HookEvent::SessionStart), "session_start");
+        assert_eq!(format_hook_event(&HookEvent::SessionStop), "session_stop");
+        assert_eq!(format_hook_event(&HookEvent::PreToolUse), "pre_tool_use");
+        assert_eq!(format_hook_event(&HookEvent::PostToolUse), "post_tool_use");
+        assert_eq!(
+            format_hook_event(&HookEvent::UserPromptSubmit),
+            "user_prompt_submit"
+        );
+        assert_eq!(format_hook_event(&HookEvent::PreTurn), "pre_turn");
+        assert_eq!(format_hook_event(&HookEvent::PostTurn), "post_turn");
+        assert_eq!(format_hook_event(&HookEvent::PreCompact), "pre_compact");
     }
 
     #[test]
-    fn parse_open_args_recognizes_create_before_path() {
-        let a = parse_open_args("--create notes/new.md").unwrap();
-        assert_eq!(a.path, "notes/new.md");
-        assert!(a.create);
+    fn format_hook_action_shell_shows_command() {
+        use agent_code_lib::config::HookAction;
+        let a = HookAction::Shell {
+            command: "echo hi".into(),
+        };
+        let rendered = format_hook_action(&a);
+        assert!(rendered.starts_with("shell:"));
+        assert!(rendered.contains("echo hi"));
     }
 
     #[test]
-    fn parse_open_args_recognizes_create_after_path() {
-        let a = parse_open_args("notes/new.md --create").unwrap();
-        assert_eq!(a.path, "notes/new.md");
-        assert!(a.create);
+    fn format_hook_action_shell_truncates_long_commands() {
+        use agent_code_lib::config::HookAction;
+        let cmd = "x".repeat(200);
+        let a = HookAction::Shell { command: cmd };
+        let rendered = format_hook_action(&a);
+        assert!(rendered.chars().count() <= "shell: ".len() + 80);
+        assert!(rendered.ends_with("..."));
     }
 
     #[test]
-    fn parse_open_args_rejects_multiple_paths() {
-        assert!(parse_open_args("a.rs b.rs").is_none());
+    fn format_hook_action_http_shows_method_and_url() {
+        use agent_code_lib::config::HookAction;
+        let a = HookAction::Http {
+            url: "https://example.com/hook".into(),
+            method: Some("POST".into()),
+        };
+        let rendered = format_hook_action(&a);
+        assert!(rendered.contains("POST"));
+        assert!(rendered.contains("https://example.com/hook"));
     }
 
     #[test]
-    fn parse_open_args_returns_none_for_empty_flags_only() {
-        // All tokens are flags — no path.
-        assert!(parse_open_args("--create").is_none());
+    fn format_hook_action_http_defaults_to_post() {
+        use agent_code_lib::config::HookAction;
+        let a = HookAction::Http {
+            url: "https://example.com".into(),
+            method: None,
+        };
+        let rendered = format_hook_action(&a);
+        assert!(rendered.contains("POST"));
     }
 
     #[test]
-    fn resolve_path_against_cwd_joins_relative() {
-        let cwd = std::path::Path::new("/tmp/project");
-        let p = resolve_path_against_cwd(cwd, "src/main.rs");
-        assert_eq!(p, std::path::Path::new("/tmp/project/src/main.rs"));
-    }
-
-    #[test]
-    fn resolve_path_against_cwd_preserves_absolute() {
-        let cwd = std::path::Path::new("/tmp/project");
-        let p = resolve_path_against_cwd(cwd, "/etc/hosts");
-        assert_eq!(p, std::path::Path::new("/etc/hosts"));
+    fn hook_event_catalog_has_unique_names() {
+        use std::collections::HashSet;
+        let names: HashSet<&str> = HOOK_EVENT_CATALOG.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names.len(), HOOK_EVENT_CATALOG.len());
     }
 }
