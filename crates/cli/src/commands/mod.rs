@@ -3029,10 +3029,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn copy_to_clipboard_errors_with_empty_path() {
         // Force `copy_to_clipboard` to have no candidates on PATH by
         // temporarily emptying PATH. This verifies the error path
         // returns a helpful string instead of silently succeeding.
+        //
+        // Windows-only: `clip.exe` lives in `%SYSTEMROOT%\System32` and
+        // Windows' `CreateProcess` searches the system directory even
+        // with an empty PATH, so clearing PATH doesn't actually hide
+        // it. The test is an assertion about the fallback code path on
+        // *nix; the Windows probe (`clip` only) has a simpler path.
         //
         // SAFETY: single-threaded test, restored before exit.
         let prev = std::env::var_os("PATH");
