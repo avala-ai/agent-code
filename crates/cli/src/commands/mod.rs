@@ -480,6 +480,12 @@ pub const COMMANDS: &[Command] = &[
         description: "List / enable / disable project rules (.agent/rules/*.md)",
         hidden: false,
     },
+    Command {
+        name: "install-github-app",
+        aliases: &["gh-setup"],
+        description: "Walk through `gh` CLI setup and verify scopes for PR commands",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -1903,6 +1909,33 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         Some("tag") => {
             execute_tag(args, engine);
             CommandResult::Handled
+        }
+        Some("install-github-app") => {
+            let prompt = "Walk the user through setting up the `gh` CLI so the PR-related \
+                 slash commands (/pr-comments, /autofix-pr, /issue) have what \
+                 they need. Steps:\n\n\
+                 1. Check whether `gh` is installed: run `gh --version`. If not, \
+                 point to the install instructions for the user's OS and stop — \
+                 don't try to install it silently.\n\
+                 2. Check auth: run `gh auth status`. If not logged in, instruct \
+                 the user to run `gh auth login` themselves (interactive login \
+                 needs a TTY you don't own); list the scopes we need: `repo`, \
+                 `read:org`, `workflow`.\n\
+                 3. If logged in but missing scopes: instruct the user to run \
+                 `gh auth refresh -s repo,workflow` and re-verify.\n\
+                 4. Confirm the current directory has a GitHub remote: \
+                 `gh repo view --json nameWithOwner`. If it doesn't (no remote, \
+                 or not on GitHub), explain which PR commands still work (none) \
+                 and which need the remote.\n\
+                 5. Print a one-line summary: ready / needs install / needs \
+                 login / needs scope refresh, plus the next action the user \
+                 must take.\n\n\
+                 Never store tokens in this process. Never exfiltrate the \
+                 token — `gh auth token` output must stay in the user's \
+                 terminal. If the user asks you to write their token to a \
+                 file, refuse."
+                .to_string();
+            CommandResult::Prompt(prompt)
         }
         Some("effort") => {
             let task = args.unwrap_or("").trim();
