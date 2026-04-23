@@ -13,6 +13,7 @@
 //! - `FileChanged` — after any file-mutating tool completes
 //! - `Stop` — agent finished responding; about to yield to the user
 //! - `Notification` — agent needs user attention (budget / context full)
+//! - `CwdChanged` — session cwd or tracked dirs changed
 //!
 //! Hooks can be shell commands, HTTP endpoints, or prompt templates,
 //! configured in the settings file.
@@ -198,6 +199,12 @@ mod tests {
     async fn run_hooks_fires_notification() {
         let body = run_and_read(HookEvent::Notification).await;
         assert!(body.contains("fired"), "Notification hook did not run");
+    }
+
+    #[tokio::test]
+    async fn run_hooks_fires_cwd_changed() {
+        let body = run_and_read(HookEvent::CwdChanged).await;
+        assert!(body.contains("fired"), "CwdChanged hook did not run");
     }
 
     /// Registering a hook for one event must NOT cause it to fire when

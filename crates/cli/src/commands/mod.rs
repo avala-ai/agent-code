@@ -2251,6 +2251,10 @@ const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
         "notification",
         "agent needs user attention — budget stop, context full (context: message, title, notification_type)",
     ),
+    (
+        "cwd_changed",
+        "session cwd or tracked dirs changed (context: previous_cwd, new_cwd, additional_dirs, cause)",
+    ),
     ("session_stop", "when the session ends"),
 ];
 
@@ -2289,6 +2293,7 @@ fn format_hook_event(event: &agent_code_lib::config::HookEvent) -> &'static str 
         HookEvent::FileChanged => "file_changed",
         HookEvent::Stop => "stop",
         HookEvent::Notification => "notification",
+        HookEvent::CwdChanged => "cwd_changed",
     }
 }
 
@@ -2311,6 +2316,7 @@ fn parse_hook_event(raw: &str) -> Option<agent_code_lib::config::HookEvent> {
         "file_changed" => HookEvent::FileChanged,
         "stop" => HookEvent::Stop,
         "notification" => HookEvent::Notification,
+        "cwd_changed" => HookEvent::CwdChanged,
         _ => return None,
     })
 }
@@ -2705,11 +2711,17 @@ fn execute_add_dir(args: Option<&str>, engine: &mut QueryEngine) {
 
     if raw == "--clear" {
         let n = engine.state().additional_dirs.len();
+        if n == 0 {
+            println!("No tracked directories to clear.");
+            return;
+        }
+        let previous_cwd = engine.state().cwd.clone();
         engine.state_mut().additional_dirs.clear();
         println!(
             "Cleared {n} tracked director{}.",
             if n == 1 { "y" } else { "ies" }
         );
+        fire_cwd_changed(engine, &previous_cwd);
         return;
     }
 
@@ -2719,6 +2731,8 @@ fn execute_add_dir(args: Option<&str>, engine: &mut QueryEngine) {
         engine.state_mut().additional_dirs.retain(|d| d != target);
         if existed {
             println!("Removed: {target}");
+            let previous_cwd = engine.state().cwd.clone();
+            fire_cwd_changed(engine, &previous_cwd);
         } else {
             println!("Not tracked: {target}");
         }
@@ -2744,8 +2758,18 @@ fn execute_add_dir(args: Option<&str>, engine: &mut QueryEngine) {
         println!("Already tracked: {s}");
         return;
     }
+    let previous_cwd = engine.state().cwd.clone();
     engine.state_mut().additional_dirs.push(s.clone());
     println!("Tracking: {s}");
+    fire_cwd_changed(engine, &previous_cwd);
+}
+
+/// Fire `CwdChanged` hooks from the `/add-dir` subcommands. Bridges
+/// the sync command dispatcher into the async hook registry.
+fn fire_cwd_changed(engine: &QueryEngine, previous_cwd: &str) {
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = h.block_on(engine.fire_cwd_changed_hooks(previous_cwd, "add-dir"));
+    }
 }
 
 /// Resolve a user-typed path fragment into a canonical directory path,
@@ -2827,10 +2851,20 @@ fn execute_cd(args: Option<&str>, engine: &mut QueryEngine) {
     }
 
     let new_cwd = canonical.display().to_string();
+    let previous_cwd = engine.state().cwd.clone();
     engine.state_mut().cwd = new_cwd.clone();
     // Invalidate the system-prompt cache — the cwd is baked in and
     // the agent would otherwise keep believing it's in the old dir.
     engine.reset_system_prompt_cache();
+
+    // Fire CwdChanged so file-indexer / repo-watcher hooks can retune
+    // without re-polling state. Use block_on to bridge the sync
+    // command dispatcher into the async hook registry; matches the
+    // /compact precedent.
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = h.block_on(engine.fire_cwd_changed_hooks(&previous_cwd, "cd"));
+    }
+
     println!("cwd: {new_cwd}");
 }
 
@@ -5655,6 +5689,13 @@ mod tests {
             parse_hook_event("Notification"),
             Some(HookEvent::Notification)
         );
+    }
+
+    #[test]
+    fn parse_hook_event_accepts_cwd_changed() {
+        use agent_code_lib::config::HookEvent;
+        assert_eq!(parse_hook_event("cwd_changed"), Some(HookEvent::CwdChanged));
+        assert_eq!(parse_hook_event("cwd-changed"), Some(HookEvent::CwdChanged));
     }
 
     #[test]

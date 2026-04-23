@@ -146,6 +146,29 @@ impl QueryEngine {
         &mut self.state
     }
 
+    /// Run any configured `CwdChanged` hooks when the session's
+    /// working-directory state mutates. `cause` is `"cd"` when the
+    /// primary cwd was replaced (e.g. via `/cd`) and `"add-dir"` when
+    /// the additional-dirs set changed (via `/add-dir`). Context
+    /// carries the previous and new cwd plus the current
+    /// additional-dirs list so repo-watchers / file-indexers can
+    /// retune their scope without re-polling state.
+    pub async fn fire_cwd_changed_hooks(
+        &self,
+        previous_cwd: &str,
+        cause: &str,
+    ) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "previous_cwd": previous_cwd,
+            "new_cwd": self.state.cwd,
+            "additional_dirs": self.state.additional_dirs,
+            "cause": cause,
+        });
+        self.hooks
+            .run_hooks(&HookEvent::CwdChanged, None, &ctx)
+            .await
+    }
+
     /// Run any configured `FileChanged` hooks when a file-mutating tool
     /// (`FileWrite`, `FileEdit`, `MultiEdit`, `NotebookEdit`) completes.
     /// Consolidates what would otherwise be four separate `PostToolUse`

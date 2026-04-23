@@ -420,6 +420,12 @@ pub enum HookEvent {
     /// `"permission_request"`) so desktop-notifier / Slack / email
     /// integrations can filter.
     Notification,
+    /// Fired when the session's working directory mutates — either
+    /// the primary cwd (via `/cd`) or the additional-dirs set (via
+    /// `/add-dir`). Context carries `previous_cwd`, `new_cwd`, the
+    /// full `additional_dirs` list, and a `cause` tag ("cd" or
+    /// "add-dir") so repo-watching hooks can retune their scope.
+    CwdChanged,
 }
 
 /// A configured hook action.
@@ -730,6 +736,14 @@ mod tests {
         assert_eq!(json, "\"notification\"");
         let back: HookEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, HookEvent::Notification);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_cwd_changed() {
+        let json = serde_json::to_string(&HookEvent::CwdChanged).unwrap();
+        assert_eq!(json, "\"cwd_changed\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::CwdChanged);
     }
 
     // ---- HookAction serde round-trip ----
