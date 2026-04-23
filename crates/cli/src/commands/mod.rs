@@ -534,6 +534,12 @@ pub const COMMANDS: &[Command] = &[
         description: "Inspect the last tool call in this session (try /debug-tool-call list)",
         hidden: false,
     },
+    Command {
+        name: "redo",
+        aliases: &["again"],
+        description: "Resubmit the most recent user prompt as a new turn",
+        hidden: false,
+    },
 ];
 
 /// Execute a slash command. Returns how to proceed.
@@ -2064,6 +2070,16 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             execute_debug_tool_call(args, engine);
             CommandResult::Handled
         }
+        Some("redo") | Some("again") => match last_user_prompt(&engine.state().messages) {
+            Some(text) => {
+                println!("↻ resubmitting: {}", preview_user_prompt(&text, 80));
+                CommandResult::Prompt(text)
+            }
+            None => {
+                println!("No previous user prompt to resubmit.");
+                CommandResult::Handled
+            }
+        },
         Some("install-github-app") => {
             let prompt = "Walk the user through setting up the `gh` CLI so the PR-related \
                  slash commands (/pr-comments, /autofix-pr, /issue) have what \
@@ -3880,7 +3896,6 @@ fn execute_open(args: Option<&str>, engine: &QueryEngine) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // /history — show recent user prompts in this session
 // ---------------------------------------------------------------------------
 
@@ -3973,6 +3988,41 @@ fn execute_history(args: Option<&str>, engine: &QueryEngine) {
         let n = rank + start + 1;
         println!("  {n:>3}. {}", preview_user_prompt(text, 100));
     }
+}
+
+// ---------------------------------------------------------------------------
+// /redo — resubmit the last real user prompt
+// ---------------------------------------------------------------------------
+
+/// Walk the message history backwards and return the text of the most
+/// recent user-authored prompt. Tool results (`is_meta`) and compact
+/// summaries are excluded, so what comes back is something the user
+/// actually typed.
+fn last_user_prompt(messages: &[agent_code_lib::llm::message::Message]) -> Option<String> {
+    use agent_code_lib::llm::message::{ContentBlock, Message};
+    for msg in messages.iter().rev() {
+        if let Message::User(u) = msg {
+            if u.is_meta || u.is_compact_summary {
+                continue;
+            }
+            // Concatenate text blocks in order so multi-block prompts
+            // round-trip intact.
+            let joined: String = u
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let trimmed = joined.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Pick an editor. Returns the binary name/path to spawn.
@@ -5265,5 +5315,104 @@ mod tests {
     #[test]
     fn clip_for_display_passes_short_text_through() {
         assert_eq!(clip_for_display("short", 100), "short");
+    }
+
+    // ---- /redo helpers ----
+
+    fn mk_user_text(text: &str) -> agent_code_lib::llm::message::Message {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+            is_meta: false,
+            is_compact_summary: false,
+        })
+    }
+
+    fn mk_tool_result(id: &str) -> agent_code_lib::llm::message::Message {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+                extra_content: vec![],
+            }],
+            is_meta: true,
+            is_compact_summary: false,
+        })
+    }
+
+    #[test]
+    fn last_user_prompt_returns_most_recent() {
+        let msgs = vec![mk_user_text("first"), mk_user_text("second")];
+        assert_eq!(last_user_prompt(&msgs).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn last_user_prompt_skips_tool_results() {
+        let msgs = vec![
+            mk_user_text("real prompt"),
+            mk_tool_result("t1"),
+            mk_tool_result("t2"),
+        ];
+        assert_eq!(last_user_prompt(&msgs).as_deref(), Some("real prompt"));
+    }
+
+    #[test]
+    fn last_user_prompt_skips_compact_summary() {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        let compact = Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![ContentBlock::Text {
+                text: "summary".into(),
+            }],
+            is_meta: false,
+            is_compact_summary: true,
+        });
+        let msgs = vec![mk_user_text("kept"), compact];
+        assert_eq!(last_user_prompt(&msgs).as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn last_user_prompt_returns_none_for_empty_session() {
+        assert!(last_user_prompt(&[]).is_none());
+    }
+
+    #[test]
+    fn last_user_prompt_skips_whitespace_only() {
+        let msgs = vec![mk_user_text("   \n "), mk_user_text("real")];
+        assert_eq!(last_user_prompt(&msgs).as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn last_user_prompt_joins_multiple_text_blocks() {
+        use agent_code_lib::llm::message::{ContentBlock, Message, UserMessage};
+        use uuid::Uuid;
+        let msg = Message::User(UserMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: "0".into(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "first line".into(),
+                },
+                ContentBlock::Text {
+                    text: "second line".into(),
+                },
+            ],
+            is_meta: false,
+            is_compact_summary: false,
+        });
+        assert_eq!(
+            last_user_prompt(&[msg]).as_deref(),
+            Some("first line\nsecond line")
+        );
     }
 }
