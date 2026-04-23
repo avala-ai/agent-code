@@ -95,6 +95,17 @@ enum Event<'a> {
         is_error: bool,
         turn: usize,
     },
+    /// A tool call was blocked by the permission system (policy-driven
+    /// denial or an explicit user `Deny` at the prompt). Consumers of
+    /// the JSONL stream previously had to grep the `tool_result.output`
+    /// field for the string "Permission denied: " to tell policy
+    /// violations apart from genuine tool errors — this event makes
+    /// them a first-class signal.
+    PermissionDenied {
+        tool: &'a str,
+        reason: &'a str,
+        turn: usize,
+    },
     TurnComplete {
         turn: usize,
         input_tokens: u64,
@@ -210,6 +221,18 @@ impl StreamSink for JsonStreamSink {
 
     fn on_tool_result(&self, tool_name: &str, result: &agent_code_lib::tools::ToolResult) {
         let state = self.inner.lock().unwrap();
+        // Policy-driven denials are still reported as a ToolResult so
+        // downstream consumers that only know about the old envelope
+        // keep working. We ALSO emit a dedicated PermissionDenied event
+        // so consumers that want to tell policy apart from tool bugs
+        // can subscribe to it directly.
+        if let Some(reason) = permission_denied_reason(&result.content, result.is_error) {
+            emit(&Event::PermissionDenied {
+                tool: tool_name,
+                reason,
+                turn: state.turn,
+            });
+        }
         emit(&Event::ToolResult {
             tool: tool_name,
             output: &result.content,
@@ -267,6 +290,37 @@ fn emit(event: &Event<'_>) {
         let _ = writeln!(lock, "{line}");
         let _ = lock.flush();
     }
+}
+
+/// If this tool result looks like a permission-system denial, return
+/// the human-readable reason so the sink can emit a structured event
+/// in addition to the normal ToolResult envelope.
+///
+/// Matches the two shapes emitted by `crates/lib/src/tools/executor.rs`:
+/// - Policy Deny: `"Permission denied: {reason}"`
+/// - User Deny at prompt: `"Permission denied by user"`
+///
+/// The contract between the executor and this sink is: if the executor
+/// ever changes its prefix, this function MUST be updated — the tests
+/// below pin both detected shapes.
+fn permission_denied_reason(content: &str, is_error: bool) -> Option<&str> {
+    if !is_error {
+        return None;
+    }
+    if let Some(reason) = content.strip_prefix("Permission denied: ") {
+        // Guard against the empty-reason case so we don't emit a
+        // stray event with `reason=""` — meaningless to consumers.
+        if reason.trim().is_empty() {
+            return None;
+        }
+        return Some(reason);
+    }
+    // User-initiated deny at the interactive prompt. No colon-delimited
+    // reason, so synthesize one from the message body itself.
+    if content == "Permission denied by user" {
+        return Some("user denied at prompt");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -386,11 +440,74 @@ mod tests {
                 turn: 3,
             })
             .unwrap(),
+            serde_json::to_value(Event::PermissionDenied {
+                tool: "Bash",
+                reason: "multi\nline\nreason",
+                turn: 4,
+            })
+            .unwrap(),
         ];
         for val in events {
             let line = serde_json::to_string(&val).unwrap();
             assert!(!line.contains('\n'), "event must be single-line: {line}",);
         }
+    }
+
+    #[test]
+    fn permission_denied_reason_detects_standard_prefix() {
+        // Pin the prefix emitted by tools/executor.rs. If the executor
+        // ever renames it, this assertion fires and points at the
+        // sync point.
+        let got = permission_denied_reason("Permission denied: path outside cwd", true);
+        assert_eq!(got, Some("path outside cwd"));
+    }
+
+    #[test]
+    fn permission_denied_reason_ignores_non_errors() {
+        // A successful tool result can never be a denial, even if its
+        // body coincidentally contains the prefix string (e.g. a log
+        // line read from disk).
+        let got = permission_denied_reason("Permission denied: oh no", false);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn permission_denied_reason_ignores_generic_tool_errors() {
+        // Regular tool errors (file not found, timeout, syntax error)
+        // must NOT be tagged as permission denials.
+        assert!(permission_denied_reason("File not found: foo.rs", true).is_none());
+        assert!(permission_denied_reason("timed out after 30s", true).is_none());
+    }
+
+    #[test]
+    fn permission_denied_reason_rejects_empty_reason() {
+        // Executor shouldn't produce these, but defense-in-depth: an
+        // empty reason emits a useless event. Better to skip.
+        assert!(permission_denied_reason("Permission denied: ", true).is_none());
+        assert!(permission_denied_reason("Permission denied:   ", true).is_none());
+    }
+
+    #[test]
+    fn permission_denied_reason_detects_user_deny_at_prompt() {
+        // Pin the exact string produced by the user-Deny branch in
+        // tools/executor.rs. Since there's no colon-delimited reason,
+        // the detector synthesizes a stable one for consumers.
+        let got = permission_denied_reason("Permission denied by user", true);
+        assert_eq!(got, Some("user denied at prompt"));
+    }
+
+    #[test]
+    fn event_serialization_permission_denied_uses_snake_case_type() {
+        let event = Event::PermissionDenied {
+            tool: "Bash",
+            reason: "network access not in allowlist",
+            turn: 3,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"permission_denied""#));
+        assert!(json.contains(r#""tool":"Bash""#));
+        assert!(json.contains(r#""reason":"network access not in allowlist""#));
+        assert!(json.contains(r#""turn":3"#));
     }
 
     #[test]
