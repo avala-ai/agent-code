@@ -30,6 +30,9 @@ pub struct Config {
     /// Process-level sandbox settings.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Session persistence settings (cleanup period, etc.).
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 /// Security and enterprise configuration.
@@ -54,6 +57,23 @@ pub struct SecurityConfig {
     /// Disable inline shell execution within skill templates.
     #[serde(default)]
     pub disable_skill_shell_execution: bool,
+}
+
+/// Session-persistence configuration.
+///
+/// Governs the lifecycle of session JSON files stored under
+/// `~/.config/agent-code/sessions/`. By default sessions are kept
+/// indefinitely. Setting `cleanup_period_days` enables time-based
+/// pruning on startup so long-running installs don't accumulate
+/// unbounded session files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Auto-delete session files whose `updated_at` is older than N
+    /// days. `None`/absent = keep forever. `Some(0)` disables pruning
+    /// explicitly (equivalent to None, kept for forward-compat in
+    /// case we later introduce a "prune everything" sentinel).
+    pub cleanup_period_days: Option<u64>,
 }
 
 /// Process-level sandbox configuration.
@@ -828,6 +848,30 @@ enabled = false
     fn template_stray_closing_brace_is_preserved() {
         let out = render_statusline_template("} {model}", &sample_vars());
         assert_eq!(out, "} gpt-5.4");
+    }
+
+    // ---- SessionConfig ----
+
+    #[test]
+    fn session_config_default_cleanup_period_is_none() {
+        let cfg = SessionConfig::default();
+        assert!(cfg.cleanup_period_days.is_none());
+    }
+
+    #[test]
+    fn session_config_parses_from_toml() {
+        let cfg: SessionConfig = toml::from_str("cleanup_period_days = 30").unwrap();
+        assert_eq!(cfg.cleanup_period_days, Some(30));
+    }
+
+    #[test]
+    fn session_config_absent_section_stays_default() {
+        // A config.toml that has no [session] section at all must
+        // still produce a default `SessionConfig` — this is the
+        // common case before this feature landed, so it has to
+        // stay backwards-compatible.
+        let full: Config = toml::from_str("[api]\nmodel = \"x\"\n").unwrap();
+        assert!(full.session.cleanup_period_days.is_none());
     }
 
     // ---- FeaturesConfig::default() ----

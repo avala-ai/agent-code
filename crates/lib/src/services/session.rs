@@ -201,6 +201,97 @@ pub fn list_sessions(limit: usize) -> Vec<SessionSummary> {
     sessions
 }
 
+/// Result of a prune sweep over the sessions directory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Files older than the threshold that were removed.
+    pub removed: usize,
+    /// Files that were kept (either fresh, or had an unparseable
+    /// `updated_at` and were left alone defensively).
+    pub kept: usize,
+}
+
+/// Delete sessions whose `updated_at` is older than `days` days.
+///
+/// A missing or malformed `updated_at` is treated as "don't know —
+/// keep it" so we never delete a file whose age we can't determine.
+/// Passing `days == 0` is an explicit no-op so `cleanup_period_days =
+/// 0` in config behaves the same as an absent value.
+pub fn prune_older_than(days: u64) -> Result<PruneStats, String> {
+    if days == 0 {
+        return Ok(PruneStats::default());
+    }
+    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
+    if !dir.is_dir() {
+        // No sessions have ever been saved on this host.
+        return Ok(PruneStats::default());
+    }
+    prune_older_than_in(&dir, days, chrono::Utc::now())
+}
+
+/// Testable variant: operate on a specific directory with a caller-
+/// provided "now" so unit tests can control time without touching
+/// the real clock or config dir.
+pub(crate) fn prune_older_than_in(
+    dir: &std::path::Path,
+    days: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PruneStats, String> {
+    if days == 0 {
+        return Ok(PruneStats::default());
+    }
+    let threshold = now - chrono::Duration::days(days as i64);
+    let mut stats = PruneStats::default();
+
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Read {dir:?} failed: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+
+        // Try to read & parse just enough to check the timestamp.
+        // Any failure => keep the file.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                stats.kept += 1;
+                continue;
+            }
+        };
+        let data: SessionData = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => {
+                stats.kept += 1;
+                continue;
+            }
+        };
+        let updated_at = match chrono::DateTime::parse_from_rfc3339(&data.updated_at) {
+            Ok(d) => d.with_timezone(&chrono::Utc),
+            Err(_) => {
+                stats.kept += 1;
+                continue;
+            }
+        };
+
+        if updated_at < threshold {
+            // Best-effort: a failed delete shouldn't abort the sweep.
+            if std::fs::remove_file(&path).is_ok() {
+                stats.removed += 1;
+            } else {
+                stats.kept += 1;
+            }
+        } else {
+            stats.kept += 1;
+        }
+    }
+    debug!(
+        "Session prune: removed {} kept {} (threshold {} days)",
+        stats.removed, stats.kept, days
+    );
+    Ok(stats)
+}
+
 /// Brief summary of a session for listing.
 #[derive(Debug)]
 pub struct SessionSummary {
@@ -733,5 +824,114 @@ mod tests {
         });
         let data: SessionData = serde_json::from_value(json).unwrap();
         assert!(data.tags.is_empty());
+    }
+
+    // ---- prune_older_than_in ----
+
+    fn write_session(dir: &std::path::Path, id: &str, updated_at: &str) {
+        let data = SessionData {
+            id: id.to_string(),
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            messages: Vec::new(),
+            turn_count: 0,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            plan_mode: false,
+            label: None,
+            tags: Vec::new(),
+        };
+        let json = serde_json::to_string_pretty(&data).unwrap();
+        std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_sessions_older_than_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // One fresh session (1 day old — should stay).
+        write_session(tmp.path(), "fresh", "2026-04-22T12:00:00Z");
+        // One stale session (40 days old — should be removed under 30d).
+        write_session(tmp.path(), "stale", "2026-03-14T12:00:00Z");
+
+        let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.kept, 1);
+        assert!(tmp.path().join("fresh.json").exists());
+        assert!(!tmp.path().join("stale.json").exists());
+    }
+
+    #[test]
+    fn prune_zero_days_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        // Ancient file — would be removed by any non-zero threshold.
+        write_session(tmp.path(), "ancient", "2020-01-01T00:00:00Z");
+        let stats = prune_older_than_in(tmp.path(), 0, now).unwrap();
+        assert_eq!(stats, PruneStats::default());
+        assert!(tmp.path().join("ancient.json").exists());
+    }
+
+    #[test]
+    fn prune_keeps_files_with_unparseable_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        // Write a valid JSON body with a garbage timestamp. Malformed
+        // `updated_at` is conservatively treated as "don't know" so we
+        // never delete a file whose age we can't determine.
+        let data = serde_json::json!({
+            "id": "weird",
+            "created_at": "not-a-date",
+            "updated_at": "also-not-a-date",
+            "cwd": "/w",
+            "model": "m",
+            "messages": [],
+            "turn_count": 0,
+        });
+        std::fs::write(
+            tmp.path().join("weird.json"),
+            serde_json::to_string(&data).unwrap(),
+        )
+        .unwrap();
+        let stats = prune_older_than_in(tmp.path(), 1, now).unwrap();
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.kept, 1);
+        assert!(tmp.path().join("weird.json").exists());
+    }
+
+    #[test]
+    fn prune_skips_non_json_files() {
+        // Stray `.tmp` / `.bak` files in the sessions dir shouldn't be
+        // scanned or counted toward the kept/removed totals.
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        std::fs::write(tmp.path().join("leftover.tmp"), b"noise").unwrap();
+        write_session(tmp.path(), "current", "2026-04-23T00:00:00Z");
+        let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    #[test]
+    fn prune_boundary_newer_than_threshold_is_kept() {
+        // Exactly at the threshold should be kept (strictly less-than
+        // delete rule). Verify the boundary so we don't accidentally
+        // drift to an off-by-one that deletes a file the user's
+        // policy said to keep.
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Exactly 30 days old.
+        write_session(tmp.path(), "edge", "2026-03-24T12:00:00Z");
+        let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
+        assert_eq!(stats.removed, 0, "file at the exact threshold must be kept");
+        assert_eq!(stats.kept, 1);
     }
 }

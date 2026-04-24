@@ -577,6 +577,25 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     agent_code_lib::memory::session_notes::init_session_notes(&session_id);
     agent_code_lib::memory::session_notes::cleanup_old_notes();
 
+    // Prune old session files when operator has opted in via
+    // `[session] cleanup_period_days = N`. Best-effort — a failing
+    // sweep must never block REPL startup.
+    if let Some(days) = engine.state().config.session.cleanup_period_days
+        && days > 0
+    {
+        match agent_code_lib::services::session::prune_older_than(days) {
+            Ok(stats) if stats.removed > 0 => {
+                tracing::info!(
+                    "Session cleanup: removed {} old session(s), kept {}",
+                    stats.removed,
+                    stats.kept
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Session cleanup skipped: {e}"),
+        }
+    }
+
     // Load project-scoped history (hashed from cwd).
     let history_path = dirs::data_dir().map(|d| {
         let cwd = &engine.state().cwd;

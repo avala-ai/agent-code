@@ -283,6 +283,23 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
         ));
     }
 
+    // Session cleanup policy. Surface it so operators can tell at a
+    // glance whether old sessions are being pruned on startup.
+    match config.session.cleanup_period_days {
+        Some(days) if days > 0 => {
+            checks.push(Check::pass(
+                "session:cleanup_period_days",
+                &format!("Session cleanup: prune files older than {days} days"),
+            ));
+        }
+        _ => {
+            checks.push(Check::warn(
+                "session:cleanup_period_days",
+                "Session cleanup disabled — set [session] cleanup_period_days to prune old sessions",
+            ));
+        }
+    }
+
     // 6. MCP servers.
     let mcp_count = config.mcp_servers.len();
     if mcp_count > 0 {
