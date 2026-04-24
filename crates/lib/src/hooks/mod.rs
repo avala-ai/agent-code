@@ -214,6 +214,12 @@ mod tests {
         assert!(body.contains("fired"), "ConfigChange hook did not run");
     }
 
+    #[tokio::test]
+    async fn run_hooks_fires_error() {
+        let body = run_and_read(HookEvent::Error).await;
+        assert!(body.contains("fired"), "Error hook did not run");
+    }
+
     /// Registering a hook for one event must NOT cause it to fire when
     /// a different event is dispatched. This protects the event-match
     /// contract callers of fire_session_start_hooks rely on.

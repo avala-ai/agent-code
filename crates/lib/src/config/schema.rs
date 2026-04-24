@@ -558,6 +558,14 @@ pub enum HookEvent {
     /// detect "a skill file just got added" without polling the
     /// filesystem.
     ConfigChange,
+    /// Fired when a turn exits in an error. Currently triggers on
+    /// unrecoverable LLM-call failures (after the retry + compaction
+    /// recovery paths have been exhausted). Context carries a
+    /// `stage` tag identifying where the failure happened (today:
+    /// `"llm_call_failed"`) and a short `message` describing the
+    /// error. Audit logs, pager integrations, and failover
+    /// automation can listen here without having to grep stderr.
+    Error,
 }
 
 /// A configured hook action.
@@ -1027,6 +1035,14 @@ enabled = false
         assert_eq!(json, "\"config_change\"");
         let back: HookEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, HookEvent::ConfigChange);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_error() {
+        let json = serde_json::to_string(&HookEvent::Error).unwrap();
+        assert_eq!(json, "\"error\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::Error);
     }
 
     // ---- HookAction serde round-trip ----

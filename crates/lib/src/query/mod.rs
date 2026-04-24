@@ -290,6 +290,25 @@ impl QueryEngine {
         self.hooks.run_hooks(&HookEvent::Stop, None, &ctx).await
     }
 
+    /// Run any configured `Error` hooks. Fired when a turn exits in
+    /// an error. Context carries a `stage` tag identifying where the
+    /// failure happened and a `message` describing it, so pagers /
+    /// audit logs / failover automation can react without having to
+    /// grep stderr.
+    pub async fn fire_error_hooks(
+        &self,
+        stage: &str,
+        message: &str,
+    ) -> Vec<crate::hooks::HookResult> {
+        let ctx = serde_json::json!({
+            "session_id": self.state.session_id,
+            "turn": self.state.turn_count,
+            "stage": stage,
+            "message": message,
+        });
+        self.hooks.run_hooks(&HookEvent::Error, None, &ctx).await
+    }
+
     pub async fn fire_post_compact_hooks(
         &self,
         messages_before: usize,
@@ -725,6 +744,13 @@ impl QueryEngine {
                             }
                             sink.on_error(&reason);
                             self.state.is_query_active = false;
+                            // Error hooks fire once per turn that
+                            // exits in an unrecoverable error, so
+                            // audit logs / pagers / failover glue
+                            // don't need to tail stderr.
+                            let _ = self
+                                .fire_error_hooks("llm_call_failed", &e.to_string())
+                                .await;
                             return Err(crate::error::Error::Other(e.to_string()));
                         }
                     }
