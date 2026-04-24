@@ -1393,7 +1393,18 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("tasks") => {
-            CommandResult::Prompt("List all background tasks and their status.".into())
+            // Snapshot the in-process TaskManager directly. Previously
+            // this command bounced through an LLM turn — the agent
+            // would call TaskList itself — which burned a turn and
+            // tokens for information we already have locally.
+            let task_mgr = engine.state().task_manager.clone();
+            let rt = tokio::runtime::Handle::current();
+            let tasks = std::thread::spawn(move || rt.block_on(task_mgr.list()))
+                .join()
+                .unwrap_or_default();
+            let now = std::time::Instant::now();
+            print!("{}", format_task_list(&tasks, now));
+            CommandResult::Handled
         }
         Some("permissions") | Some("perms") => {
             let config = &engine.state().config;
@@ -2271,6 +2282,65 @@ const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
     ),
     ("session_stop", "when the session ends"),
 ];
+
+/// Format a TaskManager snapshot for display by `/tasks`.
+///
+/// Extracted as a pure function so the table rendering can be unit-
+/// tested without spinning up a real tokio runtime or TaskManager.
+/// `now` is accepted as a parameter so tests can pin the timestamp
+/// instead of reading the real clock.
+fn format_task_list(
+    tasks: &[agent_code_lib::services::background::TaskInfo],
+    now: std::time::Instant,
+) -> String {
+    use agent_code_lib::services::background::TaskStatus;
+
+    if tasks.is_empty() {
+        return "No background tasks running.\n".to_string();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Background tasks ({}):\n\n", tasks.len()));
+    for info in tasks {
+        let status = match &info.status {
+            TaskStatus::Running => "running".to_string(),
+            TaskStatus::Completed => "completed".to_string(),
+            TaskStatus::Failed(msg) => {
+                // Keep the failure note short so the table stays
+                // readable. Full detail is still on disk at
+                // info.output_file.
+                let first = msg.lines().next().unwrap_or("").trim();
+                if first.is_empty() {
+                    "failed".to_string()
+                } else {
+                    format!("failed: {first}")
+                }
+            }
+            TaskStatus::Killed => "killed".to_string(),
+        };
+        let runtime = match info.finished_at {
+            Some(end) => end.saturating_duration_since(info.started_at),
+            None => now.saturating_duration_since(info.started_at),
+        };
+        let runtime_s = runtime.as_secs();
+        // Truncate description to one line; callers often pass full
+        // shell commands here, which can be long.
+        let desc_line = info.description.lines().next().unwrap_or("").trim();
+        let desc = if desc_line.chars().count() > 80 {
+            let mut t: String = desc_line.chars().take(77).collect();
+            t.push_str("...");
+            t
+        } else {
+            desc_line.to_string()
+        };
+        out.push_str(&format!(
+            "  {:>10}  {:>6}s  {}  {}\n",
+            info.id, runtime_s, status, desc
+        ));
+    }
+    out.push_str("\nUse TaskOutput to read output; TaskStop to cancel a running task.\n");
+    out
+}
 
 fn format_hook_action(action: &agent_code_lib::config::HookAction) -> String {
     use agent_code_lib::config::HookAction;
@@ -6474,5 +6544,140 @@ mod tests {
         let removed = rewind_one_turn(&mut msgs);
         assert_eq!(removed, 0);
         assert_eq!(msgs.len(), 1);
+    }
+
+    // ---- /tasks formatting ----
+
+    fn mk_task(
+        id: &str,
+        desc: &str,
+        status: agent_code_lib::services::background::TaskStatus,
+        started_secs_ago: u64,
+        finished_secs_ago: Option<u64>,
+        now: std::time::Instant,
+    ) -> agent_code_lib::services::background::TaskInfo {
+        agent_code_lib::services::background::TaskInfo {
+            id: id.to_string(),
+            description: desc.to_string(),
+            status,
+            output_file: std::path::PathBuf::from("/tmp/x"),
+            started_at: now - std::time::Duration::from_secs(started_secs_ago),
+            finished_at: finished_secs_ago.map(|s| now - std::time::Duration::from_secs(s)),
+        }
+    }
+
+    #[test]
+    fn format_task_list_empty_message() {
+        let now = std::time::Instant::now();
+        let out = format_task_list(&[], now);
+        assert!(out.contains("No background tasks"));
+    }
+
+    #[test]
+    fn format_task_list_running_uses_elapsed_from_now() {
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        let tasks = vec![mk_task(
+            "bg_1",
+            "echo hi",
+            TaskStatus::Running,
+            5,
+            None,
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        assert!(out.contains("bg_1"));
+        assert!(out.contains("running"));
+        assert!(out.contains("     5s"), "expected elapsed '5s' in {out:?}");
+    }
+
+    #[test]
+    fn format_task_list_completed_uses_finished_timestamp() {
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        // Started 100s ago, finished 10s ago => runtime = 90s.
+        let tasks = vec![mk_task(
+            "bg_2",
+            "sleep 90",
+            TaskStatus::Completed,
+            100,
+            Some(10),
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        assert!(out.contains("bg_2"));
+        assert!(out.contains("completed"));
+        assert!(out.contains("    90s"), "expected runtime 90s in {out:?}");
+    }
+
+    #[test]
+    fn format_task_list_failed_shows_short_reason() {
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        let tasks = vec![mk_task(
+            "bg_3",
+            "broken",
+            TaskStatus::Failed("exit status 7".into()),
+            1,
+            Some(0),
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        assert!(out.contains("failed: exit status 7"));
+    }
+
+    #[test]
+    fn format_task_list_failed_without_reason_falls_back() {
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        let tasks = vec![mk_task(
+            "bg_4",
+            "x",
+            TaskStatus::Failed(String::new()),
+            1,
+            Some(0),
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        assert!(out.contains("failed"));
+        assert!(!out.contains("failed: "));
+    }
+
+    #[test]
+    fn format_task_list_truncates_long_descriptions() {
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        let long_desc = "a".repeat(200);
+        let tasks = vec![mk_task(
+            "bg_5",
+            &long_desc,
+            TaskStatus::Running,
+            1,
+            None,
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        // 77 chars of description + "..." trailer.
+        assert!(out.contains(&format!("{}...", "a".repeat(77))));
+        assert!(!out.contains(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn format_task_list_uses_first_line_of_multiline_description() {
+        // Some shell commands span multiple lines; the table should
+        // stay single-row per task by using only the first line.
+        use agent_code_lib::services::background::TaskStatus;
+        let now = std::time::Instant::now();
+        let tasks = vec![mk_task(
+            "bg_6",
+            "first-line\nsecond-line",
+            TaskStatus::Running,
+            1,
+            None,
+            now,
+        )];
+        let out = format_task_list(&tasks, now);
+        assert!(out.contains("first-line"));
+        assert!(!out.contains("second-line"));
     }
 }
