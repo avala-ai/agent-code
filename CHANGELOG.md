@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.19.0] - 2026-04-24
+
+### Added
+
+#### Hook system — lifecycle surface expansion
+
+- **`pre_tool_use` veto** (#243): a pre-tool-use hook that exits non-zero now blocks the tool call. The model receives a synthetic error carrying the hook's stderr as the reason, and the denial is recorded on the existing `DenialTracker` so audit pipelines pick it up uniformly. `HookResult` gains a dedicated `stderr` field so block reasons stay separate from stdout.
+- **`error` event** (#241): fires when a turn exits unrecoverably (e.g. LLM call failure after retry + compaction). Context carries `session_id`, `turn`, `stage`, `message` — pagers and failover automation can listen without grepping stderr.
+- **`permission_denied` event** (#242): fires per blocked tool call, whether blocked by a configured rule or the interactive user prompt. Context carries `tool`, `tool_use_id`, `reason`, `input_summary`, `timestamp`. Batched once per turn, respects `tool_name` hook scoping, and the engine tracks a high-water mark so eviction in the 100-record ring buffer can't cause double-fires.
+
+#### Configuration surface
+
+- **`api_key_helper`** (#236): a shell command whose trimmed stdout becomes the session API key. Runs only when no static key was resolved from file or env — intended for short-lived tokens from vault / 1Password / `aws sts`. Helper errors are categorized (`SpawnFailed` / `NonZeroExit` / `InvalidUtf8`) and only the category string is logged, so subprocess output (which might carry the key) never leaks into diagnostics.
+- **`.agent/settings.local.toml`** (#234): new gitignored overlay layer that sits on top of the shared `settings.toml`. Intended for machine-specific or developer-local overrides without mutating the committed file. Walks independently from `settings.toml` so a repo-root shared config and a crate-local overlay can live at different ancestor levels.
+- **Hierarchical `AGENTS.md` discovery** (#233): the memory loader now walks from the session cwd up to the repo root (nearest `.git` ancestor), loading every `AGENTS.md` / `.agent/AGENTS.md` / `CLAUDE.md` / `.claude/CLAUDE.md` along the way in outermost→innermost order. In a monorepo a sub-package's `AGENTS.md` now composes with the repo-root one instead of the loader only seeing the cwd-level file.
+- **`[session] cleanup_period_days`** (#239): opt-in pruning of session JSON files under `~/.config/agent-code/sessions/`. Files whose `updated_at` is older than N days are deleted at REPL startup. Strictly-less-than boundary, unparseable timestamps are kept, `Some(0)` is a deliberate no-op sentinel, non-JSON files are skipped entirely.
+- **`[ui.statusline]`** (#238): customizable between-turn status divider. `enabled = false` suppresses it; `template` swaps the built-in layout with a `{model}`/`{turn}`/`{tokens}`/`{cost}`/`{cwd}`/`{session_id}` format string. Unknown placeholders pass through verbatim so forward-compat templates degrade gracefully.
+
+#### CLI commands
+
+- **`/tasks`** (#240): now lists in-process background tasks directly from the local `TaskManager` instead of bouncing through an LLM turn. Runtime math is factored into a pure `format_task_list(tasks, now)` helper so the table rendering is unit-testable without a tokio runtime.
+- **`/tools`** (#231): lists every tool available in the current session (built-ins + MCP + subagents).
+
+#### MCP
+
+- **`McpClient::reconnect_with_backoff`** (#235): exponential-backoff reconnect (1s → 2s → 4s → 8s → 16s → 30s cap, clamped against `u32::MAX` attempt counts). A transient subprocess exit or network hiccup no longer tears down the whole agent loop.
+
+#### Diagnostics
+
+- **`/doctor` deeper config validation** (#237): uses the same ancestor walk the loader uses (so a sub-crate session in a monorepo sees the repo-root `settings.toml`); reports `settings.local.toml` overlay; runs a per-file TOML parse so syntax errors surface immediately; detects unknown top-level sections against an allow-list (catches typos like `[permisions]` that `#[serde(default)]` would otherwise silently ignore); warns when multiple provider API-key env vars are set.
+
+### Changed
+
+- **`HookResult` extended with `stderr`** (#243): shell hooks now capture subprocess stderr into a dedicated field. Existing consumers continue to work — the struct is `Default + Clone`.
+
 ## [0.18.0] - 2026-04-23
 
 ### Added
@@ -266,7 +301,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/avala-ai/agent-code/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/avala-ai/agent-code/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/avala-ai/agent-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/avala-ai/agent-code/compare/v0.16.0...v0.16.1
