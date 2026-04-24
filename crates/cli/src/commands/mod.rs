@@ -2284,6 +2284,10 @@ const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
         "error",
         "a turn exited in an unrecoverable error (context: stage, message, turn)",
     ),
+    (
+        "permission_denied",
+        "a tool call was blocked by a permission rule or user prompt (context: tool, tool_use_id, reason, input_summary, timestamp)",
+    ),
     ("session_stop", "when the session ends"),
 ];
 
@@ -2384,6 +2388,7 @@ fn format_hook_event(event: &agent_code_lib::config::HookEvent) -> &'static str 
         HookEvent::CwdChanged => "cwd_changed",
         HookEvent::ConfigChange => "config_change",
         HookEvent::Error => "error",
+        HookEvent::PermissionDenied => "permission_denied",
     }
 }
 
@@ -2409,6 +2414,7 @@ fn parse_hook_event(raw: &str) -> Option<agent_code_lib::config::HookEvent> {
         "cwd_changed" => HookEvent::CwdChanged,
         "config_change" => HookEvent::ConfigChange,
         "error" => HookEvent::Error,
+        "permission_denied" => HookEvent::PermissionDenied,
         _ => return None,
     })
 }

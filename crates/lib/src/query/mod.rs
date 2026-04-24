@@ -60,6 +60,10 @@ pub struct QueryEngine {
     hooks: HookRegistry,
     cache_tracker: crate::services::cache_tracking::CacheTracker,
     denial_tracker: Arc<tokio::sync::Mutex<crate::permissions::tracking::DenialTracker>>,
+    /// High-water mark of `denial_tracker.total()` at the end of the
+    /// last turn. Used to surface exactly the new denials as
+    /// `PermissionDenied` hook events, once per turn.
+    last_seen_denial_total: usize,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
@@ -117,6 +121,7 @@ impl QueryEngine {
             denial_tracker: Arc::new(tokio::sync::Mutex::new(
                 crate::permissions::tracking::DenialTracker::new(100),
             )),
+            last_seen_denial_total: 0,
             extraction_state: Arc::new(tokio::sync::Mutex::new(
                 crate::memory::extraction::ExtractionState::new(),
             )),
@@ -307,6 +312,39 @@ impl QueryEngine {
             "message": message,
         });
         self.hooks.run_hooks(&HookEvent::Error, None, &ctx).await
+    }
+
+    /// Run `PermissionDenied` hooks for every new denial since the
+    /// last call. The engine tracks a high-water mark of
+    /// `DenialTracker.total()` and fires one hook event per new
+    /// denial. Called once per turn after the turn finishes.
+    ///
+    /// Returns the flattened hook results (one sub-vec per denial).
+    pub async fn fire_permission_denied_hooks(&mut self) -> Vec<crate::hooks::HookResult> {
+        let tracker = self.denial_tracker.lock().await;
+        let new_records = tracker.records_since(self.last_seen_denial_total);
+        let current_total = tracker.total();
+        drop(tracker);
+
+        let mut results = Vec::new();
+        for record in &new_records {
+            let ctx = serde_json::json!({
+                "session_id": self.state.session_id,
+                "turn": self.state.turn_count,
+                "tool": record.tool_name,
+                "tool_use_id": record.tool_use_id,
+                "reason": record.reason,
+                "input_summary": record.input_summary,
+                "timestamp": record.timestamp,
+            });
+            let mut r = self
+                .hooks
+                .run_hooks(&HookEvent::PermissionDenied, Some(&record.tool_name), &ctx)
+                .await;
+            results.append(&mut r);
+        }
+        self.last_seen_denial_total = current_total;
+        results
     }
 
     pub async fn fire_post_compact_hooks(
@@ -990,6 +1028,12 @@ impl QueryEngine {
                 // and we're about to hand control back to the user.
                 let last_text = last_assistant_text(&self.state.messages);
                 let _stop_results = self.fire_stop_hooks(last_text.as_deref()).await;
+
+                // PermissionDenied hooks batched once per turn. Lets
+                // audit pipelines pick up denials without having to
+                // poll the DenialTracker. Fires after Stop so hooks
+                // see them in turn-boundary order.
+                let _denied_results = self.fire_permission_denied_hooks().await;
 
                 // Fire background memory extraction (fire-and-forget).
                 // Only runs if feature enabled and memory directory exists.

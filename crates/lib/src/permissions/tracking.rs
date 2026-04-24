@@ -88,6 +88,35 @@ impl DenialTracker {
             .filter(|r| r.tool_name == tool_name)
             .collect()
     }
+
+    /// Snapshot denials recorded after `total_before`.
+    ///
+    /// Returns cloned records so the caller can iterate without
+    /// holding the tracker's mutex. If the tracker's `max_records`
+    /// limit evicted records that the caller hasn't seen yet, the
+    /// returned slice covers only the records still retained —
+    /// callers should treat the delta as a lower bound.
+    ///
+    /// Used by the query engine to emit one `PermissionDenied` hook
+    /// event per new denial after each turn.
+    pub fn records_since(&self, total_before: usize) -> Vec<DenialRecord> {
+        // How many denials arrived since `total_before`.
+        let new_count = self.total_denials.saturating_sub(total_before);
+        if new_count == 0 {
+            return Vec::new();
+        }
+        // Retained records may be fewer than `new_count` if the
+        // tracker evicted older ones. Take the tail of the deque up
+        // to `new_count` items.
+        let take = new_count.min(self.records.len());
+        self.records
+            .iter()
+            .rev()
+            .take(take)
+            .rev()
+            .cloned()
+            .collect()
+    }
 }
 
 fn summarize_input(tool_name: &str, input: &serde_json::Value) -> String {
@@ -189,5 +218,64 @@ mod tests {
             &serde_json::json!({"file_path": "/etc/passwd"}),
         );
         assert!(t.denials()[0].input_summary.contains("/etc/passwd"));
+    }
+
+    // ---- records_since ----
+
+    #[test]
+    fn records_since_zero_returns_all_retained() {
+        let mut t = DenialTracker::new(10);
+        t.record("Bash", "c1", "r1", &serde_json::json!({}));
+        t.record("Bash", "c2", "r2", &serde_json::json!({}));
+        let got = t.records_since(0);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].tool_use_id, "c1");
+        assert_eq!(got[1].tool_use_id, "c2");
+    }
+
+    #[test]
+    fn records_since_uses_total_not_retained_length() {
+        // `records_since` is indexed on total_denials, not on the
+        // retained-queue length. That matters because callers pass
+        // the tracker's `total()` value from the previous turn.
+        let mut t = DenialTracker::new(10);
+        t.record("Bash", "c1", "r1", &serde_json::json!({}));
+        t.record("Bash", "c2", "r2", &serde_json::json!({}));
+        let after_first_turn = t.total();
+        t.record("Bash", "c3", "r3", &serde_json::json!({}));
+        let new_records = t.records_since(after_first_turn);
+        assert_eq!(new_records.len(), 1);
+        assert_eq!(new_records[0].tool_use_id, "c3");
+    }
+
+    #[test]
+    fn records_since_when_no_new_denials_is_empty() {
+        let mut t = DenialTracker::new(10);
+        t.record("Bash", "c1", "r1", &serde_json::json!({}));
+        let total = t.total();
+        assert!(t.records_since(total).is_empty());
+        // Asking for a total past the actual count should also be
+        // empty rather than panic.
+        assert!(t.records_since(total + 100).is_empty());
+    }
+
+    #[test]
+    fn records_since_clamps_to_retained_when_evicted() {
+        // Ring-buffer eviction: tracker has max_records=2, 5 denials
+        // arrive after checkpoint. We can only return the latest 2.
+        let mut t = DenialTracker::new(2);
+        let checkpoint = t.total();
+        for i in 0..5 {
+            t.record("Bash", &format!("c{i}"), "r", &serde_json::json!({}));
+        }
+        let new_records = t.records_since(checkpoint);
+        assert_eq!(
+            new_records.len(),
+            2,
+            "should clamp to retained deque length"
+        );
+        // Latest two are c3, c4.
+        assert_eq!(new_records[0].tool_use_id, "c3");
+        assert_eq!(new_records[1].tool_use_id, "c4");
     }
 }

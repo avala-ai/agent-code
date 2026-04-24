@@ -566,6 +566,14 @@ pub enum HookEvent {
     /// error. Audit logs, pager integrations, and failover
     /// automation can listen here without having to grep stderr.
     Error,
+    /// Fired for each tool call that was denied — either by a
+    /// configured permission rule or by the interactive user
+    /// prompt. Context carries `tool`, `tool_use_id`, `reason`,
+    /// `input_summary`, and `timestamp`. Compliance audit logs and
+    /// safety dashboards can listen here without polling the
+    /// DenialTracker. Fired per-denial, batched once per turn after
+    /// the turn completes (new denials since the last turn).
+    PermissionDenied,
 }
 
 /// A configured hook action.
@@ -1043,6 +1051,14 @@ enabled = false
         assert_eq!(json, "\"error\"");
         let back: HookEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, HookEvent::Error);
+    }
+
+    #[test]
+    fn hook_event_serde_roundtrip_permission_denied() {
+        let json = serde_json::to_string(&HookEvent::PermissionDenied).unwrap();
+        assert_eq!(json, "\"permission_denied\"");
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, HookEvent::PermissionDenied);
     }
 
     // ---- HookAction serde round-trip ----
