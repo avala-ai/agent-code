@@ -1055,21 +1055,68 @@ impl QueryEngine {
                 }
             }
 
-            // Fire pre-tool-use hooks.
+            // Fire pre-tool-use hooks. If any hook exits non-zero,
+            // the tool call is vetoed — the tool does not execute and
+            // the model receives a synthetic error result carrying
+            // the hook's stderr as the reason. Lets operators plug in
+            // policy guards (content scanning, destructive-command
+            // blocks, compliance checks) without having to extend the
+            // permission rule grammar.
+            let mut vetoed_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut vetoed_results: Vec<crate::tools::executor::ToolCallResult> = Vec::new();
             for call in &tool_calls {
-                self.hooks
+                let hook_results = self
+                    .hooks
                     .run_hooks(&HookEvent::PreToolUse, Some(&call.name), &call.input)
                     .await;
+                if let Some(failed) = hook_results.iter().find(|r| !r.success) {
+                    // Prefer stderr for the veto reason — convention
+                    // says errors go to stderr. Fall back to stdout,
+                    // then a generic message if both are empty.
+                    let reason = if !failed.stderr.trim().is_empty() {
+                        failed.stderr.trim().to_string()
+                    } else if !failed.output.trim().is_empty() {
+                        failed.output.trim().to_string()
+                    } else {
+                        "blocked by pre-tool-use hook".to_string()
+                    };
+
+                    // Track as a denial so audit pipelines pick it up
+                    // via the existing DenialTracker / permission_denied
+                    // hook. Use the first line to keep the audit
+                    // record short.
+                    let short_reason = reason.lines().next().unwrap_or(&reason).to_string();
+                    self.denial_tracker.lock().await.record(
+                        &call.name,
+                        &call.id,
+                        &short_reason,
+                        &call.input,
+                    );
+
+                    vetoed_ids.insert(call.id.clone());
+                    vetoed_results.push(crate::tools::executor::ToolCallResult {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        result: crate::tools::ToolResult::error(format!(
+                            "Blocked by pre-tool-use hook: {short_reason}"
+                        )),
+                    });
+                }
             }
 
-            // Execute remaining tools (ones not started during streaming).
+            // Execute remaining tools (ones not started during streaming
+            // and not vetoed by a pre-tool-use hook).
             let remaining_calls: Vec<_> = tool_calls
                 .iter()
-                .filter(|c| !streaming_ids.contains(&c.id))
+                .filter(|c| !streaming_ids.contains(&c.id) && !vetoed_ids.contains(&c.id))
                 .cloned()
                 .collect();
 
             let mut results = streaming_results;
+            // Splice in the synthetic veto results so the model sees
+            // them alongside the real tool outputs.
+            results.extend(vetoed_results);
             if !remaining_calls.is_empty() {
                 let batch_results = execute_tool_calls(
                     &remaining_calls,

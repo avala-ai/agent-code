@@ -72,10 +72,12 @@ impl HookRegistry {
                         Ok(output) => HookResult {
                             success: output.status.success(),
                             output: String::from_utf8_lossy(&output.stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                         },
                         Err(e) => HookResult {
                             success: false,
-                            output: e.to_string(),
+                            output: String::new(),
+                            stderr: e.to_string(),
                         },
                     }
                 }
@@ -90,10 +92,12 @@ impl HookRegistry {
                         Ok(resp) => HookResult {
                             success: resp.status().is_success(),
                             output: resp.text().await.unwrap_or_default(),
+                            stderr: String::new(),
                         },
                         Err(e) => HookResult {
                             success: false,
-                            output: e.to_string(),
+                            output: String::new(),
+                            stderr: e.to_string(),
                         },
                     }
                 }
@@ -106,10 +110,19 @@ impl HookRegistry {
 }
 
 /// Result of executing a hook.
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct HookResult {
+    /// True if the hook ran to completion without error (shell
+    /// command exited 0, HTTP request returned 2xx).
     pub success: bool,
+    /// Stdout captured from the hook subprocess, or the HTTP
+    /// response body.
     pub output: String,
+    /// Stderr captured from the hook subprocess. Empty for HTTP
+    /// hooks. Used as the veto reason when a PreToolUse hook
+    /// blocks a tool call so operators get the hook author's
+    /// own error text instead of a generic message.
+    pub stderr: String,
 }
 
 // Shell hooks dispatch via `bash -c`, which isn't available on Windows
@@ -241,5 +254,86 @@ mod tests {
             body.is_empty(),
             "dispatching SessionStop must not fire a SessionStart hook; got {body:?}"
         );
+    }
+
+    // ---- veto path prerequisites: HookResult must carry stderr and
+    //      report `success = false` on non-zero exit so the query
+    //      engine's pre-tool-use gate has enough info to block a tool
+    //      call and surface the reason.
+
+    #[tokio::test]
+    async fn run_hooks_nonzero_exit_sets_success_false() {
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::PreToolUse,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: "exit 1".into(),
+            },
+        });
+        let ctx = serde_json::json!({});
+        let results = reg.run_hooks(&HookEvent::PreToolUse, None, &ctx).await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].success,
+            "hook exiting 1 must set success=false; got {:?}",
+            results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_hooks_captures_stderr_separately_from_stdout() {
+        // Hook authors signal block reasons on stderr (shell
+        // convention). The dispatcher must capture stderr into a
+        // dedicated field so downstream veto handling can surface
+        // the exact message without scraping mixed output.
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::PreToolUse,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: "echo on_stdout; echo on_stderr >&2; exit 2".into(),
+            },
+        });
+        let ctx = serde_json::json!({});
+        let results = reg.run_hooks(&HookEvent::PreToolUse, None, &ctx).await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(
+            results[0].output.contains("on_stdout"),
+            "stdout should be populated: {:?}",
+            results[0].output
+        );
+        assert!(
+            results[0].stderr.contains("on_stderr"),
+            "stderr should be populated: {:?}",
+            results[0].stderr
+        );
+        // Stdout and stderr must NOT be mixed.
+        assert!(
+            !results[0].output.contains("on_stderr"),
+            "stderr leaked into stdout: {:?}",
+            results[0].output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_hooks_zero_exit_leaves_success_true_regardless_of_stderr() {
+        // A hook that exits 0 is not a veto even if it wrote to
+        // stderr — some hooks log progress on stderr as a matter of
+        // style. Success is tied to exit status only.
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::PreToolUse,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: "echo noisy >&2; exit 0".into(),
+            },
+        });
+        let ctx = serde_json::json!({});
+        let results = reg.run_hooks(&HookEvent::PreToolUse, None, &ctx).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert!(results[0].stderr.contains("noisy"));
     }
 }
