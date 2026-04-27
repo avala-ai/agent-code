@@ -8,6 +8,9 @@
 | `OPENAI_API_KEY` | OpenAI API key (auto-selects OpenAI provider) |
 | `AGENT_CODE_API_BASE_URL` | API endpoint URL override |
 | `AGENT_CODE_MODEL` | Model name override |
+| `AGENT_CODE_AUTH_MODE` | `api_key` or `codex_chatgpt` |
+| `AGENT_CODE_CODEX_HOME` | Codex home for `codex_chatgpt` auth |
+| `CODEX_HOME` | Fallback Codex home used by Codex and `codex_chatgpt` auth |
 
 ## Behavior
 
@@ -32,3 +35,8 @@ Base URL auto-detection:
 - Otherwise → defaults to `https://api.anthropic.com/v1`
 
 This can always be overridden with `--api-base-url` or the config file.
+
+For ChatGPT subscription auth, run `codex login` and set
+`AGENT_CODE_AUTH_MODE=codex_chatgpt` or pass `--auth-mode codex_chatgpt`.
+This reuses Codex's `auth.json` and defaults OpenAI traffic to the Codex
+ChatGPT backend instead of requiring `OPENAI_API_KEY`.

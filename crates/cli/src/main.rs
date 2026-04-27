@@ -32,7 +32,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
-use agent_code_lib::config::Config;
+use agent_code_lib::config::{ApiAuthMode, Config};
 use agent_code_lib::llm::provider::{ProviderKind, WireFormat, detect_provider};
 use agent_code_lib::permissions::PermissionChecker;
 use agent_code_lib::query::QueryEngine;
@@ -64,6 +64,10 @@ struct Cli {
     /// API key.
     #[arg(long, env = "AGENT_CODE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+
+    /// API auth mode: api_key or codex_chatgpt.
+    #[arg(long, env = "AGENT_CODE_AUTH_MODE", value_name = "MODE")]
+    auth_mode: Option<String>,
 
     /// Enable verbose output.
     #[arg(short, long)]
@@ -207,9 +211,24 @@ fn run_setup_wizard() {
     }
 }
 
+fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
+    match value.trim().replace('-', "_").as_str() {
+        "api_key" => Ok(ApiAuthMode::ApiKey),
+        "codex_chatgpt" | "chatgpt" => Ok(ApiAuthMode::CodexChatgpt),
+        other => {
+            anyhow::bail!("invalid auth mode `{other}`; expected `api_key` or `codex_chatgpt`")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let cli_auth_mode = cli
+        .auth_mode
+        .as_deref()
+        .map(parse_api_auth_mode)
+        .transpose()?;
 
     // Initialize tracing/logging.
     let filter = if cli.verbose {
@@ -285,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
         && !cli.serve
         && !cli.acp
         && cli.command.is_none()
+        && cli_auth_mode != Some(ApiAuthMode::CodexChatgpt)
         && ui::setup::needs_setup()
     {
         run_setup_wizard();
@@ -312,6 +332,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref key) = cli.api_key {
         config.api.api_key = Some(key.clone());
+    }
+    if let Some(auth_mode) = cli_auth_mode {
+        config.api.auth_mode = auth_mode;
     }
 
     // Apply --no-sandbox before permission-mode handling so the bypass
@@ -398,7 +421,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Determine the effective API key: CLI flag > env var (in config) > config file.
     // If nothing found and interactive, run the setup wizard.
-    let has_key = cli.api_key.is_some() || config.api.api_key.is_some();
+    let has_key = cli.api_key.is_some()
+        || config.api.api_key.is_some()
+        || config.api.auth_mode == ApiAuthMode::CodexChatgpt;
 
     // The setup wizard reads from stdin via arrow-key prompts. Run it
     // only when we're actually in an interactive REPL context — i.e.
@@ -424,53 +449,85 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref key) = cli.api_key {
         config.api.api_key = Some(key.clone());
     }
+    if let Some(auth_mode) = cli_auth_mode {
+        config.api.auth_mode = auth_mode;
+    }
 
-    let api_key = config.api.api_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("API key required. Set AGENT_CODE_API_KEY or pass --api-key.")
-    })?;
+    let api_key = if config.api.auth_mode == ApiAuthMode::ApiKey {
+        Some(config.api.api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("API key required. Set AGENT_CODE_API_KEY or pass --api-key.")
+        })?)
+    } else {
+        None
+    };
 
     // Initialize LLM provider. If --model or --provider implies a different
     // provider than what's in the config, override the base URL to match.
-    let provider_kind = match cli.provider.as_str() {
-        "anthropic" => ProviderKind::Anthropic,
-        "openai" => ProviderKind::OpenAi,
-        "bedrock" | "aws" => ProviderKind::Bedrock,
-        "vertex" | "gcp" => ProviderKind::Vertex,
-        "xai" | "grok" => ProviderKind::Xai,
-        "google" | "gemini" => ProviderKind::Google,
-        "deepseek" => ProviderKind::DeepSeek,
-        "groq" => ProviderKind::Groq,
-        "mistral" => ProviderKind::Mistral,
-        "together" => ProviderKind::Together,
-        "zhipu" | "glm" | "z.ai" => ProviderKind::Zhipu,
-        "azure" | "azure-openai" => ProviderKind::AzureOpenAi,
-        _ => detect_provider(&config.api.model, &config.api.base_url),
+    let provider_kind = if config.api.auth_mode == ApiAuthMode::CodexChatgpt {
+        ProviderKind::OpenAi
+    } else {
+        match cli.provider.as_str() {
+            "anthropic" => ProviderKind::Anthropic,
+            "openai" => ProviderKind::OpenAi,
+            "bedrock" | "aws" => ProviderKind::Bedrock,
+            "vertex" | "gcp" => ProviderKind::Vertex,
+            "xai" | "grok" => ProviderKind::Xai,
+            "google" | "gemini" => ProviderKind::Google,
+            "deepseek" => ProviderKind::DeepSeek,
+            "groq" => ProviderKind::Groq,
+            "mistral" => ProviderKind::Mistral,
+            "together" => ProviderKind::Together,
+            "zhipu" | "glm" | "z.ai" => ProviderKind::Zhipu,
+            "azure" | "azure-openai" => ProviderKind::AzureOpenAi,
+            _ => detect_provider(&config.api.model, &config.api.base_url),
+        }
     };
 
     // Override base URL if the detected provider has a known default.
-    if cli.api_base_url.is_none()
+    if config.api.auth_mode != ApiAuthMode::CodexChatgpt
+        && cli.api_base_url.is_none()
         && let Some(default_url) = provider_kind.default_base_url()
     {
         config.api.base_url = default_url.to_string();
     }
-    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match provider_kind {
-        ProviderKind::AzureOpenAi => {
-            Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
+    if config.api.auth_mode == ApiAuthMode::CodexChatgpt && cli.api_base_url.is_none() {
+        config.api.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    }
+
+    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = if config.api.auth_mode
+        == ApiAuthMode::CodexChatgpt
+    {
+        let auth = agent_code_lib::llm::codex_auth::CodexChatGptAuth::load(
+            config.api.codex_home.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Arc::new(
+            agent_code_lib::llm::openai::OpenAiProvider::new_responses_with_codex_auth(
                 &config.api.base_url,
-                api_key,
-            ))
-        }
-        _ => match provider_kind.wire_format() {
-            WireFormat::Anthropic => {
-                Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                auth,
+            ),
+        )
+    } else {
+        let api_key = api_key.expect("api_key is set for ApiAuthMode::ApiKey");
+        match provider_kind {
+            ProviderKind::AzureOpenAi => {
+                Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
                     &config.api.base_url,
                     api_key,
                 ))
             }
-            WireFormat::OpenAiCompatible => Arc::new(
-                agent_code_lib::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
-            ),
-        },
+            _ => match provider_kind.wire_format() {
+                WireFormat::Anthropic => {
+                    Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                        &config.api.base_url,
+                        api_key,
+                    ))
+                }
+                WireFormat::OpenAiCompatible => Arc::new(
+                    agent_code_lib::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
+                ),
+            },
+        }
     };
     tracing::info!(
         "Using {:?} provider at {}",
@@ -482,7 +539,8 @@ async fn main() -> anyhow::Result<()> {
     // The old approach used a synchronous curl subprocess with 5s timeout,
     // blocking startup. Now we spawn it as a background task and only
     // interrupt if the key is actually invalid.
-    let api_key_check_handle = if !config.api.base_url.contains("localhost")
+    let api_key_check_handle = if config.api.auth_mode == ApiAuthMode::ApiKey
+        && !config.api.base_url.contains("localhost")
         && !config.api.base_url.contains("127.0.0.1")
         && cli.prompt.is_none()
         && !cli.dump_system_prompt
@@ -490,7 +548,9 @@ async fn main() -> anyhow::Result<()> {
         && !cli.acp
     {
         let check_url = format!("{}/models", config.api.base_url);
-        let check_key = api_key.to_string();
+        let check_key = api_key
+            .expect("api_key is set for ApiAuthMode::ApiKey")
+            .to_string();
         Some(tokio::spawn(async move {
             tokio::process::Command::new("curl")
                 .args([

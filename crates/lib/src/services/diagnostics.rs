@@ -109,7 +109,9 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 3. API configuration.
-    if config.api.api_key.is_some() {
+    if config.api.auth_mode == crate::config::ApiAuthMode::CodexChatgpt {
+        checks.push(Check::pass("config:auth", "Codex ChatGPT auth configured"));
+    } else if config.api.api_key.is_some() {
         checks.push(Check::pass("config:api_key", "API key configured"));
     } else {
         checks.push(Check::fail(
@@ -337,7 +339,12 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 8. API connectivity test (provider-aware auth).
-    if config.api.api_key.is_some() {
+    if config.api.auth_mode == crate::config::ApiAuthMode::CodexChatgpt {
+        checks.push(Check::warn(
+            "api:connectivity",
+            "Skipping /models connectivity check for Codex ChatGPT auth",
+        ));
+    } else if config.api.api_key.is_some() {
         let api_key = config.api.api_key.as_deref().unwrap_or("");
         let url = format!("{}/models", config.api.base_url);
 

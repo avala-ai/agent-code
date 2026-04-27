@@ -136,6 +136,17 @@ pub struct McpServerEntry {
     pub env: std::collections::HashMap<String, String>,
 }
 
+/// Authentication mode for the configured LLM API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAuthMode {
+    /// Use an API key from env, config, helper, or CLI flag.
+    #[default]
+    ApiKey,
+    /// Reuse an existing OpenAI Codex ChatGPT login from CODEX_HOME.
+    CodexChatgpt,
+}
+
 /// API connection settings.
 ///
 /// Configures the LLM provider: base URL, model, API key, timeouts,
@@ -148,6 +159,10 @@ pub struct ApiConfig {
     pub base_url: String,
     /// Model identifier.
     pub model: String,
+    /// Authentication mode. `api_key` uses the normal provider API key
+    /// path; `codex_chatgpt` reuses an existing Codex ChatGPT login from
+    /// `$CODEX_HOME/auth.json` (or `~/.codex/auth.json`).
+    pub auth_mode: ApiAuthMode,
     /// Optional cheaper / faster model used by `/fast`. When set, the
     /// `/fast` command toggles `model` and `fast_model` for the
     /// remainder of the session. Defaults to None — falls back to a
@@ -169,6 +184,9 @@ pub struct ApiConfig {
     /// a dumped config that could be shared.
     #[serde(default, skip_serializing)]
     pub api_key_helper: Option<String>,
+    /// Optional Codex home directory for `auth_mode = "codex_chatgpt"`.
+    /// When unset, `$CODEX_HOME` wins, then `~/.codex`.
+    pub codex_home: Option<String>,
     /// Maximum output tokens per response.
     pub max_output_tokens: Option<u32>,
     /// Thinking mode: "enabled", "disabled", or "adaptive".
@@ -258,9 +276,11 @@ impl Default for ApiConfig {
         Self {
             base_url,
             model: "gpt-5.4".to_string(),
+            auth_mode: ApiAuthMode::ApiKey,
             fast_model: None,
             api_key,
             api_key_helper: None,
+            codex_home: None,
             max_output_tokens: Some(16384),
             thinking: None,
             effort: None,
@@ -693,6 +713,25 @@ mod tests {
     fn api_config_default_api_key_helper_is_none() {
         let cfg = ApiConfig::default();
         assert!(cfg.api_key_helper.is_none());
+    }
+
+    #[test]
+    fn api_config_default_auth_mode_is_api_key() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.auth_mode, ApiAuthMode::ApiKey);
+    }
+
+    #[test]
+    fn api_config_parses_codex_chatgpt_auth_mode_from_toml() {
+        let toml = r#"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+auth_mode = "codex_chatgpt"
+codex_home = "/tmp/codex-home"
+"#;
+        let cfg: ApiConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.auth_mode, ApiAuthMode::CodexChatgpt);
+        assert_eq!(cfg.codex_home.as_deref(), Some("/tmp/codex-home"));
     }
 
     #[test]

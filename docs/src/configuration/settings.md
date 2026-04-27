@@ -13,6 +13,7 @@ Configuration loads from three layers (highest priority first):
 [api]
 base_url = "https://api.anthropic.com/v1"
 model = "claude-sonnet-4-20250514"
+auth_mode = "api_key"        # "api_key" or "codex_chatgpt"
 # api_key is resolved from env: AGENT_CODE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY
 max_output_tokens = 16384
 thinking = "enabled"          # "enabled", "disabled", or omit for default
@@ -74,4 +75,29 @@ Created .agent/settings.toml
 | `OPENAI_API_KEY` | OpenAI API key |
 | `AGENT_CODE_API_BASE_URL` | API endpoint override |
 | `AGENT_CODE_MODEL` | Model override |
+| `AGENT_CODE_AUTH_MODE` | `api_key` or `codex_chatgpt` |
+| `AGENT_CODE_CODEX_HOME` | Codex home for `codex_chatgpt` auth |
+| `CODEX_HOME` | Fallback Codex home for `codex_chatgpt` auth |
 | `EDITOR` | Determines vi/emacs REPL mode |
+
+## Codex ChatGPT auth
+
+If you are already signed in with OpenAI Codex, agent-code can reuse that
+ChatGPT session without writing an API key to agent-code config:
+
+```bash
+codex login
+agent --auth-mode codex_chatgpt --model gpt-5.4
+```
+
+Or configure it:
+
+```toml
+[api]
+auth_mode = "codex_chatgpt"
+model = "gpt-5.4"
+```
+
+This reads `$CODEX_HOME/auth.json` (or `~/.codex/auth.json`) and uses the
+Codex ChatGPT backend. Set `codex_home = "/path/to/.codex"` under `[api]`
+or `AGENT_CODE_CODEX_HOME` when the Codex home is not the default.

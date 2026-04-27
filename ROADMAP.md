@@ -1021,6 +1021,12 @@ Automated PR-to-issue linking and label synchronization:
 
 API key management is friction for new users. Adding OAuth-based authentication with OS keychain storage simplifies onboarding for users who already have provider accounts.
 
+**Current status:** partial. `auth_mode = "codex_chatgpt"` / `--auth-mode codex_chatgpt`
+now reuses an existing OpenAI Codex ChatGPT login from `$CODEX_HOME/auth.json`,
+refreshes those tokens, and routes OpenAI traffic to the Codex ChatGPT
+Responses backend. Full first-run browser OAuth, keychain storage, `/auth`, and
+login/logout UX remain open.
+
 **Authentication Flow:**
 
 ```text
@@ -1065,6 +1071,10 @@ Never store tokens in plaintext config files.
 - If refresh fails: prompt re-authentication via browser
 
 **Implementation Tasks:**
+- [x] Add explicit Codex ChatGPT auth mode that does not require `OPENAI_API_KEY`
+- [x] Read existing Codex `auth.json` without storing tokens in agent-code config
+- [x] Refresh Codex ChatGPT OAuth tokens and preserve unknown `auth.json` fields
+- [x] Add OpenAI Responses provider path for Codex ChatGPT backend traffic
 - [ ] Add `crates/lib/src/auth/` module with `AuthProvider` trait
 - [ ] Implement `OAuthProvider` with PKCE flow (browser-based)
 - [ ] Implement `ApiKeyProvider` (extract current behavior into trait)

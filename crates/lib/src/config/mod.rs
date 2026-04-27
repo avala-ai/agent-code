@@ -85,6 +85,17 @@ impl Config {
             config.api.base_url = url;
         }
 
+        // Auth mode from env overrides file config.
+        if let Ok(auth_mode) = std::env::var("AGENT_CODE_AUTH_MODE") {
+            config.api.auth_mode = toml::Value::String(auth_mode).try_into()?;
+        }
+
+        // CODEX_HOME is honored by the auth loader when codex_home is unset;
+        // this env var lets agent-code pin a different Codex home explicitly.
+        if let Ok(codex_home) = std::env::var("AGENT_CODE_CODEX_HOME") {
+            config.api.codex_home = Some(codex_home);
+        }
+
         // Model from env overrides file config.
         if let Ok(model) = std::env::var("AGENT_CODE_MODEL") {
             config.api.model = model;
