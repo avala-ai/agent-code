@@ -278,6 +278,9 @@ impl OpenAiProvider {
             "include": [],
         });
 
+        // The ChatGPT Codex Responses backend currently rejects all token-limit
+        // request fields (`max_output_tokens`, `max_completion_tokens`, and
+        // `max_tokens`), so this path cannot forward ProviderRequest::max_tokens.
         if !request.system_prompt.is_empty() {
             body["instructions"] = serde_json::Value::String(request.system_prompt.clone());
         }
@@ -620,12 +623,13 @@ fn spawn_responses_stream(
                                 let _ = tx.send(StreamEvent::ContentBlockComplete(block)).await;
                             }
                         }
-                        Some("response.completed") => {
-                            if let Some(u) = parsed.get("response").and_then(|r| r.get("usage")) {
+                        Some("response.completed") | Some("response.incomplete") => {
+                            let response = parsed.get("response");
+                            if let Some(u) = response.and_then(|r| r.get("usage")) {
                                 usage = responses_usage(u);
                             }
-                            if response_has_function_call(parsed.get("response")) {
-                                stop_reason = Some(StopReason::ToolUse);
+                            if let Some(reason) = responses_stop_reason(response) {
+                                stop_reason = Some(reason);
                             }
                             let _ = tx
                                 .send(StreamEvent::Done {
@@ -805,6 +809,26 @@ fn response_has_function_call(response: Option<&Value>) -> bool {
         })
 }
 
+fn responses_stop_reason(response: Option<&Value>) -> Option<StopReason> {
+    let response = response?;
+    if response_has_function_call(Some(response)) {
+        return Some(StopReason::ToolUse);
+    }
+    if response
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "incomplete")
+        && response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|reason| matches!(reason, "max_output_tokens" | "max_tokens"))
+    {
+        return Some(StopReason::MaxTokens);
+    }
+    None
+}
+
 fn responses_usage(usage: &Value) -> Usage {
     Usage {
         input_tokens: usage
@@ -951,6 +975,31 @@ mod tests {
     }
 
     #[test]
+    fn responses_body_omits_codex_unsupported_token_limit_fields() {
+        let provider = OpenAiProvider::new("https://example.test/v1", "test-key");
+        let request = ProviderRequest {
+            messages: vec![user_message(vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }])],
+            system_prompt: "be useful".to_string(),
+            tools: Vec::new(),
+            model: "gpt-5.4".to_string(),
+            max_tokens: 1024,
+            temperature: None,
+            enable_caching: false,
+            tool_choice: ToolChoice::None,
+            metadata: None,
+            cancel: CancellationToken::new(),
+        };
+
+        let body = provider.build_responses_body(&request);
+
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
     fn response_item_done_maps_function_call_to_tool_use() {
         let item = serde_json::json!({
             "type": "function_call",
@@ -969,6 +1018,41 @@ mod tests {
             }
             _ => panic!("expected tool use"),
         }
+    }
+
+    #[test]
+    fn responses_stop_reason_maps_function_call() {
+        let response = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_7",
+                    "name": "bash",
+                    "arguments": "{}"
+                }
+            ]
+        });
+
+        assert_eq!(
+            responses_stop_reason(Some(&response)),
+            Some(StopReason::ToolUse)
+        );
+    }
+
+    #[test]
+    fn responses_stop_reason_maps_incomplete_max_output_tokens() {
+        let response = serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {
+                "reason": "max_output_tokens"
+            }
+        });
+
+        assert_eq!(
+            responses_stop_reason(Some(&response)),
+            Some(StopReason::MaxTokens)
+        );
     }
 
     #[test]
