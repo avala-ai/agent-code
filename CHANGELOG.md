@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.20.0] - 2026-04-27
+
+### Added
+
+- **Codex ChatGPT auth** (#248): new `auth_mode = "codex_chatgpt"` / `--auth-mode codex_chatgpt` path that reuses an existing `codex login` session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` instead of requiring an `OPENAI_API_KEY`. The provider refreshes Codex OAuth tokens while preserving unknown auth-file fields and routes this mode through the ChatGPT Codex Responses backend.
+
+### Changed
+
+- **Dependency refresh** (#247): bumped `rustls-webpki` from 0.103.10 to 0.103.13.
+
 ## [0.19.0] - 2026-04-24
 
 ### Added
@@ -301,7 +311,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/avala-ai/agent-code/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/avala-ai/agent-code/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/avala-ai/agent-code/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/avala-ai/agent-code/compare/v0.16.1...v0.17.0
