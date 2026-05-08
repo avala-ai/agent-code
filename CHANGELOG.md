@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.22.0] - 2026-05-05
+
+### Added
+
+#### Service layer (Phase 8.12)
+
+- **OAuth 2.0 + PKCE service** (#277): provider-agnostic auth flow with loopback redirect handler, mandatory state-parameter binding (rejects callbacks missing `state`), HTTPS endpoint enforcement (loopback exception only when explicitly opted in), transient-vs-terminal classification of refresh failures (only `invalid_grant`/`invalid_client`/401-no-body delete cached creds; `429`/`503`/`408` and unparseable bodies are transient), browser launcher waits on the opener's exit status, file-backed `CredentialStore` with `Debug` redaction. RFC 4231 HMAC vectors covered in tests.
+- **Policy / rate-limit service** (#278): central admission control over per-minute / per-hour / per-day request and token caps plus a configurable concurrency cap, all opt-in via `[limits.<provider>]` settings. The semaphore permit is now acquired before the sliding-window record so that a future cancelled while queued releases without consuming quota.
+- **Cross-platform desktop notifier** (#280): per-platform paths via `osascript` (macOS), `notify-send` (Linux), and `New-BurntToastNotification` (Windows). Spawn-only with one-shot reapers (no zombies, no call-site latency); guards against missing Tokio runtime by falling back to a std-thread reaper. Recording test mode for assertions.
+- **Rotating tips surface** (#281): 15 bundled markdown tips embedded via `include_str!`, frequency-controlled (1 per 5 sessions, 30-day per-id repeat window with exhaustion reset), `show_after_session` gating for first-run quietness. New `/tips`, `/tips dismiss <id>`, `/tips off`, `/tips on` slash commands. Persisted state at `<agent-config>/tips_state.json` via the existing atomic-write helper.
+- **Opt-in settings-sync service** (#279): backup/restore settings under a passphrase. Pluggable `SyncBackend` trait with a `LocalFsBackend` (atomic writes + path-traversal rejection) and a stubbed HTTP backend. HMAC-SHA-256 (RFC 2104) integrity tag and verifier — replaces the original SHA-256 length-extension-vulnerable construction. Per-snapshot random salt mixed from two UUIDv4 draws + monotonic nanos. Frame magic `agscv2` so v1 frames are rejected. Encryption is gated behind `encryption_enabled` (default off) until an AEAD primitive lands; a `tracing::warn!` fires every push/pull while plaintext.
+
+#### Subagent UX (Phase 8.10 — first slice)
+
+- **`SubagentColorManager`** (#282): assigns each spawned subagent one of 8 stable theme slots (`subagent_red`, `_blue`, `_green`, `_yellow`, `_purple`, `_orange`, `_pink`, `_cyan`) deterministically by insertion order, wraps after 8, idempotent per id. Threaded through `AppState` → `ToolContext` → `TaskContext` so the Agent tool and `LocalAgentExecutor` share one allocation table. Subagent id and color propagated to children via `AGENT_CODE_SUBAGENT_ID` / `AGENT_CODE_SUBAGENT_COLOR` env vars. `/tasks` paints `LocalAgent` rows with the assigned color.
+
+### Changed
+
+- **Bumped `tokio` from 1.52.1 to 1.52.2** (#284).
+
+### Fixed
+
+- **CI Format gate**: a multi-line `tracing::debug!` in `services::notifier` was inlined to a single-arg form per rustfmt's width preference (#283).
+
+### Security
+
+- **OAuth state-parameter mandatory** (#277): callbacks missing `state` are rejected with HTTP 400, preventing CSRF-style code injection.
+- **OAuth credentials preserved on transient refresh failure** (#277): `429`/`503`/`408` and unparseable non-401 bodies no longer trigger credential deletion. Only `invalid_grant`/`invalid_client`/401-no-body are terminal.
+- **OAuth HTTPS enforcement** (#277): authorization and token endpoints must use `https://` unless `allow_insecure_local` is set AND the host is loopback. Validated at `OAuthProviderConfig` construction; `OAuthService::new` returns `Result`.
+- **OAuth browser launcher exit-status** (#277): non-zero exit from the opener now surfaces as `BrowserLaunchFailed` with the exit code, instead of timing out on the loopback after 5 minutes with a misleading error.
+- **Settings-sync HMAC**: replaced `SHA-256(secret || msg)` (vulnerable to length-extension forgery) with HMAC-SHA-256 per RFC 2104 (#279).
+- **Settings-sync passphrase wipe**: the heap bytes that backed the original passphrase `String` are zeroed in place before consuming the config (#279).
+- **Policy-quota leak on cancellation** (#278): the concurrency permit is now acquired before recording in the sliding windows, so a future cancelled while queued does not consume request/token quota.
+- **TUI bridge handles `AnsiValue`** (#274): the 256-color downgrade path's `Color::AnsiValue(n)` output now maps to `ratatui::style::Color::Indexed(n)` instead of falling through to `Color::Reset`. Restores accent / muted / success / error / warning rendering on terminals that take the downgrade path (Apple Terminal, screen/tmux-256color, `NO_COLOR` users).
+
 ## [0.21.1] - 2026-05-04
 
 ### Fixed
@@ -392,7 +427,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/avala-ai/agent-code/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/avala-ai/agent-code/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/avala-ai/agent-code/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/avala-ai/agent-code/compare/v0.19.0...v0.20.0
