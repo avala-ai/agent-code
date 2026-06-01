@@ -7,6 +7,7 @@
 
 use std::io::Write;
 
+use agent_code_lib::config::atomic::atomic_write_secret;
 use crossterm::style::Stylize;
 
 use super::selector::{SelectOption, select};
@@ -468,42 +469,90 @@ pub fn run_setup() -> Option<SetupResult> {
     Some(result)
 }
 
-/// Write config file from setup result.
-pub fn write_config(result: &SetupResult) {
+/// Render the `config.toml` body for a setup result.
+///
+/// Built through the `toml` serializer rather than string formatting so
+/// every value — most importantly the API key, which can legitimately
+/// contain `\`, `"`, or other TOML metacharacters on OpenAI-compatible
+/// "Other" endpoints — is escaped correctly. Hand-formatting silently
+/// corrupted such keys (`\b` became a backspace, a `"` made the file
+/// unparseable), so the key was effectively forgotten on the next
+/// launch even though setup appeared to succeed (see issue #288).
+fn render_config_toml(result: &SetupResult) -> String {
     let base_url = result
         .base_url
         .as_deref()
         .unwrap_or("https://api.openai.com/v1");
     let model = result.model.as_deref().unwrap_or("gpt-5.4");
-    // Include API key in config if provided (so it persists across sessions).
-    let api_key_line = if !result.api_key.is_empty() && result.api_key != "ollama" {
-        format!("api_key = \"{}\"\n", result.api_key)
-    } else {
-        String::new()
+
+    let mut api = toml::value::Table::new();
+    api.insert("base_url".into(), base_url.into());
+    api.insert("model".into(), model.into());
+    // Include the API key only when it's a real, persistable secret.
+    // Ollama needs no key, and an empty key must not be written.
+    if !result.api_key.is_empty() && result.api_key != "ollama" {
+        api.insert("api_key".into(), result.api_key.clone().into());
+    }
+
+    let mut permissions = toml::value::Table::new();
+    permissions.insert("default_mode".into(), result.permission_mode.clone().into());
+
+    let mut ui = toml::value::Table::new();
+    ui.insert("theme".into(), result.theme.clone().into());
+
+    let mut root = toml::value::Table::new();
+    root.insert("api".into(), toml::Value::Table(api));
+    root.insert("permissions".into(), toml::Value::Table(permissions));
+    root.insert("ui".into(), toml::Value::Table(ui));
+
+    // Serializing a table of tables can't produce a value-after-table
+    // error, so this only fails on a serializer bug — fall back to an
+    // empty document so `write_config` still surfaces a save error
+    // rather than panicking inside the wizard.
+    toml::to_string_pretty(&toml::Value::Table(root)).unwrap_or_default()
+}
+
+/// Write config file from setup result.
+///
+/// Persists atomically with owner-only (`0600`) permissions — the file
+/// holds the API key — and surfaces failures to the user instead of
+/// swallowing them. A silent write failure used to masquerade as a
+/// successful setup: the in-process key kept the current session
+/// working while nothing reached disk, so the next launch re-ran the
+/// wizard (issue #288).
+pub fn write_config(result: &SetupResult) {
+    let Some(config_dir) = agent_code_lib::config::agent_config_dir() else {
+        println!(
+            "  {}",
+            "Could not determine a config directory — setup was not saved. \
+             Set AGENT_CODE_API_KEY in your environment to use the agent."
+                .yellow()
+        );
+        println!();
+        return;
     };
 
-    let config = format!(
-        r#"[api]
-base_url = "{base_url}"
-model = "{model}"
-{api_key_line}
-[permissions]
-default_mode = "{}"
+    let config_path = config_dir.join("config.toml");
+    let body = render_config_toml(result);
 
-[ui]
-theme = "{}"
-"#,
-        result.permission_mode, result.theme,
-    );
-
-    if let Some(config_dir) = agent_code_lib::config::agent_config_dir() {
-        let _ = std::fs::create_dir_all(&config_dir);
-        let config_path = config_dir.join("config.toml");
-        let _ = std::fs::write(&config_path, &config);
-        println!(
-            "{}",
-            format!("  Config saved to {}", config_path.display()).dark_grey()
-        );
+    match atomic_write_secret(&config_path, body.as_bytes()) {
+        Ok(()) => {
+            println!(
+                "{}",
+                format!("  Config saved to {}", config_path.display()).dark_grey()
+            );
+        }
+        Err(e) => {
+            println!(
+                "  {}",
+                format!(
+                    "Could not save config to {} ({e}). \
+                     Set AGENT_CODE_API_KEY in your environment to use the agent.",
+                    config_path.display()
+                )
+                .yellow()
+            );
+        }
     }
     println!();
 }
@@ -515,4 +564,93 @@ pub struct SetupResult {
     pub model: Option<String>,
     pub theme: String,
     pub permission_mode: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result_with_key(api_key: &str) -> SetupResult {
+        SetupResult {
+            api_key: api_key.to_string(),
+            provider: "custom".to_string(),
+            base_url: Some("https://api.openai.com/v1".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            theme: "midnight".to_string(),
+            permission_mode: "ask".to_string(),
+        }
+    }
+
+    /// Read the `api.api_key` field back out of a rendered config the
+    /// same way `Config::load` would: parse the TOML, then index in.
+    fn loaded_api_key(result: &SetupResult) -> Option<String> {
+        let doc: toml::Value =
+            toml::from_str(&render_config_toml(result)).expect("rendered config must parse");
+        doc.get("api")
+            .and_then(|a| a.get("api_key"))
+            .and_then(|k| k.as_str())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn plain_key_round_trips() {
+        let result = result_with_key("sk-normaltoken-123");
+        assert_eq!(
+            loaded_api_key(&result).as_deref(),
+            Some("sk-normaltoken-123")
+        );
+    }
+
+    /// Issue #288: a key with a backslash used to be mangled by the
+    /// hand-rolled `format!` writer (`\b` decoded to a backspace), so
+    /// the persisted key silently differed from what the user pasted.
+    #[test]
+    fn key_with_backslash_survives() {
+        let result = result_with_key(r"sk-with\backslash");
+        assert_eq!(
+            loaded_api_key(&result).as_deref(),
+            Some(r"sk-with\backslash")
+        );
+    }
+
+    /// Issue #288: a key with a double quote used to make config.toml
+    /// unparseable, so the next launch failed to load any key at all.
+    #[test]
+    fn key_with_quote_survives() {
+        let result = result_with_key(r#"sk-with"quote"#);
+        assert_eq!(loaded_api_key(&result).as_deref(), Some(r#"sk-with"quote"#));
+    }
+
+    #[test]
+    fn other_sections_are_preserved() {
+        let result = result_with_key("sk-abc");
+        let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
+        assert_eq!(
+            doc["api"]["base_url"].as_str(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(doc["api"]["model"].as_str(), Some("gpt-5.4"));
+        assert_eq!(doc["permissions"]["default_mode"].as_str(), Some("ask"));
+        assert_eq!(doc["ui"]["theme"].as_str(), Some("midnight"));
+    }
+
+    #[test]
+    fn empty_key_is_omitted() {
+        let result = result_with_key("");
+        let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
+        assert!(
+            doc["api"].get("api_key").is_none(),
+            "an empty key must not be written"
+        );
+    }
+
+    #[test]
+    fn ollama_sentinel_key_is_omitted() {
+        let result = result_with_key("ollama");
+        let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
+        assert!(
+            doc["api"].get("api_key").is_none(),
+            "the ollama sentinel must not be persisted as a key"
+        );
+    }
 }
