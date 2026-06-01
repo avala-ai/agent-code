@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.22.1] - 2026-06-01
+
 ### Fixed
 
 - **Setup wizard silently corrupted API keys with special characters** (#288): the first-run wizard wrote `config.toml` by hand-formatting the TOML, so a pasted key containing `\` was mangled (`\b` decoded to a backspace) and a key containing `"` made the file unparseable. Either way the key was effectively "forgotten" on the next launch even though setup appeared to succeed — common on OpenAI-compatible "Other" endpoints with non-standard tokens. The wizard now serializes through the `toml` crate (correct escaping), writes atomically with owner-only (`0600`) permissions since the file holds a secret, and surfaces save failures instead of swallowing them.
+
+### Changed
+
+- **Bumped `tokio` from 1.52.2 to 1.52.3** (#287).
+- **Bumped `tree-sitter` from 0.26.8 to 0.26.9** (#289).
+- **Bumped `assert_cmd` from 2.2.1 to 2.2.2** (#286).
 
 ## [0.22.0] - 2026-05-05
 
@@ -429,7 +439,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/avala-ai/agent-code/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/avala-ai/agent-code/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/avala-ai/agent-code/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/avala-ai/agent-code/compare/v0.20.0...v0.21.0
