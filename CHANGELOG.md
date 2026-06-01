@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Fixed
+
+- **Setup wizard silently corrupted API keys with special characters** (#288): the first-run wizard wrote `config.toml` by hand-formatting the TOML, so a pasted key containing `\` was mangled (`\b` decoded to a backspace) and a key containing `"` made the file unparseable. Either way the key was effectively "forgotten" on the next launch even though setup appeared to succeed — common on OpenAI-compatible "Other" endpoints with non-standard tokens. The wizard now serializes through the `toml` crate (correct escaping), writes atomically with owner-only (`0600`) permissions since the file holds a secret, and surfaces save failures instead of swallowing them.
 
 ## [0.22.0] - 2026-05-05
 

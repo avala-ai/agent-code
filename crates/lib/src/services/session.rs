@@ -909,8 +909,14 @@ mod tests {
     fn prune_skips_non_json_files() {
         // Stray `.tmp` / `.bak` files in the sessions dir shouldn't be
         // scanned or counted toward the kept/removed totals.
+        //
+        // `now` is pinned to a fixed instant (like the sibling prune
+        // tests) rather than `Utc::now()` so the kept session never ages
+        // past the 30-day threshold as the wall clock advances.
         let tmp = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         std::fs::write(tmp.path().join("leftover.tmp"), b"noise").unwrap();
         write_session(tmp.path(), "current", "2026-04-23T00:00:00Z");
         let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
