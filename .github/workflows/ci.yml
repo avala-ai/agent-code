@@ -81,7 +81,7 @@ jobs:
         # and a spurious multi-terabyte memory allocation panic.
         run: cargo tarpaulin --engine llvm --all-targets --out xml --output-dir coverage/
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: coverage/cobertura.xml
           fail_ci_if_error: false
