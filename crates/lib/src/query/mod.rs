@@ -548,6 +548,41 @@ impl QueryEngine {
         result
     }
 
+    /// Drain steered input and inject each non-empty message as a user
+    /// message, returning whether anything was injected.
+    ///
+    /// Steered input runs the same `UserPromptSubmit` hook path as normal
+    /// user input, so audit / content-scanning instrumentation isn't
+    /// bypassed by text typed during a run. Called at each agent-loop
+    /// iteration boundary *and* just before a turn would complete, so a
+    /// message queued after the last iteration's drain is consumed by the
+    /// current turn rather than leaking into the next one.
+    async fn drain_steering(&mut self, sink: &dyn StreamSink) -> bool {
+        let mut injected = false;
+        while let Ok(steer) = self.steer_rx.try_recv() {
+            let trimmed = steer.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            sink.on_warning(&format!("↳ steering: {trimmed}"));
+            let _ = self
+                .hooks
+                .run_hooks(
+                    &HookEvent::UserPromptSubmit,
+                    None,
+                    &serde_json::json!({
+                        "user_input": trimmed,
+                        "turn": self.state.turn_count,
+                        "steered": true,
+                    }),
+                )
+                .await;
+            self.state.push_message(user_message(&trimmed));
+            injected = true;
+        }
+        injected
+    }
+
     /// The agent loop body. Wrapped by [`Self::run_turn_with_sink`],
     /// which publishes status transitions around it. Assumes the
     /// per-turn cancellation token was already installed by
@@ -613,14 +648,7 @@ impl QueryEngine {
             // tool-result messages are already appended — so steered
             // input reads as new user input rather than splitting a
             // tool-use/tool-result pair.
-            while let Ok(steer) = self.steer_rx.try_recv() {
-                let trimmed = steer.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                sink.on_warning(&format!("↳ steering: {trimmed}"));
-                self.state.push_message(user_message(trimmed));
-            }
+            self.drain_steering(sink).await;
 
             // Budget check before each turn.
             let budget_config = crate::services::budget::BudgetConfig::default();
@@ -1150,6 +1178,16 @@ impl QueryEngine {
             let tool_calls = extract_tool_calls(&content_blocks);
 
             if tool_calls.is_empty() {
+                // Before completing, consume any input steered in after
+                // this iteration's drain (e.g. typed during the final
+                // response). If present, inject it and run another
+                // iteration so it is handled by *this* turn — otherwise
+                // it would linger in the channel and leak into the next
+                // user prompt.
+                if self.drain_steering(sink).await {
+                    continue;
+                }
+
                 // No tools requested — turn is complete.
                 info!("Turn complete (no tool calls)");
                 sink.on_turn_complete(turn + 1);
@@ -2394,7 +2432,55 @@ mod tests {
         }
     }
 
+    /// A provider that, on its first call, injects a steered message into
+    /// the engine's steering channel (simulating the user steering during
+    /// the final response) and then completes with no tool calls. Used to
+    /// prove steered input queued after the iteration-top drain is still
+    /// consumed by the current turn rather than leaking to the next.
+    struct SteerOnFirstCallProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        steer: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SteerOnFirstCallProvider {
+        fn name(&self) -> &str {
+            "steer-on-first-mock"
+        }
+
+        async fn stream(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0
+                && let Some(tx) = self.steer.lock().unwrap().as_ref()
+            {
+                let _ = tx.send("follow-up via steer".to_string());
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(StreamEvent::ContentBlockComplete(ContentBlock::Text {
+                        text: "ok".into(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        usage: Usage::default(),
+                        stop_reason: Some(StopReason::EndTurn),
+                    })
+                    .await;
+            });
+            Ok(rx)
+        }
+    }
+
     fn build_engine(llm: Arc<dyn Provider>) -> QueryEngine {
+        build_engine_with_max_turns(llm, 1)
+    }
+
+    fn build_engine_with_max_turns(llm: Arc<dyn Provider>, max_turns: usize) -> QueryEngine {
         use crate::config::Config;
         use crate::permissions::PermissionChecker;
         use crate::state::AppState;
@@ -2410,7 +2496,7 @@ mod tests {
             permissions,
             state,
             QueryEngineConfig {
-                max_turns: Some(1),
+                max_turns: Some(max_turns),
                 verbose: false,
                 unattended: true,
                 agent_kind: AgentKind::Main,
@@ -2874,5 +2960,41 @@ mod tests {
         // Clean up the hanging turn.
         handle.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status()).await;
+    }
+
+    #[tokio::test]
+    async fn steering_after_final_response_is_consumed_not_leaked() {
+        // The provider steers itself during its first (final, no-tool-call)
+        // response — i.e. after this iteration's top drain. The turn must
+        // consume that input before completing, not leave it in the
+        // channel to leak into the next prompt.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steer_slot = Arc::new(std::sync::Mutex::new(None));
+        let provider = Arc::new(SteerOnFirstCallProvider {
+            calls: calls.clone(),
+            steer: steer_slot.clone(),
+        });
+        let mut engine = build_engine_with_max_turns(provider, 4);
+        *steer_slot.lock().unwrap() = Some(engine.steer_sender());
+
+        engine
+            .run_turn_with_sink("original", &NullSink)
+            .await
+            .expect("turn ok");
+
+        // The steered follow-up was injected into THIS turn's history…
+        assert!(
+            user_message_texts(&engine)
+                .iter()
+                .any(|t| t.contains("follow-up via steer")),
+            "steered input after the final response was not consumed by the turn"
+        );
+        // …and the provider ran a second time to process it (proving the
+        // turn continued rather than completing and leaking).
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "turn did not run another iteration to handle steered input"
+        );
     }
 }
