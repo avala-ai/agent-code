@@ -113,6 +113,6 @@ Type these at the start of a prompt (not as `/commands`):
 |--------|-------------|
 | `! <cmd>` | Run a shell command directly; its output streams and is injected into the conversation |
 | `& <prompt>` | Run the prompt as a background subagent and return to the prompt immediately; its result surfaces when it finishes |
-| `&/<skill> [args]` | Run a named skill/workflow as a background task (e.g. `&/review src/`). Same background lifecycle as `&`, shown as a `LocalWorkflow` in `/tasks` |
+| `&/<skill> [args]` | Run a named skill/workflow as a background task (e.g. `&/review src/`). Same background lifecycle as `&`, shown as a `LocalWorkflow` in `/tasks`. Press Tab after `&/` to complete skill names |
 
 Manage running background work with `/tasks`, `/tasks output <id>`, and `/tasks kill <id>`.

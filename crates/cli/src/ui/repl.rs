@@ -118,6 +118,67 @@ fn parse_background_skill(bg_input: &str) -> Option<(String, String)> {
     }
 }
 
+/// Find a `&/<skill-partial>` completion context ending at byte position
+/// `pos`. Returns `(slash_byte_idx, partial)` where `slash_byte_idx` is
+/// the byte position of the `/` (so the replacement overwrites the whole
+/// `/slug`) and `partial` is the slug text typed so far.
+///
+/// Only fires when the line is a background skill invocation: it starts
+/// with `&`, the next non-whitespace char is `/`, and the cursor is
+/// still inside the (whitespace-free) slug token — so `&/rev` completes
+/// but `&/review some args` no longer does.
+fn find_background_skill_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    if pos > line.len() {
+        return None;
+    }
+    let rest = line.strip_prefix('&')?;
+    // Byte offset of `rest` within `line` is 1 (the `&`).
+    let trimmed = rest.trim_start();
+    let ws = rest.len() - trimmed.len();
+    let slash_idx = 1 + ws;
+    if !line[slash_idx..].starts_with('/') {
+        return None;
+    }
+    if pos <= slash_idx {
+        return None;
+    }
+    let partial = &line[slash_idx + 1..pos];
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((slash_idx, partial))
+}
+
+/// Skill-name completion candidates for a `&/<partial>` context, scored
+/// against `partial` with the same matcher used for slash commands.
+/// Loads the skill registry (project + user + bundled) fresh so newly
+/// added skills show up without a restart.
+fn complete_skill_name(cwd: &str, partial: &str) -> Vec<Pair> {
+    let registry = agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(cwd)));
+    let mut scored: Vec<(i32, Pair)> = registry
+        .all()
+        .iter()
+        .filter_map(|skill| {
+            let score = score_command(&skill.name, &[], partial)?;
+            let desc = skill.metadata.description.as_deref().unwrap_or("");
+            Some((
+                score,
+                Pair {
+                    display: if desc.is_empty() {
+                        format!("/{}", skill.name)
+                    } else {
+                        format!("/{} — {desc}", skill.name)
+                    },
+                    replacement: format!("/{}", skill.name),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Find an `@path-partial` context ending at byte position `pos` in
 /// `line`, if any. Returns `(at_byte_idx, partial)` where `at_byte_idx`
 /// is the byte position of the `@` and `partial` is the text after it
@@ -236,6 +297,19 @@ impl Completer for CommandCompleter {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // `&/skill` background-skill completion: complete skill names
+        // after a `&/` prefix so the background-workflow feature is
+        // discoverable from the keyboard.
+        if let Some((slash_idx, partial)) = find_background_skill_context(line, pos) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let pairs = complete_skill_name(&cwd, partial);
+            if !pairs.is_empty() {
+                return Ok((slash_idx, pairs));
+            }
+        }
+
         // @path completion fires whenever the cursor is inside an @-token,
         // regardless of where that token is in the line.
         if let Some((at_idx, partial)) = find_at_context(line, pos) {
@@ -1637,6 +1711,64 @@ mod background_skill_tests {
         // rather than resolving an empty skill.
         assert_eq!(parse_background_skill("/"), None);
         assert_eq!(parse_background_skill("/   "), None);
+    }
+}
+
+#[cfg(test)]
+mod background_skill_completion_tests {
+    use super::{complete_skill_name, find_background_skill_context};
+
+    #[test]
+    fn context_at_slug_start() {
+        // `&/` with cursor right after the slash → empty partial.
+        assert_eq!(find_background_skill_context("&/", 2), Some((1, "")));
+    }
+
+    #[test]
+    fn context_with_partial() {
+        assert_eq!(find_background_skill_context("&/rev", 5), Some((1, "rev")));
+    }
+
+    #[test]
+    fn context_tolerates_space_after_amp() {
+        // `& /rev` — a space between `&` and `/` still completes; the
+        // slash index points past the space.
+        assert_eq!(find_background_skill_context("& /rev", 6), Some((2, "rev")));
+    }
+
+    #[test]
+    fn no_context_without_amp() {
+        assert_eq!(find_background_skill_context("/rev", 4), None);
+    }
+
+    #[test]
+    fn no_context_once_past_the_slug() {
+        // After whitespace, the cursor is in the args, not the slug.
+        assert_eq!(find_background_skill_context("&/review src", 12), None);
+    }
+
+    #[test]
+    fn no_context_for_plain_background_prompt() {
+        // `& fix the bug` is a free-form prompt, not a skill.
+        assert_eq!(find_background_skill_context("& fix the bug", 13), None);
+    }
+
+    #[test]
+    fn completer_matches_a_bundled_skill_prefix() {
+        // Pick a real bundled skill, then confirm a prefix of its name
+        // surfaces it as a `/name` replacement.
+        let reg = agent_code_lib::skills::SkillRegistry::load_bundled_only();
+        let Some(skill) = reg.all().first() else {
+            return; // no bundled skills in this build — nothing to assert
+        };
+        let name = skill.name.clone();
+        let prefix: String = name.chars().take(2).collect();
+        let pairs = complete_skill_name(".", &prefix);
+        assert!(
+            pairs.iter().any(|p| p.replacement == format!("/{name}")),
+            "expected /{name} among completions for prefix {prefix:?}: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
     }
 }
 
