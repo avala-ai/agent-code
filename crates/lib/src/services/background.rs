@@ -465,8 +465,28 @@ impl TaskManager {
         };
         self.persist(&snapshot);
         // Signal the live runtime (if any) outside the tasks lock.
-        if let Some(cancel) = self.cancels.lock().await.get(id) {
-            cancel.cancel();
+        let had_cancel = {
+            let cancels = self.cancels.lock().await;
+            match cancels.get(id) {
+                Some(cancel) => {
+                    cancel.cancel();
+                    true
+                }
+                None => false,
+            }
+        };
+        // Fallback for tasks with no live cancel handle in THIS process —
+        // notably tasks adopted across a restart, whose original spawner
+        // (and its cancellation token) died with the previous session.
+        // Signal the recorded process group directly so an orphaned
+        // process can't keep running (and keep modifying the worktree).
+        if !had_cancel {
+            #[cfg(unix)]
+            if let Some(pid) = snapshot.pid {
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
         }
         Ok(())
     }
@@ -548,6 +568,18 @@ impl TaskManager {
             persist_info(&dir, &info);
             tasks.insert(info.id.clone(), info);
             adopted += 1;
+        }
+
+        // Advance the id counter past every loaded id (including ones we
+        // pruned/skipped) so a new same-prefix task can't reallocate an
+        // adopted id and overwrite its record, journal, and output.
+        let max_seen = tasks.keys().filter_map(|id| numeric_suffix(id)).max();
+        drop(tasks);
+        if let Some(m) = max_seen {
+            let mut next = self.next_id.lock().await;
+            if *next <= m {
+                *next = m + 1;
+            }
         }
 
         if adopted > 0 {
@@ -754,6 +786,16 @@ fn reclassify_on_adopt(mut info: TaskInfo, alive: bool) -> TaskInfo {
         info.finished_at = Some(std::time::Instant::now());
     }
     info
+}
+
+/// Parse the numeric suffix of a task id (`"b12"` → `12`).
+///
+/// Task ids are a single-letter kind prefix followed by a global
+/// counter value; [`TaskManager::adopt`] uses this to advance the
+/// counter past recovered ids.
+fn numeric_suffix(id: &str) -> Option<u64> {
+    let start = id.find(|c: char| c.is_ascii_digit())?;
+    id[start..].parse::<u64>().ok()
 }
 
 /// Two-letter id prefix per kind so the `/tasks` table tells them
@@ -1029,6 +1071,38 @@ mod tests {
         assert!(
             !journal_path(&dir, "b888").exists(),
             "pruned task's journal should be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn numeric_suffix_parses_kind_prefixed_ids() {
+        assert_eq!(numeric_suffix("b12"), Some(12));
+        assert_eq!(numeric_suffix("a3"), Some(3));
+        assert_eq!(numeric_suffix("w0"), Some(0));
+        assert_eq!(numeric_suffix("x"), None);
+        assert_eq!(numeric_suffix(""), None);
+    }
+
+    #[tokio::test]
+    async fn adopt_advances_next_id_past_recovered_ids() {
+        let dir = unique_persist_dir();
+        let mut info = mk_info("b5", TaskStatus::Running);
+        info.pid = Some(0x7FFF_FFFE); // dead → reclassified, still loaded
+        persist_info(&dir, &info);
+
+        let mgr = TaskManager::with_persistence(dir.clone());
+        assert_eq!(mgr.adopt().await, 1);
+
+        // A newly allocated task must not collide with the adopted id.
+        let new_id = mgr
+            .register("x", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        assert_ne!(new_id, "b5", "new task reused the adopted id");
+        assert!(
+            numeric_suffix(&new_id).unwrap() > 5,
+            "id counter not advanced past adopted id: {new_id}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
