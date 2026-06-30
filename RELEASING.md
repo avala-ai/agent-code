@@ -7,8 +7,11 @@ How to cut a new release of agent-code.
 - Push access to `main`
 - GitHub secrets configured:
   - `CARGO_REGISTRY_TOKEN` - crates.io publish token
-  - `NPM_TOKEN` - npm publish token (Automation type)
   - `HOMEBREW_TAP_TOKEN` - GitHub PAT with `contents:write` on `avala-ai/homebrew-tap`
+- npm publishing uses an **OIDC trusted publisher** (no `NPM_TOKEN` secret). The trusted
+  publisher must be configured on npmjs.com for `@avala-ai/agent-code` (Publisher: GitHub
+  Actions, repo `avala-ai/agent-code`, workflow file `release.yml`) before the tag is pushed,
+  or the `publish-npm` job's OIDC exchange is rejected.
 
 ## Release naming standard
 
@@ -149,7 +152,7 @@ The tag triggers these workflows:
 | **Release** (`release.yml`) | Builds Linux/macOS/Windows binaries, creates GitHub Release, publishes to crates.io |
 | **Release** (`release.yml`) | Updates `avala-ai/homebrew-tap` formula with new version + SHA256 checksums |
 | **Docker** (`docker.yml`) | Builds and pushes `ghcr.io/avala-ai/agent-code:X.Y.Z` + `:latest` |
-| **npm** (`npm.yml`) | Publishes `agent-code` to npm (triggered by the GitHub Release) |
+| **Release** (`release.yml`) | `publish-npm` job publishes `@avala-ai/agent-code` to npm via OIDC trusted publishing + provenance |
 | **CI** (`ci.yml`) | Standard checks on the main branch push |
 
 ### 9. Verify the release
