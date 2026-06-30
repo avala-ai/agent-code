@@ -12,7 +12,10 @@
 //! 8. Inject tool results into history
 //! 9. Repeat from step 1 until no tool_use or max turns
 
+pub mod session;
 pub mod source;
+
+pub use session::{Session, TurnHandle};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +77,8 @@ pub struct QueryEngine {
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
     /// Cached system prompt (rebuilt only when inputs change).
     cached_system_prompt: Option<(u64, String)>, // (hash, prompt)
+    /// Publishes the current turn's [`TurnStatus`] to observers.
+    turn_status: tokio::sync::watch::Sender<TurnStatus>,
 }
 
 /// Callback for streaming events to the UI.
@@ -98,6 +103,33 @@ impl StreamSink for NullSink {
     fn on_tool_start(&self, _: &str, _: &serde_json::Value) {}
     fn on_tool_result(&self, _: &str, _: &crate::tools::ToolResult) {}
     fn on_error(&self, _: &str) {}
+}
+
+/// Coalesced, always-latest status of the engine's current turn.
+///
+/// Published on a `watch` channel from a single point in
+/// [`QueryEngine::run_turn_with_sink`], so the REPL and a [`Session`]
+/// handle can observe turn progress (and drive promotion/steering)
+/// without consuming the streaming `StreamSink` events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStatus {
+    /// No turn has run yet, or the last one finished and was observed.
+    Idle,
+    /// A turn is in flight.
+    Running,
+    /// The turn finished normally.
+    Completed,
+    /// The turn was cancelled (Ctrl-C / Escape / explicit cancel).
+    Aborted,
+    /// The turn ended with an error.
+    Errored(String),
+}
+
+impl TurnStatus {
+    /// Whether this is a terminal state (the turn is no longer running).
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted | Self::Errored(_))
+    }
 }
 
 impl QueryEngine {
@@ -133,6 +165,7 @@ impl QueryEngine {
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             permission_prompter: None,
             cached_system_prompt: None,
+            turn_status: tokio::sync::watch::channel(TurnStatus::Idle).0,
         }
     }
 
@@ -441,16 +474,78 @@ impl QueryEngine {
     }
 
     /// Run a turn with a stream sink for real-time UI updates.
+    ///
+    /// Publishes [`TurnStatus`] transitions on the engine's status
+    /// channel — `Running` before the work, then a terminal `Completed`
+    /// / `Aborted` / `Errored` — from this single point, so observers
+    /// (the REPL, a [`Session`] handle) can track turn state without
+    /// touching the streaming internals. The turn body itself is
+    /// unchanged in [`Self::run_turn_inner`].
     pub async fn run_turn_with_sink(
         &mut self,
         user_input: &str,
         sink: &dyn StreamSink,
     ) -> crate::error::Result<()> {
-        // Reset cancellation token for this turn. The shared handle is
-        // updated so the signal handler always cancels the current token.
+        self.begin_turn();
+        let result = self.run_turn_inner(user_input, sink).await;
+        self.finish_turn(&result);
+        result
+    }
+
+    /// Start a turn's lifecycle: install a fresh per-turn cancellation
+    /// token (so the shared handle and any observer bind to *this*
+    /// turn) and publish [`TurnStatus::Running`].
+    ///
+    /// [`run_turn_with_sink`](Self::run_turn_with_sink) calls this
+    /// itself. A [`Session`] spawning a turn calls it up front — before
+    /// the detached task starts — so the returned handle's cancel token
+    /// and status baseline already belong to the turn it represents,
+    /// then drives the body via [`Self::run_turn_spawned`].
+    pub fn begin_turn(&mut self) {
         self.cancel = CancellationToken::new();
         *self.cancel_shared.lock().unwrap() = self.cancel.clone();
+        // `send_replace` always stores the value; plain `send` is a no-op
+        // when there are currently no subscribers (it would leave the
+        // channel showing a stale/initial status for a later subscriber).
+        self.turn_status.send_replace(TurnStatus::Running);
+    }
 
+    /// Publish the terminal [`TurnStatus`] for a finished turn.
+    fn finish_turn(&self, result: &crate::error::Result<()>) {
+        let terminal = match result {
+            Ok(()) if self.cancel.is_cancelled() => TurnStatus::Aborted,
+            Ok(()) => TurnStatus::Completed,
+            Err(e) => TurnStatus::Errored(e.to_string()),
+        };
+        // `send_replace` so the terminal status is stored even when no
+        // observer is currently subscribed (see `begin_turn`).
+        self.turn_status.send_replace(terminal);
+    }
+
+    /// Run a turn whose lifecycle was already started via
+    /// [`Self::begin_turn`] (the [`Session`] spawn path). Runs the body
+    /// and publishes the terminal status, but does **not** re-install
+    /// the cancellation token — so a cancel issued against the handle
+    /// before the detached task starts still targets this turn.
+    pub async fn run_turn_spawned(
+        &mut self,
+        user_input: &str,
+        sink: &dyn StreamSink,
+    ) -> crate::error::Result<()> {
+        let result = self.run_turn_inner(user_input, sink).await;
+        self.finish_turn(&result);
+        result
+    }
+
+    /// The agent loop body. Wrapped by [`Self::run_turn_with_sink`],
+    /// which publishes status transitions around it. Assumes the
+    /// per-turn cancellation token was already installed by
+    /// [`Self::begin_turn`].
+    async fn run_turn_inner(
+        &mut self,
+        user_input: &str,
+        sink: &dyn StreamSink,
+    ) -> crate::error::Result<()> {
         // Add the user message to history.
         let user_msg = user_message(user_input);
         self.state.push_message(user_msg);
@@ -1317,6 +1412,23 @@ impl QueryEngine {
     /// Get a cloneable cancel token for use in background tasks.
     pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Subscribe to the engine's [`TurnStatus`] stream.
+    ///
+    /// The returned receiver always holds the latest status; combine
+    /// `borrow()` with `changed().await` to wait for a terminal state.
+    pub fn turn_status(&self) -> tokio::sync::watch::Receiver<TurnStatus> {
+        self.turn_status.subscribe()
+    }
+
+    /// Shared cancel handle that always points at the current turn's
+    /// token (the turn swaps it in at start). Cloneable and lockable
+    /// without holding the engine, so a spawned turn can be cancelled
+    /// while it owns the engine lock — this is what a [`Session`] turn
+    /// handle uses.
+    pub fn cancel_handle(&self) -> Arc<std::sync::Mutex<CancellationToken>> {
+        self.cancel_shared.clone()
     }
 }
 
@@ -2198,6 +2310,55 @@ mod tests {
         }
     }
 
+    /// A provider that completes its first turn normally, then hangs
+    /// (honoring cancel) on every later turn. Lets a reused-session test
+    /// observe a *second* turn that is genuinely still running after a
+    /// first turn already left a terminal value in the status channel.
+    struct CompleteThenHangProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CompleteThenHangProvider {
+        fn name(&self) -> &str {
+            "complete-then-hang-mock"
+        }
+
+        async fn stream(
+            &self,
+            request: &ProviderRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            if n == 0 {
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(StreamEvent::ContentBlockComplete(ContentBlock::Text {
+                            text: "done".into(),
+                        }))
+                        .await;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            usage: Usage::default(),
+                            stop_reason: Some(StopReason::EndTurn),
+                        })
+                        .await;
+                });
+            } else {
+                let cancel = request.cancel.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(StreamEvent::TextDelta("hanging...".into())).await;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {}
+                        _ = std::future::pending::<()>() => unreachable!(),
+                    }
+                });
+            }
+            Ok(rx)
+        }
+    }
+
     fn build_engine(llm: Arc<dyn Provider>) -> QueryEngine {
         use crate::config::Config;
         use crate::permissions::PermissionChecker;
@@ -2448,5 +2609,121 @@ mod tests {
              the token is being dropped somewhere in query::mod.rs or the \
              provider is ignoring it"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TurnStatus seam + spawnable Session
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn turn_status_transitions_to_completed() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        let rx = engine.turn_status();
+        assert_eq!(*rx.borrow(), TurnStatus::Idle);
+
+        engine
+            .run_turn_with_sink("hi", &NullSink)
+            .await
+            .expect("turn ok");
+
+        assert_eq!(*rx.borrow(), TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn turn_status_transitions_to_aborted_on_cancel() {
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine = build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        }));
+        let rx = engine.turn_status();
+        schedule_cancel(&engine, 100);
+
+        engine
+            .run_turn_with_sink("hi", &NullSink)
+            .await
+            .expect("cancelled turn returns Ok");
+
+        assert_eq!(*rx.borrow(), TurnStatus::Aborted);
+    }
+
+    #[tokio::test]
+    async fn session_spawn_turn_runs_detached_and_completes() {
+        let session = Session::new(build_engine(Arc::new(CompletingProvider)));
+        let mut handle = session
+            .spawn_turn("hi".to_string(), Arc::new(NullSink))
+            .await;
+
+        let final_status =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
+                .await
+                .expect("turn should reach terminal status");
+        assert_eq!(final_status, TurnStatus::Completed);
+
+        handle.join().await.expect("turn result ok");
+    }
+
+    #[tokio::test]
+    async fn session_spawn_turn_is_cancellable_while_running() {
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new(build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        })));
+        let mut handle = session
+            .spawn_turn("hi".to_string(), Arc::new(NullSink))
+            .await;
+
+        // Let the turn start, then cancel it via the handle (no engine
+        // lock needed even though the turn holds it).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        handle.cancel();
+
+        let final_status =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
+                .await
+                .expect("cancelled turn should reach terminal status");
+        assert_eq!(final_status, TurnStatus::Aborted);
+    }
+
+    #[tokio::test]
+    async fn session_new_turn_does_not_report_prior_turn_completion() {
+        // Regression: a reused session's status channel still holds the
+        // previous turn's terminal value. A freshly spawned turn must
+        // bind to its OWN turn — report `Running` (not the stale
+        // `Completed`), block in `wait_status`, and honor a cancel issued
+        // right after spawn.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session = Session::new(build_engine(Arc::new(CompleteThenHangProvider {
+            calls: calls.clone(),
+        })));
+
+        // Turn 1 completes; the channel now holds `Completed`.
+        session.run_turn("one", &NullSink).await.expect("turn 1 ok");
+
+        // Turn 2 hangs. Its handle must NOT inherit turn 1's terminal.
+        let mut handle = session
+            .spawn_turn("two".to_string(), Arc::new(NullSink))
+            .await;
+        assert_eq!(
+            handle.status(),
+            TurnStatus::Running,
+            "new turn handle must report its own Running, not the prior turn's terminal"
+        );
+
+        // wait_status must block on the still-running turn, not return a
+        // stale terminal immediately.
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle.wait_status()).await;
+        assert!(
+            early.is_err(),
+            "wait_status returned before the running turn finished (stale status)"
+        );
+
+        // Cancel issued against the handle must target this turn.
+        handle.cancel();
+        let final_status =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
+                .await
+                .expect("cancelled turn should reach terminal status");
+        assert_eq!(final_status, TurnStatus::Aborted);
     }
 }

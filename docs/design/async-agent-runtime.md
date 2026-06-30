@@ -132,7 +132,7 @@ provider/test scaffold; reuse them. Background lifecycle is offline-testable wit
 - [x] PR 1 — surfacing + kill + dedup
 - [x] PR 2 — `&` prefix + Agent run_in_background
 - [x] PR 3 — durable tasks + adopt
-- [ ] PR 4 — spawnable turn + event seam
+- [x] PR 4 — spawnable turn + event seam
 - [ ] PR 5 — promotion + steering
 - [ ] PR 6 — subagent concurrency + coordinator wiring
 - [ ] PR 7 — stubbed executors (workflow first)
