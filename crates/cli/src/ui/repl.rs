@@ -871,33 +871,34 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 };
                 let input = input.trim();
 
-                // & prefix: run prompt in background (fire-and-forget agent turn).
+                // & prefix: run the prompt as a background subagent task.
+                // Non-blocking — spawns a tracked LocalAgent task and
+                // returns to the prompt immediately. Its result surfaces
+                // automatically when it finishes (see
+                // surface_background_completions).
                 if input.starts_with('&') {
                     let bg_input = input.strip_prefix('&').unwrap_or("").trim().to_string();
                     if !bg_input.is_empty() {
                         let t = super::theme::current();
+                        let description: String = bg_input.chars().take(60).collect();
+                        let task_manager = engine.state().task_manager.clone();
+                        let cwd = engine.state().cwd.clone();
+                        let subagent_id = uuid::Uuid::new_v4().to_string();
+                        let id = agent_code_lib::tools::agent::spawn_background_agent(
+                            &bg_input,
+                            &description,
+                            std::path::Path::new(&cwd),
+                            &task_manager,
+                            &subagent_id,
+                            None,
+                            None,
+                        )
+                        .await;
                         eprintln!(
                             "  {} {}",
                             "⟡".with(t.accent),
-                            format!("background: {}", &bg_input[..bg_input.len().min(60)])
-                                .with(t.muted),
+                            format!("background task {id}: {description}").with(t.muted),
                         );
-                        // TODO: spawn actual background agent turn.
-                        // For now, just run it as a normal turn.
-                        sink.start_indicator();
-                        if let Err(e) = engine.run_turn_with_sink(&bg_input, &sink).await {
-                            let t = super::theme::current();
-                            eprintln!(
-                                "{} {e}",
-                                super::theme::label(
-                                    " ERROR ",
-                                    t.error,
-                                    crossterm::style::Color::White
-                                )
-                            );
-                        }
-                        sink.ensure_newline();
-                        println!();
                     }
                     continue;
                 }

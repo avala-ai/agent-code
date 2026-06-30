@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use agent_code_lib::services::background::{TaskManager, TaskStatus};
+use agent_code_lib::services::background::{TaskKind, TaskManager, TaskPayload, TaskStatus};
 use agent_code_lib::services::task_surface;
 
 async fn wait_terminal(mgr: &TaskManager, id: &str, timeout_ms: u64) -> TaskStatus {
@@ -54,6 +54,46 @@ async fn shell_task_surfaces_once_with_output_envelope() {
         mgr.drain_completions().await.is_empty(),
         "a completion must never surface twice"
     );
+}
+
+#[tokio::test]
+async fn background_agent_task_surfaces_with_localagent_envelope() {
+    // Exercises the path the `&` prefix and Agent `run_in_background`
+    // compose: a LocalAgent-kind task is spawned via `spawn_command`,
+    // its output captured, and surfaced with a LocalAgent envelope.
+    let mgr = TaskManager::new();
+    let mut cmd = tokio::process::Command::new("echo");
+    cmd.arg("subagent-result");
+    let payload = TaskPayload::LocalAgent {
+        subagent_kind: Some("bg".into()),
+        prompt: "summarize the repo".into(),
+        parent_session: None,
+    };
+    let id = mgr
+        .spawn_command(
+            cmd,
+            "summarize the repo",
+            TaskKind::LocalAgent,
+            payload,
+            None,
+        )
+        .await;
+    assert!(
+        id.starts_with('a'),
+        "LocalAgent id should use 'a' prefix: {id}"
+    );
+
+    assert_eq!(wait_terminal(&mgr, &id, 5_000).await, TaskStatus::Completed);
+
+    let drained = mgr.drain_completions().await;
+    assert_eq!(drained.len(), 1);
+    let output = mgr.read_output(&id).await.unwrap_or_default();
+    let envelope = task_surface::completion_envelope(&drained[0], &output);
+    assert!(
+        envelope.contains("kind=\"LocalAgent\""),
+        "envelope: {envelope}"
+    );
+    assert!(envelope.contains("subagent-result"), "envelope: {envelope}");
 }
 
 #[tokio::test]

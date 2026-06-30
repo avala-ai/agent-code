@@ -142,62 +142,42 @@ impl Tool for AgentTool {
             ctx.cwd.clone()
         };
 
-        // Spawn the subagent as a subprocess (agent --prompt).
-        // This gives full isolation — separate process, separate context.
-        let agent_binary = std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "agent".to_string());
+        // Background mode: register a tracked task, spawn the subagent
+        // subprocess detached, and return immediately. The subagent's
+        // output is captured to the task's output file and surfaced when
+        // it finishes (see `services::task_surface`). Requires a task
+        // manager; without one we fall through to synchronous mode.
+        let run_in_background = input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(tm) = ctx.task_manager.as_ref().filter(|_| run_in_background) {
+            let id = spawn_background_agent(
+                prompt,
+                description,
+                &agent_cwd,
+                tm,
+                &subagent_id,
+                assigned_color,
+                ctx.active_disk_output_style.as_deref(),
+            )
+            .await;
+            return Ok(ToolResult::success(format!(
+                "Agent ({description}) started in the background as task {id}. \
+                 Its result surfaces automatically when it completes — do not wait on it."
+            )));
+        }
 
-        let mut cmd = tokio::process::Command::new(&agent_binary);
-        cmd.arg("--prompt")
-            .arg(prompt)
-            .current_dir(&agent_cwd)
-            .stdout(std::process::Stdio::piped())
+        // Foreground: spawn the subagent subprocess and await it.
+        let mut cmd = build_subagent_command(
+            prompt,
+            &agent_cwd,
+            &subagent_id,
+            assigned_color,
+            ctx.active_disk_output_style.as_deref(),
+        );
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-
-        // Pass through environment so the subagent uses the same provider.
-        for var in &[
-            "AGENT_CODE_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "XAI_API_KEY",
-            "GOOGLE_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "GROQ_API_KEY",
-            "MISTRAL_API_KEY",
-            "TOGETHER_API_KEY",
-            "AGENT_CODE_API_BASE_URL",
-            "AGENT_CODE_MODEL",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-
-        // Mark the child process as running in the `subagent` role.
-        // The CLI reads this to filter output styles whose
-        // `applies_to` list excludes subagents.
-        cmd.env("AGENT_CODE_SUBAGENT", "1");
-
-        // Propagate the subagent id and assigned color to the child.
-        // The child renderer can read these to surface its output in
-        // the same color the lead's `/tasks` table shows for this
-        // agent. Set even when the manager is absent so child code
-        // can rely on `AGENT_CODE_SUBAGENT_ID` being present.
-        cmd.env("AGENT_CODE_SUBAGENT_ID", &subagent_id);
-        if let Some(color) = assigned_color {
-            cmd.env("AGENT_CODE_SUBAGENT_COLOR", color.as_str());
-        }
-
-        // Propagate the active disk-loaded output style by name so a
-        // style with `applies_to: [subagent]` actually reaches the
-        // child. Without this the subagent boots with
-        // `disk_output_style: None` and the subagent half of
-        // `applies_to` is dead at the subprocess boundary. The child
-        // looks the name up against its own loaded registry.
-        if let Some(name) = ctx.active_disk_output_style.as_deref() {
-            cmd.env("AGENT_CODE_DISK_OUTPUT_STYLE", name);
-        }
 
         let timeout = std::time::Duration::from_secs(300); // 5 minute timeout.
 
@@ -241,6 +221,93 @@ impl Tool for AgentTool {
 
         result
     }
+}
+
+/// Provider/runtime environment variables passed through to a spawned
+/// subagent so it reaches the same provider, base URL, and model.
+const SUBAGENT_ENV_PASSTHROUGH: &[&str] = &[
+    "AGENT_CODE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "TOGETHER_API_KEY",
+    "AGENT_CODE_API_BASE_URL",
+    "AGENT_CODE_MODEL",
+];
+
+/// Build the `agent --prompt` subprocess command for a subagent run.
+///
+/// Sets the program, prompt, working directory, provider env
+/// passthrough, and the subagent role/id/color/output-style markers.
+/// The caller configures stdio: the foreground path uses `output()`;
+/// the background path hands the command to
+/// [`crate::services::background::TaskManager::spawn_command`], which
+/// pipes stdio and isolates the process group.
+pub fn build_subagent_command(
+    prompt: &str,
+    cwd: &std::path::Path,
+    subagent_id: &str,
+    color: Option<SubagentColor>,
+    disk_output_style: Option<&str>,
+) -> tokio::process::Command {
+    let agent_binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "agent".to_string());
+
+    let mut cmd = tokio::process::Command::new(&agent_binary);
+    cmd.arg("--prompt").arg(prompt).current_dir(cwd);
+
+    for var in SUBAGENT_ENV_PASSTHROUGH {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
+    // Mark the child as a subagent and propagate its id/color so the
+    // child renderer and output-style filtering behave correctly.
+    cmd.env("AGENT_CODE_SUBAGENT", "1");
+    cmd.env("AGENT_CODE_SUBAGENT_ID", subagent_id);
+    if let Some(color) = color {
+        cmd.env("AGENT_CODE_SUBAGENT_COLOR", color.as_str());
+    }
+    if let Some(name) = disk_output_style {
+        cmd.env("AGENT_CODE_DISK_OUTPUT_STYLE", name);
+    }
+
+    cmd
+}
+
+/// Spawn a subagent as a tracked background task and return its id.
+///
+/// Registers a `LocalAgent` queue entry, runs the subagent subprocess
+/// detached with its output captured to the task's output file, and
+/// returns immediately. The completion is surfaced by the interactive
+/// loop (toast + result injection). Shared by the Agent tool's
+/// `run_in_background` path and the REPL `&` prefix.
+pub async fn spawn_background_agent(
+    prompt: &str,
+    description: &str,
+    cwd: &std::path::Path,
+    task_manager: &std::sync::Arc<crate::services::background::TaskManager>,
+    subagent_id: &str,
+    color: Option<SubagentColor>,
+    disk_output_style: Option<&str>,
+) -> crate::services::background::TaskId {
+    use crate::services::background::{TaskKind, TaskPayload};
+
+    let cmd = build_subagent_command(prompt, cwd, subagent_id, color, disk_output_style);
+    let payload = TaskPayload::LocalAgent {
+        subagent_kind: Some(description.to_string()),
+        prompt: prompt.to_string(),
+        parent_session: None,
+    };
+    task_manager
+        .spawn_command(cmd, description, TaskKind::LocalAgent, payload, color)
+        .await
 }
 
 /// Create a temporary git worktree for isolated execution.
@@ -294,4 +361,75 @@ async fn cleanup_worktree(worktree_path: &PathBuf) -> Result<(), String> {
     // If there are changes, leave the worktree for the user to inspect.
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_subagent_command_sets_prompt_role_and_id() {
+        let cmd = build_subagent_command(
+            "do the thing",
+            std::path::Path::new("/tmp"),
+            "sid-1",
+            None,
+            None,
+        );
+        let std_cmd = cmd.as_std();
+
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "--prompt"), "args: {args:?}");
+        assert!(args.iter().any(|a| a == "do the thing"), "args: {args:?}");
+
+        let envs: HashMap<String, String> = std_cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            envs.get("AGENT_CODE_SUBAGENT").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            envs.get("AGENT_CODE_SUBAGENT_ID").map(String::as_str),
+            Some("sid-1")
+        );
+        // No color / output style passed → those env vars are absent.
+        assert!(!envs.contains_key("AGENT_CODE_SUBAGENT_COLOR"));
+        assert!(!envs.contains_key("AGENT_CODE_DISK_OUTPUT_STYLE"));
+    }
+
+    #[test]
+    fn build_subagent_command_propagates_output_style() {
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            Some("concise"),
+        );
+        let envs: HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            envs.get("AGENT_CODE_DISK_OUTPUT_STYLE").map(String::as_str),
+            Some("concise")
+        );
+    }
 }

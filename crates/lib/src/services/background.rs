@@ -230,10 +230,36 @@ impl TaskManager {
         description: &str,
         cwd: &Path,
     ) -> Result<TaskId, String> {
-        let id = self.allocate_id("b").await;
-        let output_file = task_output_path(&id);
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c").arg(command).current_dir(cwd);
+        let payload = TaskPayload::LocalShell {
+            command: command.to_string(),
+            cwd: cwd.to_path_buf(),
+        };
+        Ok(self
+            .spawn_command(cmd, description, TaskKind::LocalShell, payload, None)
+            .await)
+    }
 
-        // Ensure output directory exists.
+    /// Spawn an arbitrary prebuilt command as a tracked background task.
+    ///
+    /// The caller constructs `cmd` (program, args, cwd, env); this
+    /// method owns the rest of the lifecycle: it registers a queue
+    /// entry, enforces piped stdio and — on Unix — an isolated process
+    /// group so [`Self::kill`] can terminate the whole tree, runs the
+    /// process, captures its output to the task's output file, and
+    /// records the terminal status. Used by [`Self::spawn_shell`] and by
+    /// the Agent tool's background path (a subagent subprocess).
+    pub async fn spawn_command(
+        &self,
+        mut cmd: tokio::process::Command,
+        description: &str,
+        kind: TaskKind,
+        payload: TaskPayload,
+        color: Option<SubagentColor>,
+    ) -> TaskId {
+        let id = self.allocate_id(id_prefix_for(kind)).await;
+        let output_file = task_output_path(&id);
         if let Some(parent) = output_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -242,18 +268,14 @@ impl TaskManager {
             id: id.clone(),
             description: description.to_string(),
             status: TaskStatus::Running,
-            output_file: output_file.clone(),
-            kind: TaskKind::LocalShell,
-            payload: Some(TaskPayload::LocalShell {
-                command: command.to_string(),
-                cwd: cwd.to_path_buf(),
-            }),
-            subagent_color: None,
+            output_file,
+            kind,
+            payload: Some(payload),
+            subagent_color: color,
             notified: false,
             started_at: std::time::Instant::now(),
             finished_at: None,
         };
-
         self.tasks.lock().await.insert(id.clone(), info);
 
         // Register a cancellation handle so `kill()` can terminate the
@@ -262,21 +284,23 @@ impl TaskManager {
         let cancel = tokio_util::sync::CancellationToken::new();
         self.cancels.lock().await.insert(id.clone(), cancel.clone());
 
-        // Spawn the process.
+        // Capture output and isolate the process group for killability.
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         let task_id = id.clone();
         let tasks = self.tasks.clone();
         let cancels = self.cancels.clone();
-        let command = command.to_string();
-        let cwd = cwd.to_path_buf();
-
         tokio::spawn(async move {
-            run_shell_task(&task_id, &command, &cwd, &tasks, cancel).await;
+            run_command_task(&task_id, cmd, &tasks, cancel).await;
             // Drop the cancel handle once the task is terminal.
             cancels.lock().await.remove(&task_id);
         });
 
-        debug!("Background task {id} started: {description}");
-        Ok(id)
+        debug!("Background {kind:?} task {id} started: {description}");
+        id
     }
 
     /// Register a non-shell task in the queue.
@@ -428,8 +452,11 @@ impl TaskManager {
     }
 }
 
-/// Run a `LocalShell` task to completion, honoring cancellation.
+/// Run a prebuilt command to completion as a background task, honoring
+/// cancellation.
 ///
+/// `cmd` is expected to already have piped stdio and (on Unix) its own
+/// process group — [`TaskManager::spawn_command`] configures both.
 /// Output is drained concurrently with the wait so a chatty command
 /// cannot deadlock by filling the pipe buffer. On cancellation the
 /// child is killed — on Unix the whole process group, so descendants
@@ -437,25 +464,13 @@ impl TaskManager {
 /// is written under the `tasks` lock; a `Killed` status set by
 /// [`TaskManager::kill`] is preserved (not overwritten with an exit
 /// result from the race).
-async fn run_shell_task(
+async fn run_command_task(
     task_id: &str,
-    command: &str,
-    cwd: &Path,
+    mut cmd: tokio::process::Command,
     tasks: &Arc<Mutex<HashMap<TaskId, TaskInfo>>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use tokio::io::AsyncReadExt;
-
-    let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // Put the child in its own process group so we can later signal the
-    // whole group (the shell plus anything it spawned).
-    #[cfg(unix)]
-    cmd.process_group(0);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -590,8 +605,8 @@ fn task_output_path(id: &TaskId) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     /// Poll until a task leaves `Running`, or give up after `timeout_ms`.
+    #[cfg(unix)]
     async fn wait_terminal(mgr: &TaskManager, id: &str, timeout_ms: u64) -> TaskStatus {
         let start = std::time::Instant::now();
         loop {
@@ -667,6 +682,34 @@ mod tests {
         assert!(ids.contains(&failed), "failed task should surface");
         assert!(!ids.contains(&running), "running task must not surface");
         assert!(!ids.contains(&killed), "killed task must not surface");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_command_uses_kind_prefix_and_captures_output() {
+        // The generic path the Agent background mode relies on: run an
+        // arbitrary command as a LocalAgent task, capture its output,
+        // and surface it once.
+        let mgr = TaskManager::new();
+        let mut cmd = tokio::process::Command::new("echo");
+        cmd.arg("agent-said-hi");
+        let payload = TaskPayload::LocalAgent {
+            subagent_kind: Some("demo".into()),
+            prompt: "noop".into(),
+            parent_session: None,
+        };
+        let id = mgr
+            .spawn_command(cmd, "demo", TaskKind::LocalAgent, payload, None)
+            .await;
+
+        assert!(
+            id.starts_with('a'),
+            "LocalAgent id should use 'a' prefix: {id}"
+        );
+        assert_eq!(wait_terminal(&mgr, &id, 5_000).await, TaskStatus::Completed);
+        let out = mgr.read_output(&id).await.unwrap();
+        assert!(out.contains("agent-said-hi"), "output: {out:?}");
+        assert_eq!(mgr.drain_completions().await.len(), 1);
     }
 
     #[cfg(unix)]

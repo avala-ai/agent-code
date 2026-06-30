@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`&`-prefix background prompts and Agent `run_in_background`**: prefixing a REPL prompt with `&` now spawns it as a tracked background subagent task and returns to the prompt immediately, instead of running synchronously (the prior behavior was a stub). The Agent tool's long-declared `run_in_background` parameter is now honored — it registers a `LocalAgent` task and returns a handle right away rather than blocking. Both share a new `TaskManager::spawn_command` runner (captures output, killable process group) and a shared `build_subagent_command` helper; results surface automatically via the completion path below.
 - **Background task completion surfacing**: the interactive REPL now reports background tasks (e.g. `bash … &`, subagent runs) as they finish, instead of leaving them invisible until `/tasks` is run. Each completion prints a one-line toast, fires a desktop notification, and injects a synthetic `is_meta` result message so the agent can reference the output on its next turn. A new `services::task_surface` module renders the injected `<task …>` envelope. Completions are de-duplicated by a new `notified` flag on `TaskInfo` so each surfaces exactly once.
 
 ### Fixed
