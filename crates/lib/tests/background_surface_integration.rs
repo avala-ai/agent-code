@@ -2,6 +2,10 @@
 //! interactive REPL relies on: spawn a real shell task, wait for it to
 //! finish, drain its completion exactly once, render the injected
 //! envelope, and confirm a killed task never surfaces.
+//!
+//! These exercise real `bash`/`echo`/`sleep` subprocesses and Unix
+//! process-group kill, so the suite is Unix-only.
+#![cfg(unix)]
 
 use std::path::Path;
 use std::time::Duration;

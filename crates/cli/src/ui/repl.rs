@@ -602,8 +602,7 @@ async fn surface_background_completions(
             elapsed,
         );
 
-        let msg =
-            agent_code_lib::services::task_surface::build_completion_message(&info, &output);
+        let msg = agent_code_lib::services::task_surface::build_completion_message(&info, &output);
         engine.state_mut().push_message(msg);
     }
 }

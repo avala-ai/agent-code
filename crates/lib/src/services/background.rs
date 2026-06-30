@@ -460,12 +460,20 @@ async fn run_shell_task(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            finalize_shell_task(task_id, tasks, TaskStatus::Failed(e.to_string()), &e.to_string())
-                .await;
+            finalize_shell_task(
+                task_id,
+                tasks,
+                TaskStatus::Failed(e.to_string()),
+                &e.to_string(),
+            )
+            .await;
             return;
         }
     };
 
+    // Only needed for the Unix process-group kill below; binding it
+    // unconditionally would be an unused variable on other platforms.
+    #[cfg(unix)]
     let pid = child.id();
 
     // Drain stdout/stderr concurrently with the wait. Reader tasks own
@@ -582,6 +590,7 @@ fn task_output_path(id: &TaskId) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     /// Poll until a task leaves `Running`, or give up after `timeout_ms`.
     async fn wait_terminal(mgr: &TaskManager, id: &str, timeout_ms: u64) -> TaskStatus {
         let start = std::time::Instant::now();
@@ -608,6 +617,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_shell_completes_and_surfaces_exactly_once() {
         let mgr = TaskManager::new();
@@ -659,6 +669,7 @@ mod tests {
         assert!(!ids.contains(&killed), "killed task must not surface");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_actually_terminates_the_process() {
         // The command waits, then writes a sentinel. A real kill stops
@@ -670,7 +681,10 @@ mod tests {
         let cmd = format!("sleep 2; touch {}", sentinel.display());
 
         let mgr = TaskManager::new();
-        let id = mgr.spawn_shell(&cmd, "sleeper", Path::new(".")).await.unwrap();
+        let id = mgr
+            .spawn_shell(&cmd, "sleeper", Path::new("."))
+            .await
+            .unwrap();
         // Let the process actually start.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
