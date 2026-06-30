@@ -493,6 +493,7 @@ impl StreamSink for TerminalSink {
 /// to avoid competing with rustyline for stdin.
 fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
     let cancel_token = engine.cancel_token();
+    let steer = engine.steer_sender();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
 
@@ -503,6 +504,13 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
         if crossterm::terminal::enable_raw_mode().is_err() {
             return;
         }
+
+        // Accumulates text typed during the turn. On Enter it is injected
+        // into the running turn as steered input (a user message applied
+        // at the next agent-loop boundary). Typed characters are not
+        // echoed (raw mode, mid-stream); the queued text is confirmed on
+        // Enter instead.
+        let mut steer_buf = String::new();
 
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
             // Poll with a short timeout to check the stop flag frequently.
@@ -520,6 +528,26 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
                     KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                         cancel_token.cancel();
                         break;
+                    }
+                    KeyCode::Enter => {
+                        let text = steer_buf.trim().to_string();
+                        steer_buf.clear();
+                        if !text.is_empty() && steer.send(text.clone()).is_ok() {
+                            let preview: String = text.chars().take(60).collect();
+                            // CRLF: the terminal is in raw mode during the turn.
+                            let _ = std::io::Write::write_all(
+                                &mut std::io::stderr(),
+                                format!("\r\n  ↳ steering queued: {preview}\r\n").as_bytes(),
+                            );
+                            let _ = std::io::Write::flush(&mut std::io::stderr());
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        steer_buf.pop();
+                    }
+                    // Buffer ordinary typed characters (ignore control combos).
+                    KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        steer_buf.push(ch);
                     }
                     _ => {}
                 }

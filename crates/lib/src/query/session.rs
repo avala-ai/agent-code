@@ -69,10 +69,14 @@ impl Session {
         // targets this turn's token, and its status baseline is this
         // turn's `Running` rather than a stale terminal value left in the
         // channel by a previous turn.
-        let (status, cancel) = {
+        let (status, cancel, steer) = {
             let mut engine = self.engine.lock().await;
             engine.begin_turn();
-            (engine.turn_status(), engine.cancel_handle())
+            (
+                engine.turn_status(),
+                engine.cancel_handle(),
+                engine.steer_sender(),
+            )
         };
 
         let engine = self.engine.clone();
@@ -85,6 +89,7 @@ impl Session {
             join,
             status,
             cancel,
+            steer,
         }
     }
 }
@@ -94,6 +99,7 @@ pub struct TurnHandle {
     join: tokio::task::JoinHandle<Result<()>>,
     status: watch::Receiver<TurnStatus>,
     cancel: Arc<std::sync::Mutex<CancellationToken>>,
+    steer: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl TurnHandle {
@@ -107,6 +113,13 @@ impl TurnHandle {
     /// even while the turn task holds it.
     pub fn cancel(&self) {
         self.cancel.lock().unwrap().cancel();
+    }
+
+    /// Steer the running turn: inject `text` as a user message at the
+    /// turn's next agent-loop iteration boundary. Returns `false` if the
+    /// turn's engine has gone away. Works without the engine lock.
+    pub fn steer(&self, text: impl Into<String>) -> bool {
+        self.steer.send(text.into()).is_ok()
     }
 
     /// Wait until the turn reaches a terminal status and return it.

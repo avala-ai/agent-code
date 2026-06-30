@@ -79,6 +79,14 @@ pub struct QueryEngine {
     cached_system_prompt: Option<(u64, String)>, // (hash, prompt)
     /// Publishes the current turn's [`TurnStatus`] to observers.
     turn_status: tokio::sync::watch::Sender<TurnStatus>,
+    /// Sender side of the steering channel. Cloned out via
+    /// [`Self::steer_sender`] so a caller can inject input into a turn
+    /// that is already running.
+    steer_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Receiver side, drained at each agent-loop iteration boundary so
+    /// steered input is injected as a user message before the next LLM
+    /// call (see [`Self::run_turn_inner`]).
+    steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
 /// Callback for streaming events to the UI.
@@ -142,6 +150,7 @@ impl QueryEngine {
     ) -> Self {
         let cancel = CancellationToken::new();
         let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             llm,
             tools,
@@ -166,6 +175,8 @@ impl QueryEngine {
             permission_prompter: None,
             cached_system_prompt: None,
             turn_status: tokio::sync::watch::channel(TurnStatus::Idle).0,
+            steer_tx,
+            steer_rx,
         }
     }
 
@@ -595,6 +606,21 @@ impl QueryEngine {
             self.state.turn_count = turn + 1;
             self.state.is_query_active = true;
             sink.on_turn_start(turn + 1);
+
+            // Steering: drain any input submitted mid-turn and inject it
+            // as a user message before this iteration's LLM call. This is
+            // a clean boundary — the previous iteration's assistant +
+            // tool-result messages are already appended — so steered
+            // input reads as new user input rather than splitting a
+            // tool-use/tool-result pair.
+            while let Ok(steer) = self.steer_rx.try_recv() {
+                let trimmed = steer.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                sink.on_warning(&format!("↳ steering: {trimmed}"));
+                self.state.push_message(user_message(trimmed));
+            }
 
             // Budget check before each turn.
             let budget_config = crate::services::budget::BudgetConfig::default();
@@ -1420,6 +1446,15 @@ impl QueryEngine {
     /// `borrow()` with `changed().await` to wait for a terminal state.
     pub fn turn_status(&self) -> tokio::sync::watch::Receiver<TurnStatus> {
         self.turn_status.subscribe()
+    }
+
+    /// A sender for steering: input pushed here is injected as a user
+    /// message at the next agent-loop iteration boundary of the running
+    /// turn (or the start of the next turn). Cloneable; works without the
+    /// engine lock, so a [`Session`] turn handle can steer a turn that
+    /// currently owns the engine.
+    pub fn steer_sender(&self) -> tokio::sync::mpsc::UnboundedSender<String> {
+        self.steer_tx.clone()
     }
 
     /// Shared cancel handle that always points at the current turn's
@@ -2725,5 +2760,119 @@ mod tests {
                 .await
                 .expect("cancelled turn should reach terminal status");
         assert_eq!(final_status, TurnStatus::Aborted);
+    }
+
+    // ---- steering ----
+
+    fn user_message_texts(engine: &QueryEngine) -> Vec<String> {
+        use crate::llm::message::{ContentBlock, Message};
+        engine
+            .state()
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(
+                    u.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn steering_injects_input_as_a_user_message() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        // Submit steered input before the turn; it is drained at the
+        // iteration boundary and injected as a user message.
+        engine
+            .steer_sender()
+            .send("also handle the edge case".into())
+            .unwrap();
+
+        engine
+            .run_turn_with_sink("original request", &NullSink)
+            .await
+            .expect("turn ok");
+
+        let texts = user_message_texts(&engine);
+        assert!(
+            texts.iter().any(|t| t.contains("original request")),
+            "original input missing"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("also handle the edge case")),
+            "steered input was not injected: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_steering_input_is_ignored() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        engine.steer_sender().send("   ".into()).unwrap();
+        engine.run_turn_with_sink("req", &NullSink).await.unwrap();
+        // Only the original user message — the blank steer is dropped.
+        let user_count = user_message_texts(&engine)
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .count();
+        assert_eq!(user_count, 1, "blank steered input should be ignored");
+    }
+
+    #[tokio::test]
+    async fn session_steers_a_turn_through_the_shared_channel() {
+        let session = Session::new(build_engine(Arc::new(CompletingProvider)));
+        // Queue steered input on the shared channel before spawning; the
+        // spawned turn drains it.
+        session
+            .engine()
+            .lock()
+            .await
+            .steer_sender()
+            .send("steered via session".into())
+            .unwrap();
+
+        let mut handle = session
+            .spawn_turn("orig".to_string(), Arc::new(NullSink))
+            .await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
+            .await
+            .expect("turn finishes");
+        assert_eq!(status, TurnStatus::Completed);
+
+        let engine = session.engine();
+        let engine = engine.lock().await;
+        assert!(
+            user_message_texts(&engine)
+                .iter()
+                .any(|t| t.contains("steered via session")),
+            "steered input was not injected into the spawned turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_handle_steer_succeeds_while_running() {
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new(build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        })));
+        let mut handle = session
+            .spawn_turn("orig".to_string(), Arc::new(NullSink))
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(handle.steer("nudge"), "steer should deliver while running");
+
+        // Clean up the hanging turn.
+        handle.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status()).await;
     }
 }
