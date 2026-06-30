@@ -548,6 +548,36 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Remove all finished (non-`Running`) tasks from the registry,
+    /// returning the ids that were cleared.
+    ///
+    /// Running tasks are left untouched. Each removed task's journal
+    /// file and captured-output file are deleted too, so a `clear`
+    /// reclaims disk and the task does not reappear after a restart via
+    /// [`Self::adopt`]. Used by the `/tasks clear` command to prune a
+    /// list that otherwise accumulates completed entries indefinitely.
+    pub async fn clear_finished(&self) -> Vec<TaskId> {
+        let mut removed = Vec::new();
+        let stale: Vec<TaskInfo> = {
+            let mut tasks = self.tasks.lock().await;
+            let finished: Vec<TaskId> = tasks
+                .iter()
+                .filter(|(_, info)| !matches!(info.status, TaskStatus::Running))
+                .map(|(id, _)| id.clone())
+                .collect();
+            finished
+                .into_iter()
+                .filter_map(|id| tasks.remove(&id))
+                .collect()
+        };
+        for info in stale {
+            self.unpersist(&info.id);
+            let _ = std::fs::remove_file(&info.output_file);
+            removed.push(info.id);
+        }
+        removed
+    }
+
     /// Collect newly-finished tasks for user notification, exactly once
     /// each.
     ///
@@ -968,6 +998,50 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id, id);
         assert!(mgr.drain_completions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_finished_removes_only_terminal_tasks() {
+        let mgr = TaskManager::new();
+
+        // One running, one completed, one failed, one killed.
+        let running = mgr
+            .register("run", TaskKind::LocalAgent, shell_payload("noop"))
+            .await;
+        let completed = mgr
+            .register("done", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&completed, TaskStatus::Completed)
+            .await
+            .unwrap();
+        let failed = mgr
+            .register("fail", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&failed, TaskStatus::Failed("boom".into()))
+            .await
+            .unwrap();
+        let killed = mgr
+            .register("kill", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&killed, TaskStatus::Killed).await.unwrap();
+
+        let removed = mgr.clear_finished().await;
+        assert_eq!(
+            removed.len(),
+            3,
+            "completed+failed+killed should be removed"
+        );
+        assert!(!removed.contains(&running));
+        assert!(removed.contains(&completed));
+        assert!(removed.contains(&failed));
+        assert!(removed.contains(&killed));
+
+        // Only the running task remains.
+        let remaining: Vec<TaskId> = mgr.list().await.into_iter().map(|t| t.id).collect();
+        assert_eq!(remaining, vec![running]);
+
+        // A second clear with nothing terminal is a no-op.
+        assert!(mgr.clear_finished().await.is_empty());
     }
 
     #[tokio::test]
