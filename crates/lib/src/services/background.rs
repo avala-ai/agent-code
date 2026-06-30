@@ -548,6 +548,47 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Remove finished tasks that have nothing left to surface,
+    /// returning the ids that were cleared.
+    ///
+    /// Clearable: `Killed` tasks (user-initiated, never surfaced) and
+    /// `Completed`/`Failed` tasks that have **already** been surfaced
+    /// (`notified == true`). A terminal-but-not-yet-notified task is
+    /// preserved — otherwise a completion that finished while the user
+    /// was at the prompt (before [`Self::drain_completions`] ran) would
+    /// be dropped before its toast, `TaskCompleted` hook, and injected
+    /// result message could fire. Running tasks are always left
+    /// untouched.
+    ///
+    /// Each removed task's journal and captured-output file are deleted
+    /// too, so a `clear` reclaims disk and the task does not reappear
+    /// after a restart via [`Self::adopt`].
+    pub async fn clear_finished(&self) -> Vec<TaskId> {
+        let mut removed = Vec::new();
+        let stale: Vec<TaskInfo> = {
+            let mut tasks = self.tasks.lock().await;
+            let clearable: Vec<TaskId> = tasks
+                .iter()
+                .filter(|(_, info)| match &info.status {
+                    TaskStatus::Running => false,
+                    TaskStatus::Killed => true,
+                    TaskStatus::Completed | TaskStatus::Failed(_) => info.notified,
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            clearable
+                .into_iter()
+                .filter_map(|id| tasks.remove(&id))
+                .collect()
+        };
+        for info in stale {
+            self.unpersist(&info.id);
+            let _ = std::fs::remove_file(&info.output_file);
+            removed.push(info.id);
+        }
+        removed
+    }
+
     /// Collect newly-finished tasks for user notification, exactly once
     /// each.
     ///
@@ -968,6 +1009,75 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id, id);
         assert!(mgr.drain_completions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_finished_removes_surfaced_terminal_tasks() {
+        let mgr = TaskManager::new();
+
+        let running = mgr
+            .register("run", TaskKind::LocalAgent, shell_payload("noop"))
+            .await;
+        let completed = mgr
+            .register("done", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&completed, TaskStatus::Completed)
+            .await
+            .unwrap();
+        let failed = mgr
+            .register("fail", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&failed, TaskStatus::Failed("boom".into()))
+            .await
+            .unwrap();
+        // Surface the completed + failed tasks (marks them notified), as
+        // the REPL does before reading the next prompt.
+        let surfaced = mgr.drain_completions().await;
+        assert_eq!(surfaced.len(), 2);
+
+        let killed = mgr
+            .register("kill", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&killed, TaskStatus::Killed).await.unwrap();
+
+        let removed = mgr.clear_finished().await;
+        assert_eq!(removed.len(), 3, "surfaced completed+failed+killed go");
+        assert!(!removed.contains(&running));
+        assert!(removed.contains(&completed));
+        assert!(removed.contains(&failed));
+        assert!(removed.contains(&killed));
+
+        let remaining: Vec<TaskId> = mgr.list().await.into_iter().map(|t| t.id).collect();
+        assert_eq!(remaining, vec![running]);
+
+        // A second clear with nothing clearable is a no-op.
+        assert!(mgr.clear_finished().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_finished_preserves_unsurfaced_completions() {
+        // A task that finished but has not been surfaced yet
+        // (`notified == false`) must survive a clear, so its toast /
+        // TaskCompleted hook / injected result can still fire.
+        let mgr = TaskManager::new();
+        let pending = mgr
+            .register("just-finished", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        mgr.set_status(&pending, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        // No drain yet → not notified → preserved.
+        let removed = mgr.clear_finished().await;
+        assert!(
+            removed.is_empty(),
+            "unsurfaced completion must not be cleared: {removed:?}"
+        );
+        assert_eq!(mgr.list().await.len(), 1);
+
+        // After it surfaces, a subsequent clear removes it.
+        assert_eq!(mgr.drain_completions().await.len(), 1);
+        assert_eq!(mgr.clear_finished().await, vec![pending]);
     }
 
     #[tokio::test]

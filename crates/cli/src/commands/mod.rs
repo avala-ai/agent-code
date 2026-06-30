@@ -262,7 +262,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "tasks",
         aliases: &[],
-        description: "List background tasks (also: output <id>, kill <id>)",
+        description: "List background tasks (also: output <id>, kill <id>, clear)",
         hidden: false,
     },
     Command {
@@ -1468,6 +1468,14 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                             .unwrap_or_else(|_| Err("output worker thread panicked".to_string()));
                     print!("{}", render_task_output(&id, result));
                 }
+                TasksAction::Clear => {
+                    let removed =
+                        std::thread::spawn(move || rt.block_on(task_mgr.clear_finished()))
+                            .join()
+                            .map(|ids| ids.len())
+                            .unwrap_or(0);
+                    print!("{}", render_clear_result(removed));
+                }
                 TasksAction::Usage(msg) => {
                     println!("{msg}");
                 }
@@ -2402,6 +2410,8 @@ enum TasksAction {
     Kill(String),
     /// `/tasks output <id>` — dump a task's captured output.
     Output(String),
+    /// `/tasks clear` — prune all finished tasks from the list.
+    Clear,
     /// Malformed input — the carried string is the message to print.
     Usage(String),
 }
@@ -2429,8 +2439,9 @@ fn parse_tasks_subcommand(args: Option<&str>) -> TasksAction {
             Some(id) => TasksAction::Output(id.to_string()),
             None => TasksAction::Usage("Usage: /tasks output <id>".to_string()),
         },
+        "clear" | "clean" | "prune" => TasksAction::Clear,
         other => TasksAction::Usage(format!(
-            "Unknown /tasks subcommand '{other}'. Try: /tasks, /tasks output <id>, /tasks kill <id>"
+            "Unknown /tasks subcommand '{other}'. Try: /tasks, /tasks output <id>, /tasks kill <id>, /tasks clear"
         )),
     }
 }
@@ -2440,6 +2451,16 @@ fn render_kill_result(id: &str, result: Result<(), String>) -> String {
     match result {
         Ok(()) => format!("Killed task '{id}'.\n"),
         Err(e) => format!("{e}\n"),
+    }
+}
+
+/// Render the outcome of `/tasks clear` (the count of finished tasks
+/// pruned) to the line printed back.
+fn render_clear_result(removed: usize) -> String {
+    match removed {
+        0 => "No finished tasks to clear.\n".to_string(),
+        1 => "Cleared 1 finished task.\n".to_string(),
+        n => format!("Cleared {n} finished tasks.\n"),
     }
 }
 
@@ -2525,7 +2546,7 @@ fn format_task_list(
         ));
     }
     out.push_str(
-        "\nUse /tasks output <id> to read output; /tasks kill <id> to cancel a running task.\n",
+        "\nUse /tasks output <id> to read output; /tasks kill <id> to cancel a running task; /tasks clear to prune finished tasks.\n",
     );
     out
 }
@@ -7926,6 +7947,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_tasks_clear_aliases() {
+        for verb in ["clear", "clean", "prune"] {
+            assert_eq!(
+                parse_tasks_subcommand(Some(verb)),
+                TasksAction::Clear,
+                "verb {verb} should map to Clear",
+            );
+        }
+        // `clear` ignores any trailing token.
+        assert_eq!(
+            parse_tasks_subcommand(Some("clear bg_1")),
+            TasksAction::Clear
+        );
+    }
+
+    #[test]
+    fn render_clear_result_pluralizes() {
+        assert_eq!(render_clear_result(0), "No finished tasks to clear.\n");
+        assert_eq!(render_clear_result(1), "Cleared 1 finished task.\n");
+        assert_eq!(render_clear_result(3), "Cleared 3 finished tasks.\n");
+    }
+
+    #[test]
     fn parse_tasks_ignores_trailing_tokens() {
         // Extra arguments after the id are tolerated — we only take
         // the first id token.
@@ -7972,6 +8016,7 @@ mod tests {
             TasksAction::List => format_task_list(&mgr.list().await, std::time::Instant::now()),
             TasksAction::Kill(id) => render_kill_result(&id, mgr.kill(&id).await),
             TasksAction::Output(id) => render_task_output(&id, mgr.read_output(&id).await),
+            TasksAction::Clear => render_clear_result(mgr.clear_finished().await.len()),
             TasksAction::Usage(msg) => format!("{msg}\n"),
         }
     }
@@ -8039,6 +8084,19 @@ mod tests {
         // 4) Bare `/tasks` lists both tasks.
         let listed = run_tasks_command(&mgr, None).await;
         assert!(listed.contains(&echo_id) && listed.contains(&sleep_id));
+
+        // 5) `/tasks clear` prunes finished tasks — but only ones already
+        //    surfaced. Drain first (as the REPL does before the prompt)
+        //    so the completed echo is marked notified; the killed sleep
+        //    is always clearable. Then clear and confirm the list empties.
+        let _ = mgr.drain_completions().await;
+        let cleared = run_tasks_command(&mgr, Some("clear")).await;
+        assert!(cleared.contains("Cleared 2 finished tasks"), "{cleared:?}");
+        let after = run_tasks_command(&mgr, None).await;
+        assert!(
+            !after.contains(&echo_id) && !after.contains(&sleep_id),
+            "cleared tasks should be gone: {after:?}"
+        );
     }
 
     #[tokio::test]
