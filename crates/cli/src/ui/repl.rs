@@ -630,6 +630,10 @@ async fn surface_background_completions(
             elapsed,
         );
 
+        // Fire TaskCompleted hooks so automation can react to background
+        // work finishing (open/hookable — the closed agents aren't).
+        let _ = engine.fire_task_completed_hooks(&info).await;
+
         let msg = agent_code_lib::services::task_surface::build_completion_message(&info, &output);
         engine.state_mut().push_message(msg);
     }

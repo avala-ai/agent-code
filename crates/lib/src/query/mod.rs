@@ -344,6 +344,32 @@ impl QueryEngine {
         self.hooks.run_hooks(&HookEvent::Stop, None, &ctx).await
     }
 
+    /// Run any configured `TaskCompleted` hooks for a finished background
+    /// task. Fired from the interactive surfacing path as each terminal
+    /// task is reported, so automation can react to background work
+    /// finishing (chain a follow-up, post to chat, kick CI) without
+    /// polling `/tasks`.
+    pub async fn fire_task_completed_hooks(
+        &self,
+        info: &crate::services::background::TaskInfo,
+    ) -> Vec<crate::hooks::HookResult> {
+        let duration_secs = info
+            .finished_at
+            .map(|f| f.saturating_duration_since(info.started_at).as_secs())
+            .unwrap_or(0);
+        let ctx = serde_json::json!({
+            "session_id": self.state.session_id,
+            "id": info.id,
+            "kind": info.kind.as_str(),
+            "status": crate::services::task_surface::status_label(&info.status),
+            "description": info.description,
+            "duration_secs": duration_secs,
+        });
+        self.hooks
+            .run_hooks(&HookEvent::TaskCompleted, None, &ctx)
+            .await
+    }
+
     /// Run any configured `Error` hooks. Fired when a turn exits in
     /// an error. Context carries a `stage` tag identifying where the
     /// failure happened and a `message` describing it, so pagers /
@@ -2997,6 +3023,55 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "turn did not run another iteration to handle steered input"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fire_task_completed_hooks_delivers_task_context() {
+        use crate::config::{HookAction, HookDefinition, HookEvent};
+        use crate::services::background::{TaskInfo, TaskKind, TaskStatus};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        engine.load_hooks(&[HookDefinition {
+            event: HookEvent::TaskCompleted,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: format!("printf '%s' \"$AGENT_CODE_HOOK_CONTEXT\" > {path:?}"),
+            },
+        }]);
+
+        let info = TaskInfo {
+            id: "a99".into(),
+            description: "demo".into(),
+            status: TaskStatus::Completed,
+            output_file: std::path::PathBuf::from("/tmp/x"),
+            kind: TaskKind::LocalAgent,
+            payload: None,
+            subagent_color: None,
+            notified: false,
+            pid: None,
+            started_at: std::time::Instant::now(),
+            finished_at: Some(std::time::Instant::now()),
+        };
+
+        let results = engine.fire_task_completed_hooks(&info).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "hook failed: {:?}", results[0].stderr);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"id\":\"a99\""), "id missing: {body}");
+        assert!(
+            body.contains("\"status\":\"completed\""),
+            "status missing: {body}"
+        );
+        assert!(
+            body.contains("\"kind\":\"LocalAgent\""),
+            "kind missing: {body}"
         );
     }
 }

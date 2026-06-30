@@ -716,6 +716,14 @@ pub enum HookEvent {
     /// DenialTracker. Fired per-denial, batched once per turn after
     /// the turn completes (new denials since the last turn).
     PermissionDenied,
+    /// Fired when a background task (a `bash … &` job or a spawned
+    /// subagent) reaches a terminal state and is surfaced to the user.
+    /// Context carries `id`, `kind`, `status` (`completed` / `failed`),
+    /// `description`, and `duration_secs`. Lets automation react to
+    /// background work finishing — chain a follow-up, post to chat,
+    /// kick CI — without polling `/tasks`. Open and hookable where the
+    /// closed agents are not.
+    TaskCompleted,
 }
 
 /// A configured hook action.
