@@ -262,7 +262,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "tasks",
         aliases: &[],
-        description: "List background tasks",
+        description: "List background tasks (also: output <id>, kill <id>)",
         hidden: false,
     },
     Command {
@@ -1436,17 +1436,42 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("tasks") => {
-            // Snapshot the in-process TaskManager directly. Previously
-            // this command bounced through an LLM turn — the agent
-            // would call TaskList itself — which burned a turn and
-            // tokens for information we already have locally.
+            // Operate on the in-process TaskManager directly. Previously
+            // this command bounced through an LLM turn — the agent would
+            // call TaskList/TaskStop/TaskOutput itself — which burned a
+            // turn and tokens for actions we can do locally. We drive the
+            // async TaskManager from a scratch OS thread because `execute`
+            // runs inside the REPL's tokio runtime, where `block_on`
+            // would panic.
             let task_mgr = engine.state().task_manager.clone();
             let rt = tokio::runtime::Handle::current();
-            let tasks = std::thread::spawn(move || rt.block_on(task_mgr.list()))
-                .join()
-                .unwrap_or_default();
-            let now = std::time::Instant::now();
-            print!("{}", format_task_list(&tasks, now));
+            match parse_tasks_subcommand(args) {
+                TasksAction::List => {
+                    let tasks = std::thread::spawn(move || rt.block_on(task_mgr.list()))
+                        .join()
+                        .unwrap_or_default();
+                    let now = std::time::Instant::now();
+                    print!("{}", format_task_list(&tasks, now));
+                }
+                TasksAction::Kill(id) => {
+                    let target = id.clone();
+                    let result = std::thread::spawn(move || rt.block_on(task_mgr.kill(&target)))
+                        .join()
+                        .unwrap_or_else(|_| Err("kill worker thread panicked".to_string()));
+                    print!("{}", render_kill_result(&id, result));
+                }
+                TasksAction::Output(id) => {
+                    let target = id.clone();
+                    let result =
+                        std::thread::spawn(move || rt.block_on(task_mgr.read_output(&target)))
+                            .join()
+                            .unwrap_or_else(|_| Err("output worker thread panicked".to_string()));
+                    print!("{}", render_task_output(&id, result));
+                }
+                TasksAction::Usage(msg) => {
+                    println!("{msg}");
+                }
+            }
             CommandResult::Handled
         }
         Some("permissions") | Some("perms") => {
@@ -2367,6 +2392,70 @@ const HOOK_EVENT_CATALOG: &[(&str, &str)] = &[
 /// tested without spinning up a real tokio runtime or TaskManager.
 /// `now` is accepted as a parameter so tests can pin the timestamp
 /// instead of reading the real clock.
+/// A parsed `/tasks` invocation. Keeping the parse pure (no I/O) lets
+/// us unit-test the dispatch table without a live `TaskManager`.
+#[derive(Debug, PartialEq, Eq)]
+enum TasksAction {
+    /// `/tasks` (or `/tasks list`) — snapshot the table.
+    List,
+    /// `/tasks kill <id>` — terminate a running task.
+    Kill(String),
+    /// `/tasks output <id>` — dump a task's captured output.
+    Output(String),
+    /// Malformed input — the carried string is the message to print.
+    Usage(String),
+}
+
+/// Parse the argument string after `/tasks` into a [`TasksAction`].
+///
+/// Bare `/tasks` lists. `kill`/`stop`/`cancel` and
+/// `output`/`out`/`log`/`logs` take a task id. Anything else is a
+/// usage error rather than a silent no-op.
+fn parse_tasks_subcommand(args: Option<&str>) -> TasksAction {
+    let args = args.map(str::trim).unwrap_or("");
+    if args.is_empty() {
+        return TasksAction::List;
+    }
+    let mut parts = args.split_whitespace();
+    let sub = parts.next().unwrap_or("");
+    let id = parts.next();
+    match sub {
+        "list" => TasksAction::List,
+        "kill" | "stop" | "cancel" => match id {
+            Some(id) => TasksAction::Kill(id.to_string()),
+            None => TasksAction::Usage("Usage: /tasks kill <id>".to_string()),
+        },
+        "output" | "out" | "log" | "logs" => match id {
+            Some(id) => TasksAction::Output(id.to_string()),
+            None => TasksAction::Usage("Usage: /tasks output <id>".to_string()),
+        },
+        other => TasksAction::Usage(format!(
+            "Unknown /tasks subcommand '{other}'. Try: /tasks, /tasks output <id>, /tasks kill <id>"
+        )),
+    }
+}
+
+/// Render the outcome of a `/tasks kill <id>` to the line printed back.
+fn render_kill_result(id: &str, result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("Killed task '{id}'.\n"),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+/// Render the outcome of a `/tasks output <id>` to the text printed
+/// back. Empty output is reported explicitly (rather than printing a
+/// blank line), and a trailing newline is ensured so the next prompt
+/// starts cleanly.
+fn render_task_output(id: &str, result: Result<String, String>) -> String {
+    match result {
+        Ok(out) if out.trim().is_empty() => format!("Task '{id}' has produced no output yet.\n"),
+        Ok(out) if out.ends_with('\n') => format!("Output of task '{id}':\n\n{out}"),
+        Ok(out) => format!("Output of task '{id}':\n\n{out}\n"),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
 fn format_task_list(
     tasks: &[agent_code_lib::services::background::TaskInfo],
     now: std::time::Instant,
@@ -2435,7 +2524,9 @@ fn format_task_list(
             desc,
         ));
     }
-    out.push_str("\nUse TaskOutput to read output; TaskStop to cancel a running task.\n");
+    out.push_str(
+        "\nUse /tasks output <id> to read output; /tasks kill <id> to cancel a running task.\n",
+    );
     out
 }
 
@@ -7780,6 +7871,174 @@ mod tests {
         // mixed-row case.
         assert!(out.contains(TaskKind::LocalAgent.as_str()));
         assert!(out.contains(TaskKind::LocalShell.as_str()));
+    }
+
+    // ---- /tasks subcommand parsing & rendering ----
+
+    #[test]
+    fn parse_tasks_bare_and_list_are_list() {
+        assert_eq!(parse_tasks_subcommand(None), TasksAction::List);
+        assert_eq!(parse_tasks_subcommand(Some("")), TasksAction::List);
+        assert_eq!(parse_tasks_subcommand(Some("   ")), TasksAction::List);
+        assert_eq!(parse_tasks_subcommand(Some("list")), TasksAction::List);
+    }
+
+    #[test]
+    fn parse_tasks_kill_aliases() {
+        for verb in ["kill", "stop", "cancel"] {
+            assert_eq!(
+                parse_tasks_subcommand(Some(&format!("{verb} bg_3"))),
+                TasksAction::Kill("bg_3".to_string()),
+                "verb {verb} should map to Kill",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tasks_output_aliases() {
+        for verb in ["output", "out", "log", "logs"] {
+            assert_eq!(
+                parse_tasks_subcommand(Some(&format!("{verb} bg_7"))),
+                TasksAction::Output("bg_7".to_string()),
+                "verb {verb} should map to Output",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tasks_missing_id_is_usage() {
+        match parse_tasks_subcommand(Some("kill")) {
+            TasksAction::Usage(msg) => assert!(msg.contains("kill <id>")),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        match parse_tasks_subcommand(Some("output")) {
+            TasksAction::Usage(msg) => assert!(msg.contains("output <id>")),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tasks_unknown_subcommand_is_usage() {
+        match parse_tasks_subcommand(Some("frobnicate bg_1")) {
+            TasksAction::Usage(msg) => assert!(msg.contains("frobnicate")),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tasks_ignores_trailing_tokens() {
+        // Extra arguments after the id are tolerated — we only take
+        // the first id token.
+        assert_eq!(
+            parse_tasks_subcommand(Some("kill bg_2 extra junk")),
+            TasksAction::Kill("bg_2".to_string()),
+        );
+    }
+
+    #[test]
+    fn render_kill_result_ok_and_err() {
+        assert_eq!(render_kill_result("bg_4", Ok(())), "Killed task 'bg_4'.\n");
+        let err = render_kill_result("bg_9", Err("Task 'bg_9' not found".to_string()));
+        assert_eq!(err, "Task 'bg_9' not found\n");
+    }
+
+    #[test]
+    fn render_task_output_variants() {
+        // Empty / whitespace-only output reports the no-output message.
+        assert!(render_task_output("bg_1", Ok(String::new())).contains("no output yet"));
+        assert!(render_task_output("bg_1", Ok("   \n".to_string())).contains("no output yet"));
+        // Output without a trailing newline gets one appended.
+        let no_nl = render_task_output("bg_1", Ok("hello".to_string()));
+        assert_eq!(no_nl, "Output of task 'bg_1':\n\nhello\n");
+        // Output already ending in newline is not double-spaced.
+        let with_nl = render_task_output("bg_1", Ok("hello\n".to_string()));
+        assert_eq!(with_nl, "Output of task 'bg_1':\n\nhello\n");
+        // Errors are passed through with a trailing newline.
+        let err = render_task_output("bg_x", Err("Task 'bg_x' not found".to_string()));
+        assert_eq!(err, "Task 'bg_x' not found\n");
+    }
+
+    /// Faithful mirror of the `Some("tasks")` arm's per-action dispatch,
+    /// minus the `execute()` string match (covered by the parse tests)
+    /// and the runtime/thread plumbing. Lets the e2e test below drive
+    /// the real `TaskManager` through the same path a user's `/tasks …`
+    /// would take.
+    #[cfg(unix)]
+    async fn run_tasks_command(
+        mgr: &agent_code_lib::services::background::TaskManager,
+        args: Option<&str>,
+    ) -> String {
+        match parse_tasks_subcommand(args) {
+            TasksAction::List => format_task_list(&mgr.list().await, std::time::Instant::now()),
+            TasksAction::Kill(id) => render_kill_result(&id, mgr.kill(&id).await),
+            TasksAction::Output(id) => render_task_output(&id, mgr.read_output(&id).await),
+            TasksAction::Usage(msg) => format!("{msg}\n"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tasks_command_manages_real_tasks_end_to_end() {
+        use agent_code_lib::services::background::{TaskManager, TaskStatus};
+
+        let mgr = TaskManager::new();
+        let cwd = std::env::current_dir().unwrap();
+
+        // 1) A quick shell task: spawn, wait for completion, read its
+        //    output via `/tasks output <id>`.
+        let echo_id = mgr
+            .spawn_shell("echo hello-from-task", "echo", &cwd)
+            .await
+            .expect("spawn echo task");
+        // Poll until the task reaches a terminal state.
+        let mut done = false;
+        for _ in 0..200 {
+            let terminal = mgr
+                .list()
+                .await
+                .into_iter()
+                .find(|t| t.id == echo_id)
+                .map(|t| !matches!(t.status, TaskStatus::Running))
+                .unwrap_or(false);
+            if terminal {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(done, "echo task should finish promptly");
+        let out = run_tasks_command(&mgr, Some(&format!("output {echo_id}"))).await;
+        assert!(
+            out.contains("hello-from-task"),
+            "output command should surface the captured stdout: {out:?}"
+        );
+
+        // 2) A long-running task: `/tasks kill <id>` terminates it and
+        //    flips its status to Killed.
+        let sleep_id = mgr
+            .spawn_shell("sleep 60", "sleep", &cwd)
+            .await
+            .expect("spawn sleep task");
+        let killed = run_tasks_command(&mgr, Some(&format!("kill {sleep_id}"))).await;
+        assert_eq!(killed, format!("Killed task '{sleep_id}'.\n"));
+        let status = mgr
+            .list()
+            .await
+            .into_iter()
+            .find(|t| t.id == sleep_id)
+            .map(|t| t.status);
+        assert_eq!(status, Some(TaskStatus::Killed));
+
+        // 3) Unknown id is reported, not silently ignored.
+        let missing = run_tasks_command(&mgr, Some("output bg_does_not_exist")).await;
+        assert!(
+            missing.contains("not found"),
+            "unknown id should report not-found: {missing:?}"
+        );
+
+        // 4) Bare `/tasks` lists both tasks.
+        let listed = run_tasks_command(&mgr, None).await;
+        assert!(listed.contains(&echo_id) && listed.contains(&sleep_id));
     }
 
     #[tokio::test]
