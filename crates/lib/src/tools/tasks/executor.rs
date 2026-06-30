@@ -166,11 +166,12 @@ impl TaskExecutorRegistry {
 
 /// Build the default registry: one executor per [`TaskKind`].
 ///
-/// `LocalShell` and `LocalAgent` reuse the existing tool path so we
-/// do not duplicate logic. The remaining kinds are stubbed —
-/// `MonitorMcp` and `Dream` raise `NotImplemented`, `RemoteAgent`
-/// is a thin wrapper over the existing `RemoteTrigger` cron path
-/// that lands fully in 8.14.
+/// `LocalShell` and `LocalAgent` reuse the existing tool path so we do
+/// not duplicate logic. `LocalWorkflow` resolves a skill slug and runs
+/// it as a subagent through the same path. The remaining kinds are
+/// stubbed — `MonitorMcp` and `Dream` raise `NotImplemented`,
+/// `RemoteAgent` is a thin wrapper over the existing `RemoteTrigger`
+/// cron path that lands fully in 8.14.
 pub fn default_registry() -> TaskExecutorRegistry {
     use super::executors::{
         DreamExecutor, LocalAgentExecutor, LocalShellExecutor, LocalWorkflowExecutor,
