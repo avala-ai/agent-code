@@ -46,7 +46,7 @@ impl TaskExecutor for LocalWorkflowExecutor {
         // Resolve the skill slug to a concrete prompt (the only
         // workflow-specific step; subagent execution is reused below).
         let registry = SkillRegistry::load_all(Some(ctx.cwd.as_path()));
-        let prompt = resolve_workflow_prompt(&workflow, &args, &registry)?;
+        let prompt = resolve_workflow_prompt(&workflow, &args, &registry, ctx.disable_skill_shell)?;
 
         // From here this mirrors the LocalAgent executor: register a queue
         // entry, run the expanded prompt as a subagent, drive the status.
@@ -100,6 +100,17 @@ impl TaskExecutor for LocalWorkflowExecutor {
         let outcome = AgentTool.call(input, &tool_ctx).await;
 
         if let (Some(tm), Some(id)) = (ctx.task_manager.as_ref(), task_id.as_ref()) {
+            // Persist the subagent's output to the registered task's
+            // file *before* marking it terminal. Completion surfacing
+            // and `TaskOutput` read that file; without this the workflow
+            // would surface/inject empty output despite producing content
+            // (the subagent runs in-process, so nothing else writes it).
+            let captured = match &outcome {
+                Ok(r) => r.content.clone(),
+                Err(e) => e.to_string(),
+            };
+            let _ = tm.write_output(id, &captured).await;
+
             let status = match &outcome {
                 Ok(r) if !r.is_error => TaskStatus::Completed,
                 Ok(_) => TaskStatus::Failed("workflow reported error".into()),
@@ -125,10 +136,15 @@ impl TaskExecutor for LocalWorkflowExecutor {
 /// Errors (as `InvalidPayload`) when the slug is empty, unknown, or
 /// expands to nothing — so a caller gets a clear message rather than a
 /// silently-empty subagent. Pure, so it can be tested without spawning.
+///
+/// `disable_shell` mirrors `security.disable_skill_shell_execution`:
+/// when set, fenced shell blocks in the template are stripped before the
+/// prompt reaches the autonomous subagent.
 pub fn resolve_workflow_prompt(
     workflow: &str,
     args: &serde_json::Value,
     registry: &SkillRegistry,
+    disable_shell: bool,
 ) -> Result<String, TaskError> {
     if workflow.trim().is_empty() {
         return Err(TaskError::InvalidPayload(
@@ -141,7 +157,7 @@ pub fn resolve_workflow_prompt(
         .ok_or_else(|| TaskError::InvalidPayload(format!("unknown workflow/skill '{workflow}'")))?;
 
     let args_str = workflow_args_to_str(args);
-    let prompt = skill.expand(args_str.as_deref());
+    let prompt = skill.expand_safe(args_str.as_deref(), disable_shell);
     if prompt.trim().is_empty() {
         return Err(TaskError::InvalidPayload(format!(
             "workflow/skill '{workflow}' expanded to an empty prompt"
@@ -179,7 +195,8 @@ mod tests {
     #[test]
     fn empty_slug_is_invalid() {
         let reg = SkillRegistry::load_bundled_only();
-        let err = resolve_workflow_prompt("   ", &serde_json::Value::Null, &reg).unwrap_err();
+        let err =
+            resolve_workflow_prompt("   ", &serde_json::Value::Null, &reg, false).unwrap_err();
         assert!(matches!(err, TaskError::InvalidPayload(_)));
     }
 
@@ -190,6 +207,7 @@ mod tests {
             "definitely-not-a-real-skill",
             &serde_json::Value::Null,
             &reg,
+            false,
         )
         .unwrap_err();
         match err {
@@ -207,11 +225,43 @@ mod tests {
             .expect("at least one bundled skill")
             .name
             .clone();
-        let prompt = resolve_workflow_prompt(&name, &serde_json::Value::Null, &reg).unwrap();
+        let prompt = resolve_workflow_prompt(&name, &serde_json::Value::Null, &reg, false).unwrap();
         assert!(
             !prompt.trim().is_empty(),
             "skill '{name}' gave empty prompt"
         );
+    }
+
+    #[test]
+    fn disable_shell_strips_fenced_blocks_from_workflow_prompt() {
+        // A registry holding one skill whose body has a fenced bash
+        // block. With the security flag off the block survives; with it
+        // on, the block is replaced by the disabled notice before the
+        // prompt would reach a subagent.
+        let skill = crate::skills::Skill {
+            name: "deploy".into(),
+            metadata: Default::default(),
+            body: "Run this:\n```bash\nrm -rf /\n```\nThen report.".into(),
+            source: PathBuf::from("test"),
+        };
+        let reg = SkillRegistry::from_skills(vec![skill]);
+
+        let allowed =
+            resolve_workflow_prompt("deploy", &serde_json::Value::Null, &reg, false).unwrap();
+        assert!(allowed.contains("rm -rf /"), "shell kept when allowed");
+
+        let stripped =
+            resolve_workflow_prompt("deploy", &serde_json::Value::Null, &reg, true).unwrap();
+        assert!(
+            !stripped.contains("rm -rf /"),
+            "shell must be stripped when disabled: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("Shell execution disabled"),
+            "stripped prompt should carry the disabled notice: {stripped:?}"
+        );
+        // Non-shell prose is preserved either way.
+        assert!(stripped.contains("Then report."));
     }
 
     #[test]

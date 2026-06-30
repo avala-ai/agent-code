@@ -91,6 +91,13 @@ pub struct TaskContext {
     /// so freshly-built test contexts that don't exercise color
     /// assignment can still be constructed via [`Self::new`].
     pub subagent_colors: Option<Arc<crate::services::subagent_colors::SubagentColorManager>>,
+    /// Mirror of `security.disable_skill_shell_execution`. When `true`,
+    /// fenced shell blocks in a skill/workflow template are stripped
+    /// before the prompt is handed to a subagent (see
+    /// [`crate::skills::Skill::expand_safe`]). Defaults to `false` so a
+    /// dispatch site that hasn't wired config yet preserves today's
+    /// behavior; the production driver threads the real flag in.
+    pub disable_skill_shell: bool,
 }
 
 impl TaskContext {
@@ -100,6 +107,7 @@ impl TaskContext {
             cancel: CancellationToken::new(),
             task_manager: None,
             subagent_colors: None,
+            disable_skill_shell: false,
         }
     }
 }
