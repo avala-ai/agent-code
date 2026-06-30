@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **Tab-completion for `/tasks` subcommands**: typing `/tasks ` and pressing Tab now completes the management subcommands (`list`, `output`, `kill`, `clear`) with short descriptions, so the task-management surface is discoverable from the keyboard.
 
 ## [0.23.0] - 2026-06-30
 

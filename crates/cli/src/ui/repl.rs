@@ -118,6 +118,63 @@ fn parse_background_skill(bg_input: &str) -> Option<(String, String)> {
     }
 }
 
+/// Find a `/tasks <subcommand-partial>` completion context ending at
+/// byte position `pos`. Returns `(token_byte_idx, partial)` where
+/// `token_byte_idx` is the byte position of the subcommand token (so the
+/// replacement overwrites it) and `partial` is what's typed so far.
+///
+/// Fires only when the line is `/tasks` followed by whitespace and the
+/// cursor is still inside the first (subcommand) token — so `/tasks ki`
+/// completes but `/tasks kill bg_3` no longer does (the cursor is in the
+/// id, not the subcommand).
+fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    if pos > line.len() {
+        return None;
+    }
+    let rest = line.strip_prefix("/tasks")?;
+    // Must be whitespace right after `/tasks` (rejects e.g. `/tasksfoo`).
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let trimmed = rest.trim_start();
+    let token_idx = line.len() - rest.len() + (rest.len() - trimmed.len());
+    if pos < token_idx {
+        return None;
+    }
+    let partial = &line[token_idx..pos];
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((token_idx, partial))
+}
+
+/// Completion candidates for `/tasks <partial>`: the management
+/// subcommands, scored against `partial` with the slash-command matcher.
+fn complete_tasks_subcommand(partial: &str) -> Vec<Pair> {
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        ("list", "show background tasks"),
+        ("output", "read a task's output (output <id>)"),
+        ("kill", "cancel a running task (kill <id>)"),
+        ("clear", "prune finished tasks"),
+    ];
+    let mut scored: Vec<(i32, Pair)> = SUBCOMMANDS
+        .iter()
+        .filter_map(|(name, desc)| {
+            let score = score_command(name, &[], partial)?;
+            Some((
+                score,
+                Pair {
+                    display: format!("{name} — {desc}"),
+                    replacement: name.to_string(),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Find a `&/<skill-partial>` completion context ending at byte position
 /// `pos`. Returns `(slash_byte_idx, partial)` where `slash_byte_idx` is
 /// the byte position of the `/` (so the replacement overwrites the whole
@@ -385,6 +442,15 @@ impl Completer for CommandCompleter {
             let pairs = complete_skill_name(&cwd, partial);
             if !pairs.is_empty() {
                 return Ok((slash_idx, pairs));
+            }
+        }
+
+        // `/tasks <subcommand>` completion: offer the management
+        // subcommands so the surface is discoverable from the keyboard.
+        if let Some((token_idx, partial)) = find_tasks_subcommand_context(line, pos) {
+            let pairs = complete_tasks_subcommand(partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
             }
         }
 
@@ -1924,6 +1990,67 @@ mod slash_completion_tests {
             pairs.len(),
             pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod tasks_subcommand_completion_tests {
+    use super::{complete_tasks_subcommand, find_tasks_subcommand_context};
+
+    #[test]
+    fn context_at_subcommand_start() {
+        // `/tasks ` with cursor after the space → empty partial at the
+        // token position (just past the space).
+        assert_eq!(find_tasks_subcommand_context("/tasks ", 7), Some((7, "")));
+    }
+
+    #[test]
+    fn context_with_partial() {
+        assert_eq!(
+            find_tasks_subcommand_context("/tasks ki", 9),
+            Some((7, "ki"))
+        );
+    }
+
+    #[test]
+    fn context_tolerates_extra_spaces() {
+        assert_eq!(
+            find_tasks_subcommand_context("/tasks   out", 12),
+            Some((9, "out"))
+        );
+    }
+
+    #[test]
+    fn no_context_without_trailing_space() {
+        // `/tasks` alone is normal command completion, not subcommand.
+        assert_eq!(find_tasks_subcommand_context("/tasks", 6), None);
+        // `/tasksfoo` is not the tasks command.
+        assert_eq!(find_tasks_subcommand_context("/tasksfoo", 9), None);
+    }
+
+    #[test]
+    fn no_context_once_in_the_id() {
+        // After the subcommand token + space, the cursor is in the id.
+        assert_eq!(find_tasks_subcommand_context("/tasks kill bg_3", 16), None);
+    }
+
+    #[test]
+    fn completes_known_subcommands() {
+        let all = complete_tasks_subcommand("");
+        let names: Vec<&String> = all.iter().map(|p| &p.replacement).collect();
+        for want in ["list", "output", "kill", "clear"] {
+            assert!(
+                names.iter().any(|n| *n == want),
+                "missing {want}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filters_by_partial() {
+        let pairs = complete_tasks_subcommand("k");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "kill");
     }
 }
 
