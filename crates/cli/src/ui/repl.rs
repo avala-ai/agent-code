@@ -792,6 +792,13 @@ impl Drop for EscapeWatcherGuard {
     }
 }
 
+/// The actionable hint shown in a finished-task toast: the command that
+/// reads that task's captured output. Embeds the task id so the user can
+/// copy it straight to the prompt.
+fn completion_output_hint(id: &str) -> String {
+    format!("/tasks output {id}")
+}
+
 /// Surface background tasks that finished since the last prompt.
 ///
 /// Drains the task manager once (de-duplicated by the `notified` flag),
@@ -830,10 +837,12 @@ async fn surface_background_completions(
             "✗".with(t.error)
         };
         eprintln!(
-            "  {} {} {} ({elapsed}s)",
+            "  {} {} {} ({elapsed}s) {} {}",
             dot,
             format!("background {label}:").with(t.muted),
             info.description.clone().with(t.text),
+            "·".with(t.muted),
+            completion_output_hint(&info.id).with(t.accent),
         );
 
         notifier.notify_task_complete(
@@ -1990,6 +1999,17 @@ mod slash_completion_tests {
             pairs.len(),
             pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_toast_tests {
+    use super::completion_output_hint;
+
+    #[test]
+    fn hint_points_at_tasks_output_with_id() {
+        assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
+        assert_eq!(completion_output_hint("w12"), "/tasks output w12");
     }
 }
 
