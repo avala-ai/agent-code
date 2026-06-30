@@ -179,6 +179,54 @@ fn complete_skill_name(cwd: &str, partial: &str) -> Vec<Pair> {
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
+/// Build `/`-completion candidates for `partial` (the text after the
+/// leading `/`, up to the cursor): built-in commands first, scored and
+/// sorted, then matching skill names (which are also invocable as
+/// `/name`). Skills are only offered while the partial is a single token
+/// (no args typed yet), and any skill colliding with a command name is
+/// dropped so the command wins.
+fn complete_slash(partial: &str, cwd: &str) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = crate::commands::COMMANDS
+        .iter()
+        .filter(|c| !c.hidden)
+        .filter_map(|c| {
+            let score = score_command(c.name, c.aliases, partial)?;
+            let alias_hint = if c.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (alias: /{})", c.aliases.join(", /"))
+            };
+            Some((
+                score,
+                Pair {
+                    display: format!("/{} — {}{alias_hint}", c.name, c.description),
+                    replacement: format!("/{}", c.name),
+                },
+            ))
+        })
+        .collect();
+
+    // Stable sort by score desc, then alphabetical by replacement for
+    // deterministic ordering across equal-scored matches.
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    let mut matches: Vec<Pair> = scored.into_iter().map(|(_, p)| p).collect();
+
+    // Skills are invocable as `/name` too, so offer them after the
+    // built-in commands. Only when the partial is still a single token
+    // (no args typed yet) — and skip any that collide with a command
+    // name already listed above.
+    if !partial.chars().any(|c| c.is_whitespace()) {
+        for pair in complete_skill_name(cwd, partial) {
+            if matches.iter().all(|m| m.replacement != pair.replacement) {
+                matches.push(pair);
+            }
+        }
+    }
+
+    matches
+}
+
 /// Find an `@path-partial` context ending at byte position `pos` in
 /// `line`, if any. Returns `(at_byte_idx, partial)` where `at_byte_idx`
 /// is the byte position of the `@` and `partial` is the text after it
@@ -328,37 +376,12 @@ impl Completer for CommandCompleter {
         }
 
         let partial = &line[1..pos];
-
-        let mut scored: Vec<(i32, Pair)> = crate::commands::COMMANDS
-            .iter()
-            .filter(|c| !c.hidden)
-            .filter_map(|c| {
-                let score = score_command(c.name, c.aliases, partial)?;
-                let alias_hint = if c.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (alias: /{})", c.aliases.join(", /"))
-                };
-                Some((
-                    score,
-                    Pair {
-                        display: format!("/{} — {}{alias_hint}", c.name, c.description),
-                        replacement: format!("/{}", c.name),
-                    },
-                ))
-            })
-            .collect();
-
-        // Stable sort by score desc, then alphabetical by replacement for
-        // deterministic ordering across equal-scored matches.
-        scored.sort_by(|(sa, pa), (sb, pb)| {
-            sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement))
-        });
-
-        let matches: Vec<Pair> = scored.into_iter().map(|(_, p)| p).collect();
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
 
         // Start replacement from position 0 (replacing the whole /partial).
-        Ok((0, matches))
+        Ok((0, complete_slash(partial, &cwd)))
     }
 }
 
@@ -1767,6 +1790,66 @@ mod background_skill_completion_tests {
         assert!(
             pairs.iter().any(|p| p.replacement == format!("/{name}")),
             "expected /{name} among completions for prefix {prefix:?}: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod slash_completion_tests {
+    use super::complete_slash;
+
+    #[test]
+    fn includes_builtin_commands() {
+        let pairs = complete_slash("hel", ".");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "/help"),
+            "expected /help: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn includes_matching_skills() {
+        // A bundled skill should be offered via `/` completion too.
+        let reg = agent_code_lib::skills::SkillRegistry::load_bundled_only();
+        let Some(skill) = reg.all().first() else {
+            return;
+        };
+        let name = skill.name.clone();
+        let prefix: String = name.chars().take(2).collect();
+        let pairs = complete_slash(&prefix, ".");
+        assert!(
+            pairs.iter().any(|p| p.replacement == format!("/{name}")),
+            "expected /{name} via /-completion for {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_replacements() {
+        // Even if a skill shared a command's name, each `/name` appears
+        // once. Assert the invariant holds across an empty partial
+        // (which surfaces everything).
+        let pairs = complete_slash("", ".");
+        let mut seen = std::collections::HashSet::new();
+        for p in &pairs {
+            assert!(
+                seen.insert(p.replacement.clone()),
+                "duplicate replacement {:?}",
+                p.replacement
+            );
+        }
+    }
+
+    #[test]
+    fn skips_skills_once_args_are_typed() {
+        // With a space in the partial, no skill load happens and the
+        // command scorer also yields nothing — so the result is empty.
+        let pairs = complete_slash("review some args", ".");
+        assert!(
+            pairs.is_empty(),
+            "expected no matches, got {} replacements: {:?}",
+            pairs.len(),
             pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
         );
     }
