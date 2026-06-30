@@ -726,6 +726,29 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let tips_session_count = tips_service.bump_session();
     let mut tip_shown_this_session = false;
 
+    // Enable durable background tasks: swap in a persistent task manager
+    // and adopt any tasks left over from a previous session. Reclassified
+    // / unfinished completions surface on the first prompt via
+    // surface_background_completions.
+    {
+        let tm = std::sync::Arc::new(
+            agent_code_lib::services::background::TaskManager::with_persistence(
+                agent_code_lib::services::background::tasks_dir(),
+            ),
+        );
+        let adopted = tm.adopt().await;
+        if adopted > 0 {
+            let t = super::theme::current();
+            eprintln!(
+                "  {} {}",
+                "⟡".with(t.accent),
+                format!("adopted {adopted} background task(s) from a previous session")
+                    .with(t.muted),
+            );
+        }
+        engine.state_mut().task_manager = tm;
+    }
+
     // Notifier for surfacing finished background tasks (respects config).
     let notifier = agent_code_lib::services::notifier::NotifierService::new(
         engine.state().config.notifier.clone(),

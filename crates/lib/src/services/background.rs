@@ -195,6 +195,12 @@ pub struct TaskInfo {
     /// un-notified.
     #[serde(default)]
     pub notified: bool,
+    /// OS process id of the task's running process, when it owns one
+    /// (`LocalShell`, and the background `LocalAgent` subprocess). Used
+    /// after a restart to probe whether an adopted task is still alive.
+    /// `None` for tasks without a process or before the child spawns.
+    #[serde(default)]
+    pub pid: Option<u32>,
     /// Wall-clock instants are not portable across processes; skip
     /// them in the persisted form.
     #[serde(skip, default = "std::time::Instant::now")]
@@ -212,6 +218,11 @@ pub struct TaskManager {
     /// spawned runtime can terminate the work — and, on Unix, the whole
     /// process group — instead of merely flipping a status field.
     cancels: Arc<Mutex<HashMap<TaskId, tokio_util::sync::CancellationToken>>>,
+    /// When set, each task's [`TaskInfo`] is journaled to
+    /// `<persist_dir>/<id>.json` on every transition, and [`Self::adopt`]
+    /// can reload tasks from it after a restart. `None` keeps the manager
+    /// purely in-memory (the default; used by tests).
+    persist_dir: Option<PathBuf>,
 }
 
 impl TaskManager {
@@ -220,6 +231,32 @@ impl TaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
             cancels: Arc::new(Mutex::new(HashMap::new())),
+            persist_dir: None,
+        }
+    }
+
+    /// Construct a manager that journals task state to `dir` so tasks
+    /// survive a process restart (see [`Self::adopt`]).
+    pub fn with_persistence(dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        Self {
+            persist_dir: Some(dir),
+            ..Self::new()
+        }
+    }
+
+    /// Journal a task record if persistence is enabled. Best-effort:
+    /// a failed write is logged, never fatal.
+    fn persist(&self, info: &TaskInfo) {
+        if let Some(dir) = &self.persist_dir {
+            persist_info(dir, info);
+        }
+    }
+
+    /// Remove a task's journal file if persistence is enabled.
+    fn unpersist(&self, id: &str) {
+        if let Some(dir) = &self.persist_dir {
+            let _ = std::fs::remove_file(journal_path(dir, id));
         }
     }
 
@@ -273,9 +310,11 @@ impl TaskManager {
             payload: Some(payload),
             subagent_color: color,
             notified: false,
+            pid: None,
             started_at: std::time::Instant::now(),
             finished_at: None,
         };
+        self.persist(&info);
         self.tasks.lock().await.insert(id.clone(), info);
 
         // Register a cancellation handle so `kill()` can terminate the
@@ -293,8 +332,9 @@ impl TaskManager {
         let task_id = id.clone();
         let tasks = self.tasks.clone();
         let cancels = self.cancels.clone();
+        let persist_dir = self.persist_dir.clone();
         tokio::spawn(async move {
-            run_command_task(&task_id, cmd, &tasks, cancel).await;
+            run_command_task(&task_id, cmd, &tasks, cancel, persist_dir).await;
             // Drop the cancel handle once the task is terminal.
             cancels.lock().await.remove(&task_id);
         });
@@ -350,9 +390,11 @@ impl TaskManager {
             payload: Some(payload),
             subagent_color: color,
             notified: false,
+            pid: None,
             started_at: std::time::Instant::now(),
             finished_at: None,
         };
+        self.persist(&info);
         self.tasks.lock().await.insert(id.clone(), info);
         debug!("Registered {kind:?} task {id}: {description}");
         id
@@ -361,18 +403,22 @@ impl TaskManager {
     /// Update the status of an existing task. Used by the kind-specific
     /// executors when their externally-driven work completes.
     pub async fn set_status(&self, id: &str, status: TaskStatus) -> Result<(), String> {
-        let mut tasks = self.tasks.lock().await;
-        let info = tasks
-            .get_mut(id)
-            .ok_or_else(|| format!("Task '{id}' not found"))?;
-        let now_finished = matches!(
-            status,
-            TaskStatus::Completed | TaskStatus::Failed(_) | TaskStatus::Killed,
-        );
-        info.status = status;
-        if now_finished && info.finished_at.is_none() {
-            info.finished_at = Some(std::time::Instant::now());
-        }
+        let snapshot = {
+            let mut tasks = self.tasks.lock().await;
+            let info = tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?;
+            let now_finished = matches!(
+                status,
+                TaskStatus::Completed | TaskStatus::Failed(_) | TaskStatus::Killed,
+            );
+            info.status = status;
+            if now_finished && info.finished_at.is_none() {
+                info.finished_at = Some(std::time::Instant::now());
+            }
+            info.clone()
+        };
+        self.persist(&snapshot);
         Ok(())
     }
 
@@ -406,7 +452,7 @@ impl TaskManager {
     /// without a handle (externally-driven kinds such as `LocalAgent`)
     /// just get the status transition; their executor observes it.
     pub async fn kill(&self, id: &str) -> Result<(), String> {
-        {
+        let snapshot = {
             let mut tasks = self.tasks.lock().await;
             let info = tasks
                 .get_mut(id)
@@ -415,7 +461,9 @@ impl TaskManager {
                 info.status = TaskStatus::Killed;
                 info.finished_at = Some(std::time::Instant::now());
             }
-        }
+            info.clone()
+        };
+        self.persist(&snapshot);
         // Signal the live runtime (if any) outside the tasks lock.
         if let Some(cancel) = self.cancels.lock().await.get(id) {
             cancel.cancel();
@@ -431,17 +479,81 @@ impl TaskManager {
     /// (the REPL loop) never reports the same completion twice.
     /// `Killed` tasks are user-initiated, so they are not surfaced here.
     pub async fn drain_completions(&self) -> Vec<TaskInfo> {
-        let mut tasks = self.tasks.lock().await;
         let mut drained = Vec::new();
-        for info in tasks.values_mut() {
-            if !info.notified
-                && matches!(info.status, TaskStatus::Completed | TaskStatus::Failed(_))
-            {
-                info.notified = true;
-                drained.push(info.clone());
+        {
+            let mut tasks = self.tasks.lock().await;
+            for info in tasks.values_mut() {
+                if !info.notified
+                    && matches!(info.status, TaskStatus::Completed | TaskStatus::Failed(_))
+                {
+                    info.notified = true;
+                    drained.push(info.clone());
+                }
             }
         }
+        // Persist the notified flip so a restart doesn't re-surface these.
+        for info in &drained {
+            self.persist(info);
+        }
         drained
+    }
+
+    /// Reload journaled tasks after a restart.
+    ///
+    /// For each task in the persistence directory: a still-`Running`
+    /// task whose process is gone is reclassified `Failed`; one whose
+    /// process is somehow still alive (an orphan) stays `Running` so the
+    /// user can see and kill it. Already-notified terminal tasks are
+    /// pruned (their completion was surfaced in a prior session).
+    /// Terminal-but-unnotified tasks are loaded so the next
+    /// [`Self::drain_completions`] surfaces them exactly once. Returns
+    /// the number of tasks adopted into the live set.
+    pub async fn adopt(&self) -> usize {
+        let Some(dir) = self.persist_dir.clone() else {
+            return 0;
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+
+        let mut adopted = 0usize;
+        let mut tasks = self.tasks.lock().await;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let info: TaskInfo = match std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+            {
+                Some(i) => i,
+                None => continue,
+            };
+
+            // Don't clobber a task already live in this session.
+            if tasks.contains_key(&info.id) {
+                continue;
+            }
+            // Prune already-surfaced terminal tasks.
+            let terminal = !matches!(info.status, TaskStatus::Running);
+            if terminal && info.notified {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+
+            let alive = info.pid.map(pid_alive).unwrap_or(false);
+            let info = reclassify_on_adopt(info, alive);
+            persist_info(&dir, &info);
+            tasks.insert(info.id.clone(), info);
+            adopted += 1;
+        }
+
+        if adopted > 0 {
+            info!("Adopted {adopted} background task(s) from a previous session");
+        }
+        adopted
     }
 
     async fn allocate_id(&self, prefix: &str) -> TaskId {
@@ -469,6 +581,7 @@ async fn run_command_task(
     mut cmd: tokio::process::Command,
     tasks: &Arc<Mutex<HashMap<TaskId, TaskInfo>>>,
     cancel: tokio_util::sync::CancellationToken,
+    persist_dir: Option<PathBuf>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -480,16 +593,25 @@ async fn run_command_task(
                 tasks,
                 TaskStatus::Failed(e.to_string()),
                 &e.to_string(),
+                &persist_dir,
             )
             .await;
             return;
         }
     };
 
-    // Only needed for the Unix process-group kill below; binding it
-    // unconditionally would be an unused variable on other platforms.
-    #[cfg(unix)]
+    // Record the OS pid so a restart can probe whether an adopted task
+    // is still alive. Also used for the Unix process-group kill below.
     let pid = child.id();
+    {
+        let mut t = tasks.lock().await;
+        if let Some(info) = t.get_mut(task_id) {
+            info.pid = pid;
+            if let Some(dir) = &persist_dir {
+                persist_info(dir, info);
+            }
+        }
+    }
 
     // Drain stdout/stderr concurrently with the wait. Reader tasks own
     // the pipe handles so they don't borrow `child`.
@@ -552,7 +674,7 @@ async fn run_command_task(
         }
     };
 
-    finalize_shell_task(task_id, tasks, status, &content).await;
+    finalize_shell_task(task_id, tasks, status, &content, &persist_dir).await;
 }
 
 /// Write a shell task's output and record its terminal status.
@@ -566,6 +688,7 @@ async fn finalize_shell_task(
     tasks: &Arc<Mutex<HashMap<TaskId, TaskInfo>>>,
     status: TaskStatus,
     content: &str,
+    persist_dir: &Option<PathBuf>,
 ) {
     let mut tasks = tasks.lock().await;
     if let Some(info) = tasks.get_mut(task_id) {
@@ -575,8 +698,62 @@ async fn finalize_shell_task(
             info.status = status;
             info.finished_at = Some(std::time::Instant::now());
         }
+        if let Some(dir) = persist_dir {
+            persist_info(dir, info);
+        }
         info!("Background task {} finished: {:?}", task_id, info.status);
     }
+}
+
+/// Journal one task record as `<dir>/<id>.json`. Best-effort.
+fn persist_info(dir: &Path, info: &TaskInfo) {
+    let _ = std::fs::create_dir_all(dir);
+    match serde_json::to_vec_pretty(info) {
+        Ok(bytes) => {
+            let _ = std::fs::write(journal_path(dir, &info.id), bytes);
+        }
+        Err(e) => debug!("failed to serialize task {} for journal: {e}", info.id),
+    }
+}
+
+/// Path of a task's journal file.
+fn journal_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.json"))
+}
+
+/// Probe whether a process id is still alive.
+///
+/// On Unix, `kill(pid, 0)` returns 0 when the process exists (and
+/// `EPERM` when it exists but we can't signal it) — both mean alive.
+/// On other platforms we conservatively report `false` (treat as gone).
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        // 0 → exists; EPERM → exists but unsignalable. Both mean alive.
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Reclassify a journaled task on adopt.
+///
+/// A task that was `Running` when its owning process died is no longer
+/// recoverable: if its process is gone we mark it `Failed`; if the
+/// process is somehow still alive (an orphan) we keep it `Running` so a
+/// caller can still see and kill it. Terminal tasks pass through
+/// unchanged. Pure so it can be unit-tested with a synthetic liveness
+/// value.
+fn reclassify_on_adopt(mut info: TaskInfo, alive: bool) -> TaskInfo {
+    if matches!(info.status, TaskStatus::Running) && !alive {
+        info.status = TaskStatus::Failed("interrupted by restart".to_string());
+        info.finished_at = Some(std::time::Instant::now());
+    }
+    info
 }
 
 /// Two-letter id prefix per kind so the `/tasks` table tells them
@@ -592,13 +769,19 @@ const fn id_prefix_for(kind: TaskKind) -> &'static str {
     }
 }
 
-/// Path where task output is stored.
-fn task_output_path(id: &TaskId) -> PathBuf {
-    let dir = dirs::cache_dir()
+/// Directory where task journals (`<id>.json`) and captured output
+/// (`<id>.out`) live. Shared across sessions so [`TaskManager::adopt`]
+/// can recover tasks left by a previous run.
+pub fn tasks_dir() -> PathBuf {
+    dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("agent-code")
-        .join("tasks");
-    dir.join(format!("{id}.out"))
+        .join("tasks")
+}
+
+/// Path where task output is stored.
+fn task_output_path(id: &TaskId) -> PathBuf {
+    tasks_dir().join(format!("{id}.out"))
 }
 
 #[cfg(test)]
@@ -742,5 +925,112 @@ mod tests {
             "process survived kill — sentinel was created"
         );
         let _ = std::fs::remove_file(&sentinel);
+    }
+
+    // ---- durability / adopt ----
+
+    fn unique_persist_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("agentcode-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn mk_info(id: &str, status: TaskStatus) -> TaskInfo {
+        TaskInfo {
+            id: id.into(),
+            description: "t".into(),
+            status,
+            output_file: tasks_dir().join(format!("{id}.out")),
+            kind: TaskKind::LocalShell,
+            payload: None,
+            subagent_color: None,
+            notified: false,
+            pid: None,
+            started_at: std::time::Instant::now(),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn reclassify_running_dead_becomes_failed() {
+        let out = reclassify_on_adopt(mk_info("b1", TaskStatus::Running), false);
+        assert!(matches!(out.status, TaskStatus::Failed(_)));
+        assert!(out.finished_at.is_some());
+    }
+
+    #[test]
+    fn reclassify_running_alive_stays_running() {
+        let out = reclassify_on_adopt(mk_info("b2", TaskStatus::Running), true);
+        assert_eq!(out.status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn reclassify_terminal_passes_through() {
+        let out = reclassify_on_adopt(mk_info("b3", TaskStatus::Completed), false);
+        assert_eq!(out.status, TaskStatus::Completed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_detects_self_and_missing() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0x7FFF_FFFE));
+    }
+
+    #[tokio::test]
+    async fn register_persists_a_journal_when_enabled() {
+        let dir = unique_persist_dir();
+        let mgr = TaskManager::with_persistence(dir.clone());
+        let id = mgr
+            .register("t", TaskKind::LocalAgent, TaskPayload::Dream { note: None })
+            .await;
+        assert!(journal_path(&dir, &id).exists(), "register should journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adopt_reclassifies_dead_running_task_and_replays_once() {
+        let dir = unique_persist_dir();
+        let mut info = mk_info("b777", TaskStatus::Running);
+        info.pid = Some(0x7FFF_FFFE); // implausible pid → not alive
+        persist_info(&dir, &info);
+
+        let mgr = TaskManager::with_persistence(dir.clone());
+        assert_eq!(mgr.adopt().await, 1);
+
+        let got = mgr.get_status("b777").await.unwrap();
+        assert!(
+            matches!(got.status, TaskStatus::Failed(_)),
+            "expected Failed after adopt, got {:?}",
+            got.status
+        );
+
+        // The reclassified, un-notified task surfaces exactly once.
+        assert_eq!(mgr.drain_completions().await.len(), 1);
+        assert!(mgr.drain_completions().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adopt_prunes_already_notified_terminal_task() {
+        let dir = unique_persist_dir();
+        let mut info = mk_info("b888", TaskStatus::Completed);
+        info.notified = true;
+        persist_info(&dir, &info);
+
+        let mgr = TaskManager::with_persistence(dir.clone());
+        assert_eq!(
+            mgr.adopt().await,
+            0,
+            "notified terminal task should be pruned, not adopted"
+        );
+        assert!(mgr.get_status("b888").await.is_none());
+        assert!(
+            !journal_path(&dir, "b888").exists(),
+            "pruned task's journal should be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

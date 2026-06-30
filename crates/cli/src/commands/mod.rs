@@ -7602,6 +7602,7 @@ mod tests {
             payload: None,
             subagent_color: None,
             notified: false,
+            pid: None,
             started_at: now - std::time::Duration::from_secs(started_secs_ago),
             finished_at: finished_secs_ago.map(|s| now - std::time::Duration::from_secs(s)),
         }
@@ -7739,6 +7740,7 @@ mod tests {
             payload: None,
             subagent_color: Some(color),
             notified: false,
+            pid: None,
             started_at: now - std::time::Duration::from_secs(1),
             finished_at: None,
         }

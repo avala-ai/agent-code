@@ -79,6 +79,7 @@ mod tests {
             payload: None,
             subagent_color: None,
             notified: false,
+            pid: None,
             started_at: std::time::Instant::now(),
             finished_at: None,
         }
