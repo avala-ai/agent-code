@@ -91,6 +91,13 @@ pub struct TaskContext {
     /// so freshly-built test contexts that don't exercise color
     /// assignment can still be constructed via [`Self::new`].
     pub subagent_colors: Option<Arc<crate::services::subagent_colors::SubagentColorManager>>,
+    /// Mirror of `security.disable_skill_shell_execution`. When `true`,
+    /// fenced shell blocks in a skill/workflow template are stripped
+    /// before the prompt is handed to a subagent (see
+    /// [`crate::skills::Skill::expand_safe`]). Defaults to `false` so a
+    /// dispatch site that hasn't wired config yet preserves today's
+    /// behavior; the production driver threads the real flag in.
+    pub disable_skill_shell: bool,
 }
 
 impl TaskContext {
@@ -100,6 +107,7 @@ impl TaskContext {
             cancel: CancellationToken::new(),
             task_manager: None,
             subagent_colors: None,
+            disable_skill_shell: false,
         }
     }
 }
@@ -166,11 +174,12 @@ impl TaskExecutorRegistry {
 
 /// Build the default registry: one executor per [`TaskKind`].
 ///
-/// `LocalShell` and `LocalAgent` reuse the existing tool path so we
-/// do not duplicate logic. The remaining kinds are stubbed —
-/// `MonitorMcp` and `Dream` raise `NotImplemented`, `RemoteAgent`
-/// is a thin wrapper over the existing `RemoteTrigger` cron path
-/// that lands fully in 8.14.
+/// `LocalShell` and `LocalAgent` reuse the existing tool path so we do
+/// not duplicate logic. `LocalWorkflow` resolves a skill slug and runs
+/// it as a subagent through the same path. The remaining kinds are
+/// stubbed — `MonitorMcp` and `Dream` raise `NotImplemented`,
+/// `RemoteAgent` is a thin wrapper over the existing `RemoteTrigger`
+/// cron path that lands fully in 8.14.
 pub fn default_registry() -> TaskExecutorRegistry {
     use super::executors::{
         DreamExecutor, LocalAgentExecutor, LocalShellExecutor, LocalWorkflowExecutor,

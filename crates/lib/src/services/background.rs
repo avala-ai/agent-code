@@ -465,6 +465,29 @@ impl TaskManager {
             .map_err(|e| format!("Failed to read output: {e}"))
     }
 
+    /// Persist `content` as a task's captured output.
+    ///
+    /// Externally-driven kinds (e.g. `LocalAgent` / `LocalWorkflow`,
+    /// whose work runs inside an `AgentTool` call rather than a process
+    /// whose stdout we stream to a file) must call this with the
+    /// subagent's result before marking the task terminal — otherwise
+    /// completion surfacing (`read_output`, `TaskOutput`) reads an empty
+    /// file even though the run produced content.
+    pub async fn write_output(&self, id: &str, content: &str) -> Result<(), String> {
+        let output_file = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?
+                .output_file
+                .clone()
+        };
+        if let Some(parent) = output_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&output_file, content).map_err(|e| format!("Failed to write output: {e}"))
+    }
+
     /// List all tasks.
     pub async fn list(&self) -> Vec<TaskInfo> {
         self.tasks.lock().await.values().cloned().collect()
@@ -945,6 +968,47 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id, id);
         assert!(mgr.drain_completions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_output_round_trips_for_registered_task() {
+        // Externally-driven kinds (LocalAgent / LocalWorkflow) have no
+        // process streaming to the output file, so they persist their
+        // result via write_output. Confirm it lands where read_output /
+        // TaskOutput / completion surfacing look for it.
+        let mgr = TaskManager::new();
+        let id = mgr
+            .register(
+                "workflow run",
+                TaskKind::LocalWorkflow,
+                shell_payload("noop"),
+            )
+            .await;
+
+        // The output file path lives in a shared cache dir, so a prior
+        // run could have left a stale file under the same id. Clear it so
+        // the "no output yet" precondition is real: a freshly-registered
+        // task has no output file, so a read errors (the REPL surfacing
+        // path treats that as empty — precisely the "no output" symptom
+        // write_output prevents).
+        let output_file = mgr.get_status(&id).await.unwrap().output_file;
+        let _ = std::fs::remove_file(&output_file);
+        assert!(mgr.read_output(&id).await.is_err());
+
+        mgr.write_output(&id, "subagent produced this")
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.read_output(&id).await.unwrap(),
+            "subagent produced this"
+        );
+
+        // A second write replaces, not appends.
+        mgr.write_output(&id, "final").await.unwrap();
+        assert_eq!(mgr.read_output(&id).await.unwrap(), "final");
+
+        // Unknown id is an error, not a silent write.
+        assert!(mgr.write_output("bg_missing", "x").await.is_err());
     }
 
     #[tokio::test]

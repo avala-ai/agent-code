@@ -140,6 +140,14 @@ impl SkillRegistry {
         Self { skills: Vec::new() }
     }
 
+    /// Build a registry from an explicit set of skills, bypassing disk
+    /// loading. Useful for callers that synthesize skills in memory and
+    /// for tests that need a known fixture rather than whatever happens
+    /// to be installed.
+    pub fn from_skills(skills: Vec<Skill>) -> Self {
+        Self { skills }
+    }
+
     /// Load only the skills that ship with the binary, ignoring user
     /// and project skill directories. Use this in tests that assert on
     /// the prompt fragments shipped with `agent-code` — `load_all`
