@@ -104,9 +104,16 @@ impl HookRegistry {
     }
 }
 
+/// Upper bound on the context size copied into `AGENT_CODE_HOOK_CONTEXT`.
+/// Kept well under typical `ARG_MAX`/env limits (which args + env share)
+/// so a large context can never make the hook fail to spawn; the full
+/// context is always available on stdin.
+const MAX_ENV_CONTEXT_BYTES: usize = 16 * 1024;
+
 /// Run a shell hook, delivering the event context via `stdin` (a single
 /// JSON line) and environment (`AGENT_CODE_HOOK_EVENT`,
-/// `AGENT_CODE_HOOK_TOOL`, `AGENT_CODE_HOOK_CONTEXT`).
+/// `AGENT_CODE_HOOK_TOOL`, and `AGENT_CODE_HOOK_CONTEXT` when small
+/// enough).
 async fn run_shell_hook(
     command: &str,
     event_name: &str,
@@ -120,10 +127,21 @@ async fn run_shell_hook(
         .arg(command)
         .env("AGENT_CODE_HOOK_EVENT", event_name)
         .env("AGENT_CODE_HOOK_TOOL", tool_name.unwrap_or(""))
-        .env("AGENT_CODE_HOOK_CONTEXT", context_json)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // Only expose the context as an env var when it's small. A large
+    // context (e.g. a PreToolUse hook on a big FileWrite/MultiEdit
+    // input) could exceed the OS exec arg/env limit and make `spawn`
+    // fail — and for PreToolUse a failed hook is treated as a veto, so a
+    // valid large tool call would be wrongly blocked. stdin always
+    // carries the full context regardless.
+    if context_json.len() <= MAX_ENV_CONTEXT_BYTES {
+        cmd.env("AGENT_CODE_HOOK_CONTEXT", context_json);
+    } else {
+        cmd.env("AGENT_CODE_HOOK_CONTEXT_TRUNCATED", "1");
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -317,6 +335,52 @@ mod tests {
         let body =
             run_capturing_hook(|p| format!("printf '%s' \"$AGENT_CODE_HOOK_EVENT\" > {p:?}")).await;
         assert_eq!(body, "task_completed");
+    }
+
+    #[tokio::test]
+    async fn large_context_omits_env_but_still_spawns_and_delivers_via_stdin() {
+        // A context far larger than MAX_ENV_CONTEXT_BYTES must not be put
+        // in the environment (it could blow the exec limit and fail the
+        // hook → a PreToolUse veto), but the hook must still run and see
+        // the full context on stdin.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::TaskCompleted,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: format!(
+                    "printf 'envlen=%s truncated=%s\\n' \"${{#AGENT_CODE_HOOK_CONTEXT}}\" \
+                     \"$AGENT_CODE_HOOK_CONTEXT_TRUNCATED\" > {path:?}; wc -c >> {path:?}"
+                ),
+            },
+        });
+
+        let big = "x".repeat(MAX_ENV_CONTEXT_BYTES * 2);
+        let ctx = serde_json::json!({ "blob": big });
+        let results = reg.run_hooks(&HookEvent::TaskCompleted, None, &ctx).await;
+        assert!(results[0].success, "hook failed: {:?}", results[0].stderr);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        // Env var was omitted (length 0) and flagged truncated.
+        assert!(body.contains("envlen=0"), "env should be empty: {body}");
+        assert!(
+            body.contains("truncated=1"),
+            "truncated flag missing: {body}"
+        );
+        // stdin still delivered the full (large) context.
+        let stdin_bytes: usize = body
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(
+            stdin_bytes > MAX_ENV_CONTEXT_BYTES,
+            "stdin did not carry the full context ({stdin_bytes} bytes)"
+        );
     }
 
     #[tokio::test]
