@@ -174,19 +174,32 @@ jobs:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-latest
+    # OIDC trusted publishing: the job mints a short-lived id-token that
+    # npm exchanges for publish rights, so there is no long-lived
+    # NPM_TOKEN secret. `id-token: write` is required for both the OIDC
+    # exchange and the signed provenance attestation.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      # Trusted publishing requires npm >= 11.5.1; node 20 ships npm 10.x.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
       - name: Update version from tag
         working-directory: npm
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
+      # No NODE_AUTH_TOKEN: auth comes from the OIDC token above. The
+      # trusted publisher for @avala-ai/agent-code must be configured on
+      # npm (Publisher: GitHub Actions, repo avala-ai/agent-code,
+      # workflow file release.yml) for this to succeed. `--provenance`
+      # publishes a signed build-provenance attestation.
       - name: Publish
         working-directory: npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
