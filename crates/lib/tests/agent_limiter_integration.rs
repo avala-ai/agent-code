@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_code_lib::services::agent_control::AgentExecutionLimiter;
-use agent_code_lib::services::background::{TaskKind, TaskManager, TaskPayload, TaskStatus};
+use agent_code_lib::services::background::{
+    TaskInfo, TaskKind, TaskManager, TaskPayload, TaskStatus,
+};
 
 fn sleep_cmd(secs: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sleep");
@@ -105,4 +107,114 @@ async fn unbounded_when_no_limiter() {
         start.elapsed() < Duration::from_millis(1_000),
         "uncapped tasks did not run concurrently"
     );
+}
+
+#[tokio::test]
+async fn killed_while_queued_task_is_never_started() {
+    // Cap of 1. Task A holds the only slot; task B queues behind it.
+    // Killing B while queued must discard it — it must never spawn its
+    // process (which would create a sentinel file).
+    let mgr = TaskManager::new();
+    let limiter = Arc::new(AgentExecutionLimiter::new(1));
+
+    let a = mgr
+        .spawn_command(
+            sleep_cmd("1.0"),
+            "holder",
+            TaskKind::LocalAgent,
+            agent_payload(),
+            None,
+            Some(limiter.clone()),
+        )
+        .await;
+
+    let sentinel =
+        std::env::temp_dir().join(format!("agentcode-queuekill-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_file(&sentinel);
+    let mut b_cmd = tokio::process::Command::new("bash");
+    b_cmd.arg("-c").arg(format!("touch {}", sentinel.display()));
+    let b = mgr
+        .spawn_command(
+            b_cmd,
+            "queued",
+            TaskKind::LocalAgent,
+            agent_payload(),
+            None,
+            Some(limiter.clone()),
+        )
+        .await;
+
+    // Kill B while it's queued behind A.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    mgr.kill(&b).await.unwrap();
+
+    // Let A finish (frees the slot) and give a discarded-vs-run margin.
+    wait_all_done(&mgr, &[a], Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(
+        !sentinel.exists(),
+        "killed queued task still ran its process"
+    );
+    assert_eq!(mgr.get_status(&b).await.unwrap().status, TaskStatus::Killed);
+    let _ = std::fs::remove_file(&sentinel);
+}
+
+#[tokio::test]
+async fn adopt_reserves_a_slot_for_a_live_subagent() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = std::env::temp_dir().join(format!("agentcode-adoptcap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A live process standing in for a subagent that survived a restart.
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    cmd.process_group(0);
+    let mut child = cmd.spawn().unwrap();
+    let pid = child.id();
+
+    let info = TaskInfo {
+        id: "a1".to_string(),
+        description: "orphan subagent".to_string(),
+        status: TaskStatus::Running,
+        output_file: dir.join("a1.out"),
+        kind: TaskKind::LocalAgent,
+        payload: None,
+        subagent_color: None,
+        notified: false,
+        pid: Some(pid),
+        started_at: std::time::Instant::now(),
+        finished_at: None,
+    };
+    std::fs::write(dir.join("a1.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+
+    let mgr = TaskManager::with_persistence(dir.clone());
+    let limiter = Arc::new(AgentExecutionLimiter::new(2));
+    assert_eq!(mgr.adopt(Some(limiter.clone())).await, 1);
+
+    // One of the two slots is reserved for the adopted live subagent.
+    assert_eq!(
+        limiter.available(),
+        1,
+        "adopted subagent did not reserve a slot"
+    );
+
+    // When the adopted process exits, the watcher releases its slot.
+    // (Reap the child each poll: as our own child it would otherwise
+    // linger as a zombie whose pid still looks alive. In production the
+    // adopted pid is an orphan reaped by init.)
+    let _ = child.kill();
+    let mut released = false;
+    for _ in 0..60 {
+        let _ = child.try_wait();
+        if limiter.available() == 2 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released, "slot not released after the adopted process died");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

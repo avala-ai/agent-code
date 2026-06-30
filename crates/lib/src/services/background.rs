@@ -339,10 +339,29 @@ impl TaskManager {
             // and hold it for the task's lifetime. Spawns past the cap
             // queue here; the task is already registered (visible to
             // `/tasks`) while it waits. `None` → unbounded (shell tasks).
+            //
+            // While queued, race the acquire against cancellation: if the
+            // task is killed (`kill` cancels the token and already set the
+            // status to `Killed`) while waiting for a slot, discard it
+            // here so the process is never started.
             let _slot = match limiter {
-                Some(l) => l.acquire().await,
+                Some(l) => {
+                    tokio::select! {
+                        guard = l.acquire() => guard,
+                        _ = cancel.cancelled() => {
+                            cancels.lock().await.remove(&task_id);
+                            return;
+                        }
+                    }
+                }
                 None => None,
             };
+            // A cancel that landed between acquiring the slot and now also
+            // means we must not start the process.
+            if cancel.is_cancelled() {
+                cancels.lock().await.remove(&task_id);
+                return;
+            }
             run_command_task(&task_id, cmd, &tasks, cancel, persist_dir).await;
             // Drop the cancel handle once the task is terminal.
             cancels.lock().await.remove(&task_id);
@@ -543,7 +562,10 @@ impl TaskManager {
     /// Terminal-but-unnotified tasks are loaded so the next
     /// [`Self::drain_completions`] surfaces them exactly once. Returns
     /// the number of tasks adopted into the live set.
-    pub async fn adopt(&self) -> usize {
+    pub async fn adopt(
+        &self,
+        limiter: Option<Arc<crate::services::agent_control::AgentExecutionLimiter>>,
+    ) -> usize {
         let Some(dir) = self.persist_dir.clone() else {
             return 0;
         };
@@ -553,6 +575,9 @@ impl TaskManager {
         };
 
         let mut adopted = 0usize;
+        // pids of adopted, still-running subagents — they keep occupying a
+        // concurrency slot until their process exits (see below).
+        let mut live_subagent_pids: Vec<u32> = Vec::new();
         let mut tasks = self.tasks.lock().await;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -580,6 +605,12 @@ impl TaskManager {
 
             let alive = info.pid.map(pid_alive).unwrap_or(false);
             let info = reclassify_on_adopt(info, alive);
+            if alive
+                && info.kind == TaskKind::LocalAgent
+                && let Some(pid) = info.pid
+            {
+                live_subagent_pids.push(pid);
+            }
             persist_info(&dir, &info);
             tasks.insert(info.id.clone(), info);
             adopted += 1;
@@ -594,6 +625,27 @@ impl TaskManager {
             let mut next = self.next_id.lock().await;
             if *next <= m {
                 *next = m + 1;
+            }
+        }
+
+        // Reserve a concurrency slot for each adopted, still-running
+        // subagent so new background spawns this session can't start up to
+        // the full cap *on top of* the processes that survived the
+        // restart. Each reservation is released by a watcher when the
+        // adopted process exits. If the live count already exceeds the cap
+        // we reserve as many as we can (try_acquire stops returning slots),
+        // which still prevents new spawns until some adopted ones finish.
+        if let Some(limiter) = limiter {
+            for pid in live_subagent_pids {
+                let Some(guard) = limiter.try_acquire() else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    while pid_alive(pid) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    drop(guard);
+                });
             }
         }
 
@@ -1053,7 +1105,7 @@ mod tests {
         persist_info(&dir, &info);
 
         let mgr = TaskManager::with_persistence(dir.clone());
-        assert_eq!(mgr.adopt().await, 1);
+        assert_eq!(mgr.adopt(None).await, 1);
 
         let got = mgr.get_status("b777").await.unwrap();
         assert!(
@@ -1078,7 +1130,7 @@ mod tests {
 
         let mgr = TaskManager::with_persistence(dir.clone());
         assert_eq!(
-            mgr.adopt().await,
+            mgr.adopt(None).await,
             0,
             "notified terminal task should be pruned, not adopted"
         );
@@ -1108,7 +1160,7 @@ mod tests {
         persist_info(&dir, &info);
 
         let mgr = TaskManager::with_persistence(dir.clone());
-        assert_eq!(mgr.adopt().await, 1);
+        assert_eq!(mgr.adopt(None).await, 1);
 
         // A newly allocated task must not collide with the adopted id.
         let new_id = mgr

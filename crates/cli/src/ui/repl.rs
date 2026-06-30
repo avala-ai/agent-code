@@ -764,7 +764,9 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 agent_code_lib::services::background::tasks_dir(),
             ),
         );
-        let adopted = tm.adopt().await;
+        // Pass the shared subagent limiter so adopted, still-running
+        // subagents reserve a slot and new spawns can't exceed the cap.
+        let adopted = tm.adopt(Some(engine.state().agent_limiter.clone())).await;
         if adopted > 0 {
             let t = super::theme::current();
             eprintln!(

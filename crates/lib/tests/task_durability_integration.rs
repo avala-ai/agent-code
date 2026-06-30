@@ -43,7 +43,7 @@ async fn completed_task_is_adopted_by_a_fresh_manager_and_surfaces() {
     // leftover task and surfaces its completion exactly once.
     let mgr2 = TaskManager::with_persistence(dir.clone());
     assert!(
-        mgr2.adopt().await >= 1,
+        mgr2.adopt(None).await >= 1,
         "expected to adopt the leftover task"
     );
 
