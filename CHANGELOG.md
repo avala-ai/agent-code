@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Adopted background tasks could be orphaned or overwritten after restart**: two follow-ups to durable task adoption. (1) `TaskManager::kill` now falls back to signalling the recorded process group by pid when a task has no in-process cancellation handle — so a task *adopted* across a restart (whose original spawner is gone) is actually terminated instead of just marked `Killed` while its process keeps running. (2) `adopt()` now advances the task-id counter past every recovered id, so a newly allocated same-prefix task can no longer reuse an adopted id and overwrite its record, journal, and output.
 - **Killing a background task left the process running**: `TaskManager::kill` previously only flipped a status field, orphaning the underlying process (and its children). Shell tasks now register a cancellation handle; `kill` terminates the live process — on Unix the entire process group, so descendants are not orphaned — and a status-only `Killed` is preserved against a racing natural exit.
 
 ## [0.22.1] - 2026-06-01
