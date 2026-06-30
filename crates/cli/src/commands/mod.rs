@@ -8085,9 +8085,11 @@ mod tests {
         let listed = run_tasks_command(&mgr, None).await;
         assert!(listed.contains(&echo_id) && listed.contains(&sleep_id));
 
-        // 5) `/tasks clear` prunes the finished echo + killed sleep, but
-        //    only because both are now terminal. Clear, then confirm the
-        //    list is empty.
+        // 5) `/tasks clear` prunes finished tasks — but only ones already
+        //    surfaced. Drain first (as the REPL does before the prompt)
+        //    so the completed echo is marked notified; the killed sleep
+        //    is always clearable. Then clear and confirm the list empties.
+        let _ = mgr.drain_completions().await;
         let cleared = run_tasks_command(&mgr, Some("clear")).await;
         assert!(cleared.contains("Cleared 2 finished tasks"), "{cleared:?}");
         let after = run_tasks_command(&mgr, None).await;
