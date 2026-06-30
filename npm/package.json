@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/avala-ai/agent-code"
+    "url": "git+https://github.com/avala-ai/agent-code.git"
   },
   "homepage": "https://github.com/avala-ai/agent-code",
   "keywords": ["ai", "agent", "coding", "cli", "terminal", "llm"],

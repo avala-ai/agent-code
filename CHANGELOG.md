@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Adopted background tasks could be orphaned or overwritten after restart**: two follow-ups to durable task adoption. (1) `TaskManager::kill` now falls back to signalling the recorded process group by pid when a task has no in-process cancellation handle — so a task *adopted* across a restart (whose original spawner is gone) is actually terminated instead of just marked `Killed` while its process keeps running. (2) `adopt()` now advances the task-id counter past every recovered id, so a newly allocated same-prefix task can no longer reuse an adopted id and overwrite its record, journal, and output.
 - **Killing a background task left the process running**: `TaskManager::kill` previously only flipped a status field, orphaning the underlying process (and its children). Shell tasks now register a cancellation handle; `kill` terminates the live process — on Unix the entire process group, so descendants are not orphaned — and a status-only `Killed` is preserved against a racing natural exit.
 
+### Changed
+
+- **npm releases now publish via OIDC trusted publishing with provenance**: the `@avala-ai/agent-code` npm package is published through a GitHub Actions trusted publisher (OpenID Connect) instead of a long-lived `NPM_TOKEN`, and ships a signed build-provenance attestation (`npm publish --provenance`). No release secret to leak, and installers can verify the package was built from this repo's tagged release workflow.
+
 ## [0.22.1] - 2026-06-01
 
 ### Fixed
