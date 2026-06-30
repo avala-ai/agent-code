@@ -76,6 +76,7 @@ async fn background_agent_task_surfaces_with_localagent_envelope() {
             TaskKind::LocalAgent,
             payload,
             None,
+            None,
         )
         .await;
     assert!(

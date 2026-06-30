@@ -160,6 +160,7 @@ impl Tool for AgentTool {
                 &subagent_id,
                 assigned_color,
                 ctx.active_disk_output_style.as_deref(),
+                ctx.agent_limiter.clone(),
             )
             .await;
             return Ok(ToolResult::success(format!(
@@ -288,6 +289,7 @@ pub fn build_subagent_command(
 /// returns immediately. The completion is surfaced by the interactive
 /// loop (toast + result injection). Shared by the Agent tool's
 /// `run_in_background` path and the REPL `&` prefix.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_background_agent(
     prompt: &str,
     description: &str,
@@ -296,6 +298,7 @@ pub async fn spawn_background_agent(
     subagent_id: &str,
     color: Option<SubagentColor>,
     disk_output_style: Option<&str>,
+    limiter: Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
 ) -> crate::services::background::TaskId {
     use crate::services::background::{TaskKind, TaskPayload};
 
@@ -306,7 +309,14 @@ pub async fn spawn_background_agent(
         parent_session: None,
     };
     task_manager
-        .spawn_command(cmd, description, TaskKind::LocalAgent, payload, color)
+        .spawn_command(
+            cmd,
+            description,
+            TaskKind::LocalAgent,
+            payload,
+            color,
+            limiter,
+        )
         .await
 }
 

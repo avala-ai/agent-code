@@ -134,5 +134,5 @@ provider/test scaffold; reuse them. Background lifecycle is offline-testable wit
 - [x] PR 3 — durable tasks + adopt
 - [x] PR 4 — spawnable turn + event seam
 - [~] PR 5 — steering (engine + Session + REPL) ✅; promotion primitive ✅ (`Session::spawn_turn`); REPL promotion hotkey deferred (needs run_repl→Session ownership change)
-- [ ] PR 6 — subagent concurrency + coordinator wiring
+- [~] PR 6 — subagent concurrency cap ✅ (`AgentExecutionLimiter`, queues past the cap); parallel-dispatch via the executor (it strips subprocess context for read-only tools) and Coordinator/mailbox wiring deferred
 - [ ] PR 7 — stubbed executors (workflow first)

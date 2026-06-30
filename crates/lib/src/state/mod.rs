@@ -101,6 +101,8 @@ pub struct AppState {
     pub plan_mode: bool,
     /// Shared background task manager.
     pub task_manager: std::sync::Arc<crate::services::background::TaskManager>,
+    /// Caps concurrently-running background subagents.
+    pub agent_limiter: std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>,
     /// Stable per-session color assignments for spawned subagents.
     ///
     /// Populated by [`crate::tools::agent::AgentTool`] and the
@@ -155,6 +157,11 @@ impl AppState {
             model_usage: HashMap::new(),
             plan_mode: false,
             task_manager: std::sync::Arc::new(crate::services::background::TaskManager::new()),
+            agent_limiter: std::sync::Arc::new(
+                crate::services::agent_control::AgentExecutionLimiter::new(
+                    crate::services::agent_control::DEFAULT_MAX_SUBAGENTS,
+                ),
+            ),
             subagent_colors: crate::services::subagent_colors::SubagentColorManager::shared(),
             session_id: crate::services::session::new_session_id(),
             break_cache_next: false,

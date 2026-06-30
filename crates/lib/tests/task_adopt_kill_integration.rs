@@ -43,7 +43,10 @@ async fn kill_terminates_an_adopted_live_task_by_pid() {
 
     // A fresh manager adopts it (process is alive → stays Running).
     let mgr = TaskManager::with_persistence(dir.clone());
-    assert!(mgr.adopt().await >= 1, "should adopt the journaled task");
+    assert!(
+        mgr.adopt(None).await >= 1,
+        "should adopt the journaled task"
+    );
     let adopted = mgr.get_status("a4242").await.expect("adopted");
     assert_eq!(adopted.status, TaskStatus::Running);
 
@@ -104,7 +107,7 @@ async fn kill_does_not_signal_stale_pid_of_terminal_task() {
     std::fs::write(dir.join("a9001.json"), serde_json::to_vec(&info).unwrap()).unwrap();
 
     let mgr = TaskManager::with_persistence(dir.clone());
-    assert!(mgr.adopt().await >= 1);
+    assert!(mgr.adopt(None).await >= 1);
 
     // kill() on the already-terminal task must be a no-op for the process.
     mgr.kill("a9001").await.expect("kill");

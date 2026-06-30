@@ -142,6 +142,7 @@ pub async fn execute_tool_calls(
                                     // sandbox would be inert here anyway.
                                     sandbox: None,
                                     active_disk_output_style: None,
+                                    agent_limiter: None,
                                 },
                                 &perm_checker,
                             )

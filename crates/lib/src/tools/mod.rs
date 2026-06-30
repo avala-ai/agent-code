@@ -230,6 +230,11 @@ pub struct ToolContext {
     /// `applies_to: [subagent]` actually reaches the child. `None` means
     /// the parent has no active disk style (built-in or default).
     pub active_disk_output_style: Option<String>,
+    /// Caps the number of concurrently-running background subagents the
+    /// `Agent` tool may spawn. `None` leaves subagent spawns unbounded
+    /// (e.g. in tests / non-interactive contexts).
+    pub agent_limiter:
+        Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
 }
 
 /// Result of a tool execution.

@@ -1031,6 +1031,7 @@ impl QueryEngine {
                                                         permission_prompter: None,
                                                         sandbox: None,
                                                         active_disk_output_style: None,
+                                                        agent_limiter: None,
                                                     },
                                                 )
                                                 .await
@@ -1266,6 +1267,7 @@ impl QueryEngine {
                     .disk_output_style
                     .as_ref()
                     .map(|s| s.name.clone()),
+                agent_limiter: Some(self.state.agent_limiter.clone()),
             };
 
             // Collect streaming tool results first.
