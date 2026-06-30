@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.23.0] - 2026-06-30
+
 ### Added
 
 - **`/tasks clear` prunes finished tasks**: a new `/tasks clear` (aliases `clean`/`prune`) removes every finished (non-running) task from the list and deletes its journal + output files, so the background-task list no longer accumulates completed entries indefinitely. Running tasks are left untouched. New `TaskManager::clear_finished`.
@@ -462,7 +466,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/avala-ai/agent-code/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/avala-ai/agent-code/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/avala-ai/agent-code/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/avala-ai/agent-code/compare/v0.21.0...v0.21.1

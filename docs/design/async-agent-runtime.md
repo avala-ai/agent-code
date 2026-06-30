@@ -129,11 +129,30 @@ provider/test scaffold; reuse them. Background lifecycle is offline-testable wit
 ---
 
 ## 5. Progress
-- [x] PR 1 — surfacing + kill + dedup
-- [x] PR 2 — `&` prefix + Agent run_in_background
-- [x] PR 3 — durable tasks + adopt
-- [x] PR 4 — spawnable turn + event seam
-- [~] PR 5 — steering (engine + Session + REPL) ✅; promotion primitive ✅ (`Session::spawn_turn`); REPL promotion hotkey deferred (needs run_repl→Session ownership change)
-- [~] PR 6 — subagent concurrency cap ✅ (`AgentExecutionLimiter`, queues past the cap); parallel-dispatch via the executor (it strips subprocess context for read-only tools) and Coordinator/mailbox wiring deferred
-- [~] PR 7 — pivoted: the stubbed executors (`MonitorMcp`/`Dream`/`RemoteAgent`) are **test-only dead code** (the executor registry has no production driver — real spawns go through `spawn_shell`/`spawn_background_agent`), so implementing them is low-value until the registry is wired into a dispatch path. Shipped instead: (a) the **open/hookable** differentiator — a `TaskCompleted` hook event **and** actual hook-context delivery (stdin JSON + env vars + HTTP body); (b) a real **`LocalWorkflow` executor** (resolve skill slug → expand → run as subagent), so it's no longer a `NotImplemented` stub and is exercised via the registry tests.
-- [ ] follow-up — wire the executor registry into a production dispatch path (then `MonitorMcp`/`Dream`/`RemoteAgent` become worth implementing).
+
+**Status: core roadmap complete.** Every gap with real production value has shipped. What
+remains (below) is optional, net-new scaffolding, not unfinished work.
+
+Shipped:
+- [x] PR 1 — completion surfacing + kill correctness + dedup
+- [x] PR 2 — `&` prefix + Agent `run_in_background`
+- [x] PR 3 — durable tasks + adopt-on-restart
+- [x] PR 4 — spawnable turn + `watch<TurnStatus>` event seam
+- [x] PR 5 — turn steering (engine + `Session` + REPL); promotion *primitive* via `Session::spawn_turn`
+- [x] PR 6 — subagent concurrency cap (`AgentExecutionLimiter`, queues past the cap)
+- [x] PR 7 — `TaskCompleted` hook + real hook-context delivery (stdin JSON + env + HTTP body)
+- [x] PR 8 — `LocalWorkflow` executor (resolve skill slug → expand → run as subagent)
+- [x] PR 9 — `&/skill`: run a skill as a background task (first production trigger for `LocalWorkflow`)
+- [x] PR 10 — `/tasks` management surface: `output` / `kill` / `clear` (+ `&/` and `/` skill tab-completion)
+- [x] infra — npm publishing via OIDC trusted publishing + provenance
+
+Deliberately **not** built (decisions, not omissions):
+- **REPL promote-hotkey** (foreground turn → background mid-flight): dropped. The interactive turn
+  borrows the single engine lock for its whole duration; a clean promote would require re-architecting
+  `run_repl` around `Session` ownership for marginal value. The spawn primitive exists if revisited.
+- **Stubbed executors** (`MonitorMcp` / `RemoteAgent` / `Dream`) and the **multi-agent `Coordinator`**:
+  these remain test-only scaffolding. The executor registry has no production dispatch driver (real
+  background work goes through `spawn_shell` / `spawn_background_agent`), and `Coordinator` is
+  instantiated only in tests. Each is a net-new feature with its own design — to be picked up
+  intentionally if/when the product calls for MCP-watch, cloud-trigger, idle-time, or
+  agent-team capabilities, not as leftover roadmap debt.
