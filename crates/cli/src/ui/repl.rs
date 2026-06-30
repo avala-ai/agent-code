@@ -99,6 +99,25 @@ fn fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
     true
 }
 
+/// Parse a `&`-prefixed background input (already `&`-stripped and
+/// trimmed) into a `(skill_slug, args)` pair when it names a skill —
+/// i.e. it starts with `/`. `& /review src` → `("review", "src")`,
+/// `& just do the thing` → `None` (a free-form subagent prompt).
+///
+/// A bare `&/` (no slug) yields `None` so it falls through to the
+/// free-form path rather than trying to resolve an empty skill.
+fn parse_background_skill(bg_input: &str) -> Option<(String, String)> {
+    let rest = bg_input.strip_prefix('/')?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once(char::is_whitespace) {
+        Some((slug, args)) => Some((slug.to_string(), args.trim().to_string())),
+        None => Some((rest.to_string(), String::new())),
+    }
+}
+
 /// Find an `@path-partial` context ending at byte position `pos` in
 /// `line`, if any. Returns `(at_byte_idx, partial)` where `at_byte_idx`
 /// is the byte position of the `@` and `partial` is the text after it
@@ -937,27 +956,86 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                     let bg_input = input.strip_prefix('&').unwrap_or("").trim().to_string();
                     if !bg_input.is_empty() {
                         let t = super::theme::current();
-                        let description: String = bg_input.chars().take(60).collect();
                         let task_manager = engine.state().task_manager.clone();
                         let agent_limiter = engine.state().agent_limiter.clone();
                         let cwd = engine.state().cwd.clone();
                         let subagent_id = uuid::Uuid::new_v4().to_string();
-                        let id = agent_code_lib::tools::agent::spawn_background_agent(
-                            &bg_input,
-                            &description,
-                            std::path::Path::new(&cwd),
-                            &task_manager,
-                            &subagent_id,
-                            None,
-                            None,
-                            Some(agent_limiter),
-                        )
-                        .await;
-                        eprintln!(
-                            "  {} {}",
-                            "⟡".with(t.accent),
-                            format!("background task {id}: {description}").with(t.muted),
-                        );
+
+                        // `&/skill args` runs a named skill/workflow as a
+                        // background task; `& <prompt>` runs a free-form
+                        // subagent. Both go through the same subprocess
+                        // runner and surface on completion.
+                        if let Some((slug, args_str)) = parse_background_skill(&bg_input) {
+                            let disable_shell =
+                                engine.state().config.security.disable_skill_shell_execution;
+                            let registry = agent_code_lib::skills::SkillRegistry::load_all(Some(
+                                std::path::Path::new(&cwd),
+                            ));
+                            let args_val = if args_str.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String(args_str.clone())
+                            };
+                            match agent_code_lib::tools::tasks::resolve_workflow_prompt(
+                                &slug,
+                                &args_val,
+                                &registry,
+                                disable_shell,
+                            ) {
+                                Ok(prompt) => {
+                                    let description: String = if args_str.is_empty() {
+                                        format!("/{slug}")
+                                    } else {
+                                        format!("/{slug} {args_str}").chars().take(60).collect()
+                                    };
+                                    let id =
+                                        agent_code_lib::tools::agent::spawn_background_workflow(
+                                            &slug,
+                                            args_val,
+                                            &prompt,
+                                            &description,
+                                            std::path::Path::new(&cwd),
+                                            &task_manager,
+                                            &subagent_id,
+                                            None,
+                                            None,
+                                            Some(agent_limiter),
+                                        )
+                                        .await;
+                                    eprintln!(
+                                        "  {} {}",
+                                        "⟡".with(t.accent),
+                                        format!("background workflow {id}: {description}")
+                                            .with(t.muted),
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  {} {}",
+                                        "✗".with(t.error),
+                                        format!("background workflow: {e}").with(t.muted),
+                                    );
+                                }
+                            }
+                        } else {
+                            let description: String = bg_input.chars().take(60).collect();
+                            let id = agent_code_lib::tools::agent::spawn_background_agent(
+                                &bg_input,
+                                &description,
+                                std::path::Path::new(&cwd),
+                                &task_manager,
+                                &subagent_id,
+                                None,
+                                None,
+                                Some(agent_limiter),
+                            )
+                            .await;
+                            eprintln!(
+                                "  {} {}",
+                                "⟡".with(t.accent),
+                                format!("background task {id}: {description}").with(t.muted),
+                            );
+                        }
                     }
                     continue;
                 }
@@ -1516,6 +1594,49 @@ mod completer_tests {
             name_prefix > alias_prefix,
             "name prefix {name_prefix} should beat alias prefix {alias_prefix}"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_skill_tests {
+    use super::parse_background_skill;
+
+    #[test]
+    fn slug_only() {
+        assert_eq!(
+            parse_background_skill("/review"),
+            Some(("review".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn slug_with_args() {
+        assert_eq!(
+            parse_background_skill("/review src/main.rs and tests"),
+            Some(("review".to_string(), "src/main.rs and tests".to_string()))
+        );
+    }
+
+    #[test]
+    fn extra_whitespace_between_slug_and_args_is_trimmed() {
+        assert_eq!(
+            parse_background_skill("/deploy    prod"),
+            Some(("deploy".to_string(), "prod".to_string()))
+        );
+    }
+
+    #[test]
+    fn free_form_prompt_is_not_a_skill() {
+        assert_eq!(parse_background_skill("just fix the bug"), None);
+        assert_eq!(parse_background_skill("run the build"), None);
+    }
+
+    #[test]
+    fn bare_slash_is_not_a_skill() {
+        // No slug after `/` → fall through to the free-form path
+        // rather than resolving an empty skill.
+        assert_eq!(parse_background_skill("/"), None);
+        assert_eq!(parse_background_skill("/   "), None);
     }
 }
 

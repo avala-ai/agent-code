@@ -17,6 +17,6 @@ mod remote_agent;
 pub use dream::DreamExecutor;
 pub use local_agent::LocalAgentExecutor;
 pub use local_shell::LocalShellExecutor;
-pub use local_workflow::LocalWorkflowExecutor;
+pub use local_workflow::{LocalWorkflowExecutor, resolve_workflow_prompt};
 pub use monitor_mcp::MonitorMcpExecutor;
 pub use remote_agent::RemoteAgentExecutor;

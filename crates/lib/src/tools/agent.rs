@@ -320,6 +320,47 @@ pub async fn spawn_background_agent(
         .await
 }
 
+/// Spawn an already-resolved workflow/skill prompt as a background task.
+///
+/// Mirrors [`spawn_background_agent`] — same subprocess runner, output
+/// capture, killable process group, and concurrency limiter — but tags
+/// the task as [`TaskKind::LocalWorkflow`] and records a `LocalWorkflow`
+/// payload (the originating skill slug + args) so `/tasks` and the
+/// completion surface label it as a workflow run rather than a free-form
+/// subagent. The caller is responsible for resolving the slug to
+/// `prompt` (see `resolve_workflow_prompt`).
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_background_workflow(
+    workflow: &str,
+    args: serde_json::Value,
+    prompt: &str,
+    description: &str,
+    cwd: &std::path::Path,
+    task_manager: &std::sync::Arc<crate::services::background::TaskManager>,
+    subagent_id: &str,
+    color: Option<SubagentColor>,
+    disk_output_style: Option<&str>,
+    limiter: Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
+) -> crate::services::background::TaskId {
+    use crate::services::background::{TaskKind, TaskPayload};
+
+    let cmd = build_subagent_command(prompt, cwd, subagent_id, color, disk_output_style);
+    let payload = TaskPayload::LocalWorkflow {
+        workflow: workflow.to_string(),
+        args,
+    };
+    task_manager
+        .spawn_command(
+            cmd,
+            description,
+            TaskKind::LocalWorkflow,
+            payload,
+            color,
+            limiter,
+        )
+        .await
+}
+
 /// Create a temporary git worktree for isolated execution.
 async fn create_worktree(base_cwd: &PathBuf) -> Result<PathBuf, String> {
     let branch_name = format!(
@@ -441,5 +482,46 @@ mod tests {
             envs.get("AGENT_CODE_DISK_OUTPUT_STYLE").map(String::as_str),
             Some("concise")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_background_workflow_tags_localworkflow_kind_and_payload() {
+        use crate::services::background::{TaskKind, TaskManager, TaskPayload};
+
+        let tm = std::sync::Arc::new(TaskManager::new());
+        let id = spawn_background_workflow(
+            "review",
+            serde_json::json!("src/main.rs"),
+            "Review the code in src/main.rs",
+            "/review src/main.rs",
+            std::path::Path::new("."),
+            &tm,
+            "wf-sid-1",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // The task is registered with the workflow kind and payload
+        // immediately, regardless of how the (test-binary) child exits.
+        let info = tm
+            .list()
+            .await
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("workflow task registered");
+        assert_eq!(info.kind, TaskKind::LocalWorkflow);
+        match info.payload {
+            Some(TaskPayload::LocalWorkflow { workflow, args }) => {
+                assert_eq!(workflow, "review");
+                assert_eq!(args, serde_json::json!("src/main.rs"));
+            }
+            other => panic!("expected LocalWorkflow payload, got {other:?}"),
+        }
+
+        // Don't leave the child running past the test.
+        let _ = tm.kill(&id).await;
     }
 }

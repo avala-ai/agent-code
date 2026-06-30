@@ -23,6 +23,7 @@ pub mod tools;
 pub use executor::{
     TaskContext, TaskError, TaskExecutor, TaskExecutorRegistry, TaskResult, default_registry,
 };
+pub use executors::resolve_workflow_prompt;
 pub use tools::{
     TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool,
 };
