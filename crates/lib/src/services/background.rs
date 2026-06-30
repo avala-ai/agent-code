@@ -452,16 +452,17 @@ impl TaskManager {
     /// without a handle (externally-driven kinds such as `LocalAgent`)
     /// just get the status transition; their executor observes it.
     pub async fn kill(&self, id: &str) -> Result<(), String> {
-        let snapshot = {
+        let (snapshot, was_running) = {
             let mut tasks = self.tasks.lock().await;
             let info = tasks
                 .get_mut(id)
                 .ok_or_else(|| format!("Task '{id}' not found"))?;
-            if info.status == TaskStatus::Running {
+            let was_running = info.status == TaskStatus::Running;
+            if was_running {
                 info.status = TaskStatus::Killed;
                 info.finished_at = Some(std::time::Instant::now());
             }
-            info.clone()
+            (info.clone(), was_running)
         };
         self.persist(&snapshot);
         // Signal the live runtime (if any) outside the tasks lock.
@@ -480,7 +481,12 @@ impl TaskManager {
         // (and its cancellation token) died with the previous session.
         // Signal the recorded process group directly so an orphaned
         // process can't keep running (and keep modifying the worktree).
-        if !had_cancel {
+        //
+        // Gated on `was_running`: a task that was already terminal (e.g.
+        // a completed/failed row loaded by `adopt()`) must not be
+        // signalled — its recorded pid is stale and the OS may have
+        // reused it for an unrelated process.
+        if was_running && !had_cancel {
             #[cfg(unix)]
             if let Some(pid) = snapshot.pid {
                 unsafe {

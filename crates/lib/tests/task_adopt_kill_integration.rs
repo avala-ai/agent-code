@@ -69,3 +69,54 @@ async fn kill_terminates_an_adopted_live_task_by_pid() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn kill_does_not_signal_stale_pid_of_terminal_task() {
+    // A terminal (failed/completed) task loaded by adopt() carries a pid
+    // that is stale — the process exited and the OS may have reused the
+    // number. kill() must NOT signal it. We prove this by pointing a
+    // terminal task's pid at a *live, unrelated* process and confirming
+    // kill() leaves it running.
+    let dir = std::env::temp_dir().join(format!("agentcode-stalepid-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    cmd.process_group(0);
+    let mut bystander = cmd.spawn().expect("spawn bystander");
+    let pid = bystander.id();
+
+    // Journal a *terminal* (Failed, unnotified) task whose pid happens to
+    // point at the live bystander — the dangerous stale-pid case.
+    let info = TaskInfo {
+        id: "a9001".to_string(),
+        description: "ghost".to_string(),
+        status: TaskStatus::Failed("interrupted by restart".to_string()),
+        output_file: dir.join("a9001.out"),
+        kind: TaskKind::LocalAgent,
+        payload: None,
+        subagent_color: None,
+        notified: false,
+        pid: Some(pid),
+        started_at: std::time::Instant::now(),
+        finished_at: None,
+    };
+    std::fs::write(dir.join("a9001.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+
+    let mgr = TaskManager::with_persistence(dir.clone());
+    assert!(mgr.adopt().await >= 1);
+
+    // kill() on the already-terminal task must be a no-op for the process.
+    mgr.kill("a9001").await.expect("kill");
+
+    // Give any (erroneous) signal time to land, then confirm the
+    // bystander is still alive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        matches!(bystander.try_wait(), Ok(None)),
+        "kill() signalled a stale pid and killed an unrelated process"
+    );
+
+    let _ = bystander.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
