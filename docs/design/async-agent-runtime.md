@@ -135,4 +135,4 @@ provider/test scaffold; reuse them. Background lifecycle is offline-testable wit
 - [x] PR 4 — spawnable turn + event seam
 - [~] PR 5 — steering (engine + Session + REPL) ✅; promotion primitive ✅ (`Session::spawn_turn`); REPL promotion hotkey deferred (needs run_repl→Session ownership change)
 - [~] PR 6 — subagent concurrency cap ✅ (`AgentExecutionLimiter`, queues past the cap); parallel-dispatch via the executor (it strips subprocess context for read-only tools) and Coordinator/mailbox wiring deferred
-- [ ] PR 7 — stubbed executors (workflow first)
+- [~] PR 7 — pivoted: the stubbed executors (`LocalWorkflow`/`MonitorMcp`/`Dream`/`RemoteAgent`) are **test-only dead code** (the executor registry has no production driver — real spawns go through `spawn_shell`/`spawn_background_agent`), so implementing them is low-value until the registry is wired into a dispatch path. Instead shipped the **open/hookable** differentiator: a `TaskCompleted` hook event **and** actual hook-context delivery (stdin JSON + env vars + HTTP body — previously the context was built but never delivered to any hook).

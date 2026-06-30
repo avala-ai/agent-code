@@ -41,9 +41,37 @@ method = "POST"
 |-------|--------------|
 | `session_start` | Session begins |
 | `session_stop` | Session ends |
-| `pre_tool_use` | Before a tool executes |
+| `user_prompt_submit` | User submits input (incl. steered mid-turn input) |
+| `pre_turn` / `post_turn` | Around each agent turn |
+| `pre_tool_use` | Before a tool executes (non-zero exit / failure vetoes the call) |
 | `post_tool_use` | After a tool completes |
-| `user_prompt_submit` | User submits input |
+| `file_changed` | After a file-mutating tool completes |
+| `pre_compact` / `post_compact` | Around history compaction |
+| `task_completed` | A background task (`bash … &` or a spawned subagent) finished |
+| `stop` | Agent finished responding; about to yield to the user |
+| `notification` | Agent needs user attention (budget / context full) |
+| `permission_denied` | A tool call was denied (per-denial, batched per turn) |
+| `cwd_changed` / `config_change` / `error` | Working dir changed / extensions reloaded / turn errored |
+
+## Hook context
+
+Every hook receives the event's context — which task finished, which tool ran, the prompt, etc. — three ways:
+
+- **stdin** — the full context as a single JSON line (read it with `cat`, `jq`, etc.).
+- **environment** — `AGENT_CODE_HOOK_EVENT` (the event name), `AGENT_CODE_HOOK_TOOL` (the tool name, when applicable), and `AGENT_CODE_HOOK_CONTEXT` (the JSON, when it's small enough to pass safely; for very large contexts this is omitted and `AGENT_CODE_HOOK_CONTEXT_TRUNCATED=1` is set — use stdin instead).
+- **HTTP** — for `http` hooks the context is sent as the request body (`POST`).
+
+For example, a `task_completed` hook that posts finished subagents to Slack:
+
+```toml
+[[hooks]]
+event = "task_completed"
+[hooks.action]
+type = "shell"
+command = 'jq -r "\"\(.kind) \(.id) → \(.status)\"" | xargs -I{} curl -s -X POST "$SLACK_URL" -d "{}"'
+```
+
+The `task_completed` context carries `id`, `kind`, `status`, `description`, and `duration_secs`.
 
 ## Hook actions
 

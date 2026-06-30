@@ -2478,6 +2478,7 @@ fn format_hook_event(event: &agent_code_lib::config::HookEvent) -> &'static str 
         HookEvent::ConfigChange => "config_change",
         HookEvent::Error => "error",
         HookEvent::PermissionDenied => "permission_denied",
+        HookEvent::TaskCompleted => "task_completed",
     }
 }
 

@@ -37,9 +37,27 @@ method = "POST"
 |-------|--------------|
 | `session_start` | Session begins |
 | `session_stop` | Session ends |
-| `pre_tool_use` | Before a tool executes |
+| `user_prompt_submit` | User submits input (incl. steered mid-turn input) |
+| `pre_turn` / `post_turn` | Around each agent turn |
+| `pre_tool_use` | Before a tool executes (non-zero exit / failure vetoes the call) |
 | `post_tool_use` | After a tool completes |
-| `user_prompt_submit` | User submits input |
+| `file_changed` | After a file-mutating tool completes |
+| `pre_compact` / `post_compact` | Around history compaction |
+| `task_completed` | A background task (`bash … &` or a spawned subagent) finished |
+| `stop` | Agent finished responding; about to yield to the user |
+| `notification` | Agent needs user attention (budget / context full) |
+| `permission_denied` | A tool call was denied (per-denial, batched per turn) |
+| `cwd_changed` / `config_change` / `error` | Working dir changed / extensions reloaded / turn errored |
+
+## Hook context
+
+Every hook receives the event's context (which task finished, which tool ran, the prompt, etc.):
+
+- **stdin** — the full context as a single JSON line.
+- **environment** — `AGENT_CODE_HOOK_EVENT`, `AGENT_CODE_HOOK_TOOL` (when applicable), and `AGENT_CODE_HOOK_CONTEXT` (the JSON, when small enough to pass safely; large contexts omit it and set `AGENT_CODE_HOOK_CONTEXT_TRUNCATED=1` — use stdin instead).
+- **HTTP** — `http` hooks receive the context as the request body (`POST`).
+
+The `task_completed` context carries `id`, `kind`, `status`, `description`, and `duration_secs`.
 
 ## Hook actions
 

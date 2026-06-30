@@ -55,38 +55,33 @@ impl HookRegistry {
         &self,
         event: &HookEvent,
         tool_name: Option<&str>,
-        _context: &serde_json::Value,
+        context: &serde_json::Value,
     ) -> Vec<HookResult> {
         let hooks = self.get_hooks(event, tool_name);
         let mut results = Vec::new();
 
+        // The event's context, delivered to each hook so it can act on
+        // the details (which task finished, which tool, etc.). Shell
+        // hooks receive it as a JSON line on stdin (the convention
+        // hook-based agents use) and in `AGENT_CODE_HOOK_CONTEXT`; HTTP
+        // hooks receive it as the request body.
+        let event_name = serde_json::to_value(event)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        let context_json = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_string());
+
         for hook in hooks {
             let result = match &hook.action {
                 HookAction::Shell { command } => {
-                    match tokio::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(command)
-                        .output()
-                        .await
-                    {
-                        Ok(output) => HookResult {
-                            success: output.status.success(),
-                            output: String::from_utf8_lossy(&output.stdout).to_string(),
-                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        },
-                        Err(e) => HookResult {
-                            success: false,
-                            output: String::new(),
-                            stderr: e.to_string(),
-                        },
-                    }
+                    run_shell_hook(command, &event_name, tool_name, &context_json).await
                 }
                 HookAction::Http { url, method } => {
                     let client = reqwest::Client::new();
                     let method = method.as_deref().unwrap_or("POST");
                     let req = match method {
                         "GET" => client.get(url),
-                        _ => client.post(url),
+                        _ => client.post(url).json(context),
                     };
                     match req.send().await {
                         Ok(resp) => HookResult {
@@ -106,6 +101,77 @@ impl HookRegistry {
         }
 
         results
+    }
+}
+
+/// Upper bound on the context size copied into `AGENT_CODE_HOOK_CONTEXT`.
+/// Kept well under typical `ARG_MAX`/env limits (which args + env share)
+/// so a large context can never make the hook fail to spawn; the full
+/// context is always available on stdin.
+const MAX_ENV_CONTEXT_BYTES: usize = 16 * 1024;
+
+/// Run a shell hook, delivering the event context via `stdin` (a single
+/// JSON line) and environment (`AGENT_CODE_HOOK_EVENT`,
+/// `AGENT_CODE_HOOK_TOOL`, and `AGENT_CODE_HOOK_CONTEXT` when small
+/// enough).
+async fn run_shell_hook(
+    command: &str,
+    event_name: &str,
+    tool_name: Option<&str>,
+    context_json: &str,
+) -> HookResult {
+    use tokio::io::AsyncWriteExt;
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(command)
+        .env("AGENT_CODE_HOOK_EVENT", event_name)
+        .env("AGENT_CODE_HOOK_TOOL", tool_name.unwrap_or(""))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Only expose the context as an env var when it's small. A large
+    // context (e.g. a PreToolUse hook on a big FileWrite/MultiEdit
+    // input) could exceed the OS exec arg/env limit and make `spawn`
+    // fail — and for PreToolUse a failed hook is treated as a veto, so a
+    // valid large tool call would be wrongly blocked. stdin always
+    // carries the full context regardless.
+    if context_json.len() <= MAX_ENV_CONTEXT_BYTES {
+        cmd.env("AGENT_CODE_HOOK_CONTEXT", context_json);
+    } else {
+        cmd.env("AGENT_CODE_HOOK_CONTEXT_TRUNCATED", "1");
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return HookResult {
+                success: false,
+                output: String::new(),
+                stderr: e.to_string(),
+            };
+        }
+    };
+
+    // Write the context to stdin and close it so the hook can `cat` it.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(context_json.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        // Dropping `stdin` here closes the pipe (EOF for the child).
+    }
+
+    match child.wait_with_output().await {
+        Ok(output) => HookResult {
+            success: output.status.success(),
+            output: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        },
+        Err(e) => HookResult {
+            success: false,
+            output: String::new(),
+            stderr: e.to_string(),
+        },
     }
 }
 
@@ -213,6 +279,108 @@ mod tests {
     async fn run_hooks_fires_notification() {
         let body = run_and_read(HookEvent::Notification).await;
         assert!(body.contains("fired"), "Notification hook did not run");
+    }
+
+    #[tokio::test]
+    async fn run_hooks_fires_task_completed() {
+        let body = run_and_read(HookEvent::TaskCompleted).await;
+        assert!(body.contains("fired"), "TaskCompleted hook did not run");
+    }
+
+    /// Run a shell hook that writes `script` (with the context delivered
+    /// via env/stdin) and return what it captured.
+    async fn run_capturing_hook(script_to_file: impl Fn(&std::path::Path) -> String) -> String {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::TaskCompleted,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: script_to_file(&path),
+            },
+        });
+
+        let ctx = serde_json::json!({ "id": "a7", "status": "completed", "kind": "LocalAgent" });
+        let results = reg.run_hooks(&HookEvent::TaskCompleted, None, &ctx).await;
+        assert!(results[0].success, "hook failed: {:?}", results[0].stderr);
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_hooks_delivers_context_via_env() {
+        let body =
+            run_capturing_hook(|p| format!("printf '%s' \"$AGENT_CODE_HOOK_CONTEXT\" > {p:?}"))
+                .await;
+        assert!(
+            body.contains("\"id\":\"a7\""),
+            "env context missing: {body}"
+        );
+        assert!(body.contains("\"status\":\"completed\""));
+    }
+
+    #[tokio::test]
+    async fn run_hooks_delivers_context_via_stdin() {
+        let body = run_capturing_hook(|p| format!("cat > {p:?}")).await;
+        assert!(
+            body.contains("\"id\":\"a7\""),
+            "stdin context missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_hooks_sets_event_name_env() {
+        let body =
+            run_capturing_hook(|p| format!("printf '%s' \"$AGENT_CODE_HOOK_EVENT\" > {p:?}")).await;
+        assert_eq!(body, "task_completed");
+    }
+
+    #[tokio::test]
+    async fn large_context_omits_env_but_still_spawns_and_delivers_via_stdin() {
+        // A context far larger than MAX_ENV_CONTEXT_BYTES must not be put
+        // in the environment (it could blow the exec limit and fail the
+        // hook → a PreToolUse veto), but the hook must still run and see
+        // the full context on stdin.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut reg = HookRegistry::new();
+        reg.register(HookDefinition {
+            event: HookEvent::TaskCompleted,
+            tool_name: None,
+            action: HookAction::Shell {
+                command: format!(
+                    "printf 'envlen=%s truncated=%s\\n' \"${{#AGENT_CODE_HOOK_CONTEXT}}\" \
+                     \"$AGENT_CODE_HOOK_CONTEXT_TRUNCATED\" > {path:?}; wc -c >> {path:?}"
+                ),
+            },
+        });
+
+        let big = "x".repeat(MAX_ENV_CONTEXT_BYTES * 2);
+        let ctx = serde_json::json!({ "blob": big });
+        let results = reg.run_hooks(&HookEvent::TaskCompleted, None, &ctx).await;
+        assert!(results[0].success, "hook failed: {:?}", results[0].stderr);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        // Env var was omitted (length 0) and flagged truncated.
+        assert!(body.contains("envlen=0"), "env should be empty: {body}");
+        assert!(
+            body.contains("truncated=1"),
+            "truncated flag missing: {body}"
+        );
+        // stdin still delivered the full (large) context.
+        let stdin_bytes: usize = body
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(
+            stdin_bytes > MAX_ENV_CONTEXT_BYTES,
+            "stdin did not carry the full context ({stdin_bytes} bytes)"
+        );
     }
 
     #[tokio::test]
