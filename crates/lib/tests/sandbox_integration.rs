@@ -29,6 +29,7 @@ fn make_ctx(cwd: std::path::PathBuf, sandbox: Option<Arc<SandboxExecutor>>) -> T
         permission_prompter: None,
         sandbox,
         active_disk_output_style: None,
+        agent_limiter: None,
     }
 }
 

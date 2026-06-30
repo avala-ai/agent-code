@@ -274,7 +274,7 @@ impl TaskManager {
             cwd: cwd.to_path_buf(),
         };
         Ok(self
-            .spawn_command(cmd, description, TaskKind::LocalShell, payload, None)
+            .spawn_command(cmd, description, TaskKind::LocalShell, payload, None, None)
             .await)
     }
 
@@ -294,6 +294,7 @@ impl TaskManager {
         kind: TaskKind,
         payload: TaskPayload,
         color: Option<SubagentColor>,
+        limiter: Option<Arc<crate::services::agent_control::AgentExecutionLimiter>>,
     ) -> TaskId {
         let id = self.allocate_id(id_prefix_for(kind)).await;
         let output_file = task_output_path(&id);
@@ -334,6 +335,14 @@ impl TaskManager {
         let cancels = self.cancels.clone();
         let persist_dir = self.persist_dir.clone();
         tokio::spawn(async move {
+            // Bound concurrent subagents: acquire a slot before running
+            // and hold it for the task's lifetime. Spawns past the cap
+            // queue here; the task is already registered (visible to
+            // `/tasks`) while it waits. `None` → unbounded (shell tasks).
+            let _slot = match limiter {
+                Some(l) => l.acquire().await,
+                None => None,
+            };
             run_command_task(&task_id, cmd, &tasks, cancel, persist_dir).await;
             // Drop the cancel handle once the task is terminal.
             cancels.lock().await.remove(&task_id);
@@ -930,7 +939,7 @@ mod tests {
             parent_session: None,
         };
         let id = mgr
-            .spawn_command(cmd, "demo", TaskKind::LocalAgent, payload, None)
+            .spawn_command(cmd, "demo", TaskKind::LocalAgent, payload, None, None)
             .await;
 
         assert!(

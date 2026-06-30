@@ -34,6 +34,7 @@ fn ctx_with_manager(mgr: Arc<TaskManager>) -> ToolContext {
         permission_prompter: None,
         sandbox: None,
         active_disk_output_style: None,
+        agent_limiter: None,
     }
 }
 

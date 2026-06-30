@@ -933,6 +933,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                         let t = super::theme::current();
                         let description: String = bg_input.chars().take(60).collect();
                         let task_manager = engine.state().task_manager.clone();
+                        let agent_limiter = engine.state().agent_limiter.clone();
                         let cwd = engine.state().cwd.clone();
                         let subagent_id = uuid::Uuid::new_v4().to_string();
                         let id = agent_code_lib::tools::agent::spawn_background_agent(
@@ -943,6 +944,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                             &subagent_id,
                             None,
                             None,
+                            Some(agent_limiter),
                         )
                         .await;
                         eprintln!(
