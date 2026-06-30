@@ -7601,6 +7601,7 @@ mod tests {
             kind: agent_code_lib::services::background::TaskKind::LocalShell,
             payload: None,
             subagent_color: None,
+            notified: false,
             started_at: now - std::time::Duration::from_secs(started_secs_ago),
             finished_at: finished_secs_ago.map(|s| now - std::time::Duration::from_secs(s)),
         }
@@ -7737,6 +7738,7 @@ mod tests {
             kind: agent_code_lib::services::background::TaskKind::LocalAgent,
             payload: None,
             subagent_color: Some(color),
+            notified: false,
             started_at: now - std::time::Duration::from_secs(1),
             finished_at: None,
         }

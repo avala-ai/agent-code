@@ -31,6 +31,7 @@ pub mod session_env;
 pub mod settings_sync;
 pub mod shell_passthrough;
 pub mod subagent_colors;
+pub mod task_surface;
 pub mod telemetry;
 pub mod tips;
 pub mod tokens;

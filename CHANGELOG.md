@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **Background task completion surfacing**: the interactive REPL now reports background tasks (e.g. `bash … &`, subagent runs) as they finish, instead of leaving them invisible until `/tasks` is run. Each completion prints a one-line toast, fires a desktop notification, and injects a synthetic `is_meta` result message so the agent can reference the output on its next turn. A new `services::task_surface` module renders the injected `<task …>` envelope. Completions are de-duplicated by a new `notified` flag on `TaskInfo` so each surfaces exactly once.
+
+### Fixed
+
+- **Killing a background task left the process running**: `TaskManager::kill` previously only flipped a status field, orphaning the underlying process (and its children). Shell tasks now register a cancellation handle; `kill` terminates the live process — on Unix the entire process group, so descendants are not orphaned — and a status-only `Killed` is preserved against a racing natural exit.
 
 ## [0.22.1] - 2026-06-01
 

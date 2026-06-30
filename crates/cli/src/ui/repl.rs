@@ -552,6 +552,62 @@ impl Drop for EscapeWatcherGuard {
     }
 }
 
+/// Surface background tasks that finished since the last prompt.
+///
+/// Drains the task manager once (de-duplicated by the `notified` flag),
+/// and for each newly-finished task: prints a one-line toast, fires a
+/// desktop notification, and injects a synthetic `is_meta` result
+/// message so the agent can reference the output on its next turn.
+/// Killed tasks are not surfaced (the user initiated them).
+async fn surface_background_completions(
+    engine: &mut QueryEngine,
+    notifier: &agent_code_lib::services::notifier::NotifierService,
+) {
+    use agent_code_lib::services::background::TaskStatus;
+
+    let task_manager = engine.state().task_manager.clone();
+    let completed = task_manager.drain_completions().await;
+    if completed.is_empty() {
+        return;
+    }
+
+    let t = super::theme::current();
+    for info in completed {
+        let (label, ok) = match &info.status {
+            TaskStatus::Completed => ("done", true),
+            TaskStatus::Failed(_) => ("failed", false),
+            _ => continue,
+        };
+        let elapsed = info
+            .finished_at
+            .map(|f| f.saturating_duration_since(info.started_at).as_secs())
+            .unwrap_or(0);
+        let output = task_manager.read_output(&info.id).await.unwrap_or_default();
+
+        let dot = if ok {
+            "✓".with(t.success)
+        } else {
+            "✗".with(t.error)
+        };
+        eprintln!(
+            "  {} {} {} ({elapsed}s)",
+            dot,
+            format!("background {label}:").with(t.muted),
+            info.description.clone().with(t.text),
+        );
+
+        notifier.notify_task_complete(
+            &format!("Task {label}: {}", info.description),
+            output.trim(),
+            elapsed,
+        );
+
+        let msg =
+            agent_code_lib::services::task_surface::build_completion_message(&info, &output);
+        engine.state_mut().push_message(msg);
+    }
+}
+
 /// Run the interactive REPL loop.
 pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     // Configure editing mode and load custom keybindings.
@@ -671,11 +727,20 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     let tips_session_count = tips_service.bump_session();
     let mut tip_shown_this_session = false;
 
+    // Notifier for surfacing finished background tasks (respects config).
+    let notifier = agent_code_lib::services::notifier::NotifierService::new(
+        engine.state().config.notifier.clone(),
+    );
+
     let mut ctrl_c_pending = false;
 
     loop {
         let sink = TerminalSink::new(verbose);
         let t = super::theme::current();
+
+        // Surface any background tasks that finished since the last
+        // prompt (toast + desktop notification + result injection).
+        surface_background_completions(engine, &notifier).await;
 
         // Inline status divider before prompt (after first turn).
         {
