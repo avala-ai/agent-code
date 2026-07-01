@@ -593,6 +593,23 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /// Execute a slash command. Returns how to proceed.
+/// The "Input prefixes" section shown by `/help`, documenting the
+/// non-slash prompt prefixes so they're discoverable alongside commands.
+fn format_input_prefixes_help() -> String {
+    let mut out = String::new();
+    out.push_str("\nInput prefixes:\n");
+    out.push_str(
+        "  ! <cmd>             Run a shell command; its output is injected into the conversation\n",
+    );
+    out.push_str(
+        "  & <prompt>          Run a prompt as a background subagent (returns to the prompt now)\n",
+    );
+    out.push_str(
+        "  &/<skill> [args]    Run a skill/workflow as a background task (Tab completes skills)\n",
+    );
+    out
+}
+
 /// Theme names accepted by the `/color` command. Shared with the REPL
 /// tab-completer so suggestions match exactly what the command accepts.
 pub(crate) const COLOR_THEME_NAMES: &[&str] = &[
@@ -640,6 +657,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                     println!("  /{:<18} {}", skill.name, desc);
                 }
             }
+            print!("{}", format_input_prefixes_help());
             println!();
             CommandResult::Handled
         }
@@ -7912,6 +7930,15 @@ mod tests {
             parse_tasks_subcommand(Some("clear bg_1")),
             TasksAction::Clear
         );
+    }
+
+    #[test]
+    fn help_input_prefixes_lists_all_three() {
+        let out = format_input_prefixes_help();
+        assert!(out.contains("Input prefixes"));
+        assert!(out.contains("! <cmd>"), "missing ! prefix: {out:?}");
+        assert!(out.contains("& <prompt>"), "missing & prefix: {out:?}");
+        assert!(out.contains("&/<skill>"), "missing &/skill prefix: {out:?}");
     }
 
     #[test]

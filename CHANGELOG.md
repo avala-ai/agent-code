@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/help` now lists the input prefixes**: the in-REPL `/help` output has a new "Input prefixes" section documenting `! <cmd>` (shell), `& <prompt>` (background subagent), and `&/<skill>` (background workflow) — so these non-slash features are discoverable alongside the commands and skills.
+
 - **Tab-completion for `/resume <id>`**: pressing Tab after `/resume ` lists your recent sessions (most recent first) with each session's label — so you can pick one to resume without recalling its UUID.
 
 - **Provider-aware tab-completion for `/model <name>`**: pressing Tab after `/model ` completes the models for your *current* provider (Anthropic, OpenAI, xAI, Google, …), and tracks a provider switched mid-session. The model catalog is extracted to a shared `llm::provider::models_for_provider`, so the `/model` picker and its completion stay in sync.
