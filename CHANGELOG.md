@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Provider-aware tab-completion for `/model <name>`**: pressing Tab after `/model ` completes the models for your *current* provider (Anthropic, OpenAI, xAI, Google, …), and tracks a provider switched mid-session. The model catalog is extracted to a shared `llm::provider::models_for_provider`, so the `/model` picker and its completion stay in sync.
 - **Tab-completion for `/output-style <name>`** (and its `/style` alias): completes the installed style names — built-in plus any project/user styles — loaded fresh from the registry.
 - **Tab-completion for `/color <theme>`**: pressing Tab after `/color ` completes the accepted theme names. The list is now shared between the command and the completer, so a suggested completion always validates.
 

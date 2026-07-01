@@ -45,7 +45,14 @@ fn raw_eprint(text: &str) {
 }
 
 /// Tab-completion helper for slash commands.
-struct CommandCompleter;
+///
+/// Holds a shared snapshot of the active `(model, base_url)` so
+/// `/model` completion can resolve the current provider and offer only
+/// that provider's models. The REPL loop refreshes the snapshot before
+/// each prompt (the model can change mid-session via `/model`).
+struct CommandCompleter {
+    model_ctx: std::sync::Arc<std::sync::Mutex<(String, String)>>,
+}
 
 /// Match score for a command candidate against a user-typed partial.
 ///
@@ -517,6 +524,29 @@ impl Completer for CommandCompleter {
             }
         }
 
+        // `/model <name>` completion: offer the current provider's
+        // models. The provider is derived from the live (model, base_url)
+        // snapshot, so switching providers mid-session updates the list.
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "model") {
+            let pairs = self
+                .model_ctx
+                .lock()
+                .ok()
+                .map(|ctx| {
+                    let provider = agent_code_lib::llm::provider::detect_provider(&ctx.0, &ctx.1);
+                    let names: Vec<&str> =
+                        agent_code_lib::llm::provider::models_for_provider(provider)
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .collect();
+                    complete_from_names(&names, partial)
+                })
+                .unwrap_or_default();
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
         // @path completion fires whenever the cursor is inside an @-token,
         // regardless of where that token is in the line.
         if let Some((at_idx, partial)) = find_at_context(line, pos) {
@@ -937,7 +967,15 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
         rustyline::Editor::<CommandCompleter, rustyline::history::DefaultHistory>::with_config(
             rl_config,
         )?;
-    rl.set_helper(Some(CommandCompleter));
+    // Shared (model, base_url) snapshot so `/model` completion can resolve
+    // the active provider. Refreshed before each prompt (see the loop).
+    let model_ctx = std::sync::Arc::new(std::sync::Mutex::new((
+        engine.state().config.api.model.clone(),
+        engine.state().config.api.base_url.clone(),
+    )));
+    rl.set_helper(Some(CommandCompleter {
+        model_ctx: model_ctx.clone(),
+    }));
 
     // Generate a session ID for persistence. Clone for later use since
     // Stylize methods consume the String.
@@ -1146,6 +1184,13 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
         }
 
         let prompt = format!("{} ", "❯".with(t.accent).bold());
+
+        // Refresh the completer's model snapshot so `/model` completion
+        // tracks a provider changed earlier this session.
+        if let Ok(mut ctx) = model_ctx.lock() {
+            ctx.0 = engine.state().config.api.model.clone();
+            ctx.1 = engine.state().config.api.base_url.clone();
+        }
 
         match rl.readline(&prompt) {
             Ok(line) => {
@@ -2073,6 +2118,58 @@ mod completion_toast_tests {
     fn hint_points_at_tasks_output_with_id() {
         assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
         assert_eq!(completion_output_hint("w12"), "/tasks output w12");
+    }
+}
+
+#[cfg(test)]
+mod model_completion_tests {
+    use super::CommandCompleter;
+    use rustyline::Context;
+    use rustyline::completion::Completer;
+    use rustyline::history::DefaultHistory;
+    use std::sync::{Arc, Mutex};
+
+    fn completer(model: &str, base_url: &str) -> CommandCompleter {
+        CommandCompleter {
+            model_ctx: Arc::new(Mutex::new((model.to_string(), base_url.to_string()))),
+        }
+    }
+
+    #[test]
+    fn model_completion_is_provider_aware() {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        // Anthropic snapshot → Claude models, and no OpenAI models.
+        let c = completer("claude-sonnet-4-20250514", "https://api.anthropic.com");
+        let (idx, pairs) = c.complete("/model claude-o", 15, &ctx).unwrap();
+        assert_eq!(idx, 7, "replacement should overwrite the model token");
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.replacement == "claude-opus-4-20250514"),
+            "expected a claude model: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs.iter().any(|p| p.replacement.starts_with("gpt")),
+            "must not offer OpenAI models on an Anthropic provider"
+        );
+    }
+
+    #[test]
+    fn model_completion_tracks_provider_switch() {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        // OpenAI snapshot → gpt models surface instead.
+        let c = completer("gpt-4.1", "https://api.openai.com/v1");
+        let (_idx, pairs) = c.complete("/model gpt-5", 12, &ctx).unwrap();
+        assert!(
+            pairs.iter().any(|p| p.replacement.starts_with("gpt-5.4")),
+            "expected gpt-5.4 models: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
     }
 }
 

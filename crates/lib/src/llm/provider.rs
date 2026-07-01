@@ -92,6 +92,73 @@ impl std::fmt::Display for ProviderError {
 }
 
 /// Detect the right provider from a model name or base URL.
+/// Suggested models for a provider, as `(id, description)` pairs.
+///
+/// Powers the `/model` interactive selector and its tab-completion, so
+/// both surfaces stay in sync. Providers without a curated list return
+/// an empty slice (the caller falls back to "type any name"). These are
+/// suggestions, not an allow-list — `/model <name>` accepts any string.
+pub fn models_for_provider(kind: ProviderKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex => &[
+            ("claude-opus-4-20250514", "Opus 4 · Most capable"),
+            ("claude-sonnet-4-20250514", "Sonnet 4 · Balanced"),
+            ("claude-haiku-4-20250414", "Haiku 4 · Fast"),
+        ],
+        ProviderKind::OpenAi => &[
+            ("gpt-5.4", "GPT-5.4 · Most capable"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini · Balanced"),
+            ("gpt-5.4-nano", "GPT-5.4 Nano · Fast"),
+            ("gpt-4.1", "GPT-4.1 · Previous gen"),
+            ("gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
+            ("gpt-4.1-nano", "GPT-4.1 Nano · Fastest"),
+            ("o3", "o3 · Reasoning"),
+            ("o3-mini", "o3 Mini · Fast reasoning"),
+        ],
+        ProviderKind::Xai => &[
+            ("grok-3", "Grok 3 · Most capable"),
+            ("grok-3-mini", "Grok 3 Mini · Fast"),
+        ],
+        ProviderKind::Google => &[
+            ("gemini-2.5-pro", "Gemini 2.5 Pro · Most capable"),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
+        ],
+        ProviderKind::DeepSeek => &[
+            ("deepseek-chat", "DeepSeek Chat · General"),
+            ("deepseek-reasoner", "DeepSeek Reasoner · Reasoning"),
+        ],
+        ProviderKind::Mistral => &[
+            ("mistral-large-latest", "Mistral Large · Most capable"),
+            ("codestral-latest", "Codestral · Code-focused"),
+        ],
+        ProviderKind::Zhipu => &[
+            ("glm-4.7", "GLM-4.7 · Latest"),
+            ("glm-4.6", "GLM-4.6 · Balanced"),
+            ("glm-4.6-air", "GLM-4.6 Air · Fast"),
+            ("glm-4.5", "GLM-4.5 · Previous gen"),
+        ],
+        ProviderKind::Cohere => &[
+            ("command-r-plus", "Command R+ · Most capable"),
+            ("command-r", "Command R · Balanced"),
+            ("command-light", "Command Light · Fast"),
+        ],
+        ProviderKind::Perplexity => &[
+            ("sonar-pro", "Sonar Pro · Most capable, web search"),
+            ("sonar", "Sonar · Balanced, web search"),
+            ("sonar-deep-research", "Sonar Deep Research · In-depth"),
+        ],
+        ProviderKind::OpenRouter => &[
+            ("anthropic/claude-sonnet-4", "Claude Sonnet 4 · Balanced"),
+            ("anthropic/claude-opus-4", "Claude Opus 4 · Most capable"),
+            ("openai/gpt-4.1", "GPT-4.1 · Balanced"),
+            ("openai/gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
+            ("google/gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
+            ("meta-llama/llama-3.3-70b", "Llama 3.3 70B · Open"),
+        ],
+        _ => &[],
+    }
+}
+
 pub fn detect_provider(model: &str, base_url: &str) -> ProviderKind {
     let model_lower = model.to_lowercase();
     let url_lower = base_url.to_lowercase();
@@ -292,6 +359,32 @@ impl ProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_for_provider_returns_expected_catalogs() {
+        // Anthropic-family providers share the Claude catalog.
+        for k in [
+            ProviderKind::Anthropic,
+            ProviderKind::Bedrock,
+            ProviderKind::Vertex,
+        ] {
+            let models = models_for_provider(k);
+            assert!(models.iter().any(|(id, _)| id.starts_with("claude-")));
+        }
+        // OpenAI has gpt/o-series; xAI has grok; provider without a
+        // curated list returns empty.
+        assert!(
+            models_for_provider(ProviderKind::OpenAi)
+                .iter()
+                .any(|(id, _)| id.starts_with("gpt-"))
+        );
+        assert!(
+            models_for_provider(ProviderKind::Xai)
+                .iter()
+                .any(|(id, _)| *id == "grok-3")
+        );
+        assert!(models_for_provider(ProviderKind::OpenAiCompatible).is_empty());
+    }
 
     #[test]
     fn test_detect_from_url_anthropic() {
