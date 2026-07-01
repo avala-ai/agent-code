@@ -196,9 +196,10 @@ fn session_completion_pairs(
 
 /// Session-id completion for `/resume <partial>`: lists recent sessions
 /// (most recent first) so a session can be picked without recalling its
-/// UUID.
+/// UUID. Uses the summary-only listing (no transcript parsing) since it
+/// runs synchronously on a tab-completion keypress.
 fn complete_session_id(partial: &str) -> Vec<Pair> {
-    let sessions = agent_code_lib::services::session::list_sessions(50);
+    let sessions = agent_code_lib::services::session::list_session_summaries(50);
     session_completion_pairs(&sessions, partial)
 }
 
