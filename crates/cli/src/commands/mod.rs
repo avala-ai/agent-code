@@ -593,6 +593,17 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /// Execute a slash command. Returns how to proceed.
+/// Theme names accepted by the `/color` command. Shared with the REPL
+/// tab-completer so suggestions match exactly what the command accepts.
+pub(crate) const COLOR_THEME_NAMES: &[&str] = &[
+    "midnight",
+    "daybreak",
+    "midnight-muted",
+    "daybreak-muted",
+    "terminal",
+    "auto",
+];
+
 pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
     let input = input.trim_start_matches('/');
     let (cmd, args) = input
@@ -1558,14 +1569,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("color") => {
-            let themes = [
-                "midnight",
-                "daybreak",
-                "midnight-muted",
-                "daybreak-muted",
-                "terminal",
-                "auto",
-            ];
+            let themes = COLOR_THEME_NAMES;
             if let Some(name) = args {
                 if themes.contains(&name) {
                     engine.state_mut().config.ui.theme = name.to_string();

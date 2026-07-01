@@ -118,21 +118,21 @@ fn parse_background_skill(bg_input: &str) -> Option<(String, String)> {
     }
 }
 
-/// Find a `/tasks <subcommand-partial>` completion context ending at
-/// byte position `pos`. Returns `(token_byte_idx, partial)` where
-/// `token_byte_idx` is the byte position of the subcommand token (so the
-/// replacement overwrites it) and `partial` is what's typed so far.
+/// Find the first-argument completion context for `/<cmd> <partial>`
+/// ending at byte position `pos`. Returns `(token_byte_idx, partial)`
+/// where `token_byte_idx` is the byte position of the argument token (so
+/// the replacement overwrites it) and `partial` is what's typed so far.
 ///
-/// Fires only when the line is `/tasks` followed by whitespace and the
-/// cursor is still inside the first (subcommand) token — so `/tasks ki`
-/// completes but `/tasks kill bg_3` no longer does (the cursor is in the
-/// id, not the subcommand).
-fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+/// Fires only when the line is `/<cmd>` followed by whitespace and the
+/// cursor is still inside the first argument token — so `/color mid`
+/// completes but `/color midnight extra` no longer does.
+fn find_command_arg_context<'a>(line: &'a str, pos: usize, cmd: &str) -> Option<(usize, &'a str)> {
     if pos > line.len() {
         return None;
     }
-    let rest = line.strip_prefix("/tasks")?;
-    // Must be whitespace right after `/tasks` (rejects e.g. `/tasksfoo`).
+    let after_slash = line.strip_prefix('/')?;
+    let rest = after_slash.strip_prefix(cmd)?;
+    // Must be whitespace right after the command (rejects e.g. `/colorx`).
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
@@ -146,6 +146,35 @@ fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)
         return None;
     }
     Some((token_idx, partial))
+}
+
+/// `/tasks <subcommand>` context — a thin wrapper over
+/// [`find_command_arg_context`] for the tasks management verbs.
+fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    find_command_arg_context(line, pos, "tasks")
+}
+
+/// Score `names` against `partial` with the slash-command matcher and
+/// return bare-name completion candidates (no leading `/`), best-first.
+/// Used to complete a command's argument from a fixed value set (e.g.
+/// `/color <theme>`).
+fn complete_from_names(names: &[&str], partial: &str) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = names
+        .iter()
+        .filter_map(|name| {
+            let score = score_command(name, &[], partial)?;
+            Some((
+                score,
+                Pair {
+                    display: name.to_string(),
+                    replacement: name.to_string(),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Completion candidates for `/tasks <partial>`: the management
@@ -449,6 +478,15 @@ impl Completer for CommandCompleter {
         // subcommands so the surface is discoverable from the keyboard.
         if let Some((token_idx, partial)) = find_tasks_subcommand_context(line, pos) {
             let pairs = complete_tasks_subcommand(partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/color <theme>` completion: offer the theme names the command
+        // accepts (same list, so a completion always validates).
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "color") {
+            let pairs = complete_from_names(crate::commands::COLOR_THEME_NAMES, partial);
             if !pairs.is_empty() {
                 return Ok((token_idx, pairs));
             }
@@ -2010,6 +2048,56 @@ mod completion_toast_tests {
     fn hint_points_at_tasks_output_with_id() {
         assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
         assert_eq!(completion_output_hint("w12"), "/tasks output w12");
+    }
+}
+
+#[cfg(test)]
+mod color_completion_tests {
+    use super::{complete_from_names, find_command_arg_context};
+
+    #[test]
+    fn arg_context_detects_partial() {
+        assert_eq!(
+            find_command_arg_context("/color mid", 10, "color"),
+            Some((7, "mid"))
+        );
+        // Cursor at the arg start (just past the space) → empty partial.
+        assert_eq!(
+            find_command_arg_context("/color ", 7, "color"),
+            Some((7, ""))
+        );
+    }
+
+    #[test]
+    fn arg_context_rejects_non_matching() {
+        // No trailing space → still command completion.
+        assert_eq!(find_command_arg_context("/color", 6, "color"), None);
+        // Different command.
+        assert_eq!(find_command_arg_context("/model gpt", 10, "color"), None);
+        // Past the first arg token.
+        assert_eq!(
+            find_command_arg_context("/color midnight x", 17, "color"),
+            None
+        );
+        // Prefix collision: `/colorful` is not `/color <arg>`.
+        assert_eq!(find_command_arg_context("/colorful", 9, "color"), None);
+    }
+
+    #[test]
+    fn completes_only_accepted_theme_names() {
+        // Every completion offered must be a name `/color` accepts, and
+        // a prefix should surface the matching theme.
+        let pairs = complete_from_names(crate::commands::COLOR_THEME_NAMES, "mid");
+        let names: Vec<&String> = pairs.iter().map(|p| &p.replacement).collect();
+        assert!(names.iter().any(|n| *n == "midnight"));
+        assert!(names.iter().any(|n| *n == "midnight-muted"));
+        for p in &pairs {
+            assert!(
+                crate::commands::COLOR_THEME_NAMES.contains(&p.replacement.as_str()),
+                "offered non-accepted theme {:?}",
+                p.replacement
+            );
+        }
     }
 }
 

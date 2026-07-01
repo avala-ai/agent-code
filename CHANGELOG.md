@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tab-completion for `/color <theme>`**: pressing Tab after `/color ` completes the accepted theme names. The list is now shared between the command and the completer, so a suggested completion always validates.
+
 - **Finished-task toast shows how to read the output**: when a background task (`bash … &`, a subagent, or `&/skill`) finishes, the completion toast now appends `/tasks output <id>` — so the task id is visible and you can copy the command straight to the prompt instead of running `/tasks` to find it.
 - **Tab-completion for `/tasks` subcommands**: typing `/tasks ` and pressing Tab now completes the management subcommands (`list`, `output`, `kill`, `clear`) with short descriptions, so the task-management surface is discoverable from the keyboard.
 
