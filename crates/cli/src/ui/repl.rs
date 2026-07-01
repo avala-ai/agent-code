@@ -154,6 +154,17 @@ fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)
     find_command_arg_context(line, pos, "tasks")
 }
 
+/// Output-style name completion for `/output-style <partial>`. Loads the
+/// registry (built-in + project + user styles) fresh so custom styles
+/// show up, then scores their names against `partial`.
+fn complete_output_style_name(cwd: &str, partial: &str) -> Vec<Pair> {
+    let registry = agent_code_lib::output_styles::OutputStyleRegistry::load_all(Some(
+        std::path::Path::new(cwd),
+    ));
+    let names: Vec<&str> = registry.all().iter().map(|s| s.name.as_str()).collect();
+    complete_from_names(&names, partial)
+}
+
 /// Score `names` against `partial` with the slash-command matcher and
 /// return bare-name completion candidates (no leading `/`), best-first.
 /// Used to complete a command's argument from a fixed value set (e.g.
@@ -487,6 +498,20 @@ impl Completer for CommandCompleter {
         // accepts (same list, so a completion always validates).
         if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "color") {
             let pairs = complete_from_names(crate::commands::COLOR_THEME_NAMES, partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/output-style <name>` (alias `/style`) completion: offer the
+        // installed style names (built-in + project + user).
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "output-style")
+            .or_else(|| find_command_arg_context(line, pos, "style"))
+        {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let pairs = complete_output_style_name(&cwd, partial);
             if !pairs.is_empty() {
                 return Ok((token_idx, pairs));
             }
@@ -2048,6 +2073,39 @@ mod completion_toast_tests {
     fn hint_points_at_tasks_output_with_id() {
         assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
         assert_eq!(completion_output_hint("w12"), "/tasks output w12");
+    }
+}
+
+#[cfg(test)]
+mod output_style_completion_tests {
+    use super::complete_output_style_name;
+
+    #[test]
+    fn completes_a_builtin_style() {
+        // The built-in "default" style is always present; a prefix of it
+        // should surface it. (Loads the real registry over cwd.)
+        let pairs = complete_output_style_name(".", "def");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "default"),
+            "expected 'default' among completions: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_completion_is_a_real_style() {
+        let registry = agent_code_lib::output_styles::OutputStyleRegistry::load_all(Some(
+            std::path::Path::new("."),
+        ));
+        let known: std::collections::HashSet<&str> =
+            registry.all().iter().map(|s| s.name.as_str()).collect();
+        for p in complete_output_style_name(".", "") {
+            assert!(
+                known.contains(p.replacement.as_str()),
+                "offered unknown style {:?}",
+                p.replacement
+            );
+        }
     }
 }
 
