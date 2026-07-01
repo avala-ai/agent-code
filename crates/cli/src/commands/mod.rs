@@ -737,65 +737,7 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 let base_url = engine.state().config.api.base_url.clone();
                 let provider = agent_code_lib::llm::provider::detect_provider(&current, &base_url);
 
-                use agent_code_lib::llm::provider::ProviderKind;
-                let models: Vec<(&str, &str)> = match provider {
-                    ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex => vec![
-                        ("claude-opus-4-20250514", "Opus 4 · Most capable"),
-                        ("claude-sonnet-4-20250514", "Sonnet 4 · Balanced"),
-                        ("claude-haiku-4-20250414", "Haiku 4 · Fast"),
-                    ],
-                    ProviderKind::OpenAi => vec![
-                        ("gpt-5.4", "GPT-5.4 · Most capable"),
-                        ("gpt-5.4-mini", "GPT-5.4 Mini · Balanced"),
-                        ("gpt-5.4-nano", "GPT-5.4 Nano · Fast"),
-                        ("gpt-4.1", "GPT-4.1 · Previous gen"),
-                        ("gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
-                        ("gpt-4.1-nano", "GPT-4.1 Nano · Fastest"),
-                        ("o3", "o3 · Reasoning"),
-                        ("o3-mini", "o3 Mini · Fast reasoning"),
-                    ],
-                    ProviderKind::Xai => vec![
-                        ("grok-3", "Grok 3 · Most capable"),
-                        ("grok-3-mini", "Grok 3 Mini · Fast"),
-                    ],
-                    ProviderKind::Google => vec![
-                        ("gemini-2.5-pro", "Gemini 2.5 Pro · Most capable"),
-                        ("gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
-                    ],
-                    ProviderKind::DeepSeek => vec![
-                        ("deepseek-chat", "DeepSeek Chat · General"),
-                        ("deepseek-reasoner", "DeepSeek Reasoner · Reasoning"),
-                    ],
-                    ProviderKind::Mistral => vec![
-                        ("mistral-large-latest", "Mistral Large · Most capable"),
-                        ("codestral-latest", "Codestral · Code-focused"),
-                    ],
-                    ProviderKind::Zhipu => vec![
-                        ("glm-4.7", "GLM-4.7 · Latest"),
-                        ("glm-4.6", "GLM-4.6 · Balanced"),
-                        ("glm-4.6-air", "GLM-4.6 Air · Fast"),
-                        ("glm-4.5", "GLM-4.5 · Previous gen"),
-                    ],
-                    ProviderKind::Cohere => vec![
-                        ("command-r-plus", "Command R+ · Most capable"),
-                        ("command-r", "Command R · Balanced"),
-                        ("command-light", "Command Light · Fast"),
-                    ],
-                    ProviderKind::Perplexity => vec![
-                        ("sonar-pro", "Sonar Pro · Most capable, web search"),
-                        ("sonar", "Sonar · Balanced, web search"),
-                        ("sonar-deep-research", "Sonar Deep Research · In-depth"),
-                    ],
-                    ProviderKind::OpenRouter => vec![
-                        ("anthropic/claude-sonnet-4", "Claude Sonnet 4 · Balanced"),
-                        ("anthropic/claude-opus-4", "Claude Opus 4 · Most capable"),
-                        ("openai/gpt-4.1", "GPT-4.1 · Balanced"),
-                        ("openai/gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
-                        ("google/gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
-                        ("meta-llama/llama-3.3-70b", "Llama 3.3 70B · Open"),
-                    ],
-                    _ => vec![],
-                };
+                let models = agent_code_lib::llm::provider::models_for_provider(provider);
 
                 if models.is_empty() {
                     println!("Model: {current}");
