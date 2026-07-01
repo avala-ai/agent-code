@@ -161,6 +161,48 @@ fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)
     find_command_arg_context(line, pos, "tasks")
 }
 
+/// Build `/resume <partial>` completion candidates from session
+/// summaries. Pure (takes the list) so it can be tested with fixtures.
+/// Preserves the input order (recency) for equal-scored matches, since
+/// most recent sessions are the likeliest resume targets. The display
+/// shows a short id plus the label (or last-updated time) so a UUID is
+/// pickable without typing it.
+fn session_completion_pairs(
+    sessions: &[agent_code_lib::services::session::SessionSummary],
+    partial: &str,
+) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = sessions
+        .iter()
+        .filter_map(|s| {
+            let score = score_command(&s.id, &[], partial)?;
+            let short: String = s.id.chars().take(8).collect();
+            let hint = match s.label.as_deref() {
+                Some(label) if !label.is_empty() => label.to_string(),
+                _ => s.updated_at.clone(),
+            };
+            Some((
+                score,
+                Pair {
+                    display: format!("{short}… · {hint}"),
+                    replacement: s.id.clone(),
+                },
+            ))
+        })
+        .collect();
+    // Stable sort by score desc keeps recency order within equal scores.
+    scored.sort_by(|(a, _), (b, _)| b.cmp(a));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Session-id completion for `/resume <partial>`: lists recent sessions
+/// (most recent first) so a session can be picked without recalling its
+/// UUID. Uses the summary-only listing (no transcript parsing) since it
+/// runs synchronously on a tab-completion keypress.
+fn complete_session_id(partial: &str) -> Vec<Pair> {
+    let sessions = agent_code_lib::services::session::list_session_summaries(50);
+    session_completion_pairs(&sessions, partial)
+}
+
 /// Output-style name completion for `/output-style <partial>`. Loads the
 /// registry (built-in + project + user styles) fresh so custom styles
 /// show up, then scores their names against `partial`.
@@ -542,6 +584,15 @@ impl Completer for CommandCompleter {
                     complete_from_names(&names, partial)
                 })
                 .unwrap_or_default();
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/resume <id>` completion: offer recent session ids (with their
+        // labels) so a session can be picked without recalling its UUID.
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "resume") {
+            let pairs = complete_session_id(partial);
             if !pairs.is_empty() {
                 return Ok((token_idx, pairs));
             }
@@ -2118,6 +2169,52 @@ mod completion_toast_tests {
     fn hint_points_at_tasks_output_with_id() {
         assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
         assert_eq!(completion_output_hint("w12"), "/tasks output w12");
+    }
+}
+
+#[cfg(test)]
+mod resume_completion_tests {
+    use super::session_completion_pairs;
+    use agent_code_lib::services::session::SessionSummary;
+
+    fn mk(id: &str, label: Option<&str>, updated: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            cwd: "/tmp".to_string(),
+            model: "m".to_string(),
+            turn_count: 0,
+            message_count: 0,
+            updated_at: updated.to_string(),
+            label: label.map(str::to_string),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_partial_lists_all_in_recency_order() {
+        let sessions = vec![
+            mk("aaaa1111-2222", Some("refactor auth"), "2026-06-30T10:00"),
+            mk("bbbb3333-4444", None, "2026-06-29T09:00"),
+        ];
+        let pairs = session_completion_pairs(&sessions, "");
+        // Order preserved (input is recency-sorted); replacement is the id.
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].replacement, "aaaa1111-2222");
+        assert_eq!(pairs[1].replacement, "bbbb3333-4444");
+        // Labelled session shows its label; unlabelled shows the time.
+        assert!(pairs[0].display.contains("refactor auth"));
+        assert!(pairs[1].display.contains("2026-06-29T09:00"));
+    }
+
+    #[test]
+    fn partial_filters_by_id_prefix() {
+        let sessions = vec![
+            mk("aaaa1111", Some("one"), "t1"),
+            mk("bbbb2222", Some("two"), "t2"),
+        ];
+        let pairs = session_completion_pairs(&sessions, "bbbb");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "bbbb2222");
     }
 }
 

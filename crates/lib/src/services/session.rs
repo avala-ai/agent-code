@@ -201,6 +201,64 @@ pub fn list_sessions(limit: usize) -> Vec<SessionSummary> {
     sessions
 }
 
+/// Summary fields only, deserialized WITHOUT materializing the
+/// `messages` transcript (serde skips the unknown field), so hot-path
+/// callers don't pay to allocate every session's full history.
+#[derive(serde::Deserialize)]
+struct SessionMetaLite {
+    id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    turn_count: usize,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Like [`list_sessions`], but skips parsing the message transcripts —
+/// for callers that only need the summary fields on a hot path (e.g.
+/// tab-completion). `message_count` is reported as `0` (not read), since
+/// counting messages would require deserializing the transcript this
+/// path deliberately avoids.
+pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
+    let dir = match sessions_dir() {
+        Some(d) if d.is_dir() => d,
+        _ => return Vec::new(),
+    };
+
+    let mut sessions: Vec<SessionSummary> = std::fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let content = std::fs::read_to_string(entry.path()).ok()?;
+            let m: SessionMetaLite = serde_json::from_str(&content).ok()?;
+            Some(SessionSummary {
+                id: m.id,
+                cwd: m.cwd,
+                model: m.model,
+                turn_count: m.turn_count,
+                message_count: 0,
+                updated_at: m.updated_at,
+                label: m.label,
+                tags: m.tags,
+            })
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.truncate(limit);
+    sessions
+}
+
 /// Result of a prune sweep over the sessions directory.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PruneStats {
@@ -396,6 +454,32 @@ pub fn new_session_id() -> String {
 mod tests {
     use super::*;
     use crate::llm::message::{ContentBlock, Message, UserMessage, user_message};
+
+    #[test]
+    fn session_meta_lite_deserializes_metadata_and_skips_messages() {
+        // A session JSON with a (deliberately arbitrary, non-Message)
+        // `messages` array. The lite metadata path must pull the summary
+        // fields and ignore the transcript entirely — so it never has to
+        // parse the potentially huge/complex message history.
+        let json = r#"{
+            "id": "sess-123",
+            "created_at": "2026-06-30T09:00:00Z",
+            "updated_at": "2026-06-30T10:00:00Z",
+            "cwd": "/work",
+            "model": "some-model",
+            "messages": [1, "arbitrary", {"nested": [2, 3]}],
+            "turn_count": 4,
+            "label": "refactor auth",
+            "tags": ["wip", "auth"]
+        }"#;
+        let m: SessionMetaLite = serde_json::from_str(json).unwrap();
+        assert_eq!(m.id, "sess-123");
+        assert_eq!(m.updated_at, "2026-06-30T10:00:00Z");
+        assert_eq!(m.model, "some-model");
+        assert_eq!(m.turn_count, 4);
+        assert_eq!(m.label.as_deref(), Some("refactor auth"));
+        assert_eq!(m.tags, vec!["wip".to_string(), "auth".to_string()]);
+    }
 
     /// Helper: build a session containing the given messages with
     /// fixed, deterministic metadata. Used by wire-up tests.
