@@ -2484,7 +2484,10 @@ fn format_task_list(
     use agent_code_lib::services::background::TaskStatus;
 
     if tasks.is_empty() {
-        return "No background tasks running.\n".to_string();
+        return "No background tasks running.\n\
+                Start one with `& <prompt>` (background subagent) or \
+                `&/<skill>` (background workflow).\n"
+            .to_string();
     }
 
     let mut out = String::new();
@@ -7726,6 +7729,9 @@ mod tests {
         let now = std::time::Instant::now();
         let out = format_task_list(&[], now);
         assert!(out.contains("No background tasks"));
+        // Empty state hints at how to start one.
+        assert!(out.contains("& <prompt>"), "missing & hint: {out:?}");
+        assert!(out.contains("&/<skill>"), "missing &/skill hint: {out:?}");
     }
 
     #[test]
