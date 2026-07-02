@@ -96,27 +96,36 @@ impl PermissionChecker {
         let Some(ref scope) = self.read_scope else {
             return PermissionDecision::Allow;
         };
-        let path_arg = input
-            .get("file_path")
-            .or_else(|| input.get("path"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-
-        // The effective read root is the explicit path argument, or the
-        // process working directory that `Grep`/`Glob` default to when no
-        // path is given. Either way it must resolve inside the scope, so a
-        // missing path can no longer be a way out of it.
-        let effective: String = match path_arg {
-            Some(p) => p.to_string(),
-            None => std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-        };
-        if !read_scope_allows(scope, &effective) {
-            return PermissionDecision::Deny(format!(
-                "read outside the scan scope is not allowed: {effective}"
-            ));
+        // Validate EVERY path-bearing argument, not just the first. Different
+        // read tools read different fields (`FileRead` uses `file_path`,
+        // `Grep`/`Glob` use `path`), and a call may set several — checking
+        // only one lets `{"file_path": <in-scope>, "path": "/etc"}` slip the
+        // out-of-scope path past the gate.
+        let mut checked_any = false;
+        for key in ["file_path", "path"] {
+            if let Some(p) = input
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                checked_any = true;
+                if !read_scope_allows(scope, p) {
+                    return PermissionDecision::Deny(format!(
+                        "read outside the scan scope is not allowed: {p}"
+                    ));
+                }
+            }
+        }
+        // No explicit path: `Grep`/`Glob` default to the process working
+        // directory, which must itself be in scope.
+        if !checked_any {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            if !read_scope_allows(scope, &cwd.to_string_lossy()) {
+                return PermissionDecision::Deny(format!(
+                    "read outside the scan scope is not allowed: {}",
+                    cwd.display()
+                ));
+            }
         }
 
         // A `Glob` `pattern` is joined onto the search root, so an absolute
@@ -493,6 +502,24 @@ mod tests {
         assert!(matches!(
             checker.check_read_scope("FileRead", &outside),
             PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn read_scope_checks_every_path_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), "x").unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+        // An in-scope `file_path` must not excuse an out-of-scope `path` — a
+        // Grep/Glob actually reads `path`, so both fields are validated.
+        let mixed = serde_json::json!({
+            "file_path": dir.path().join("in.txt").to_string_lossy(),
+            "path": "/etc",
+            "pattern": ".*"
+        });
+        assert!(matches!(
+            checker.check_read_scope("Grep", &mixed),
+            PermissionDecision::Deny(_)
         ));
     }
 
