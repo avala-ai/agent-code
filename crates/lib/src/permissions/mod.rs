@@ -96,18 +96,41 @@ impl PermissionChecker {
         let Some(ref scope) = self.read_scope else {
             return PermissionDecision::Allow;
         };
-        let raw = input
+        let path_arg = input
             .get("file_path")
             .or_else(|| input.get("path"))
-            .and_then(|v| v.as_str());
-        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
-            return PermissionDecision::Allow;
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        // The effective read root is the explicit path argument, or the
+        // process working directory that `Grep`/`Glob` default to when no
+        // path is given. Either way it must resolve inside the scope, so a
+        // missing path can no longer be a way out of it.
+        let effective: String = match path_arg {
+            Some(p) => p.to_string(),
+            None => std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
         };
-        if read_scope_allows(scope, raw) {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Deny(format!("read outside the scan scope is not allowed: {raw}"))
+        if !read_scope_allows(scope, &effective) {
+            return PermissionDecision::Deny(format!(
+                "read outside the scan scope is not allowed: {effective}"
+            ));
         }
+
+        // `Glob` can carry an absolute `pattern` (e.g. `/etc/**`) with no
+        // `path` argument, which would otherwise escape the scope.
+        if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str())
+            && Path::new(pattern).is_absolute()
+            && !read_scope_allows(scope, pattern)
+        {
+            return PermissionDecision::Deny(format!(
+                "glob pattern outside the scan scope is not allowed: {pattern}"
+            ));
+        }
+
+        PermissionDecision::Allow
     }
 
     /// Check whether a tool operation is permitted.
@@ -381,7 +404,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_scope_confines_reads() {
+    fn read_scope_confines_explicit_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("in.txt"), "x").unwrap();
         let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
@@ -395,17 +418,47 @@ mod tests {
             PermissionDecision::Allow
         ));
 
-        // Out-of-scope read is denied.
+        // Out-of-scope FileRead and out-of-scope Grep path are denied.
         let outside = serde_json::json!({"file_path": "/etc/hostname"});
         assert!(matches!(
             checker.check_read_scope("FileRead", &outside),
             PermissionDecision::Deny(_)
         ));
+        let grep_out = serde_json::json!({"path": "/etc", "pattern": "root"});
+        assert!(matches!(
+            checker.check_read_scope("Grep", &grep_out),
+            PermissionDecision::Deny(_)
+        ));
+    }
 
-        // A call with no explicit path (Grep/Glob defaulting to cwd) is allowed.
+    #[test]
+    fn read_scope_denies_missing_path_that_defaults_outside() {
+        // A no-path Grep/Glob defaults to the process cwd; with a scope that
+        // is not the cwd, that resolves outside the scope and is denied.
+        let dir = tempfile::tempdir().unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
         let no_path = serde_json::json!({"pattern": "foo"});
         assert!(matches!(
             checker.check_read_scope("Grep", &no_path),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn read_scope_denies_absolute_glob_pattern() {
+        // Scope = cwd so the effective-root check passes and the absolute
+        // pattern is what must be caught.
+        let cwd = std::env::current_dir().unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(cwd);
+        let glob_abs = serde_json::json!({"pattern": "/etc/**"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_abs),
+            PermissionDecision::Deny(_)
+        ));
+        // A relative pattern with no path defaults to the in-scope cwd.
+        let glob_rel = serde_json::json!({"pattern": "**/*.rs"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_rel),
             PermissionDecision::Allow
         ));
     }

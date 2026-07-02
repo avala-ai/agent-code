@@ -211,12 +211,25 @@ pub struct ScanReport {
 }
 
 impl ScanReport {
-    /// Count of findings at or above `threshold`.
+    /// Count of standalone findings at or above `threshold`.
     pub fn findings_at_or_above(&self, threshold: Severity) -> usize {
         self.findings
             .iter()
             .filter(|f| f.severity.rank() >= threshold.rank())
             .count()
+    }
+
+    /// Count of standalone findings AND attack chains at or above
+    /// `threshold`. This is the correct value for a CI exit gate: a reducer
+    /// can compose a P0 chain from members that are each individually below
+    /// the threshold, and that composed vulnerability must still gate.
+    pub fn items_at_or_above(&self, threshold: Severity) -> usize {
+        self.findings_at_or_above(threshold)
+            + self
+                .chains
+                .iter()
+                .filter(|c| c.combined_severity.rank() >= threshold.rank())
+                .count()
     }
 }
 
@@ -320,5 +333,49 @@ mod tests {
         };
         assert_eq!(report.findings_at_or_above(Severity::P1), 2);
         assert_eq!(report.findings_at_or_above(Severity::P0), 1);
+    }
+
+    #[test]
+    fn items_at_or_above_includes_chains() {
+        let finding = Finding {
+            id: "f".into(),
+            cwe: None,
+            file: "a".into(),
+            line_range: None,
+            severity: Severity::P2,
+            confidence: 0.9,
+            title: "t".into(),
+            root_cause: String::new(),
+            exploit_preconditions: String::new(),
+            evidence: String::new(),
+            selector_id: None,
+            shard_id: None,
+        };
+        let chain = AttackChain {
+            chain_id: "c1".into(),
+            member_finding_ids: vec!["f".into()],
+            combined_severity: Severity::P0,
+            narrative: "n".into(),
+            combined_preconditions: String::new(),
+        };
+        let report = ScanReport {
+            profile: "security".into(),
+            repo_root: ".".into(),
+            scanned_files: 1,
+            dropped_files: 0,
+            signals: 1,
+            shards: 1,
+            worker_failures: 0,
+            findings: vec![finding],
+            chains: vec![chain],
+            cost_usd: 0.0,
+            tokens: TokenTotals::default(),
+            duration_ms: 0,
+            incremental: false,
+            base_commit: None,
+        };
+        // The lone finding is P2; the composed chain is P0 and must gate.
+        assert_eq!(report.findings_at_or_above(Severity::P1), 0);
+        assert_eq!(report.items_at_or_above(Severity::P1), 1);
     }
 }

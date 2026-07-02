@@ -31,6 +31,11 @@ pub struct ScanArgs {
 /// CI can tell "scan found issues" from "scan itself failed".
 const EXIT_FINDINGS_OVER_THRESHOLD: i32 = 2;
 
+/// Exit code when one or more MAP workers failed, so the scan could not
+/// cover every shard. A "no findings" result in this state is untrustworthy,
+/// so CI must not read it as a pass.
+const EXIT_INCOMPLETE_COVERAGE: i32 = 3;
+
 pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyhow::Result<()> {
     let threshold = args
         .severity_threshold
@@ -80,14 +85,9 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
         println!("{rendered}");
     }
 
-    if report.worker_failures > 0 {
-        eprintln!(
-            "Warning: {} map worker(s) failed and were skipped — coverage is incomplete.",
-            report.worker_failures
-        );
-    }
-
-    let over = report.findings_at_or_above(threshold);
+    // Count findings AND attack chains at or above the threshold: a chain
+    // can be over-threshold even when its member findings are not.
+    let over = report.items_at_or_above(threshold);
     eprintln!(
         "Scanned {} file(s) with signals, {} shard(s); {} finding(s), {} at/above {}. Cost ${:.4}.",
         report.scanned_files,
@@ -97,12 +97,29 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
         threshold,
         report.cost_usd,
     );
+    if report.worker_failures > 0 {
+        eprintln!(
+            "Warning: {} map worker(s) failed — coverage is incomplete, so a clean \
+             result cannot be trusted.",
+            report.worker_failures
+        );
+    }
 
-    if over > 0 {
+    // Exit code precedence: findings at/above threshold (2) outrank an
+    // incomplete scan (3); a scan that could not cover every shard must not
+    // report success, or a provider outage would look like a clean gate.
+    let exit_code = if over > 0 {
+        Some(EXIT_FINDINGS_OVER_THRESHOLD)
+    } else if report.worker_failures > 0 {
+        Some(EXIT_INCOMPLETE_COVERAGE)
+    } else {
+        None
+    };
+    if let Some(code) = exit_code {
         // Flush stdout before exiting so a redirected report is complete.
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        std::process::exit(EXIT_FINDINGS_OVER_THRESHOLD);
+        std::process::exit(code);
     }
     Ok(())
 }
