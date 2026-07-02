@@ -209,51 +209,78 @@ Keep every real finding (deduplicated and reprioritised). Return an empty chains
 /// chains) if the reply is unparseable, so a flaky reducer never loses the
 /// work MAP already did.
 pub fn parse_reduce_result(text: &str, fallback: &[Finding]) -> ReduceResult {
+    parse_reduce_result_checked(text, fallback).0
+}
+
+/// Like [`parse_reduce_result`], but also reports whether the reply was a
+/// *trustworthy* reduce envelope.
+///
+/// `trusted` is false when the reducer ran but produced no usable envelope —
+/// no JSON, valid JSON of the wrong shape (`{"error": ...}`), a truncated/prose
+/// turn (e.g. a turn-cap or budget stop returns `Ok` with unparseable text), or
+/// a findings array whose elements fail to deserialize. In every such case the
+/// reducer's cross-shard **chain** composition (which nothing else produces)
+/// cannot be relied on, so the caller must treat coverage as incomplete rather
+/// than reporting a false clean. `result` still carries the best-effort
+/// findings (the reducer's when usable, else the MAP fallback) so nothing is
+/// silently dropped, and `chains` are only surfaced when the envelope parsed
+/// cleanly.
+pub fn parse_reduce_result_checked(text: &str, fallback: &[Finding]) -> (ReduceResult, bool) {
+    let untrusted = || {
+        (
+            ReduceResult {
+                findings: fallback.to_vec(),
+                chains: Vec::new(),
+            },
+            false,
+        )
+    };
+
     let Some(v) = extract_json_value(text) else {
-        return ReduceResult {
-            findings: fallback.to_vec(),
-            chains: Vec::new(),
-        };
+        return untrusted();
     };
+    if !(v.is_array() || v.get("findings").is_some()) {
+        // Valid JSON but not a findings envelope (wrong shape).
+        return untrusted();
+    }
 
-    let findings = if v.is_array() || v.get("findings").is_some() {
-        // The reducer returned a findings envelope. Parse it strictly:
-        //  - an explicit empty array is a deliberate "all candidates were false
-        //    positives" verdict — honor it;
-        //  - a non-empty array is only trusted if EVERY element deserializes.
-        //    If any element is malformed (schema drift, truncation), the reduce
-        //    output is untrustworthy, so fall back to the MAP findings rather
-        //    than letting a filter-and-drop silently erase real work — which
-        //    would flip the CI gate to a clean exit while a P0 exists.
-        let arr = if v.is_array() {
-            v.as_array()
-        } else {
-            v.get("findings").and_then(|f| f.as_array())
-        };
-        match arr {
-            Some(items) if items.is_empty() => Vec::new(),
-            Some(items) => strict_findings(items).unwrap_or_else(|| fallback.to_vec()),
-            // `findings` present but not an array (null, string, object): the
-            // reply is unusable, so keep the MAP findings.
-            None => fallback.to_vec(),
-        }
+    let arr = if v.is_array() {
+        v.as_array()
     } else {
-        // No findings field at all: the reply is unusable, so keep the MAP
-        // findings rather than silently dropping real work.
-        fallback.to_vec()
+        v.get("findings").and_then(|f| f.as_array())
     };
-    let chains = v
-        .get("chains")
-        .and_then(|c| c.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|it| serde_json::from_value::<AttackChain>(it.clone()).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let (findings, trusted) = match arr {
+        // An explicit empty array is a deliberate "all candidates were false
+        // positives" verdict — honor it, and it IS a trustworthy envelope.
+        Some(items) if items.is_empty() => (Vec::new(), true),
+        // A non-empty array is trustworthy only if EVERY element deserializes;
+        // otherwise the output is malformed (schema drift, truncation) — fall
+        // back to the MAP findings AND flag it untrusted so the gate reports
+        // incomplete coverage instead of erasing real work.
+        Some(items) => match strict_findings(items) {
+            Some(parsed) => (parsed, true),
+            None => (fallback.to_vec(), false),
+        },
+        // `findings` present but not an array (null, string, object).
+        None => (fallback.to_vec(), false),
+    };
 
-    ReduceResult { findings, chains }
+    // Chains are only believable when the envelope itself parsed cleanly.
+    let chains = if trusted {
+        v.get("chains")
+            .and_then(|c| c.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|it| serde_json::from_value::<AttackChain>(it.clone()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    (ReduceResult { findings, chains }, trusted)
 }
 
 /// Findings at or above `threshold`.
@@ -400,6 +427,34 @@ mod tests {
             &fallback,
         );
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn reduce_checked_reports_trust_correctly() {
+        let fb = vec![finding("f1", "a.py", Severity::P0, 0.9)];
+        // Trusted: a clean envelope with valid findings.
+        let (_r, t) = parse_reduce_result_checked(
+            "```json\n{\"findings\":[{\"id\":\"g\",\"file\":\"a.py\",\"severity\":\"P0\",\"title\":\"x\"}],\"chains\":[]}\n```",
+            &fb,
+        );
+        assert!(t, "valid envelope is trusted");
+        // Trusted: an explicit empty verdict.
+        let (_r, t) =
+            parse_reduce_result_checked("```json\n{\"findings\":[],\"chains\":[]}\n```", &fb);
+        assert!(t, "explicit empty is trusted");
+        // Untrusted: a turn-cap / prose reply with no JSON — chains lost.
+        let (r, t) = parse_reduce_result_checked("I ran out of turns before writing JSON.", &fb);
+        assert!(!t, "prose / no-JSON is untrusted");
+        assert_eq!(r.findings.len(), 1, "MAP fallback still surfaced");
+        assert!(r.chains.is_empty());
+        // Untrusted: wrong-shape JSON.
+        let (_r, t) = parse_reduce_result_checked("{\"error\":\"rate limited\"}", &fb);
+        assert!(!t, "wrong-shape JSON is untrusted");
+        // Untrusted: malformed findings element (drops trust, keeps fallback).
+        let (r, t) =
+            parse_reduce_result_checked("```json\n{\"findings\":[{\"id\":\"f\"}]}\n```", &fb);
+        assert!(!t, "malformed findings are untrusted");
+        assert_eq!(r.findings.len(), 1, "MAP fallback preserved");
     }
 
     #[test]

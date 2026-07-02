@@ -212,7 +212,17 @@ pub async fn run_scan(agent: Arc<dyn AmrAgent>, cfg: &ScanConfig) -> Result<Scan
             Ok(run) => {
                 cost += run.cost_usd;
                 tokens.add(run.input_tokens, run.output_tokens);
-                let result = reduce::parse_reduce_result(&run.text, &deduped);
+                let (result, trusted) = reduce::parse_reduce_result_checked(&run.text, &deduped);
+                if !trusted {
+                    // The reducer returned `Ok` but no usable envelope (a
+                    // turn-cap/budget stop leaves unparseable or empty text, a
+                    // truncated JSON, or a prose reply). Its chain composition —
+                    // the ONLY place cross-shard attack chains are produced —
+                    // cannot be trusted, so count it as incomplete coverage,
+                    // symmetric with the MAP usable-envelope check above. The
+                    // MAP findings are still surfaced from the fallback.
+                    worker_failures += 1;
+                }
                 (result.findings, result.chains)
             }
             // A failed reducer must not lose the MAP work, but it also means
@@ -404,6 +414,57 @@ mod tests {
             "a REDUCE failure must count as incomplete coverage"
         );
         // The MAP finding is still surfaced (best effort), never silently lost.
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].severity, Severity::P0);
+    }
+
+    #[tokio::test]
+    async fn reduce_ok_but_unusable_reply_counts_as_incomplete_coverage() {
+        // A reducer can return Ok with NO usable envelope — a turn-cap/budget
+        // stop leaves unparseable or empty text. That silently drops cross-shard
+        // chains, so it must be flagged as incomplete coverage just like a hard
+        // reduce failure (otherwise a composed-only P0 would exit clean).
+        struct UnusableReduce;
+        #[async_trait::async_trait]
+        impl AmrAgent for UnusableReduce {
+            async fn run(
+                &self,
+                prompt: &str,
+                _opts: &RunOpts,
+            ) -> Result<crate::amr::agent::AgentRun, AmrError> {
+                let text = if prompt.contains("examining ONE shard") {
+                    r#"```json
+{"findings":[{"id":"","cwe":"CWE-78","file":"app.py","line_range":[3,3],
+"severity":"P0","confidence":0.9,"title":"OS command injection",
+"root_cause":"x","exploit_preconditions":"y","evidence":"os.system"}]}
+```"#
+                } else {
+                    // REDUCE ran out of turns before emitting any JSON.
+                    "I inspected the files but ran out of turns before writing the report."
+                };
+                Ok(crate::amr::agent::AgentRun {
+                    text: text.to_string(),
+                    cost_usd: 0.0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "app.py",
+            "import os\ndef h(r):\n    os.system('ping ' + r.host)\n",
+        );
+        let cfg = ScanConfig::new(dir.path());
+        let report = run_scan(Arc::new(UnusableReduce), &cfg).await.unwrap();
+
+        assert!(
+            report.worker_failures >= 1,
+            "an Ok-but-unusable reduce reply must count as incomplete coverage"
+        );
+        // MAP findings are still surfaced from the fallback, not lost.
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].severity, Severity::P0);
     }

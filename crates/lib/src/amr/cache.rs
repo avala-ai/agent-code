@@ -201,10 +201,15 @@ pub fn changed_files_since(repo_root: &Path, base: &str) -> Option<BTreeSet<Path
     files.extend(strip_prefix_paths(parse_nul_paths(&diff.stdout), &prefix));
 
     // Uncommitted + untracked changes (porcelain v1, NUL-delimited).
+    // `--untracked-files=all` is required: the default (`normal`) collapses a
+    // wholly-untracked directory into a single `dir/` entry, which the shard
+    // stage would `repo_root.join(...)` to a directory and silently skip — so
+    // every file in a brand-new module would go unscanned and the gate would
+    // read clean. `all` lists each untracked file individually.
     if let Ok(status) = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["status", "--porcelain=v1", "-z"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         && status.status.success()
     {
@@ -433,6 +438,51 @@ mod tests {
                 .iter()
                 .any(|p| p.to_string_lossy().starts_with("sub/")),
             "no top-level-relative paths leak through; got {changed:?}"
+        );
+    }
+
+    #[test]
+    fn changed_files_since_lists_files_in_new_untracked_dirs() {
+        // Regression: `git status` default mode collapses a wholly-untracked
+        // directory into a single `dir/` entry, which the shard stage would
+        // join to a directory and silently skip — leaving a brand-new module
+        // unscanned and the gate falsely clean. --untracked-files=all lists the
+        // individual files.
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t.co"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.py"), "x=1\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "base"]);
+        let base = head_commit(root).unwrap();
+
+        // A brand-new, wholly-untracked directory of code.
+        std::fs::create_dir_all(root.join("handlers")).unwrap();
+        std::fs::write(root.join("handlers/v.py"), "import os\nos.system(x)\n").unwrap();
+
+        let changed = changed_files_since(root, &base).unwrap();
+        assert!(
+            changed.contains(&PathBuf::from("handlers/v.py")),
+            "the new untracked file is listed individually; got {changed:?}"
+        );
+        assert!(
+            !changed
+                .iter()
+                .any(|p| matches!(p.to_string_lossy().as_ref(), "handlers/" | "handlers")),
+            "no bare directory entry that the shard stage would skip; got {changed:?}"
         );
     }
 
