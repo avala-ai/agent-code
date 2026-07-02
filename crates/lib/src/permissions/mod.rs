@@ -135,16 +135,11 @@ impl PermissionChecker {
         // regexes like `../` or `/admin` are legitimate and must not be blocked.
         if tool_name == "Glob"
             && let Some(pattern) = input.get("pattern").and_then(|v| v.as_str())
+            && glob_pattern_escapes(pattern)
         {
-            let p = Path::new(pattern);
-            let escapes = p.is_absolute()
-                || p.components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-            if escapes {
-                return PermissionDecision::Deny(format!(
-                    "glob pattern may not escape the scan scope: {pattern}"
-                ));
-            }
+            return PermissionDecision::Deny(format!(
+                "glob pattern may not escape the scan scope: {pattern}"
+            ));
         }
 
         PermissionDecision::Allow
@@ -378,6 +373,25 @@ fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
 /// symlink or `..` traversal cannot escape the scope for an existing file;
 /// a non-existent path falls back to the unresolved absolute path (the read
 /// will fail anyway, so the exfiltration risk is only for real files).
+/// True if a `Glob` pattern would escape the scan root when joined onto it.
+///
+/// A `Glob` pattern is appended to the search root, so an absolute pattern
+/// (`/etc/**`) or one with a `..` traversal (`../.ssh/*`) reads outside the
+/// scope even when the `path` argument is in-scope. This must be
+/// platform-independent: `Path::is_absolute()` is not (a Unix-style `/etc/**`
+/// is not "absolute" on Windows, and `Path::components()` on Linux does not
+/// split on `\`), so a scan running on Windows would otherwise miss `/etc/**`.
+fn glob_pattern_escapes(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    // Leading `/` or `\` — absolute or UNC on some platform.
+    let leading_sep = matches!(bytes.first(), Some(b'/' | b'\\'));
+    // Windows drive prefix like `C:` (with or without a following separator).
+    let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    // A `..` segment under EITHER separator, regardless of host platform.
+    let has_parent = pattern.split(['/', '\\']).any(|seg| seg == "..");
+    Path::new(pattern).is_absolute() || leading_sep || drive_prefix || has_parent
+}
+
 fn read_scope_allows(scope: &Path, raw: &str) -> bool {
     let target = Path::new(raw);
     let abs_target = if target.is_absolute() {
@@ -499,6 +513,31 @@ mod tests {
             checker.check_read_scope("Grep", &no_path),
             PermissionDecision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn glob_pattern_escape_detection_is_platform_independent() {
+        // Escaping patterns — must be caught on every host OS (on Windows a
+        // Unix-style "/etc/**" is not `is_absolute()`, hence the explicit
+        // leading-separator / drive-prefix / dotdot checks).
+        for esc in [
+            "/etc/**",
+            "\\\\server\\share\\*",
+            "C:\\Windows\\*",
+            "c:/Windows/*",
+            "../.ssh/*",
+            "..\\secrets\\*",
+            "src/../../../etc/*",
+        ] {
+            assert!(
+                glob_pattern_escapes(esc),
+                "{esc} must be flagged as escaping"
+            );
+        }
+        // In-scope relative patterns — must be allowed.
+        for ok in ["**/*.rs", "src/**/*.toml", "*.py", "a/b/c.txt"] {
+            assert!(!glob_pattern_escapes(ok), "{ok} must be allowed");
+        }
     }
 
     #[test]
