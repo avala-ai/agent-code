@@ -19,7 +19,7 @@ use crate::output_styles::AgentKind;
 use crate::permissions::PermissionChecker;
 use crate::query::{QueryEngine, QueryEngineConfig, StreamSink};
 use crate::state::AppState;
-use crate::tools::registry::{ToolRegistry, ToolVisibilityFilter};
+use crate::tools::registry::ToolRegistry;
 
 use super::AmrError;
 
@@ -122,13 +122,15 @@ impl AmrAgent for EngineAgent {
         // AMR workers are non-interactive: never prompt for permission.
         config.permissions.default_mode = crate::config::PermissionMode::Allow;
 
-        let mut registry = ToolRegistry::default_tools();
-        if opts.read_only {
-            registry.set_visibility(ToolVisibilityFilter::new(
-                READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
-                Vec::new(),
-            ));
-        }
+        // Confined workers get a registry that only contains the read tools,
+        // so the executor cannot dispatch a write/exec/network tool even if the
+        // model emits a call for a hidden name. A read scope on the permission
+        // checker (below) then bounds which paths those tools may touch.
+        let registry = if opts.read_only {
+            ToolRegistry::read_only_file_tools()
+        } else {
+            ToolRegistry::default_tools()
+        };
 
         let mut permission_checker = PermissionChecker::from_config(&config.permissions)
             .with_project_root(opts.project_root.clone());

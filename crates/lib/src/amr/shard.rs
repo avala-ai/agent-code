@@ -60,12 +60,28 @@ pub fn collect_signals(profile: &Profile, input: &ShardInput) -> Result<ShardOut
     };
 
     let mut out = ShardOutput::default();
+    let root_canon = input.repo_root.canonicalize().ok();
     for rel in &files {
         let abs = input.repo_root.join(rel);
-        let Ok(meta) = std::fs::metadata(&abs) else {
+        // `symlink_metadata` does not follow the final component: a repo whose
+        // file is a symlink to a local secret (e.g. `~/.ssh/id_rsa`) must not
+        // be read into a selector signal.
+        let Ok(meta) = std::fs::symlink_metadata(&abs) else {
             continue;
         };
+        if meta.file_type().is_symlink() {
+            out.dropped_files += 1;
+            continue;
+        }
         if !meta.is_file() {
+            continue;
+        }
+        // Defense in depth: skip anything that resolves outside the scan root
+        // (e.g. via a symlinked parent directory in the path).
+        if let (Some(root), Ok(canon)) = (root_canon.as_ref(), abs.canonicalize())
+            && !canon.starts_with(root)
+        {
+            out.dropped_files += 1;
             continue;
         }
         out.total_files += 1;

@@ -87,7 +87,8 @@ The report includes the aggregate cost and token totals for the run.
 
 ## Incremental runs
 
-State is cached under `.agent/amr/cache.json`: the commit that was scanned and
+State is cached in your user cache directory (keyed by repo path, never inside
+the scanned repo): the commit that was scanned and
 the per-file findings from the Map stage. On `--incremental`, the engine asks
 git which files changed since that commit, re-runs Map only over those, carries
 cached findings for every unchanged file forward, and re-runs the cheap Reduce

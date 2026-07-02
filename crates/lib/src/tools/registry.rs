@@ -127,6 +127,20 @@ impl ToolRegistry {
         registry
     }
 
+    /// A registry containing only the local read tools (`FileRead`, `Grep`,
+    /// `Glob`). Confined workers (the AMR scan map phase) use this so the
+    /// executor physically cannot dispatch a write, exec, or network tool
+    /// even if the model emits a tool-use block for a hidden name. Combine
+    /// with a read scope on the permission checker to also bound the paths
+    /// these tools may touch.
+    pub fn read_only_file_tools() -> Self {
+        let mut registry = Self::new();
+        registry.register(Arc::new(super::file_read::FileReadTool));
+        registry.register(Arc::new(super::grep::GrepTool));
+        registry.register(Arc::new(super::glob::GlobTool));
+        registry
+    }
+
     /// Register a new tool.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);

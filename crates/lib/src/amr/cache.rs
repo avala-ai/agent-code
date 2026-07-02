@@ -27,9 +27,24 @@ use sha2::{Digest, Sha256};
 
 use super::types::Finding;
 
-/// Where the cache lives, relative to the repo root. Matches the repo's
-/// existing `.agent/` project-config convention.
-pub const CACHE_RELPATH: &str = ".agent/amr/cache.json";
+/// On-disk path of the incremental cache for `repo_root`.
+///
+/// The cache lives under the user cache directory, keyed by the canonical
+/// repo path — NOT inside the scanned repository. A scanned repo therefore
+/// cannot supply a poisoned cache (one that sets `base_commit` to skip every
+/// file), and scans never write into the target tree.
+fn cache_path(repo_root: &Path) -> Option<PathBuf> {
+    let canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let key = sha256_hex(canon.to_string_lossy().as_bytes());
+    Some(
+        dirs::cache_dir()?
+            .join("agent-code")
+            .join("amr")
+            .join(format!("{key}.json")),
+    )
+}
 
 /// Persisted incremental-scan state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -46,16 +61,20 @@ impl ScanCache {
     /// Load the cache for `repo_root`, or an empty cache if none exists or
     /// it cannot be parsed (a stale/corrupt cache is never fatal).
     pub fn load(repo_root: &Path) -> Self {
-        let path = repo_root.join(CACHE_RELPATH);
+        let Some(path) = cache_path(repo_root) else {
+            return Self::default();
+        };
         match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
-    /// Persist the cache under `repo_root`, creating `.agent/amr/` as needed.
+    /// Persist the cache for `repo_root` under the user cache directory.
     pub fn save(&self, repo_root: &Path) -> std::io::Result<()> {
-        let path = repo_root.join(CACHE_RELPATH);
+        let Some(path) = cache_path(repo_root) else {
+            return Ok(());
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -214,23 +233,34 @@ mod tests {
 
     #[test]
     fn cache_roundtrips_through_disk() {
-        let dir = tempfile::tempdir().unwrap();
+        // Redirect the user cache dir so the test never touches the real one.
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvGuard::set_many(&[
+            ("HOME", home.path()),
+            ("XDG_CACHE_HOME", home.path()),
+        ]);
+        let repo = tempfile::tempdir().unwrap();
         let mut cache = ScanCache {
             base_commit: Some("abc123".into()),
             ..Default::default()
         };
         cache.index_findings(&[finding("f1", "a.py"), finding("f2", "a.py")]);
-        cache.save(dir.path()).unwrap();
+        cache.save(repo.path()).unwrap();
 
-        let loaded = ScanCache::load(dir.path());
+        let loaded = ScanCache::load(repo.path());
         assert_eq!(loaded.base_commit.as_deref(), Some("abc123"));
         assert_eq!(loaded.all_findings().len(), 2);
     }
 
     #[test]
     fn missing_cache_loads_as_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ScanCache::load(dir.path());
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::EnvGuard::set_many(&[
+            ("HOME", home.path()),
+            ("XDG_CACHE_HOME", home.path()),
+        ]);
+        let repo = tempfile::tempdir().unwrap();
+        let cache = ScanCache::load(repo.path());
         assert!(cache.base_commit.is_none());
         assert!(cache.all_findings().is_empty());
     }
