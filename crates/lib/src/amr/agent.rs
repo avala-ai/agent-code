@@ -130,8 +130,13 @@ impl AmrAgent for EngineAgent {
             ));
         }
 
-        let permission_checker = PermissionChecker::from_config(&config.permissions)
+        let mut permission_checker = PermissionChecker::from_config(&config.permissions)
             .with_project_root(opts.project_root.clone());
+        if opts.read_only {
+            // Confine the worker's reads to the scan target so injected
+            // instructions in scanned code cannot exfiltrate local files.
+            permission_checker = permission_checker.with_read_scope(opts.project_root.clone());
+        }
         let app_state = AppState::new(config.clone());
 
         let mut engine = QueryEngine::new(

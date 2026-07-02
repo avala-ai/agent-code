@@ -37,6 +37,13 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
         .parse::<amr::Severity>()
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    // Validate the output format up front so a bad value fails before any
+    // scanning work (LLM calls, cache writes) happens.
+    match args.format.as_str() {
+        "json" | "markdown" | "md" => {}
+        other => anyhow::bail!("unknown --format `{other}` (expected markdown or json)"),
+    }
+
     let mut cfg = ScanConfig::new(&args.path);
     cfg.profile = args.profile;
     cfg.map_model = args.map_model;

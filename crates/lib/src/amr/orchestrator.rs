@@ -77,6 +77,15 @@ fn resolve_profile(name: &str) -> Result<Profile, AmrError> {
 pub async fn run_scan(agent: Arc<dyn AmrAgent>, cfg: &ScanConfig) -> Result<ScanReport, AmrError> {
     let started = Instant::now();
     let profile = resolve_profile(&cfg.profile)?;
+
+    // Fail loudly on a missing or unreadable scan root rather than walking
+    // nothing and reporting a clean repo — a false pass for a security gate.
+    if !cfg.repo_root.is_dir() {
+        return Err(AmrError::Invalid(format!(
+            "scan path is not a readable directory: {}",
+            cfg.repo_root.display()
+        )));
+    }
     let repo_abs = std::fs::canonicalize(&cfg.repo_root).unwrap_or_else(|_| cfg.repo_root.clone());
 
     // --- incremental gating -------------------------------------------------
@@ -356,6 +365,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = ScanConfig::new(dir.path());
         cfg.profile = "nope".into();
+        let err = run_scan(scripted_agent(), &cfg).await.unwrap_err();
+        assert!(matches!(err, AmrError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn missing_scan_path_errors() {
+        // A bad path must fail loudly, not silently report a clean repo.
+        let cfg = ScanConfig::new("/nonexistent/amr-scan-path-xyz");
         let err = run_scan(scripted_agent(), &cfg).await.unwrap_err();
         assert!(matches!(err, AmrError::Invalid(_)));
     }
