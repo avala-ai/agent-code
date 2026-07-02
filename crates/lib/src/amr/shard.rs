@@ -62,6 +62,17 @@ pub fn collect_signals(profile: &Profile, input: &ShardInput) -> Result<ShardOut
     let mut out = ShardOutput::default();
     let root_canon = input.repo_root.canonicalize().ok();
     for rel in &files {
+        // Hidden files (`.env`, `.git/config`, dotdirs) are outside the scan
+        // scope. `walk_repo` already drops them via `.hidden(true)`, but the
+        // incremental path takes its file list from `git diff`/`status`, which
+        // reports changed hidden files too. Filter here so a secret in e.g.
+        // `.env` is never read into a selector signal and thus never embedded
+        // in a MAP prompt — mirroring the permission read-scope that denies
+        // hidden paths to worker tool reads.
+        if path_has_hidden_component(rel) {
+            out.dropped_files += 1;
+            continue;
+        }
         let abs = input.repo_root.join(rel);
         // `symlink_metadata` does not follow the final component: a repo whose
         // file is a symlink to a local secret (e.g. `~/.ssh/id_rsa`) must not
@@ -147,6 +158,17 @@ fn walk_repo(repo_root: &Path) -> Result<Vec<PathBuf>, AmrError> {
     Ok(files)
 }
 
+/// True if any component of `rel` begins with `.` (a dotfile or dotdir such as
+/// `.env`, `.git/config`, or `config/.secret`). Hidden files are outside the
+/// scan scope; the permission read-scope enforces the same rule for worker
+/// reads, and this keeps the deterministic shard stage consistent with it on
+/// the incremental path (where the file list comes from git, not `walk_repo`).
+fn path_has_hidden_component(rel: &Path) -> bool {
+    rel.components().any(
+        |c| matches!(c, std::path::Component::Normal(os) if os.to_string_lossy().starts_with('.')),
+    )
+}
+
 /// Heuristic binary detection: a NUL byte in the first 8 KiB.
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
@@ -208,6 +230,44 @@ mod tests {
             out.signals
                 .iter()
                 .all(|s| s.file.as_path() == Path::new("b.py"))
+        );
+    }
+
+    #[test]
+    fn incremental_list_skips_hidden_secret_files() {
+        // Regression: the incremental path takes its file list from git, which
+        // reports changed hidden files like `.env`. Those must be dropped
+        // before any read so a credential never lands in a selector signal
+        // (and thus a MAP prompt). A full walk already skips them.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", "api_key = \"sk-secretvalue123\"\n");
+        write(dir.path(), ".git/config", "token = \"sk-secretvalue456\"\n");
+        write(dir.path(), "app.py", "eval(x)\n");
+
+        let profile = security_profile();
+        let input = ShardInput {
+            repo_root: dir.path().to_path_buf(),
+            files: Some(vec![
+                PathBuf::from(".env"),
+                PathBuf::from(".git/config"),
+                PathBuf::from("app.py"),
+            ]),
+            max_file_bytes: 1_000_000,
+        };
+        let out = collect_signals(&profile, &input).unwrap();
+        // Only app.py is read; the hidden files are dropped, not scanned.
+        assert_eq!(out.total_files, 1, "hidden files are not even read");
+        assert!(
+            out.signals
+                .iter()
+                .all(|s| s.file.as_path() == Path::new("app.py")),
+            "no signal may carry a hidden-file path or its secret contents"
+        );
+        assert!(
+            !out.signals
+                .iter()
+                .any(|s| s.evidence.contains("sk-secretvalue")),
+            "no secret from a hidden file leaks into a signal"
         );
     }
 
