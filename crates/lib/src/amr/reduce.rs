@@ -123,6 +123,18 @@ fn strict_findings(items: &[Value]) -> Option<Vec<Finding>> {
     Some(out)
 }
 
+/// Parse every element of a chains array strictly. Returns `None` if any
+/// element fails to deserialize, so a malformed chain marks the reduce output
+/// untrusted rather than being silently dropped (which could hide a chain-only
+/// over-threshold result behind a clean exit).
+fn strict_chains(items: &[Value]) -> Option<Vec<AttackChain>> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(serde_json::from_value::<AttackChain>(it.clone()).ok()?);
+    }
+    Some(out)
+}
+
 fn findings_from_value(v: &Value) -> Vec<Finding> {
     let arr = if v.is_array() {
         v.as_array()
@@ -265,19 +277,26 @@ pub fn parse_reduce_result_checked(text: &str, fallback: &[Finding]) -> (ReduceR
         None => (fallback.to_vec(), false),
     };
 
-    // Chains are only believable when the envelope itself parsed cleanly.
-    let chains = if trusted {
-        v.get("chains")
-            .and_then(|c| c.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|it| serde_json::from_value::<AttackChain>(it.clone()).ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+    // Chains are only believable when the envelope parsed cleanly, and they are
+    // parsed strictly too: a malformed chain (like a malformed finding) taints
+    // the whole reduce output. Silently dropping it could hide a chain-only
+    // P0/P1 — a chain can be over-threshold even when its members are not — and
+    // flip the gate to a clean exit, so mark the result untrusted instead.
+    let (chains, trusted) = if !trusted {
+        (Vec::new(), false)
     } else {
-        Vec::new()
+        match v.get("chains") {
+            // No chains field is a valid "no cross-shard chains" result.
+            None => (Vec::new(), true),
+            Some(c) => match c.as_array() {
+                Some(items) => match strict_chains(items) {
+                    Some(parsed) => (parsed, true),
+                    None => (Vec::new(), false),
+                },
+                // `chains` present but not an array: unusable envelope.
+                None => (Vec::new(), false),
+            },
+        }
     };
 
     (ReduceResult { findings, chains }, trusted)
@@ -455,6 +474,29 @@ mod tests {
             parse_reduce_result_checked("```json\n{\"findings\":[{\"id\":\"f\"}]}\n```", &fb);
         assert!(!t, "malformed findings are untrusted");
         assert_eq!(r.findings.len(), 1, "MAP fallback preserved");
+    }
+
+    #[test]
+    fn reduce_malformed_chain_marks_output_untrusted() {
+        // Findings parse fine, but a chain element is malformed (missing
+        // required fields). The chain must not be silently dropped while the
+        // result stays trusted — that could hide a chain-only over-threshold
+        // result behind a clean exit. Mark it untrusted so the gate flags
+        // incomplete coverage.
+        let fb = vec![finding("f1", "a.py", Severity::P0, 0.9)];
+        let text = "```json\n{\"findings\":[\
+            {\"id\":\"g\",\"file\":\"a.py\",\"severity\":\"P0\",\"title\":\"ok\"}],\
+            \"chains\":[{\"chain_id\":\"c1\"}]}\n```";
+        let (result, trusted) = parse_reduce_result_checked(text, &fb);
+        assert!(!trusted, "a malformed chain taints the reduce output");
+        assert!(
+            result.chains.is_empty(),
+            "the malformed chain is not surfaced"
+        );
+        // A well-formed chains array (or none) stays trusted.
+        let (_r, t) =
+            parse_reduce_result_checked("```json\n{\"findings\":[],\"chains\":[]}\n```", &fb);
+        assert!(t, "empty chains + empty findings is a trusted verdict");
     }
 
     #[test]

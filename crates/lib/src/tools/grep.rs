@@ -242,13 +242,6 @@ impl Tool for GrepTool {
                 // Fallback to grep if rg is not installed.
                 let mut fallback = Command::new("grep");
                 fallback.arg("-r").arg("--color=never");
-                // ripgrep skips hidden files/dirs by default; plain `grep -r`
-                // does not. When confined to a read scope (AMR workers), match
-                // ripgrep so a recursive grep of the scan root cannot return
-                // secrets from `.env` or `.git/` that the scope forbids.
-                for excl in fallback_hidden_excludes(ctx.permission_checker.has_read_scope()) {
-                    fallback.arg(excl);
-                }
                 if show_line_numbers && output_mode == "content" {
                     fallback.arg("-n");
                 }
@@ -262,6 +255,16 @@ impl Tool for GrepTool {
                 }
                 if let Some(glob_pat) = glob_filter {
                     fallback.arg("--include").arg(glob_pat);
+                }
+                // ripgrep skips hidden files/dirs by default; plain `grep -r`
+                // does not. When confined to a read scope (AMR workers), match
+                // ripgrep so a recursive grep of the scan root cannot return
+                // secrets from `.env` or `.git/`. These excludes are appended
+                // AFTER any user `--include` so that on a grep which resolves a
+                // conflicting include/exclude by last-match, a worker-supplied
+                // `--include=.env*` still cannot re-include a hidden file.
+                for excl in fallback_hidden_excludes(ctx.permission_checker.has_read_scope()) {
+                    fallback.arg(excl);
                 }
                 // Same option-injection guard as the ripgrep path above.
                 fallback.arg("--").arg(pattern).arg(&search_path);
