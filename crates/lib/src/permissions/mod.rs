@@ -90,7 +90,7 @@ impl PermissionChecker {
     /// `Grep`/`Glob` that defaults to the working directory) is allowed.
     pub fn check_read_scope(
         &self,
-        _tool_name: &str,
+        tool_name: &str,
         input: &serde_json::Value,
     ) -> PermissionDecision {
         let Some(ref scope) = self.read_scope else {
@@ -121,8 +121,12 @@ impl PermissionChecker {
 
         // A `Glob` `pattern` is joined onto the search root, so an absolute
         // pattern (`/etc/**`) or one containing `..` (`../.ssh/*`) escapes the
-        // scope even when the `path` argument is in-scope.
-        if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+        // scope even when the `path` argument is in-scope. This applies ONLY
+        // to `Glob`: `Grep`'s `pattern` is a content regex, not a path, so
+        // regexes like `../` or `/admin` are legitimate and must not be blocked.
+        if tool_name == "Glob"
+            && let Some(pattern) = input.get("pattern").and_then(|v| v.as_str())
+        {
             let p = Path::new(pattern);
             let escapes = p.is_absolute()
                 || p.components()
@@ -470,6 +474,14 @@ mod tests {
         let glob_rel = serde_json::json!({"pattern": "**/*.rs"});
         assert!(matches!(
             checker.check_read_scope("Glob", &glob_rel),
+            PermissionDecision::Allow
+        ));
+
+        // Grep's `pattern` is a content regex, not a path: a regex that looks
+        // like a path must not be blocked when the search path is in-scope.
+        let grep_regex = serde_json::json!({"path": ".", "pattern": "../ or /admin"});
+        assert!(matches!(
+            checker.check_read_scope("Grep", &grep_regex),
             PermissionDecision::Allow
         ));
     }

@@ -135,6 +135,23 @@ pub fn head_commit(repo_root: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// True only when `repo_root` is a git repo with a completely clean working
+/// tree (no staged, unstaged, or untracked changes). Incremental caching keys
+/// on the HEAD commit, so a scan of a dirty tree must not be cached under
+/// HEAD — a later clean `--incremental` run would otherwise treat the changed
+/// files as unchanged and skip them.
+pub fn worktree_is_clean(repo_root: &Path) -> bool {
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        Ok(out) => out.status.success() && out.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
 /// Repo-relative files that changed since `base` (committed diff plus
 /// modified/untracked working-tree files). `None` if git is unavailable
 /// or `base` is unknown, which signals the caller to fall back to a full scan.

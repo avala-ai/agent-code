@@ -87,6 +87,29 @@ pub fn parse_worker_findings(text: &str) -> WorkerFindings {
     }
 }
 
+/// Parse a MAP worker reply, distinguishing a usable findings envelope
+/// (possibly empty) from output that never actually assessed the shard.
+///
+/// Returns `None` when the reply is not a usable envelope — no JSON at all,
+/// valid JSON of the wrong shape (`{"error": ...}`), or a `findings` array
+/// whose elements fail to deserialize — which the orchestrator treats as
+/// incomplete coverage rather than a covered-but-clean shard.
+pub fn parse_worker_findings_checked(text: &str) -> Option<Vec<Finding>> {
+    let v = extract_json_value(text)?;
+    let arr = if v.is_array() {
+        v.as_array()
+    } else {
+        v.get("findings").and_then(|f| f.as_array())
+    }?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        // A single element that fails to deserialize means the shard's output
+        // is untrustworthy — surface it as incomplete rather than dropping it.
+        out.push(serde_json::from_value::<Finding>(item.clone()).ok()?);
+    }
+    Some(out)
+}
+
 fn findings_from_value(v: &Value) -> Vec<Finding> {
     let arr = if v.is_array() {
         v.as_array()
@@ -278,6 +301,24 @@ mod tests {
     fn parse_worker_findings_accepts_bare_array() {
         let text = r#"[{"id":"f1","file":"a.py","severity":"P1","title":"x"}]"#;
         assert_eq!(parse_worker_findings(text).findings.len(), 1);
+    }
+
+    #[test]
+    fn checked_parse_distinguishes_envelope_from_garbage() {
+        // No JSON and wrong-shape JSON both mean the shard was not assessed.
+        assert!(parse_worker_findings_checked("i refuse").is_none());
+        assert!(parse_worker_findings_checked(r#"{"error":"rate limited"}"#).is_none());
+        // A valid but empty envelope is a covered shard with no findings.
+        assert_eq!(
+            parse_worker_findings_checked(r#"{"findings":[]}"#).map(|v| v.len()),
+            Some(0)
+        );
+        // A well-formed finding parses.
+        let ok = r#"{"findings":[{"id":"f","file":"a.py","severity":"P0","title":"t"}]}"#;
+        assert_eq!(parse_worker_findings_checked(ok).map(|v| v.len()), Some(1));
+        // A finding missing a required field taints the whole shard.
+        let bad = r#"{"findings":[{"id":"f","file":"a.py","title":"no severity"}]}"#;
+        assert!(parse_worker_findings_checked(bad).is_none());
     }
 
     #[test]
