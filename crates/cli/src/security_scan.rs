@@ -49,7 +49,35 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
         other => anyhow::bail!("unknown --format `{other}` (expected markdown or json)"),
     }
 
-    let mut cfg = ScanConfig::new(&args.path);
+    // Resolve `-o` to an absolute path BEFORE any chdir, so the report still
+    // lands where the user expects (their invocation directory).
+    let output_abs = args.output.as_ref().map(|o| {
+        let p = std::path::Path::new(o);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        }
+    });
+
+    // Run from inside the scan root. Read-only worker tools resolve a RELATIVE
+    // path (e.g. a worker following an import with `FileRead("helper.py")` or
+    // `Grep(path: "src")`) against the process working directory, and so does
+    // the read-scope permission check. If the scan target is not the invoker's
+    // cwd, those relative reads would resolve outside the scope and be denied —
+    // shrinking coverage — even though the file is inside the target repo.
+    // Making cwd == scan root keeps the tool and the permission gate consistent
+    // (no scope escape) while letting relative reads land in-scope. A canonical
+    // path that is not a directory is left for `run_scan` to reject.
+    let scan_root: std::path::PathBuf = match std::fs::canonicalize(&args.path) {
+        Ok(abs) if abs.is_dir() => {
+            let _ = std::env::set_current_dir(&abs);
+            abs
+        }
+        _ => std::path::PathBuf::from(&args.path),
+    };
+
+    let mut cfg = ScanConfig::new(&scan_root);
     cfg.profile = args.profile;
     cfg.map_model = args.map_model;
     cfg.reduce_model = args.reduce_model;
@@ -78,9 +106,9 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
         other => anyhow::bail!("unknown --format `{other}` (expected markdown or json)"),
     };
 
-    if let Some(path) = &args.output {
+    if let Some(path) = &output_abs {
         std::fs::write(path, &rendered)?;
-        eprintln!("Report written to {path}");
+        eprintln!("Report written to {}", path.display());
     } else {
         println!("{rendered}");
     }

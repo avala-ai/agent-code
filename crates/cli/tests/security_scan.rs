@@ -139,3 +139,35 @@ fn invalid_format_fails() {
         .failure()
         .stderr(predicate::str::contains("format"));
 }
+
+#[test]
+fn output_path_is_relative_to_the_invocation_dir_not_the_scan_root() {
+    // The scan runs from inside the scan root (so a worker's relative reads
+    // resolve there), but a relative `-o` must still land in the directory the
+    // user invoked the command from. A clean repo keeps this offline.
+    let scan = tempfile::tempdir().unwrap();
+    std::fs::write(
+        scan.path().join("safe.py"),
+        "def add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
+    let invoke = tempfile::tempdir().unwrap();
+
+    agent()
+        .current_dir(invoke.path())
+        .arg("security-scan")
+        .arg(scan.path())
+        .args(["--format", "json", "-o", "report.json"])
+        .env("AGENT_CODE_API_KEY", DUMMY_KEY)
+        .assert()
+        .success();
+
+    assert!(
+        invoke.path().join("report.json").exists(),
+        "-o resolves against the invocation dir"
+    );
+    assert!(
+        !scan.path().join("report.json").exists(),
+        "-o must not land in the scan root the process chdir'd into"
+    );
+}

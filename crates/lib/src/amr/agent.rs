@@ -112,15 +112,27 @@ impl EngineAgent {
     }
 }
 
+/// Derive a worker engine's config from the base config:
+/// - apply the per-call model override (a cheaper model for MAP, say);
+/// - run non-interactively (never prompt for permission);
+/// - disable end-of-turn background memory extraction. Leaving it on would fire
+///   an extra, unaccounted LLM request per shard (undercounting cost and adding
+///   rate-limit exposure) and distill memories from the untrusted repository
+///   being scanned into the user's persistent memory store.
+fn worker_config(base: &Config, opts: &RunOpts) -> Config {
+    let mut config = base.clone();
+    if let Some(model) = &opts.model {
+        config.api.model = model.clone();
+    }
+    config.permissions.default_mode = crate::config::PermissionMode::Allow;
+    config.features.extract_memories = false;
+    config
+}
+
 #[async_trait]
 impl AmrAgent for EngineAgent {
     async fn run(&self, prompt: &str, opts: &RunOpts) -> Result<AgentRun, AmrError> {
-        let mut config = self.base_config.clone();
-        if let Some(model) = &opts.model {
-            config.api.model = model.clone();
-        }
-        // AMR workers are non-interactive: never prompt for permission.
-        config.permissions.default_mode = crate::config::PermissionMode::Allow;
+        let config = worker_config(&self.base_config, opts);
 
         // Confined workers get a registry that only contains the read tools,
         // so the executor cannot dispatch a write/exec/network tool even if the
@@ -257,6 +269,27 @@ mod tests {
         let run = agent.run("hello", &opts).await.unwrap();
         assert_eq!(run.text, "saw:hello");
         assert_eq!(run.cost_usd, 0.25);
+    }
+
+    #[test]
+    fn worker_config_hardens_the_base_config() {
+        let mut base = Config::default();
+        base.features.extract_memories = true;
+        base.permissions.default_mode = crate::config::PermissionMode::Ask;
+        let opts = RunOpts::map_worker(PathBuf::from("/repo"), Some("cheap-model".into()), 10);
+
+        let cfg = worker_config(&base, &opts);
+        // No per-shard background memory extraction: it would add an unaccounted
+        // LLM call per shard and pull memories from the scanned repo into the
+        // user's store.
+        assert!(!cfg.features.extract_memories);
+        // Non-interactive: workers never prompt.
+        assert!(matches!(
+            cfg.permissions.default_mode,
+            crate::config::PermissionMode::Allow
+        ));
+        // The per-call model override is applied.
+        assert_eq!(cfg.api.model, "cheap-model");
     }
 
     #[test]
