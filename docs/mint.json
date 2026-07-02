@@ -102,7 +102,8 @@
     {
       "group": "Guides",
       "pages": [
-        "guides/performance"
+        "guides/performance",
+        "guides/security-scan"
       ]
     },
     {

@@ -1,0 +1,108 @@
+---
+title: "Security Scan (Agentic MapReduce)"
+description: "Whole-repo vulnerability discovery that considers the entire codebase, not just what a search agent happened to open"
+---
+
+## What it is
+
+`agent security-scan` finds exploitable vulnerabilities across an **entire**
+repository. It is built on an *Agentic MapReduce* engine: a general pattern for
+analysis tasks where a result is only trustworthy if the whole codebase was
+considered.
+
+A single search-driven agent is the wrong tool for this. It spends most of its
+budget *finding* the work rather than doing it, it carries unrelated discoveries
+in one context window, and it stops when it decides it is done rather than when a
+finite work queue is exhausted. Agentic MapReduce inverts that: an agent spends
+reasoning **once** to author a deterministic relevance test, that test runs over
+the whole tree with no model in the loop, and expensive per-shard reasoning only
+touches files that actually matched.
+
+```text
+  repo ─▶ PLAN ──▶ SHARD ────▶ BATCH ──▶ MAP ─────▶ REDUCE ──▶ report
+        (agent)  (determ.)   (determ.) (N agents)  (1 agent)
+           │        │            │         │            │
+   selectors    Signal[]     Batch[]   Finding[]   deduped +
+   (baseline)   drop zero-             per shard   chained +
+                signal files                       prioritized
+```
+
+| Stage | What happens | Model in the loop? |
+|-------|--------------|--------------------|
+| **Plan** | Selectors decide which code is relevant. The security profile ships a recall-oriented baseline. | Baseline (per-repo authoring is on the roadmap) |
+| **Shard** | Selectors run over the whole tree; each match emits a *signal*. Files with no signals are dropped before any worker runs. | No |
+| **Batch** | Signals are packed into bounded shards. `--batch-size` is the cost lever. | No |
+| **Map** | One worker per shard, in parallel, reads the real code, clears a false-positive gate, and reports findings. | Yes |
+| **Reduce** | One worker deduplicates, reconciles, composes cross-shard **attack chains**, and prioritizes. It reasons over conclusions, never the whole repo. | Yes |
+
+## Quickstart
+
+```bash
+# Scan the current repository, print a Markdown report.
+agent security-scan
+
+# Scan a path, emit JSON for CI, gate the exit code on P0/P1 findings.
+agent security-scan ./service --format json --severity-threshold P1 -o report.json
+
+# Only re-scan what changed since the last scanned commit.
+agent security-scan --incremental
+```
+
+The scan exits non-zero (code `2`) when it surfaces findings at or above
+`--severity-threshold`, so it slots into CI as a gate.
+
+## How the selectors work
+
+Two selector kinds decide relevance deterministically:
+
+- **Lexical** — a regex over file text. Cheap, language-agnostic, good for
+  secrets and string sinks.
+- **AST** — matches syntax nodes (for example, call expressions whose callee is
+  a dangerous API), so a `call` node is a real call, not the word `eval` inside a
+  comment. Uses bundled tree-sitter grammars (Python and JavaScript today);
+  languages without a grammar fall back to lexical selection.
+
+Because selectors are deterministic and inspectable, coverage rests on selector
+recall rather than an agent's unfalsifiable "I've looked everywhere". The
+baseline is intentionally a little broad; the Map worker applies a
+false-positive gate.
+
+## Workers are read-only
+
+Map and Reduce workers are in-process runs of the same agent engine, over
+whatever LLM you have configured. Map workers are restricted to `FileRead`,
+`Grep`, and `Glob`, so a scan can **never** modify the repository it analyzes.
+
+## Cost and speed levers
+
+| Flag | Effect |
+|------|--------|
+| `--batch-size N` | Signals per shard. The primary multiplier on worker count, wall-clock, and tokens. |
+| `--max-concurrency N` | Concurrent Map workers (respect provider rate limits). |
+| `--map-model` / `--reduce-model` | Tier the models per stage — a cheaper model for the many Map workers, a stronger one for the single Reduce. |
+| `--incremental` | Scan only files changed since the last scanned commit; cached findings for unchanged files carry forward. |
+| `--severity-threshold` | Gate the exit code. |
+
+The report includes the aggregate cost and token totals for the run.
+
+## Incremental runs
+
+State is cached under `.agent/amr/cache.json`: the commit that was scanned and
+the per-file findings from the Map stage. On `--incremental`, the engine asks
+git which files changed since that commit, re-runs Map only over those, carries
+cached findings for every unchanged file forward, and re-runs the cheap Reduce
+over the union. You pay for the diff, not a full pass.
+
+## Limits and roadmap
+
+The vertical slice ships the security profile end to end. Not yet included, and
+tracked as follow-ups:
+
+- **Runtime verification.** Findings are statically gated and confidence-scored;
+  a sandboxed per-finding reproduction stage is future work and requires
+  stronger isolation than the current tool sandbox.
+- **More languages and selector kinds.** Call-graph and schema-diff selectors,
+  and grammars beyond Python and JavaScript.
+- **More profiles.** The engine is task-agnostic; code-review, dead-code, and
+  dependency-audit profiles reuse the same machinery.
+- **SARIF output** for security-tool interop.

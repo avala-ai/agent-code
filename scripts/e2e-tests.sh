@@ -814,6 +814,84 @@ else
 fi  # end of API key check
 
 # ══════════════════════════════════════════════════════════════════
+#  N: Security Scan (Agentic MapReduce)
+# ══════════════════════════════════════════════════════════════════
+
+section "N: Security Scan (Agentic MapReduce)"
+
+# N1: help lists the scan flags (no API key needed)
+output=$("${AGENT}" security-scan --help 2>&1) || true
+if echo "${output}" | grep -q -- "--batch-size" \
+    && echo "${output}" | grep -q -- "--severity-threshold" \
+    && echo "${output}" | grep -q -- "--incremental" \
+    && echo "${output}" | grep -q -- "--format"; then
+    pass "N1: security-scan --help shows scan flags"
+else
+    fail "N1: security-scan --help" "Missing expected flags"
+fi
+
+if [[ -z "${AGENT_CODE_API_KEY:-}" ]]; then
+    echo "  SKIP: AGENT_CODE_API_KEY not set, skipping scan runs"
+else
+    # N2: clean repo → valid JSON report, zero findings, zero shards.
+    # No file emits a signal, so the scan short-circuits before any worker
+    # runs (no LLM call), exercising the deterministic + report path.
+    N_CLEAN=$(mktemp -d)
+    git init "${N_CLEAN}" --quiet
+    printf 'def add(a, b):\n    return a + b\n' > "${N_CLEAN}/safe.py"
+    clean_raw=$("${AGENT}" --model "${MODEL}" security-scan "${N_CLEAN}" --format json 2>/dev/null) || true
+    # Extract the JSON report (from the first line that is `{`) so any stray
+    # log line on stdout can't break jq parsing.
+    clean_json=$(printf '%s\n' "${clean_raw}" | sed -n '/^{/,$p')
+    if echo "${clean_json}" | jq -e '.profile == "security" and (.findings | length == 0) and .shards == 0' > /dev/null 2>&1; then
+        pass "N2: clean repo → 0 findings, 0 shards, valid JSON"
+    else
+        fail "N2: clean scan" "Unexpected report: $(echo "${clean_json}" | head -c 200)"
+    fi
+    rm -rf "${N_CLEAN}"
+
+    # N3: seeded vulnerability. The deterministic layer MUST fire (a real
+    # os.system call on request input produces a signal and a shard). The
+    # MAP/REDUCE finding is model-dependent, so it is a strong-pass when
+    # present and a tolerated miss otherwise (mirrors D10's model-flake
+    # handling).
+    N_VULN=$(mktemp -d)
+    git init "${N_VULN}" --quiet
+    cat > "${N_VULN}/app.py" <<'PY'
+import os
+
+
+def handle(request):
+    host = request.args["host"]
+    # Command injection: unsanitized user input flows into os.system.
+    os.system("ping -c 1 " + host)
+PY
+    vuln_raw=$("${AGENT}" --model "${MODEL}" security-scan "${N_VULN}" \
+        --format json --batch-size 20 --max-concurrency 2 --severity-threshold P2 2>/dev/null)
+    scan_exit=$?
+    vuln_json=$(printf '%s\n' "${vuln_raw}" | sed -n '/^{/,$p')
+
+    if echo "${vuln_json}" | jq -e '.profile == "security" and .signals >= 1 and .shards >= 1' > /dev/null 2>&1; then
+        pass "N3a: seeded vuln → deterministic signals + shards produced"
+    else
+        fail "N3a: vuln scan pipeline" "No signals/shards: $(echo "${vuln_json}" | head -c 200)"
+    fi
+
+    finding_count=$(echo "${vuln_json}" | jq '.findings | length' 2>/dev/null || echo 0)
+    if [[ "${finding_count}" -ge 1 ]]; then
+        pass "N3b: model surfaced ${finding_count} finding(s) on the injected vulnerability"
+        if [[ "${scan_exit}" -eq 2 ]]; then
+            pass "N3c: exit code 2 when findings meet --severity-threshold"
+        else
+            fail "N3c: exit code" "Expected 2 with findings present, got ${scan_exit}"
+        fi
+    else
+        echo "  ⚠ N3b: model surfaced 0 findings (deterministic layer OK; model-side miss tolerated)"
+    fi
+    rm -rf "${N_VULN}"
+fi
+
+# ══════════════════════════════════════════════════════════════════
 #  F: Skills System (no API key needed)
 # ══════════════════════════════════════════════════════════════════
 

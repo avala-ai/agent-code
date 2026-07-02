@@ -101,27 +101,27 @@ impl std::fmt::Display for ProviderError {
 pub fn models_for_provider(kind: ProviderKind) -> &'static [(&'static str, &'static str)] {
     match kind {
         ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex => &[
-            ("claude-opus-4-20250514", "Opus 4 · Most capable"),
-            ("claude-sonnet-4-20250514", "Sonnet 4 · Balanced"),
-            ("claude-haiku-4-20250414", "Haiku 4 · Fast"),
+            ("claude-opus-4-8", "Opus 4.8 · Most capable"),
+            ("claude-sonnet-5", "Sonnet 5 · Balanced"),
+            ("claude-haiku-4-5", "Haiku 4.5 · Fast"),
+            ("claude-fable-5", "Fable 5 · Frontier"),
         ],
         ProviderKind::OpenAi => &[
-            ("gpt-5.4", "GPT-5.4 · Most capable"),
-            ("gpt-5.4-mini", "GPT-5.4 Mini · Balanced"),
-            ("gpt-5.4-nano", "GPT-5.4 Nano · Fast"),
-            ("gpt-4.1", "GPT-4.1 · Previous gen"),
-            ("gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
-            ("gpt-4.1-nano", "GPT-4.1 Nano · Fastest"),
+            ("gpt-5.5", "GPT-5.5 · Most capable"),
+            ("gpt-5.5-pro", "GPT-5.5 Pro · Reasoning"),
+            ("gpt-5.4", "GPT-5.4 · Balanced"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini · Fast"),
+            ("gpt-5.4-nano", "GPT-5.4 Nano · Fastest"),
             ("o3", "o3 · Reasoning"),
-            ("o3-mini", "o3 Mini · Fast reasoning"),
         ],
         ProviderKind::Xai => &[
-            ("grok-3", "Grok 3 · Most capable"),
-            ("grok-3-mini", "Grok 3 Mini · Fast"),
+            ("grok-4.3", "Grok 4.3 · Most capable"),
+            ("grok-4", "Grok 4 · Balanced"),
         ],
         ProviderKind::Google => &[
-            ("gemini-2.5-pro", "Gemini 2.5 Pro · Most capable"),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
+            ("gemini-3-pro", "Gemini 3 Pro · Most capable"),
+            ("gemini-3.5-flash", "Gemini 3.5 Flash · Fast"),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash · Previous gen"),
         ],
         ProviderKind::DeepSeek => &[
             ("deepseek-chat", "DeepSeek Chat · General"),
@@ -148,12 +148,15 @@ pub fn models_for_provider(kind: ProviderKind) -> &'static [(&'static str, &'sta
             ("sonar-deep-research", "Sonar Deep Research · In-depth"),
         ],
         ProviderKind::OpenRouter => &[
-            ("anthropic/claude-sonnet-4", "Claude Sonnet 4 · Balanced"),
-            ("anthropic/claude-opus-4", "Claude Opus 4 · Most capable"),
-            ("openai/gpt-4.1", "GPT-4.1 · Balanced"),
-            ("openai/gpt-4.1-mini", "GPT-4.1 Mini · Fast"),
-            ("google/gemini-2.5-flash", "Gemini 2.5 Flash · Fast"),
-            ("meta-llama/llama-3.3-70b", "Llama 3.3 70B · Open"),
+            ("anthropic/claude-sonnet-5", "Claude Sonnet 5 · Balanced"),
+            (
+                "anthropic/claude-opus-4.8",
+                "Claude Opus 4.8 · Most capable",
+            ),
+            ("openai/gpt-5.5", "GPT-5.5 · Most capable"),
+            ("google/gemini-3-pro", "Gemini 3 Pro"),
+            ("x-ai/grok-4.3", "Grok 4.3"),
+            ("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro · Open"),
         ],
         _ => &[],
     }
@@ -381,7 +384,7 @@ mod tests {
         assert!(
             models_for_provider(ProviderKind::Xai)
                 .iter()
-                .any(|(id, _)| *id == "grok-3")
+                .any(|(id, _)| id.starts_with("grok-"))
         );
         assert!(models_for_provider(ProviderKind::OpenAiCompatible).is_empty());
     }

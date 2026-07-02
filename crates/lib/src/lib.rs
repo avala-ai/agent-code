@@ -68,6 +68,7 @@
 
 #![allow(dead_code, clippy::new_without_default, clippy::len_without_is_empty)]
 
+pub mod amr;
 pub mod config;
 pub mod error;
 pub mod hooks;

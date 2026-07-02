@@ -1,0 +1,218 @@
+//! SHARD stage: run the profile's selectors over the tree and emit signals.
+//!
+//! Deterministic and model-free. Walks the repository (honouring
+//! `.gitignore`), applies every selector to each text file, and drops any
+//! file that produces zero signals before the expensive MAP stage ever
+//! sees it. File order is sorted so a given tree always yields the same
+//! signals in the same order, which keeps batching and snapshot tests
+//! reproducible.
+
+use std::path::{Path, PathBuf};
+
+use ignore::WalkBuilder;
+
+use super::AmrError;
+use super::profile::Profile;
+use super::types::Signal;
+
+/// Inputs to the shard stage.
+pub struct ShardInput {
+    pub repo_root: PathBuf,
+    /// When `Some`, restrict scanning to these repo-relative paths (the
+    /// incremental / diff case). When `None`, walk the whole tree.
+    pub files: Option<Vec<PathBuf>>,
+    /// Skip files larger than this many bytes (minified bundles, blobs).
+    pub max_file_bytes: usize,
+}
+
+impl ShardInput {
+    pub fn full(repo_root: impl Into<PathBuf>) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            files: None,
+            max_file_bytes: 1_000_000,
+        }
+    }
+}
+
+/// Output of the shard stage: the signals plus coverage accounting.
+#[derive(Debug, Default)]
+pub struct ShardOutput {
+    pub signals: Vec<Signal>,
+    /// Text files considered (read and classified).
+    pub total_files: usize,
+    /// Files that produced at least one signal (reach MAP).
+    pub scanned_files: usize,
+    /// Files considered but dropped for emitting zero signals.
+    pub dropped_files: usize,
+}
+
+/// Run every selector over the selected files and collect signals.
+pub fn collect_signals(profile: &Profile, input: &ShardInput) -> Result<ShardOutput, AmrError> {
+    let files = match &input.files {
+        Some(list) => {
+            let mut v = list.clone();
+            v.sort();
+            v.dedup();
+            v
+        }
+        None => walk_repo(&input.repo_root)?,
+    };
+
+    let mut out = ShardOutput::default();
+    for rel in &files {
+        let abs = input.repo_root.join(rel);
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        out.total_files += 1;
+        if meta.len() as usize > input.max_file_bytes {
+            out.dropped_files += 1;
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&abs) else {
+            out.dropped_files += 1;
+            continue;
+        };
+        if looks_binary(&bytes) {
+            out.dropped_files += 1;
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            out.dropped_files += 1;
+            continue;
+        };
+
+        let mut file_signals = Vec::new();
+        for selector in &profile.selectors {
+            file_signals.extend(selector.scan_text(rel, &text));
+        }
+        if file_signals.is_empty() {
+            out.dropped_files += 1;
+        } else {
+            file_signals.sort_by(|a, b| {
+                let ao = a.byte_range.map(|r| r.0).unwrap_or(0);
+                let bo = b.byte_range.map(|r| r.0).unwrap_or(0);
+                ao.cmp(&bo).then_with(|| a.selector_id.cmp(&b.selector_id))
+            });
+            out.scanned_files += 1;
+            out.signals.extend(file_signals);
+        }
+    }
+    Ok(out)
+}
+
+/// Walk the repository, returning sorted repo-relative paths of files that
+/// git would track (respecting `.gitignore` and skipping hidden/`.git`).
+fn walk_repo(repo_root: &Path) -> Result<Vec<PathBuf>, AmrError> {
+    let mut files = Vec::new();
+    for entry in WalkBuilder::new(repo_root)
+        .standard_filters(true)
+        .hidden(true)
+        .git_ignore(true)
+        .parents(true)
+        .build()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if let Ok(rel) = entry.path().strip_prefix(repo_root) {
+            files.push(rel.to_path_buf());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Heuristic binary detection: a NUL byte in the first 8 KiB.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::amr::profile::security_profile;
+    use std::fs;
+
+    fn write(dir: &Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn collect_drops_clean_files_and_keeps_vulnerable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "clean.py", "def add(a, b):\n    return a + b\n");
+        write(
+            dir.path(),
+            "vuln.py",
+            "import os\ndef h(r):\n    os.system('x' + r)\n",
+        );
+        write(dir.path(), "notes.md", "# just docs\n");
+
+        let profile = security_profile();
+        let out = collect_signals(&profile, &ShardInput::full(dir.path())).unwrap();
+
+        assert!(out.total_files >= 3);
+        assert_eq!(out.scanned_files, 1, "only vuln.py should reach MAP");
+        assert!(out.dropped_files >= 2);
+        assert!(
+            out.signals
+                .iter()
+                .all(|s| s.file.as_path() == Path::new("vuln.py"))
+        );
+    }
+
+    #[test]
+    fn incremental_restricts_to_given_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.py", "eval(x)\n");
+        write(dir.path(), "b.py", "eval(y)\n");
+
+        let profile = security_profile();
+        let input = ShardInput {
+            repo_root: dir.path().to_path_buf(),
+            files: Some(vec![PathBuf::from("b.py")]),
+            max_file_bytes: 1_000_000,
+        };
+        let out = collect_signals(&profile, &input).unwrap();
+        assert_eq!(out.total_files, 1);
+        assert!(
+            out.signals
+                .iter()
+                .all(|s| s.file.as_path() == Path::new("b.py"))
+        );
+    }
+
+    #[test]
+    fn oversized_and_binary_files_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file with a NUL byte is treated as binary.
+        fs::write(dir.path().join("blob.py"), b"eval(\0x)\n").unwrap();
+        let profile = security_profile();
+        let out = collect_signals(&profile, &ShardInput::full(dir.path())).unwrap();
+        assert_eq!(out.scanned_files, 0);
+    }
+
+    #[test]
+    fn output_is_deterministic_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "z.py", "os.system(a)\n");
+        write(dir.path(), "a.py", "eval(b)\n");
+        let profile = security_profile();
+        let run1 = collect_signals(&profile, &ShardInput::full(dir.path())).unwrap();
+        let run2 = collect_signals(&profile, &ShardInput::full(dir.path())).unwrap();
+        assert_eq!(run1.signals, run2.signals);
+    }
+}
