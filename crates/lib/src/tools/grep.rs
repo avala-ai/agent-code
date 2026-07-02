@@ -218,6 +218,15 @@ impl Tool for GrepTool {
         if let Some(glob_pat) = glob_filter {
             cmd.arg("--glob").arg(glob_pat);
         }
+        // Re-assert the hidden-file skip AFTER the user glob. ripgrep normally
+        // skips dotfiles, but a `--glob '.env*'` re-includes them; ripgrep gives
+        // precedence to the LAST matching glob, so appending these exclusions
+        // stops a confined worker from whitelisting `.env`/dotfiles to defeat
+        // the read-scope. Gated on the scope so interactive greps keep the
+        // ability to target dotfiles explicitly.
+        for excl in rg_hidden_exclude_globs(ctx.permission_checker.has_read_scope()) {
+            cmd.arg(excl);
+        }
 
         // `--` terminates option parsing: the user-controlled `pattern` (and
         // the `search_path`) are positional operands, never flags. Without it a
@@ -325,12 +334,26 @@ impl Tool for GrepTool {
 }
 
 /// Extra `grep` args that make the non-ripgrep fallback skip hidden files and
-/// directories (`.env`, `.git/…`), matching ripgrep's default. Applied only
-/// when the call is confined to a read scope (AMR workers); an unconfined,
-/// interactive grep keeps searching hidden files as before.
+/// directories (`.env`, `.git/…`), matching ripgrep's default. `--exclude`
+/// takes priority over `--include`, so this also neutralizes a user glob that
+/// tries to whitelist a dotfile. Applied only when the call is confined to a
+/// read scope (AMR workers); an unconfined, interactive grep keeps searching
+/// hidden files as before.
 fn fallback_hidden_excludes(has_read_scope: bool) -> &'static [&'static str] {
     if has_read_scope {
         &["--exclude-dir=.*", "--exclude=.*"]
+    } else {
+        &[]
+    }
+}
+
+/// Trailing ripgrep `--glob` exclusions that re-assert the default dotfile skip
+/// even when the user's `--glob` whitelists a hidden file (`--glob '.env*'`).
+/// ripgrep honors the last matching glob, so these are appended after the user
+/// glob. Applied only under a read scope (AMR workers).
+fn rg_hidden_exclude_globs(has_read_scope: bool) -> &'static [&'static str] {
+    if has_read_scope {
+        &["--glob=!.*", "--glob=!**/.*/**"]
     } else {
         &[]
     }
@@ -348,18 +371,25 @@ mod tests {
     fn hidden_excludes_only_apply_under_a_read_scope() {
         // Unconfined interactive grep is unchanged.
         assert!(fallback_hidden_excludes(false).is_empty());
+        assert!(rg_hidden_exclude_globs(false).is_empty());
         // A confined worker skips hidden files/dirs, matching ripgrep's default
         // so the `grep -r` fallback cannot leak `.env` / `.git/` secrets.
         let confined = fallback_hidden_excludes(true);
         assert!(confined.contains(&"--exclude-dir=.*"));
         assert!(confined.contains(&"--exclude=.*"));
+        // And the ripgrep path re-asserts the dotfile skip after a user glob.
+        assert!(rg_hidden_exclude_globs(true).contains(&"--glob=!.*"));
     }
 
-    fn test_ctx() -> ToolContext {
+    fn ctx_with(scope: Option<PathBuf>) -> ToolContext {
+        let mut checker = PermissionChecker::allow_all();
+        if let Some(root) = scope {
+            checker = checker.with_read_scope(root);
+        }
         ToolContext {
             cwd: PathBuf::from("."),
             cancel: CancellationToken::new(),
-            permission_checker: Arc::new(PermissionChecker::allow_all()),
+            permission_checker: Arc::new(checker),
             verbose: false,
             plan_mode: false,
             file_cache: None,
@@ -372,6 +402,10 @@ mod tests {
             active_disk_output_style: None,
             agent_limiter: None,
         }
+    }
+
+    fn test_ctx() -> ToolContext {
+        ctx_with(None)
     }
 
     #[tokio::test]
@@ -399,6 +433,41 @@ mod tests {
         assert!(
             out.content.contains("--hidden"),
             "the pattern was treated as a literal regex (found the matching line), not a flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_scope_blocks_glob_whitelisting_hidden_files() {
+        // Regression: `--glob '.env*'` re-includes dotfiles in ripgrep, which
+        // would let a confined worker exfiltrate `.env` despite the read scope.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join(".env"), "SECRET=sk-LEAK\n").unwrap();
+        std::fs::write(root.join("app.py"), "x = \"sk-OK\"\n").unwrap();
+
+        let input = json!({
+            "pattern": "sk-",
+            "path": root.to_string_lossy(),
+            "glob": ".env*",
+            "output_mode": "content",
+        });
+
+        // Confined: the glob cannot whitelist the hidden file.
+        let confined = GrepTool
+            .call(input.clone(), &ctx_with(Some(root.clone())))
+            .await
+            .unwrap()
+            .content;
+        assert!(
+            !confined.contains("sk-LEAK"),
+            "a read-scoped worker must not read .env via a glob whitelist"
+        );
+
+        // Interactive (no scope): the explicit glob still targets the dotfile.
+        let open = GrepTool.call(input, &test_ctx()).await.unwrap().content;
+        assert!(
+            open.contains("sk-LEAK"),
+            "without a scope, an explicit glob keeps targeting dotfiles"
         );
     }
 }
