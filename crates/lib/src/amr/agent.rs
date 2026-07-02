@@ -45,7 +45,15 @@ impl StreamSink for CapturingSink {
     fn on_text(&self, text: &str) {
         self.text.lock().unwrap().push_str(text);
     }
-    fn on_tool_start(&self, _tool_name: &str, _input: &serde_json::Value) {}
+    // A MAP/REDUCE worker streams reasoning text and then calls a tool; the
+    // final JSON answer arrives in a LATER turn. Clear the buffer when a tool
+    // call starts so `take()` returns only the text streamed after the last
+    // tool call (the final turn). Otherwise an earlier preamble's fenced block
+    // or `{...}` span could be parsed as the answer instead of the real JSON,
+    // causing false worker failures or stale findings.
+    fn on_tool_start(&self, _tool_name: &str, _input: &serde_json::Value) {
+        self.text.lock().unwrap().clear();
+    }
     fn on_tool_result(&self, _tool_name: &str, _result: &crate::tools::ToolResult) {}
     fn on_error(&self, _error: &str) {}
 }
@@ -306,5 +314,21 @@ mod tests {
         sink.on_text("world");
         assert_eq!(sink.take(), "hello world");
         assert_eq!(sink.take(), "", "take drains the buffer");
+    }
+
+    #[test]
+    fn capturing_sink_keeps_only_text_after_the_last_tool_call() {
+        let sink = CapturingSink::default();
+        // A multi-turn worker's pre-tool preamble — note it contains a fenced
+        // block the AMR parser would otherwise latch onto.
+        sink.on_text("Let me inspect this.\n```py\neval(x)\n```\n");
+        sink.on_tool_start("FileRead", &serde_json::json!({"file_path": "a.py"}));
+        // The real answer, streamed in the turn after the tool result.
+        sink.on_text("```json\n{\"findings\":[]}\n```");
+        assert_eq!(
+            sink.take(),
+            "```json\n{\"findings\":[]}\n```",
+            "only text after the last tool call is captured, not the preamble"
+        );
     }
 }
