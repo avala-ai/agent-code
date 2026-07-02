@@ -180,9 +180,15 @@ pub fn parse_reduce_result(text: &str, fallback: &[Finding]) -> ReduceResult {
         };
     };
 
-    let findings = {
-        let f = findings_from_value(&v);
-        if f.is_empty() { fallback.to_vec() } else { f }
+    let findings = if v.is_array() || v.get("findings").is_some() {
+        // The reducer returned an explicit findings list. An empty list is a
+        // deliberate verdict — it cleared every MAP candidate as a false
+        // positive — so honor it rather than restoring the fallback.
+        findings_from_value(&v)
+    } else {
+        // No findings field at all: the reply is unusable, so keep the MAP
+        // findings rather than silently dropping real work.
+        fallback.to_vec()
     };
     let chains = v
         .get("chains")
@@ -312,6 +318,18 @@ mod tests {
         let result = parse_reduce_result("the reducer said nothing parseable", &fallback);
         assert_eq!(result.findings.len(), 1);
         assert!(result.chains.is_empty());
+    }
+
+    #[test]
+    fn reduce_honors_explicit_empty_findings() {
+        let fallback = vec![finding("f1", "a.py", Severity::P0, 0.9)];
+        // A valid, explicit empty list means the reducer rejected every
+        // candidate as a false positive — it must not be restored.
+        let result = parse_reduce_result(
+            "```json\n{\"findings\": [], \"chains\": []}\n```",
+            &fallback,
+        );
+        assert!(result.findings.is_empty());
     }
 
     #[test]

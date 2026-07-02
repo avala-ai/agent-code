@@ -153,13 +153,20 @@ pub async fn run_scan(agent: Arc<dyn AmrAgent>, cfg: &ScanConfig) -> Result<Scan
                 Ok((shard_id, Ok(run))) => {
                     cost += run.cost_usd;
                     tokens.add(run.input_tokens, run.output_tokens);
-                    let wf = reduce::parse_worker_findings(&run.text);
-                    for mut f in wf.findings {
-                        if f.shard_id.is_none() {
-                            f.shard_id = Some(shard_id.clone());
+                    // A worker that returns no parseable JSON (prose, a
+                    // truncated turn, a refusal) never actually covered its
+                    // shard. Count it as a failure so the scan reports
+                    // incomplete coverage instead of a false clean.
+                    if reduce::extract_json_value(&run.text).is_none() {
+                        worker_failures += 1;
+                    } else {
+                        for mut f in reduce::parse_worker_findings(&run.text).findings {
+                            if f.shard_id.is_none() {
+                                f.shard_id = Some(shard_id.clone());
+                            }
+                            f.file = relativize(&f.file, &repo_abs);
+                            map_findings.push(f);
                         }
-                        f.file = relativize(&f.file, &repo_abs);
-                        map_findings.push(f);
                     }
                 }
                 Ok((_, Err(_))) | Err(_) => worker_failures += 1,
@@ -176,11 +183,17 @@ pub async fn run_scan(agent: Arc<dyn AmrAgent>, cfg: &ScanConfig) -> Result<Scan
     };
     reduce::assign_ids(&mut deduped);
 
-    // Persist MAP-stage findings for the next incremental run.
-    existing_cache.base_commit = cache::head_commit(&cfg.repo_root).or(existing_cache.base_commit);
-    existing_cache.findings_by_file.clear();
-    existing_cache.index_findings(&deduped);
-    let _ = existing_cache.save(&cfg.repo_root);
+    // Persist MAP-stage findings for the next incremental run — but only when
+    // coverage was complete. Advancing the cache after a worker failure would
+    // let a later `--incremental` run treat the un-covered files as unchanged
+    // and skip them, turning a transient failure into permanent blind spots.
+    if worker_failures == 0 {
+        existing_cache.base_commit =
+            cache::head_commit(&cfg.repo_root).or(existing_cache.base_commit);
+        existing_cache.findings_by_file.clear();
+        existing_cache.index_findings(&deduped);
+        let _ = existing_cache.save(&cfg.repo_root);
+    }
 
     // --- REDUCE -------------------------------------------------------------
     let (mut final_findings, chains) = if deduped.is_empty() {

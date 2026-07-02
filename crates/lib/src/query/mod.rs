@@ -1040,6 +1040,16 @@ impl QueryEngine {
                                         let tool_name = name.clone();
 
                                         let handle = tokio::spawn(async move {
+                                            // Enforce permissions on the streaming fast-path too.
+                                            // Read-only tools are started here without going
+                                            // through the executor's check, so a read scope or
+                                            // deny rule would otherwise be bypassed.
+                                            if let crate::permissions::PermissionDecision::Deny(
+                                                reason,
+                                            ) = tool.check_permissions(&input, &perm).await
+                                            {
+                                                return crate::tools::ToolResult::error(reason);
+                                            }
                                             match tool
                                                 .call(
                                                     input,

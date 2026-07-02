@@ -119,15 +119,19 @@ impl PermissionChecker {
             ));
         }
 
-        // `Glob` can carry an absolute `pattern` (e.g. `/etc/**`) with no
-        // `path` argument, which would otherwise escape the scope.
-        if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str())
-            && Path::new(pattern).is_absolute()
-            && !read_scope_allows(scope, pattern)
-        {
-            return PermissionDecision::Deny(format!(
-                "glob pattern outside the scan scope is not allowed: {pattern}"
-            ));
+        // A `Glob` `pattern` is joined onto the search root, so an absolute
+        // pattern (`/etc/**`) or one containing `..` (`../.ssh/*`) escapes the
+        // scope even when the `path` argument is in-scope.
+        if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+            let p = Path::new(pattern);
+            let escapes = p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if escapes {
+                return PermissionDecision::Deny(format!(
+                    "glob pattern may not escape the scan scope: {pattern}"
+                ));
+            }
         }
 
         PermissionDecision::Allow
@@ -445,17 +449,24 @@ mod tests {
     }
 
     #[test]
-    fn read_scope_denies_absolute_glob_pattern() {
-        // Scope = cwd so the effective-root check passes and the absolute
-        // pattern is what must be caught.
+    fn read_scope_denies_escaping_glob_patterns() {
+        // Scope = cwd so the effective-root check passes and the pattern is
+        // what must be caught.
         let cwd = std::env::current_dir().unwrap();
         let checker = PermissionChecker::allow_all().with_read_scope(cwd);
+        // Absolute pattern escapes.
         let glob_abs = serde_json::json!({"pattern": "/etc/**"});
         assert!(matches!(
             checker.check_read_scope("Glob", &glob_abs),
             PermissionDecision::Deny(_)
         ));
-        // A relative pattern with no path defaults to the in-scope cwd.
+        // A `..` traversal escapes even with an in-scope path.
+        let glob_dotdot = serde_json::json!({"path": ".", "pattern": "../.ssh/*"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_dotdot),
+            PermissionDecision::Deny(_)
+        ));
+        // A plain relative pattern with no path defaults to the in-scope cwd.
         let glob_rel = serde_json::json!({"pattern": "**/*.rs"});
         assert!(matches!(
             checker.check_read_scope("Glob", &glob_rel),
