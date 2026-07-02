@@ -35,6 +35,12 @@ pub struct PermissionChecker {
     /// `None` means "no project root known" — runtime checks that
     /// require it become best-effort.
     project_root: Option<PathBuf>,
+    /// When set, read-only tools may only touch paths inside this root.
+    /// `None` (the default) leaves reads unrestricted, preserving the
+    /// interactive agent's behavior. Set for confined workers such as the
+    /// AMR security-scan map phase, so a prompt injection in scanned code
+    /// cannot read files (e.g. `~/.ssh`) outside the scan target.
+    read_scope: Option<PathBuf>,
 }
 
 impl PermissionChecker {
@@ -44,6 +50,7 @@ impl PermissionChecker {
             default_mode: config.default_mode,
             rules: config.rules.clone(),
             project_root: None,
+            read_scope: None,
         }
     }
 
@@ -53,6 +60,7 @@ impl PermissionChecker {
             default_mode: PermissionMode::Allow,
             rules: Vec::new(),
             project_root: None,
+            read_scope: None,
         }
     }
 
@@ -64,6 +72,101 @@ impl PermissionChecker {
     pub fn with_project_root(mut self, project_root: PathBuf) -> Self {
         self.project_root = Some(project_root);
         self
+    }
+
+    /// Builder: confine read-only tools to `root`. Reads of paths that
+    /// resolve outside `root` are denied. Used by sandboxed workers (AMR
+    /// scan map phase) so scanned code cannot exfiltrate local files.
+    #[must_use]
+    pub fn with_read_scope(mut self, root: PathBuf) -> Self {
+        self.read_scope = Some(root);
+        self
+    }
+
+    /// Confine a read-only tool call to [`Self::read_scope`]. With no scope
+    /// set (the default) reads are always allowed, so the interactive
+    /// agent is unaffected. With a scope set, a path argument that resolves
+    /// outside the scope is denied; a call with no explicit path (e.g. a
+    /// `Grep`/`Glob` that defaults to the working directory) is allowed.
+    pub fn check_read_scope(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> PermissionDecision {
+        let Some(ref scope) = self.read_scope else {
+            return PermissionDecision::Allow;
+        };
+        // Validate EVERY path-bearing argument, not just the first. Different
+        // read tools read different fields (`FileRead` uses `file_path`,
+        // `Grep`/`Glob` use `path`), and a call may set several — checking
+        // only one lets `{"file_path": <in-scope>, "path": "/etc"}` slip the
+        // out-of-scope path past the gate.
+        let mut checked_any = false;
+        for key in ["file_path", "path"] {
+            if let Some(p) = input
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                checked_any = true;
+                if !read_scope_allows(scope, p) {
+                    return PermissionDecision::Deny(format!(
+                        "read outside the scan scope is not allowed: {p}"
+                    ));
+                }
+            }
+        }
+        // No explicit path: `Grep`/`Glob` default to the process working
+        // directory, which must itself be in scope.
+        if !checked_any {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            if !read_scope_allows(scope, &cwd.to_string_lossy()) {
+                return PermissionDecision::Deny(format!(
+                    "read outside the scan scope is not allowed: {}",
+                    cwd.display()
+                ));
+            }
+        }
+
+        // A `Glob` `pattern` is joined onto the search root, so an absolute
+        // pattern (`/etc/**`) or one containing `..` (`../.ssh/*`) escapes the
+        // scope even when the `path` argument is in-scope. This applies ONLY
+        // to `Glob`: `Grep`'s `pattern` is a content regex, not a path, so
+        // regexes like `../` or `/admin` are legitimate and must not be blocked.
+        if tool_name == "Glob"
+            && let Some(pattern) = input.get("pattern").and_then(|v| v.as_str())
+            && glob_pattern_escapes(pattern)
+        {
+            return PermissionDecision::Deny(format!(
+                "glob pattern may not escape the scan scope: {pattern}"
+            ));
+        }
+
+        PermissionDecision::Allow
+    }
+
+    /// True when a read scope is configured (AMR worker confinement is
+    /// active). Recursive tools use this to decide whether to constrain the
+    /// files their traversal reaches.
+    pub fn has_read_scope(&self) -> bool {
+        self.read_scope.is_some()
+    }
+
+    /// Whether `path` may be read under the active read scope. With no scope
+    /// set (the interactive agent) this is always true. With a scope set it
+    /// applies the same containment + hidden-file rules as
+    /// [`Self::check_read_scope`].
+    ///
+    /// The permission gate validates a tool's path *arguments*, but a
+    /// recursive `Grep`/`Glob` reaches descendants that were never arguments
+    /// (e.g. `.env` under an in-scope root). Those tools call this to filter
+    /// their own results back down to the scope, so recursion cannot exfiltrate
+    /// a hidden or out-of-scope file the gate would have denied as an argument.
+    pub fn read_scope_allows_path(&self, path: &Path) -> bool {
+        match &self.read_scope {
+            None => true,
+            Some(scope) => read_scope_allows(scope, &path.to_string_lossy()),
+        }
     }
 
     /// Check whether a tool operation is permitted.
@@ -266,6 +369,59 @@ fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
 /// .git/config`, `bash -c '... > .git/config'`). Keep the constant in
 /// a single place so adding a new protected directory updates every
 /// surface at once.
+/// True when `raw` resolves inside `scope`. Canonicalizes both sides so a
+/// symlink or `..` traversal cannot escape the scope for an existing file;
+/// a non-existent path falls back to the unresolved absolute path (the read
+/// will fail anyway, so the exfiltration risk is only for real files).
+/// True if a `Glob` pattern would escape the scan root when joined onto it.
+///
+/// A `Glob` pattern is appended to the search root, so an absolute pattern
+/// (`/etc/**`) or one with a `..` traversal (`../.ssh/*`) reads outside the
+/// scope even when the `path` argument is in-scope. This must be
+/// platform-independent: `Path::is_absolute()` is not (a Unix-style `/etc/**`
+/// is not "absolute" on Windows, and `Path::components()` on Linux does not
+/// split on `\`), so a scan running on Windows would otherwise miss `/etc/**`.
+fn glob_pattern_escapes(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    // Leading `/` or `\` — absolute or UNC on some platform.
+    let leading_sep = matches!(bytes.first(), Some(b'/' | b'\\'));
+    // Windows drive prefix like `C:` (with or without a following separator).
+    let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    // A `..` segment under EITHER separator, regardless of host platform.
+    let has_parent = pattern.split(['/', '\\']).any(|seg| seg == "..");
+    Path::new(pattern).is_absolute() || leading_sep || drive_prefix || has_parent
+}
+
+fn read_scope_allows(scope: &Path, raw: &str) -> bool {
+    let target = Path::new(raw);
+    let abs_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(target))
+            .unwrap_or_else(|_| target.to_path_buf())
+    };
+    let canon_target = abs_target.canonicalize().unwrap_or(abs_target);
+    let canon_scope = scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
+    if !canon_target.starts_with(&canon_scope) {
+        return false;
+    }
+    // Deny hidden files/dirs beneath the root (`.env`, `.git/…`, other
+    // dotfiles). The shard walk excludes them from the scan, and they
+    // commonly hold local secrets, so a prompt-injected worker must not be
+    // able to read them just because they sit inside the scan root.
+    if let Ok(rel) = canon_target.strip_prefix(&canon_scope) {
+        let hidden = rel.components().any(|c| {
+            matches!(c, std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.'))
+        });
+        if hidden {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) const PROTECTED_DIRS: &[&str] = &[
     ".git/",
     ".git\\",
@@ -317,6 +473,187 @@ fn mode_to_decision(mode: PermissionMode, tool_name: &str) -> PermissionDecision
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_scope_confines_explicit_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), "x").unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+
+        // In-scope read is allowed.
+        let inside = serde_json::json!({
+            "file_path": dir.path().join("in.txt").to_string_lossy()
+        });
+        assert!(matches!(
+            checker.check_read_scope("FileRead", &inside),
+            PermissionDecision::Allow
+        ));
+
+        // Out-of-scope FileRead and out-of-scope Grep path are denied.
+        let outside = serde_json::json!({"file_path": "/etc/hostname"});
+        assert!(matches!(
+            checker.check_read_scope("FileRead", &outside),
+            PermissionDecision::Deny(_)
+        ));
+        let grep_out = serde_json::json!({"path": "/etc", "pattern": "root"});
+        assert!(matches!(
+            checker.check_read_scope("Grep", &grep_out),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn read_scope_denies_missing_path_that_defaults_outside() {
+        // A no-path Grep/Glob defaults to the process cwd; with a scope that
+        // is not the cwd, that resolves outside the scope and is denied.
+        let dir = tempfile::tempdir().unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+        let no_path = serde_json::json!({"pattern": "foo"});
+        assert!(matches!(
+            checker.check_read_scope("Grep", &no_path),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn glob_pattern_escape_detection_is_platform_independent() {
+        // Escaping patterns — must be caught on every host OS (on Windows a
+        // Unix-style "/etc/**" is not `is_absolute()`, hence the explicit
+        // leading-separator / drive-prefix / dotdot checks).
+        for esc in [
+            "/etc/**",
+            "\\\\server\\share\\*",
+            "C:\\Windows\\*",
+            "c:/Windows/*",
+            "../.ssh/*",
+            "..\\secrets\\*",
+            "src/../../../etc/*",
+        ] {
+            assert!(
+                glob_pattern_escapes(esc),
+                "{esc} must be flagged as escaping"
+            );
+        }
+        // In-scope relative patterns — must be allowed.
+        for ok in ["**/*.rs", "src/**/*.toml", "*.py", "a/b/c.txt"] {
+            assert!(!glob_pattern_escapes(ok), "{ok} must be allowed");
+        }
+    }
+
+    #[test]
+    fn read_scope_denies_escaping_glob_patterns() {
+        // Scope = cwd so the effective-root check passes and the pattern is
+        // what must be caught.
+        let cwd = std::env::current_dir().unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(cwd);
+        // Absolute pattern escapes.
+        let glob_abs = serde_json::json!({"pattern": "/etc/**"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_abs),
+            PermissionDecision::Deny(_)
+        ));
+        // A `..` traversal escapes even with an in-scope path.
+        let glob_dotdot = serde_json::json!({"path": ".", "pattern": "../.ssh/*"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_dotdot),
+            PermissionDecision::Deny(_)
+        ));
+        // A plain relative pattern with no path defaults to the in-scope cwd.
+        let glob_rel = serde_json::json!({"pattern": "**/*.rs"});
+        assert!(matches!(
+            checker.check_read_scope("Glob", &glob_rel),
+            PermissionDecision::Allow
+        ));
+
+        // Grep's `pattern` is a content regex, not a path: a regex that looks
+        // like a path must not be blocked when the search path is in-scope.
+        let grep_regex = serde_json::json!({"path": ".", "pattern": "../ or /admin"});
+        assert!(matches!(
+            checker.check_read_scope("Grep", &grep_regex),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn no_read_scope_allows_any_path() {
+        let checker = PermissionChecker::allow_all();
+        let outside = serde_json::json!({"file_path": "/etc/hostname"});
+        assert!(matches!(
+            checker.check_read_scope("FileRead", &outside),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn read_scope_checks_every_path_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), "x").unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+        // An in-scope `file_path` must not excuse an out-of-scope `path` — a
+        // Grep/Glob actually reads `path`, so both fields are validated.
+        let mixed = serde_json::json!({
+            "file_path": dir.path().join("in.txt").to_string_lossy(),
+            "path": "/etc",
+            "pattern": ".*"
+        });
+        assert!(matches!(
+            checker.check_read_scope("Grep", &mixed),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn read_scope_denies_hidden_and_git_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.py"), "x").unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+
+        // In-scope but hidden/secret files are denied.
+        for f in [".env", ".git/config"] {
+            let input = serde_json::json!({"file_path": dir.path().join(f).to_string_lossy()});
+            assert!(
+                matches!(
+                    checker.check_read_scope("FileRead", &input),
+                    PermissionDecision::Deny(_)
+                ),
+                "{f} must be denied"
+            );
+        }
+        // A normal source file is allowed.
+        let ok = serde_json::json!({"file_path": dir.path().join("src/app.py").to_string_lossy()});
+        assert!(matches!(
+            checker.check_read_scope("FileRead", &ok),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn read_scope_allows_path_filters_hidden_and_out_of_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.py"), "x").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+
+        // No scope: every path is allowed (interactive agent unaffected).
+        let open = PermissionChecker::allow_all();
+        assert!(!open.has_read_scope());
+        assert!(open.read_scope_allows_path(&dir.path().join(".env")));
+
+        // Scoped: in-scope source allowed; hidden descendants and out-of-scope
+        // paths denied — the filter recursive tools apply to their results.
+        let scoped = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+        assert!(scoped.has_read_scope());
+        assert!(scoped.read_scope_allows_path(&dir.path().join("src/app.py")));
+        assert!(!scoped.read_scope_allows_path(&dir.path().join(".env")));
+        assert!(!scoped.read_scope_allows_path(&dir.path().join(".git/config")));
+        assert!(!scoped.read_scope_allows_path(std::path::Path::new("/etc/passwd")));
+    }
 
     #[test]
     fn test_glob_match() {

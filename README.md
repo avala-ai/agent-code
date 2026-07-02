@@ -42,19 +42,19 @@ Works with any LLM. Set one env var and go:
 
 | Provider | Env Variable | Default Model |
 |----------|-------------|---------------|
-| OpenAI | `OPENAI_API_KEY` | gpt-5.4 |
-| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4 |
-| xAI | `XAI_API_KEY` | grok-3 |
-| Google | `GOOGLE_API_KEY` | gemini-2.5-flash |
+| OpenAI | `OPENAI_API_KEY` | gpt-5.5 |
+| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-5 |
+| xAI | `XAI_API_KEY` | grok-4.3 |
+| Google | `GOOGLE_API_KEY` | gemini-3-pro |
 | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
 | Groq | `GROQ_API_KEY` | llama-3.3-70b |
 | Mistral | `MISTRAL_API_KEY` | mistral-large |
 | Together | `TOGETHER_API_KEY` | meta-llama-3.1-70b |
 | Zhipu (z.ai) | `ZHIPU_API_KEY` | glm-4.7 |
 | Ollama | (none) | qwen3:latest |
-| AWS Bedrock | `AGENT_CODE_USE_BEDROCK` | claude-sonnet-4 |
-| Google Vertex | `AGENT_CODE_USE_VERTEX` | claude-sonnet-4 |
-| OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4 |
+| AWS Bedrock | `AGENT_CODE_USE_BEDROCK` | claude-sonnet-5 |
+| Google Vertex | `AGENT_CODE_USE_VERTEX` | claude-sonnet-5 |
+| OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-5 |
 | Cohere | `COHERE_API_KEY` | command-r-plus |
 | Perplexity | `PERPLEXITY_API_KEY` | sonar-pro |
 
@@ -159,6 +159,8 @@ Highlights: `/theme`, `/output-style`, `/plugin`, `/tools`, `/team-remember`, `/
 ## Security
 
 Protected directories (`.git/`, `.husky/`, `node_modules/`) are blocked from writes regardless of permission settings. Destructive shell commands trigger warnings. [Learn more ->](SECURITY.md)
+
+**Whole-repo security scanning.** `agent security-scan` finds exploitable vulnerabilities across an entire codebase using an Agentic MapReduce engine (plan → shard → map → reduce): deterministic selectors pick out relevant code, parallel read-only workers investigate each shard, and a reducer deduplicates, composes cross-shard attack chains, and prioritizes. Supports incremental diff-only runs and JSON/Markdown output. [Guide ->](docs/guides/security-scan.mdx)
 
 ## Platforms
 

@@ -127,7 +127,11 @@ pub trait Tool: Send + Sync {
         checker: &PermissionChecker,
     ) -> PermissionDecision {
         if self.is_read_only() {
-            PermissionDecision::Allow
+            // Reads are allowed, but honor a read scope when one is set
+            // (confined workers such as the AMR scan map phase). With no
+            // scope this returns Allow, so the interactive agent is
+            // unaffected.
+            checker.check_read_scope(self.name(), input)
         } else {
             checker.check(self.name(), input)
         }

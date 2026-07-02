@@ -12,6 +12,7 @@ mod attach;
 mod commands;
 mod daemon;
 mod output;
+mod security_scan;
 mod serve;
 mod ui;
 mod update;
@@ -161,6 +162,39 @@ enum SubCommand {
         #[arg(long)]
         webhook_port: Option<u16>,
     },
+    /// Whole-repo security scan via Agentic MapReduce (plan → shard → map → reduce).
+    SecurityScan {
+        /// Repository path to scan (default: current directory).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Scan profile to run.
+        #[arg(long, default_value = "security")]
+        profile: String,
+        /// Output format: markdown (default) or json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Model for MAP workers (defaults to the session model).
+        #[arg(long)]
+        map_model: Option<String>,
+        /// Model for the REDUCE worker (defaults to the session model).
+        #[arg(long)]
+        reduce_model: Option<String>,
+        /// Max signals per shard — the fan-out and cost lever.
+        #[arg(long, default_value = "40")]
+        batch_size: usize,
+        /// Max concurrent MAP workers.
+        #[arg(long, default_value = "6")]
+        max_concurrency: usize,
+        /// Severity gate for the process exit code: P0, P1, or P2.
+        #[arg(long, default_value = "P1")]
+        severity_threshold: String,
+        /// Only scan files changed since the last scanned commit.
+        #[arg(long)]
+        incremental: bool,
+        /// Write the report to a file instead of stdout.
+        #[arg(long, short)]
+        output: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -248,7 +282,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Logs go to stderr so stdout stays clean for machine-readable output
+    // (`--output-format json`, `security-scan --format json`) and never
+    // corrupts the interactive TUI.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
 
     // Validate output format early — fail fast on bad values before
     // touching config, API keys, or the setup wizard.
@@ -576,6 +616,41 @@ async fn main() -> anyhow::Result<()> {
         provider_kind,
         config.api.base_url
     );
+
+    // Security scan (Agentic MapReduce) needs the provider but not the
+    // interactive engine, MCP fan-out, or the REPL, so dispatch here and
+    // return before that setup.
+    if let Some(SubCommand::SecurityScan {
+        path,
+        profile,
+        format,
+        map_model,
+        reduce_model,
+        batch_size,
+        max_concurrency,
+        severity_threshold,
+        incremental,
+        output,
+    }) = &cli.command
+    {
+        return security_scan::run(
+            llm.clone(),
+            config.clone(),
+            security_scan::ScanArgs {
+                path: path.clone(),
+                profile: profile.clone(),
+                format: format.clone(),
+                map_model: map_model.clone(),
+                reduce_model: reduce_model.clone(),
+                batch_size: *batch_size,
+                max_concurrency: *max_concurrency,
+                severity_threshold: severity_threshold.clone(),
+                incremental: *incremental,
+                output: output.clone(),
+            },
+        )
+        .await;
+    }
 
     // Validate API key in background (non-blocking).
     // The old approach used a synchronous curl subprocess with 5s timeout,
