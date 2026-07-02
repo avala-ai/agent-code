@@ -365,7 +365,23 @@ fn read_scope_allows(scope: &Path, raw: &str) -> bool {
     };
     let canon_target = abs_target.canonicalize().unwrap_or(abs_target);
     let canon_scope = scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
-    canon_target.starts_with(&canon_scope)
+    if !canon_target.starts_with(&canon_scope) {
+        return false;
+    }
+    // Deny hidden files/dirs beneath the root (`.env`, `.git/…`, other
+    // dotfiles). The shard walk excludes them from the scan, and they
+    // commonly hold local secrets, so a prompt-injected worker must not be
+    // able to read them just because they sit inside the scan root.
+    if let Ok(rel) = canon_target.strip_prefix(&canon_scope) {
+        let hidden = rel.components().any(|c| {
+            matches!(c, std::path::Component::Normal(name)
+                if name.to_string_lossy().starts_with('.'))
+        });
+        if hidden {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) const PROTECTED_DIRS: &[&str] = &[
@@ -520,6 +536,35 @@ mod tests {
         assert!(matches!(
             checker.check_read_scope("Grep", &mixed),
             PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn read_scope_denies_hidden_and_git_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.py"), "x").unwrap();
+        let checker = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+
+        // In-scope but hidden/secret files are denied.
+        for f in [".env", ".git/config"] {
+            let input = serde_json::json!({"file_path": dir.path().join(f).to_string_lossy()});
+            assert!(
+                matches!(
+                    checker.check_read_scope("FileRead", &input),
+                    PermissionDecision::Deny(_)
+                ),
+                "{f} must be denied"
+            );
+        }
+        // A normal source file is allowed.
+        let ok = serde_json::json!({"file_path": dir.path().join("src/app.py").to_string_lossy()});
+        assert!(matches!(
+            checker.check_read_scope("FileRead", &ok),
+            PermissionDecision::Allow
         ));
     }
 
