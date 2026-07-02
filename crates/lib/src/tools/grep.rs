@@ -228,6 +228,13 @@ impl Tool for GrepTool {
                 // Fallback to grep if rg is not installed.
                 let mut fallback = Command::new("grep");
                 fallback.arg("-r").arg("--color=never");
+                // ripgrep skips hidden files/dirs by default; plain `grep -r`
+                // does not. When confined to a read scope (AMR workers), match
+                // ripgrep so a recursive grep of the scan root cannot return
+                // secrets from `.env` or `.git/` that the scope forbids.
+                for excl in fallback_hidden_excludes(ctx.permission_checker.has_read_scope()) {
+                    fallback.arg(excl);
+                }
                 if show_line_numbers && output_mode == "content" {
                     fallback.arg("-n");
                 }
@@ -308,5 +315,33 @@ impl Tool for GrepTool {
             }
             _ => Ok(ToolResult::success(result)),
         }
+    }
+}
+
+/// Extra `grep` args that make the non-ripgrep fallback skip hidden files and
+/// directories (`.env`, `.git/…`), matching ripgrep's default. Applied only
+/// when the call is confined to a read scope (AMR workers); an unconfined,
+/// interactive grep keeps searching hidden files as before.
+fn fallback_hidden_excludes(has_read_scope: bool) -> &'static [&'static str] {
+    if has_read_scope {
+        &["--exclude-dir=.*", "--exclude=.*"]
+    } else {
+        &[]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_excludes_only_apply_under_a_read_scope() {
+        // Unconfined interactive grep is unchanged.
+        assert!(fallback_hidden_excludes(false).is_empty());
+        // A confined worker skips hidden files/dirs, matching ripgrep's default
+        // so the `grep -r` fallback cannot leak `.env` / `.git/` secrets.
+        let confined = fallback_hidden_excludes(true);
+        assert!(confined.contains(&"--exclude-dir=.*"));
+        assert!(confined.contains(&"--exclude=.*"));
     }
 }

@@ -74,6 +74,12 @@ impl Tool for GlobTool {
             .map_err(|e| ToolError::InvalidInput(format!("Invalid glob pattern: {e}")))?
             .filter_map(|entry| entry.ok())
             .filter(|p| p.is_file())
+            // Confine results to the read scope when one is active (AMR
+            // workers). A pattern like `**/*` matches dotfiles under the
+            // default glob options, so without this a confined worker could
+            // enumerate `.env` or `.git/` that the permission gate forbids as
+            // an explicit path argument. No scope set → keeps every match.
+            .filter(|p| ctx.permission_checker.read_scope_allows_path(p))
             .collect();
 
         // Sort by modification time (most recent first).
@@ -103,5 +109,80 @@ impl Tool for GlobTool {
         }
 
         Ok(ToolResult::success(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::PermissionChecker;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx_with_scope(scope: Option<PathBuf>) -> ToolContext {
+        let mut checker = PermissionChecker::allow_all();
+        if let Some(root) = scope {
+            checker = checker.with_read_scope(root);
+        }
+        ToolContext {
+            cwd: PathBuf::from("."),
+            cancel: CancellationToken::new(),
+            permission_checker: Arc::new(checker),
+            verbose: false,
+            plan_mode: false,
+            file_cache: None,
+            denial_tracker: None,
+            task_manager: None,
+            subagent_colors: None,
+            session_allows: None,
+            permission_prompter: None,
+            sandbox: None,
+            active_disk_output_style: None,
+            agent_limiter: None,
+        }
+    }
+
+    async fn glob_all(ctx: &ToolContext, root: &std::path::Path) -> String {
+        let out = GlobTool
+            .call(
+                json!({ "pattern": "**/*", "path": root.to_string_lossy() }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        out.content
+    }
+
+    #[tokio::test]
+    async fn read_scope_hides_dotfiles_from_recursive_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "x").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=sk-abc123").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "token=sk-def456").unwrap();
+
+        // Unconfined: the raw glob surfaces the dotfiles (documents that the
+        // scope filter below is load-bearing, not a no-op).
+        let unconfined = glob_all(&ctx_with_scope(None), dir.path()).await;
+        assert!(unconfined.contains("app.py"));
+        assert!(
+            unconfined.contains(".env"),
+            "default glob returns dotfiles, so the scope filter must remove them"
+        );
+
+        // Confined to the scan root: dotfiles are filtered out entirely.
+        let confined = glob_all(&ctx_with_scope(Some(dir.path().to_path_buf())), dir.path()).await;
+        assert!(
+            confined.contains("app.py"),
+            "in-scope source is still listed"
+        );
+        assert!(
+            !confined.contains(".env"),
+            "a confined worker must not enumerate .env"
+        );
+        assert!(
+            !confined.contains(".git/config") && !confined.contains(".git\\config"),
+            "a confined worker must not enumerate .git internals"
+        );
     }
 }

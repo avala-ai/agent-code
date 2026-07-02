@@ -150,6 +150,30 @@ impl PermissionChecker {
         PermissionDecision::Allow
     }
 
+    /// True when a read scope is configured (AMR worker confinement is
+    /// active). Recursive tools use this to decide whether to constrain the
+    /// files their traversal reaches.
+    pub fn has_read_scope(&self) -> bool {
+        self.read_scope.is_some()
+    }
+
+    /// Whether `path` may be read under the active read scope. With no scope
+    /// set (the interactive agent) this is always true. With a scope set it
+    /// applies the same containment + hidden-file rules as
+    /// [`Self::check_read_scope`].
+    ///
+    /// The permission gate validates a tool's path *arguments*, but a
+    /// recursive `Grep`/`Glob` reaches descendants that were never arguments
+    /// (e.g. `.env` under an in-scope root). Those tools call this to filter
+    /// their own results back down to the scope, so recursion cannot exfiltrate
+    /// a hidden or out-of-scope file the gate would have denied as an argument.
+    pub fn read_scope_allows_path(&self, path: &Path) -> bool {
+        match &self.read_scope {
+            None => true,
+            Some(scope) => read_scope_allows(scope, &path.to_string_lossy()),
+        }
+    }
+
     /// Check whether a tool operation is permitted.
     ///
     /// Evaluates in order: protected paths, explicit rules, default mode.
@@ -566,6 +590,30 @@ mod tests {
             checker.check_read_scope("FileRead", &ok),
             PermissionDecision::Allow
         ));
+    }
+
+    #[test]
+    fn read_scope_allows_path_filters_hidden_and_out_of_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.py"), "x").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+
+        // No scope: every path is allowed (interactive agent unaffected).
+        let open = PermissionChecker::allow_all();
+        assert!(!open.has_read_scope());
+        assert!(open.read_scope_allows_path(&dir.path().join(".env")));
+
+        // Scoped: in-scope source allowed; hidden descendants and out-of-scope
+        // paths denied — the filter recursive tools apply to their results.
+        let scoped = PermissionChecker::allow_all().with_read_scope(dir.path().to_path_buf());
+        assert!(scoped.has_read_scope());
+        assert!(scoped.read_scope_allows_path(&dir.path().join("src/app.py")));
+        assert!(!scoped.read_scope_allows_path(&dir.path().join(".env")));
+        assert!(!scoped.read_scope_allows_path(&dir.path().join(".git/config")));
+        assert!(!scoped.read_scope_allows_path(std::path::Path::new("/etc/passwd")));
     }
 
     #[test]
