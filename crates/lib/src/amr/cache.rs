@@ -177,6 +177,15 @@ pub fn worktree_is_clean(repo_root: &Path) -> bool {
 pub fn changed_files_since(repo_root: &Path, base: &str) -> Option<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
 
+    // git reports paths relative to the repository TOP-LEVEL, but the shard
+    // stage and cache keys are relative to `repo_root`, which may be a
+    // SUBDIRECTORY of the git repo (e.g. `security-scan ./services/api` in a
+    // monorepo). Translate every path back to repo_root-relative and drop
+    // anything outside repo_root; otherwise a changed file is never re-scanned
+    // (repo_root.join(top_level_path) points at a nonexistent nested path) and
+    // its stale cached finding is carried forward — a false-clean gate.
+    let prefix = git_show_prefix(repo_root);
+
     // NUL-delimited so paths with spaces/newlines/quotes and rename records
     // survive intact; line-based parsing silently corrupts them, which would
     // let a changed file be skipped and reported clean.
@@ -189,7 +198,7 @@ pub fn changed_files_since(repo_root: &Path, base: &str) -> Option<BTreeSet<Path
     if !diff.status.success() {
         return None;
     }
-    files.extend(parse_nul_paths(&diff.stdout));
+    files.extend(strip_prefix_paths(parse_nul_paths(&diff.stdout), &prefix));
 
     // Uncommitted + untracked changes (porcelain v1, NUL-delimited).
     if let Ok(status) = Command::new("git")
@@ -199,10 +208,46 @@ pub fn changed_files_since(repo_root: &Path, base: &str) -> Option<BTreeSet<Path
         .output()
         && status.status.success()
     {
-        files.extend(parse_status_z(&status.stdout));
+        files.extend(strip_prefix_paths(parse_status_z(&status.stdout), &prefix));
     }
 
     Some(files)
+}
+
+/// `repo_root`'s path relative to its git top-level as a `/`-terminated,
+/// forward-slashed prefix (`git rev-parse --show-prefix`). Empty when
+/// `repo_root` is itself the top-level (or not in a git repo). git always
+/// emits forward slashes here and in diff/status output, so prefix stripping
+/// is a plain string operation on every platform.
+fn git_show_prefix(repo_root: &Path) -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--show-prefix"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim_end_matches('\n').to_string())
+        .unwrap_or_default()
+}
+
+/// Rebase git's top-level-relative paths onto `repo_root` by stripping
+/// `prefix`. Paths that do not start with `prefix` are outside the scan root
+/// (a sibling subdirectory in a monorepo) and are dropped.
+fn strip_prefix_paths(paths: Vec<PathBuf>, prefix: &str) -> Vec<PathBuf> {
+    if prefix.is_empty() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter_map(|p| {
+            p.to_string_lossy()
+                .strip_prefix(prefix)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .collect()
 }
 
 /// Split NUL-delimited git output (`--name-only -z`) into paths.
@@ -326,6 +371,69 @@ mod tests {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, vec!["a b.py".to_string(), "c\td.py".to_string()]);
+    }
+
+    #[test]
+    fn changed_files_since_relativizes_a_subdirectory_scan_root() {
+        // Regression: when the scan root is a SUBDIRECTORY of the git repo,
+        // git reports top-level-relative paths (`sub/a.py`). They must be
+        // rebased to the scan root (`a.py`) — matching the shard walk and cache
+        // keys — and changes outside the scan root must be dropped. Otherwise
+        // an incremental subdir scan silently skips changed files.
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t.co"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("sub/a.py"), "x=1\n").unwrap();
+        std::fs::write(root.join("sub/deep/c.py"), "z=1\n").unwrap();
+        std::fs::write(root.join("top.py"), "y=1\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "base"]);
+        let base = head_commit(root).unwrap();
+
+        // Change files inside the subdir (committed diff) plus one outside it.
+        std::fs::write(root.join("sub/a.py"), "x=2\n").unwrap();
+        std::fs::write(root.join("sub/deep/c.py"), "z=2\n").unwrap();
+        std::fs::write(root.join("top.py"), "y=2\n").unwrap();
+        git(root, &["commit", "-aqm", "change"]);
+
+        let subroot = root.join("sub");
+        let changed = changed_files_since(&subroot, &base).unwrap();
+
+        // Rebased to the scan root, nested path preserved, sibling dropped.
+        assert!(
+            changed.contains(&PathBuf::from("a.py")),
+            "sub/a.py -> a.py; got {changed:?}"
+        );
+        assert!(
+            changed.contains(&PathBuf::from("deep/c.py")),
+            "sub/deep/c.py -> deep/c.py; got {changed:?}"
+        );
+        assert!(
+            !changed
+                .iter()
+                .any(|p| p.to_string_lossy().contains("top.py")),
+            "a change outside the scan root is excluded; got {changed:?}"
+        );
+        assert!(
+            !changed
+                .iter()
+                .any(|p| p.to_string_lossy().starts_with("sub/")),
+            "no top-level-relative paths leak through; got {changed:?}"
+        );
     }
 
     #[test]

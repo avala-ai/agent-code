@@ -99,8 +99,8 @@ pub async fn run(llm: Arc<dyn Provider>, config: Config, args: ScanArgs) -> anyh
     );
     if report.worker_failures > 0 {
         eprintln!(
-            "Warning: {} map worker(s) failed — coverage is incomplete, so a clean \
-             result cannot be trusted.",
+            "Warning: {} scan worker(s) failed (map coverage gap or a failed reduce) \
+             — the analysis is incomplete, so a clean result cannot be trusted.",
             report.worker_failures
         );
     }

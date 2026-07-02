@@ -215,8 +215,16 @@ pub async fn run_scan(agent: Arc<dyn AmrAgent>, cfg: &ScanConfig) -> Result<Scan
                 let result = reduce::parse_reduce_result(&run.text, &deduped);
                 (result.findings, result.chains)
             }
-            // A failed reducer must not lose the MAP work.
-            Err(_) => (deduped.clone(), Vec::new()),
+            // A failed reducer must not lose the MAP work, but it also means
+            // the scan could not complete its analysis (and any cross-shard
+            // attack chains — which only REDUCE composes — are lost). Count it
+            // as incomplete coverage, exactly like a MAP-worker failure, so the
+            // gate reports non-clean instead of a false pass on a transient
+            // provider outage.
+            Err(_) => {
+                worker_failures += 1;
+                (deduped.clone(), Vec::new())
+            }
         }
     };
     reduce::assign_ids(&mut final_findings);
@@ -349,6 +357,55 @@ mod tests {
         assert_eq!(report.findings[0].severity, Severity::P0);
         assert!(!report.findings[0].id.is_empty(), "ids are backfilled");
         assert_eq!(report.chains.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reduce_failure_counts_as_incomplete_coverage() {
+        // A transient REDUCE-stage provider failure must not read as a clean
+        // scan: MAP covered the shard and found a P0, but the analysis did not
+        // complete, so the gate must report incomplete coverage.
+        struct FailingReduce;
+        #[async_trait::async_trait]
+        impl AmrAgent for FailingReduce {
+            async fn run(
+                &self,
+                prompt: &str,
+                _opts: &RunOpts,
+            ) -> Result<crate::amr::agent::AgentRun, AmrError> {
+                if prompt.contains("examining ONE shard") {
+                    Ok(crate::amr::agent::AgentRun {
+                        text: r#"```json
+{"findings":[{"id":"","cwe":"CWE-78","file":"app.py","line_range":[3,3],
+"severity":"P0","confidence":0.9,"title":"OS command injection",
+"root_cause":"x","exploit_preconditions":"y","evidence":"os.system"}]}
+```"#
+                            .to_string(),
+                        cost_usd: 0.0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    })
+                } else {
+                    Err(AmrError::Worker("reduce provider outage".into()))
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "app.py",
+            "import os\ndef h(r):\n    os.system('ping ' + r.host)\n",
+        );
+        let cfg = ScanConfig::new(dir.path());
+        let report = run_scan(Arc::new(FailingReduce), &cfg).await.unwrap();
+
+        assert!(
+            report.worker_failures >= 1,
+            "a REDUCE failure must count as incomplete coverage"
+        );
+        // The MAP finding is still surfaced (best effort), never silently lost.
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].severity, Severity::P0);
     }
 
     #[tokio::test]
