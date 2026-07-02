@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.24.0] - 2026-07-02
+
 ### Added
+
+- **`agent security-scan`: whole-repo security scanning via Agentic MapReduce** (#335): a new subcommand that hunts exploitable vulnerabilities across an *entire* repository, built on a general-purpose Agentic MapReduce engine (`plan → shard → batch → map → reduce → gate`). Deterministic *selectors* (lexical patterns plus tree-sitter AST queries for Python and JavaScript) run over the whole tree with no model in the loop and drop files that produce no signals; parallel, strictly read-only MAP workers — confined by a permission read-scope to the scan target so a scan can neither modify the repository nor read outside it — investigate each shard and clear a false-positive gate; a reduce worker deduplicates, composes cross-shard attack chains, and prioritizes. Findings carry severity, confidence, and preconditions; output is JSON or Markdown; the process exit code gates CI on `--severity-threshold`, and reports *incomplete coverage* rather than a false clean when a worker fails. Diff-aware via an incremental cache (`--incremental`), provider-agnostic, and shipped with a docs guide and a hermetic test suite. Security scanning is the first *profile* on a task-agnostic engine.
 
 - **`/help` now lists the input prefixes**: the in-REPL `/help` output has a new "Input prefixes" section documenting `! <cmd>` (shell), `& <prompt>` (background subagent), and `&/<skill>` (background workflow) — so these non-slash features are discoverable alongside the commands and skills.
 
@@ -477,7 +483,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/avala-ai/agent-code/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/avala-ai/agent-code/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/avala-ai/agent-code/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/avala-ai/agent-code/compare/v0.21.1...v0.22.0
