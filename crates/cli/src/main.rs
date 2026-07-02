@@ -282,7 +282,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Logs go to stderr so stdout stays clean for machine-readable output
+    // (`--output-format json`, `security-scan --format json`) and never
+    // corrupts the interactive TUI.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
 
     // Validate output format early — fail fast on bad values before
     // touching config, API keys, or the setup wizard.

@@ -2242,9 +2242,7 @@ mod model_completion_tests {
         let (idx, pairs) = c.complete("/model claude-o", 15, &ctx).unwrap();
         assert_eq!(idx, 7, "replacement should overwrite the model token");
         assert!(
-            pairs
-                .iter()
-                .any(|p| p.replacement == "claude-opus-4-20250514"),
+            pairs.iter().any(|p| p.replacement == "claude-opus-4-8"),
             "expected a claude model: {:?}",
             pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
         );

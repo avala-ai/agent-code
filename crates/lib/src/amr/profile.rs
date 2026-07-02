@@ -204,6 +204,12 @@ For every candidate signal:
   3. Apply the false-positive gate: if you cannot articulate a concrete
      exploit path and its preconditions, DO NOT report it.
 
+Work efficiently and stay in scope. Read the files named in the signals and
+the immediate code around each signal; you may open a directly imported
+helper when it is essential, but do NOT crawl the wider repository or run
+broad searches. As soon as you have assessed this shard's signals, output
+your JSON and stop.
+
 Account for every file you were handed. Prefer a small number of real,
 well-evidenced findings over many speculative ones.";
 

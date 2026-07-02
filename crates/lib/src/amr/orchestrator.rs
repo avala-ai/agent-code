@@ -53,8 +53,10 @@ impl ScanConfig {
             reduce_model: None,
             max_signals_per_shard: 40,
             max_concurrency: 6,
-            map_max_turns: 12,
-            reduce_max_turns: 8,
+            // A map worker reads several files per shard before it can
+            // report; too low a budget makes it hit the turn cap mid-scan.
+            map_max_turns: 30,
+            reduce_max_turns: 12,
             severity_threshold: Severity::P2,
             incremental: false,
             max_file_bytes: 1_000_000,
