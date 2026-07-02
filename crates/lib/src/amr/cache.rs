@@ -177,36 +177,67 @@ pub fn worktree_is_clean(repo_root: &Path) -> bool {
 pub fn changed_files_since(repo_root: &Path, base: &str) -> Option<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
 
+    // NUL-delimited so paths with spaces/newlines/quotes and rename records
+    // survive intact; line-based parsing silently corrupts them, which would
+    // let a changed file be skipped and reported clean.
     let diff = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--name-only", &format!("{base}..HEAD")])
+        .args(["diff", "--name-only", "-z", &format!("{base}..HEAD")])
         .output()
         .ok()?;
     if !diff.status.success() {
         return None;
     }
-    for line in String::from_utf8_lossy(&diff.stdout).lines() {
-        if !line.trim().is_empty() {
-            files.insert(PathBuf::from(line.trim()));
-        }
-    }
+    files.extend(parse_nul_paths(&diff.stdout));
 
-    // Uncommitted changes and untracked files (porcelain: XY <path>).
+    // Uncommitted + untracked changes (porcelain v1, NUL-delimited).
     if let Ok(status) = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain=v1", "-z"])
         .output()
+        && status.status.success()
     {
-        for line in String::from_utf8_lossy(&status.stdout).lines() {
-            if line.len() > 3 {
-                files.insert(PathBuf::from(line[3..].trim()));
-            }
-        }
+        files.extend(parse_status_z(&status.stdout));
     }
 
     Some(files)
+}
+
+/// Split NUL-delimited git output (`--name-only -z`) into paths.
+fn parse_nul_paths(bytes: &[u8]) -> Vec<PathBuf> {
+    String::from_utf8_lossy(bytes)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Parse `git status --porcelain=v1 -z` output. Each record is `XY <path>`;
+/// a rename/copy (`R`/`C`) is followed by its original path as the next NUL
+/// field, which is included so a renamed file is always re-scanned.
+fn parse_status_z(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut tokens = text.split('\0').filter(|t| !t.is_empty());
+    let mut out = Vec::new();
+    while let Some(entry) = tokens.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status_code = &entry[..2];
+        let path = &entry[3..];
+        if !path.is_empty() {
+            out.push(PathBuf::from(path));
+        }
+        if (status_code.contains('R') || status_code.contains('C'))
+            && let Some(orig) = tokens.next()
+            && !orig.is_empty()
+        {
+            out.push(PathBuf::from(orig));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -286,5 +317,31 @@ mod tests {
         assert_eq!(sha256_hex(b"hello"), sha256_hex(b"hello"));
         assert_ne!(sha256_hex(b"hello"), sha256_hex(b"world"));
         assert_eq!(sha256_hex(b"hello").len(), 64);
+    }
+
+    #[test]
+    fn parse_nul_paths_preserves_special_chars() {
+        let paths: Vec<String> = parse_nul_paths(b"a b.py\0c\td.py\0")
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["a b.py".to_string(), "c\td.py".to_string()]);
+    }
+
+    #[test]
+    fn parse_status_z_handles_spaces_and_renames() {
+        // Untracked with a space, a modified file, and a rename (new + orig).
+        let bytes = b"?? a b.py\0 M src/x.py\0R  new.py\0old.py\0";
+        let paths: Vec<String> = parse_status_z(bytes)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.contains(&"a b.py".to_string()));
+        assert!(paths.contains(&"src/x.py".to_string()));
+        assert!(paths.contains(&"new.py".to_string()));
+        assert!(
+            paths.contains(&"old.py".to_string()),
+            "rename origin included"
+        );
     }
 }
