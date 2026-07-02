@@ -219,7 +219,12 @@ impl Tool for GrepTool {
             cmd.arg("--glob").arg(glob_pat);
         }
 
-        cmd.arg(pattern).arg(&search_path);
+        // `--` terminates option parsing: the user-controlled `pattern` (and
+        // the `search_path`) are positional operands, never flags. Without it a
+        // confined worker could pass `pattern: "-uu"` to re-enable ripgrep's
+        // hidden/ignored search and exfiltrate `.env`, defeating the read-scope
+        // confinement. It also lets a legitimate pattern begin with `-`.
+        cmd.arg("--").arg(pattern).arg(&search_path);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = match cmd.output().await {
@@ -249,7 +254,8 @@ impl Tool for GrepTool {
                 if let Some(glob_pat) = glob_filter {
                     fallback.arg("--include").arg(glob_pat);
                 }
-                fallback.arg(pattern).arg(&search_path);
+                // Same option-injection guard as the ripgrep path above.
+                fallback.arg("--").arg(pattern).arg(&search_path);
                 fallback.stdout(Stdio::piped()).stderr(Stdio::piped());
                 fallback.output().await.map_err(|e| {
                     ToolError::ExecutionFailed(format!(
@@ -333,6 +339,10 @@ fn fallback_hidden_excludes(has_read_scope: bool) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::PermissionChecker;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn hidden_excludes_only_apply_under_a_read_scope() {
@@ -343,5 +353,52 @@ mod tests {
         let confined = fallback_hidden_excludes(true);
         assert!(confined.contains(&"--exclude-dir=.*"));
         assert!(confined.contains(&"--exclude=.*"));
+    }
+
+    fn test_ctx() -> ToolContext {
+        ToolContext {
+            cwd: PathBuf::from("."),
+            cancel: CancellationToken::new(),
+            permission_checker: Arc::new(PermissionChecker::allow_all()),
+            verbose: false,
+            plan_mode: false,
+            file_cache: None,
+            denial_tracker: None,
+            task_manager: None,
+            subagent_colors: None,
+            session_allows: None,
+            permission_prompter: None,
+            sandbox: None,
+            active_disk_output_style: None,
+            agent_limiter: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pattern_that_looks_like_a_flag_is_searched_literally() {
+        // Regression for option injection: a `pattern` beginning with `-` must
+        // be a positional regex, never parsed as an rg/grep flag. If it were,
+        // `-uu` / `--hidden` would re-enable hidden-file search and defeat the
+        // AMR read-scope confinement.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "harmless --hidden token\n").unwrap();
+
+        let out = GrepTool
+            .call(
+                json!({
+                    "pattern": "--hidden",
+                    "path": dir.path().to_string_lossy(),
+                    "output_mode": "content",
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "flag-like pattern must not error out");
+        assert!(
+            out.content.contains("--hidden"),
+            "the pattern was treated as a literal regex (found the matching line), not a flag"
+        );
     }
 }
