@@ -110,6 +110,19 @@ pub fn parse_worker_findings_checked(text: &str) -> Option<Vec<Finding>> {
     Some(out)
 }
 
+/// Parse every element of a findings array strictly. Returns `None` if any
+/// element fails to deserialize, so callers can distinguish "the model listed
+/// findings we could parse" from "the model listed findings but the output is
+/// malformed" — the latter must not be silently reduced to a shorter (or
+/// empty) list.
+fn strict_findings(items: &[Value]) -> Option<Vec<Finding>> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(serde_json::from_value::<Finding>(it.clone()).ok()?);
+    }
+    Some(out)
+}
+
 fn findings_from_value(v: &Value) -> Vec<Finding> {
     let arr = if v.is_array() {
         v.as_array()
@@ -204,10 +217,26 @@ pub fn parse_reduce_result(text: &str, fallback: &[Finding]) -> ReduceResult {
     };
 
     let findings = if v.is_array() || v.get("findings").is_some() {
-        // The reducer returned an explicit findings list. An empty list is a
-        // deliberate verdict — it cleared every MAP candidate as a false
-        // positive — so honor it rather than restoring the fallback.
-        findings_from_value(&v)
+        // The reducer returned a findings envelope. Parse it strictly:
+        //  - an explicit empty array is a deliberate "all candidates were false
+        //    positives" verdict — honor it;
+        //  - a non-empty array is only trusted if EVERY element deserializes.
+        //    If any element is malformed (schema drift, truncation), the reduce
+        //    output is untrustworthy, so fall back to the MAP findings rather
+        //    than letting a filter-and-drop silently erase real work — which
+        //    would flip the CI gate to a clean exit while a P0 exists.
+        let arr = if v.is_array() {
+            v.as_array()
+        } else {
+            v.get("findings").and_then(|f| f.as_array())
+        };
+        match arr {
+            Some(items) if items.is_empty() => Vec::new(),
+            Some(items) => strict_findings(items).unwrap_or_else(|| fallback.to_vec()),
+            // `findings` present but not an array (null, string, object): the
+            // reply is unusable, so keep the MAP findings.
+            None => fallback.to_vec(),
+        }
     } else {
         // No findings field at all: the reply is unusable, so keep the MAP
         // findings rather than silently dropping real work.
@@ -371,6 +400,44 @@ mod tests {
             &fallback,
         );
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn reduce_malformed_findings_fall_back_instead_of_erasing() {
+        // The reducer returns a NON-empty findings array, but the sole element
+        // is missing required fields (schema drift / truncation). This must not
+        // erase the MAP P0 — it falls back to the MAP findings so the CI gate
+        // still fires.
+        let fallback = vec![finding("f1", "a.py", Severity::P0, 0.9)];
+        let result = parse_reduce_result(
+            "```json\n{\"findings\":[{\"id\":\"f-0000\"}],\"chains\":[]}\n```",
+            &fallback,
+        );
+        assert_eq!(result.findings.len(), 1, "MAP finding must survive");
+        assert_eq!(result.findings[0].severity, Severity::P0);
+    }
+
+    #[test]
+    fn reduce_partial_parse_failure_falls_back() {
+        // One good finding, one malformed: the whole reduce output is
+        // untrusted, so we keep the MAP findings rather than a lossy subset.
+        let fallback = vec![
+            finding("f1", "a.py", Severity::P0, 0.9),
+            finding("f2", "b.py", Severity::P1, 0.8),
+        ];
+        let text = "```json\n{\"findings\":[\
+            {\"id\":\"g\",\"file\":\"a.py\",\"severity\":\"P0\",\"title\":\"ok\"},\
+            {\"id\":\"bad\",\"title\":\"missing file+severity\"}],\"chains\":[]}\n```";
+        let result = parse_reduce_result(text, &fallback);
+        assert_eq!(result.findings.len(), 2, "falls back to both MAP findings");
+    }
+
+    #[test]
+    fn reduce_non_array_findings_field_falls_back() {
+        // `findings` present but not an array is unusable → keep MAP findings.
+        let fallback = vec![finding("f1", "a.py", Severity::P0, 0.9)];
+        let result = parse_reduce_result("```json\n{\"findings\": null}\n```", &fallback);
+        assert_eq!(result.findings.len(), 1);
     }
 
     #[test]
