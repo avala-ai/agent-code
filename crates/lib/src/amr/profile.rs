@@ -60,59 +60,119 @@ fn ast_call(
 
 /// The built-in security profile: whole-repo vulnerability discovery.
 pub fn security_profile() -> Profile {
+    use Lang::*;
     let selectors = vec![
         // --- Remote code execution / command injection -----------------
         ast_call(
             "rce.py_dangerous_call",
             "Python call to a code/command execution sink",
-            vec![Lang::Python],
+            vec![Python],
             &["call"],
             r"^(os\.system|os\.popen|subprocess\.(Popen|call|run|check_output|check_call)|eval|exec|__import__|compile)\b",
         ),
         ast_call(
             "rce.js_dangerous_call",
             "JavaScript call to a code/command execution sink",
-            vec![Lang::JavaScript],
+            vec![JavaScript],
             &["call_expression"],
             r"(child_process|\.exec(Sync)?\s*\(|\beval\s*\(|new Function|vm\.runIn)",
         ),
         lex(
             "rce.subprocess_shell_true",
             "subprocess invoked with shell=True",
-            vec![Lang::Python],
+            vec![Python],
             r"shell\s*=\s*True",
         ),
         lex(
             "rce.node_exec",
             "Node child_process exec sink",
-            vec![Lang::JavaScript, Lang::TypeScript],
+            vec![JavaScript, TypeScript],
             r"child_process|\bexecSync\b|\bexec\s*\(",
+        ),
+        lex(
+            "rce.go_exec",
+            "Go command execution sink",
+            vec![Go],
+            r"\bexec\.Command\b|os/exec|syscall\.(Exec|ForkExec)",
+        ),
+        lex(
+            "rce.ruby_exec",
+            "Ruby command execution sink",
+            vec![Ruby],
+            r"(\bsystem\s*\(|\bexec\s*\(|%x\{|Open3\.|Kernel\.(system|spawn|exec)|\bIO\.popen|--exec)",
+        ),
+        lex(
+            "rce.php_exec",
+            "PHP command execution sink",
+            vec![Php],
+            r"\b(shell_exec|exec|system|passthru|proc_open|popen)\s*\(",
+        ),
+        lex(
+            "rce.java_exec",
+            "Java command execution sink",
+            vec![Java, Scala, Kotlin],
+            r"(Runtime\.getRuntime\(\)\s*\.\s*exec|new\s+ProcessBuilder|ProcessBuilder\s*\()",
+        ),
+        lex(
+            "rce.rust_exec",
+            "Rust process execution sink",
+            vec![Rust],
+            r"(process::)?Command::new",
+        ),
+        lex(
+            "rce.c_exec",
+            "C/C++ process/command execution sink",
+            vec![C, Cpp],
+            r"\b(system|popen|execve|execl|execlp|execvp)\s*\(",
         ),
         // --- Insecure deserialization ----------------------------------
         lex(
             "deser.python",
-            "Insecure deserialization sink",
-            vec![Lang::Python],
+            "Insecure Python deserialization sink",
+            vec![Python],
             r"(pickle\s*\.\s*loads?|marshal\s*\.\s*loads?|yaml\s*\.\s*load\s*\(|jsonpickle)",
+        ),
+        lex(
+            "deser.ruby",
+            "Unsafe Ruby deserialization sink",
+            vec![Ruby],
+            r"(Marshal\.load|YAML\.load\b|Oj\.load|Psych\.(load|unsafe_load))",
+        ),
+        lex(
+            "deser.php",
+            "PHP unserialize of possibly untrusted data",
+            vec![Php],
+            r"\bunserialize\s*\(",
+        ),
+        lex(
+            "deser.java",
+            "Unsafe Java/JVM deserialization sink",
+            vec![Java, Scala, Kotlin],
+            r"(ObjectInputStream|readObject\s*\(|readUnshared|XMLDecoder|enableDefaultTyping|new\s+Yaml\s*\()",
+        ),
+        lex(
+            "deser.dotnet",
+            "Unsafe .NET deserialization sink",
+            vec![CSharp],
+            r"(BinaryFormatter|LosFormatter|NetDataContractSerializer|ObjectStateFormatter|JavaScriptSerializer|TypeNameHandling)",
+        ),
+        // --- XML external entities (XXE) --------------------------------
+        lex(
+            "xxe.parser",
+            "XML parser that may resolve external entities",
+            vec![],
+            r"(DocumentBuilderFactory|SAXParserFactory|XMLInputFactory|SchemaFactory|TransformerFactory|XMLReader|libxml_disable_entity_loader|Nokogiri::XML|etree\.parse|lxml\.etree)",
         ),
         // --- SQL injection ---------------------------------------------
         lex(
             "sqli.raw_query",
             "Raw SQL execution with possible string building",
-            vec![
-                Lang::Python,
-                Lang::JavaScript,
-                Lang::TypeScript,
-                Lang::Go,
-                Lang::Java,
-                Lang::Ruby,
-                Lang::Php,
-            ],
-            r"(execute|executemany|executescript|query|raw)\s*\(",
+            vec![Python, JavaScript, TypeScript, Go, Java, Ruby, Php, CSharp, Scala, Kotlin],
+            r"(execute|executemany|executescript|query|rawQuery|prepare)\s*\(",
         ),
         lex(
             "sqli.fstring",
-            "SQL keyword inside an interpolated/f-string",
+            "SQL keyword inside an interpolated/concatenated string",
             vec![],
             r#"(?i)(select|insert into|update|delete from)\b[^;\n]*(\{|%s|\$\{|"\s*\+|'\s*\+|f")"#,
         ),
@@ -120,34 +180,141 @@ pub fn security_profile() -> Profile {
         lex(
             "ssrf.http_client",
             "Outbound HTTP request (possible SSRF sink)",
-            vec![Lang::Python, Lang::JavaScript, Lang::TypeScript],
+            vec![Python, JavaScript, TypeScript],
             r"(requests\.(get|post|put|delete|head|request)|urllib\.request\.urlopen|axios\.|fetch\s*\(|http\.get)",
+        ),
+        lex(
+            "ssrf.go",
+            "Go outbound HTTP request (possible SSRF sink)",
+            vec![Go],
+            r"(http\.(Get|Post|Head|NewRequest|NewRequestWithContext)|net\.Dial)",
+        ),
+        lex(
+            "ssrf.ruby",
+            "Ruby outbound HTTP request (possible SSRF sink)",
+            vec![Ruby],
+            r"(Net::HTTP|open-uri|URI\.(open|parse)|HTTParty|Faraday|RestClient)",
+        ),
+        lex(
+            "ssrf.jvm",
+            "JVM outbound HTTP request (possible SSRF sink)",
+            vec![Java, Scala, Kotlin],
+            r"(HttpURLConnection|HttpClient|RestTemplate|WebClient|new\s+URL\s*\()",
+        ),
+        lex(
+            "ssrf.php",
+            "PHP outbound request (possible SSRF sink)",
+            vec![Php],
+            r"(curl_exec|curl_init|fsockopen|file_get_contents\s*\(\s*\$)",
+        ),
+        lex(
+            "ssrf.rust",
+            "Rust outbound HTTP request (possible SSRF sink)",
+            vec![Rust],
+            r"(reqwest::|hyper::Client|ureq::)",
         ),
         // --- Path traversal --------------------------------------------
         lex(
             "path.open_concat",
             "File open with a concatenated/interpolated path",
-            vec![Lang::Python, Lang::JavaScript, Lang::TypeScript],
+            vec![Python, JavaScript, TypeScript],
             r#"(open|readFile|readFileSync|sendFile|createReadStream)\s*\([^)\n]*(\+|\{|\$\{|%s|os\.path\.join)"#,
+        ),
+        lex(
+            "path.ruby",
+            "Ruby file access (possible path traversal)",
+            vec![Ruby],
+            r"(File\.(read|open|join|expand_path|new|binread)|IO\.(read|binread)|send_file|Rack::(File|Static)|Dir\[)",
+        ),
+        lex(
+            "path.go",
+            "Go file access (possible path traversal)",
+            vec![Go],
+            r"(os\.(Open|OpenFile|ReadFile)|ioutil\.ReadFile|http\.ServeFile|filepath\.Join)",
+        ),
+        lex(
+            "path.jvm",
+            "JVM file access (possible path traversal)",
+            vec![Java, Scala, Kotlin],
+            r"(new\s+File\s*\(|Paths\.get|Files\.(newInputStream|readAllBytes|copy)|FileInputStream|getResourceAsStream)",
+        ),
+        lex(
+            "path.php",
+            "PHP file access (possible path traversal / LFI)",
+            vec![Php],
+            r"\b(fopen|readfile|file_get_contents|fpassthru)\s*\(|\b(include|require)(_once)?\b[^;'\x22\n]*\$",
+        ),
+        lex(
+            "path.rust",
+            "Rust file access (possible path traversal)",
+            vec![Rust],
+            r"(File::open|File::create|fs::(read|read_to_string|write|File)|Path::new|PathBuf::from)",
+        ),
+        lex(
+            "path.c",
+            "C/C++ file open (possible path traversal)",
+            vec![C, Cpp],
+            r"\b(fopen|openat|open)\s*\(",
+        ),
+        lex(
+            "path.archive_slip",
+            "Archive extraction (zip-slip / tar traversal surface)",
+            vec![],
+            r"(?i)(zipentry|getnextentry|tarentry|extractall|extract\s*\(|unzip|untar)",
+        ),
+        // --- Prototype pollution (JS/TS) -------------------------------
+        lex(
+            "proto.pollution",
+            "Prototype-pollution sink",
+            vec![JavaScript, TypeScript],
+            r"(__proto__|constructor\s*\.\s*prototype|prototype\s*\[|Object\.assign|deepmerge|mergeWith)",
+        ),
+        // --- Regular-expression denial of service -----------------------
+        lex(
+            "redos.regex",
+            "Dynamically built or nested-quantifier regex (ReDoS surface)",
+            vec![JavaScript, TypeScript, Python, Ruby, Java, Scala, Elixir],
+            r"(new\s+RegExp\s*\(|re\.compile\s*\(|Pattern\.compile\s*\(|Regex\.new|~r\(|\([^)\n]*[+*][^)\n]*\)\s*[+*])",
+        ),
+        // --- Memory safety (Rust / C / C++) -----------------------------
+        lex(
+            "mem.rust_unsafe",
+            "Rust unchecked/unsafe memory operation",
+            vec![Rust],
+            r"(\bunsafe\b|get_unchecked(_mut)?|from_raw_parts(_mut)?|::transmute|\.offset\s*\(|\.add\s*\(|MaybeUninit|assume_init|from_utf8_unchecked)",
+        ),
+        lex(
+            "mem.c_unsafe_fn",
+            "C/C++ unbounded buffer operation",
+            vec![C, Cpp],
+            r"\b(strcpy|strcat|sprintf|vsprintf|gets|stpcpy|wcscpy|memcpy|memmove|alloca)\s*\(",
+        ),
+        // --- Integer overflow / narrowing -------------------------------
+        lex(
+            "int.narrowing_cast",
+            "Narrowing integer cast (overflow/truncation surface)",
+            vec![Go, Rust, C, Cpp],
+            r"(\b(u?int(8|16|32)|i(8|16|32)|u(8|16|32))\s*\(|\bas\s+[iu](8|16|32)\b|\(\s*(short|u?int(8|16)_t)\s*\))",
         ),
         // --- Template injection ----------------------------------------
         lex(
             "ssti.render_string",
             "Template rendered from a string (possible SSTI)",
-            vec![Lang::Python],
+            vec![Python],
             r"render_template_string\s*\(",
+        ),
+        // --- Cross-site scripting / unescaped output --------------------
+        lex(
+            "xss.unescaped_output",
+            "Unescaped value rendered into output",
+            vec![],
+            r"(<%=|\.html_safe\b|\braw\s*\(|innerHTML\s*=|dangerouslySetInnerHTML|document\.write\s*\(|\becho\s+\$|Response\.Write)",
         ),
         // --- Weak cryptography -----------------------------------------
         lex(
             "crypto.weak_hash",
             "Weak hash primitive",
-            vec![
-                Lang::Python,
-                Lang::JavaScript,
-                Lang::TypeScript,
-                Lang::Go,
-                Lang::Java,
-            ],
+            vec![Python, JavaScript, TypeScript, Go, Java, Ruby, Php, CSharp],
             r"(?i)\b(md5|sha1)\b\s*[\(:]",
         ),
         // --- Hardcoded secrets -----------------------------------------
@@ -169,12 +336,12 @@ pub fn security_profile() -> Profile {
             vec![],
             r#"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*["'][^"'\n]{6,}["']"#,
         ),
-        // --- Broad recall safety net -----------------------------------
+        // --- Authentication / access-control boundary ------------------
         lex(
-            "auth.decorator",
+            "auth.boundary",
             "Auth/permission boundary marker",
-            vec![Lang::Python],
-            r"(?i)@(login_required|permission_required|requires_auth|authenticated)",
+            vec![],
+            r"(?i)(@(login_required|permission_required|requires_auth|authenticated|preauthorize|rolesallowed|secured))\b|\b(authorize|authenticate|has_?role|is_?admin|check_?permission|before_action|require_?auth)\b",
         ),
     ];
 
@@ -283,5 +450,101 @@ mod tests {
             signals.is_empty(),
             "benign code should emit no signals, got {signals:?}"
         );
+    }
+
+    /// Assert that scanning `text` at `path` produces at least one signal
+    /// from the selector with id `want`.
+    fn fires(path: &str, text: &str, want: &str) {
+        let p = security_profile();
+        let hit = p
+            .selectors
+            .iter()
+            .flat_map(|s| s.scan_text(Path::new(path), text))
+            .any(|s| s.selector_id == want);
+        assert!(hit, "expected selector `{want}` to fire on {path}");
+    }
+
+    #[test]
+    fn ruby_file_access_is_selected() {
+        // rack-style path handling that the old Python/JS-only path selector missed.
+        fires(
+            "lib/rack/static.rb",
+            "path = Utils.unescape(env[\"PATH_INFO\"])\nFile.open(::File.join(root, path))\n",
+            "path.ruby",
+        );
+    }
+
+    #[test]
+    fn rust_unsafe_memory_op_is_selected() {
+        fires(
+            "src/lib.rs",
+            "pub fn get2(&self, i: usize) -> &T {\n    unsafe { self.slots.get_unchecked(i) }\n}\n",
+            "mem.rust_unsafe",
+        );
+    }
+
+    #[test]
+    fn js_prototype_pollution_is_selected() {
+        fires(
+            "src/parse.js",
+            "if (key === '__proto__') { target[key] = value }\n",
+            "proto.pollution",
+        );
+    }
+
+    #[test]
+    fn php_unserialize_is_selected() {
+        fires(
+            "app/controller.php",
+            "$data = unserialize($_POST['payload']);\n",
+            "deser.php",
+        );
+    }
+
+    #[test]
+    fn dotnet_deserialization_is_selected() {
+        fires(
+            "src/CopyData.cs",
+            "var fmt = new BinaryFormatter();\nreturn fmt.Deserialize(stream);\n",
+            "deser.dotnet",
+        );
+    }
+
+    #[test]
+    fn jvm_xxe_parser_is_selected() {
+        fires(
+            "src/main/java/org/cyclonedx/CycloneDxSchema.java",
+            "SchemaFactory sf = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);\n",
+            "xxe.parser",
+        );
+    }
+
+    #[test]
+    fn go_command_execution_is_selected() {
+        fires(
+            "internal/database/pull.go",
+            "cmd := exec.Command(\"git\", \"rebase\", \"--exec\", script)\n",
+            "rce.go_exec",
+        );
+    }
+
+    #[test]
+    fn c_unbounded_buffer_op_is_selected() {
+        fires(
+            "code/Material/MaterialSystem.cpp",
+            "char buf[256];\nstrcpy(buf, prop->mKey.data);\n",
+            "mem.c_unsafe_fn",
+        );
+    }
+
+    #[test]
+    fn newly_supported_extensions_classify() {
+        use crate::amr::selectors::Lang;
+        assert_eq!(Lang::from_path(Path::new("a.cs")), Some(Lang::CSharp));
+        assert_eq!(Lang::from_path(Path::new("a.scala")), Some(Lang::Scala));
+        assert_eq!(Lang::from_path(Path::new("a.kt")), Some(Lang::Kotlin));
+        assert_eq!(Lang::from_path(Path::new("a.swift")), Some(Lang::Swift));
+        assert_eq!(Lang::from_path(Path::new("a.dart")), Some(Lang::Dart));
+        assert_eq!(Lang::from_path(Path::new("a.ex")), Some(Lang::Elixir));
     }
 }
