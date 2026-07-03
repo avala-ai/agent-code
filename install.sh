@@ -82,15 +82,30 @@ resolved_agent_path() {
     canonicalize "$found"
 }
 
+# Single-quote a string for safe reuse in a shell rc file: wrap in single
+# quotes and escape any embedded single quote as '\''. Works for POSIX shells
+# and fish (both treat '...' as literal). Used so an install dir containing
+# spaces or metacharacters survives alias expansion in the user's shell.
+sq() {
+    local s=$1
+    s=${s//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
 # Append the name guard to a single rc file, replacing any existing block.
 # $1 = rc file path, $2 = flavor (posix|fish)
 write_guard_to() {
-    local rc="$1" flavor="$2" body tmp
+    local rc="$1" flavor="$2" body tmp agent_cmd
 
     # Fail early (non-zero) if the rc location can't be prepared, so callers
     # never report a guard as installed when the write couldn't happen.
     mkdir -p "$(dirname "$rc")" || return 1
     touch "$rc" || return 1
+
+    # Quoted alias target — an unquoted path with spaces would word-split when
+    # the alias is expanded, so `agent` would run neither the binary nor the
+    # PATH fallback.
+    agent_cmd="$(sq "${INSTALL_DIR}/agent")"
 
     if [ "$flavor" = "fish" ]; then
         # Prepend PATH inline rather than with `fish_add_path`, which persists to
@@ -104,7 +119,7 @@ ${GUARD_BEGIN}
 if not contains "${INSTALL_DIR}" \$PATH
     set -gx PATH "${INSTALL_DIR}" \$PATH
 end
-alias agent="${INSTALL_DIR}/agent"
+alias agent=${agent_cmd}
 ${GUARD_END}
 EOF
 )"
@@ -117,7 +132,7 @@ case ":\$PATH:" in
     *":${INSTALL_DIR}:"*) ;;
     *) export PATH="${INSTALL_DIR}:\$PATH" ;;
 esac
-alias agent="${INSTALL_DIR}/agent"
+alias agent=${agent_cmd}
 ${GUARD_END}
 EOF
 )"
@@ -129,7 +144,10 @@ EOF
     # missing (a hand-edited rc), the buffered lines are flushed back verbatim
     # so no user content is ever lost.
     tmp="$(mktemp)"
-    awk -v b="$GUARD_BEGIN" -v e="$GUARD_END" '
+    # If awk is missing or errors, `$tmp` may be empty/partial; abort BEFORE
+    # overwriting the rc so a stripping failure can never truncate the user's
+    # existing shell config.
+    if ! awk -v b="$GUARD_BEGIN" -v e="$GUARD_END" '
         !in_block && $0 == b { in_block=1; buf=$0; next }
         in_block {
             buf = buf ORS $0
@@ -138,7 +156,10 @@ EOF
         }
         { print }
         END { if (in_block) print buf }
-    ' "$rc" > "$tmp"
+    ' "$rc" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
 
     # Drop trailing blank lines, then separate the block with one blank line.
     # Propagate a failed write as non-zero so `install_shell_guard` doesn't
@@ -155,7 +176,7 @@ EOF
 # resolves to agent-code regardless of PATH ordering or a competing symlink.
 # Returns 0 if at least one rc file was written.
 install_shell_guard() {
-    local shell_name updated=1
+    local shell_name updated=1 login_rc
     shell_name="$(basename "${SHELL:-}")"
 
     case "$shell_name" in
@@ -167,8 +188,21 @@ install_shell_guard() {
             ;;
         bash)
             write_guard_to "$HOME/.bashrc" posix && updated=0
-            # macOS bash login shells read .bash_profile, not .bashrc.
-            [ "$(uname -s)" = "Darwin" ] && write_guard_to "$HOME/.bash_profile" posix
+            # macOS bash login shells read only the FIRST existing of
+            # .bash_profile, .bash_login, .profile. Write to whichever already
+            # exists so we don't shadow (and silently stop sourcing) the user's
+            # profile; if none exist, create the conventional .bash_profile.
+            if [ "$(uname -s)" = "Darwin" ]; then
+                login_rc="$HOME/.bash_profile"
+                if [ -e "$HOME/.bash_login" ] && [ ! -e "$HOME/.bash_profile" ]; then
+                    login_rc="$HOME/.bash_login"
+                elif [ -e "$HOME/.profile" ] \
+                    && [ ! -e "$HOME/.bash_profile" ] \
+                    && [ ! -e "$HOME/.bash_login" ]; then
+                    login_rc="$HOME/.profile"
+                fi
+                write_guard_to "$login_rc" posix
+            fi
             ;;
         *)
             write_guard_to "$HOME/.profile" posix && updated=0
