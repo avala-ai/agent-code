@@ -148,8 +148,21 @@ fn bind_rw(out: &mut Vec<OsString>, path: &Path) {
 
 /// Shadow a forbidden path so its contents cannot be read inside the sandbox.
 ///
-/// The base `--ro-bind / /` exposes the whole host read-only, so a forbidden
-/// path must be overlaid with something empty:
+/// The base `--ro-bind / /` exposes the whole host read-only under *every*
+/// spelling of a path, so masking only the configured spelling is not enough:
+/// if a component is a symlink (a symlinked `$HOME`, or `/var/run -> /run`) the
+/// secret is still reachable via the canonical path. So the canonical variant
+/// is masked too, mirroring [`bind_rw`]'s symlink handling.
+fn mask_path(out: &mut Vec<OsString>, path: &Path) {
+    mask_one(out, path);
+    if let Ok(canonical) = std::fs::canonicalize(path)
+        && canonical != path
+    {
+        mask_one(out, &canonical);
+    }
+}
+
+/// Overlay a single path with an empty mount so its contents are unreadable:
 /// - a regular file is masked with a read-only bind of `/dev/null` (an empty
 ///   file mount point must itself be a file);
 /// - a directory — or a path that does not exist — is masked with an empty
@@ -157,7 +170,7 @@ fn bind_rw(out: &mut Vec<OsString>, path: &Path) {
 ///
 /// `/dev/null` is resolved from the host, so it is available regardless of the
 /// `--dev` overlay applied earlier.
-fn mask_path(out: &mut Vec<OsString>, path: &Path) {
+fn mask_one(out: &mut Vec<OsString>, path: &Path) {
     if std::fs::metadata(path)
         .map(|m| m.is_file())
         .unwrap_or(false)
@@ -331,6 +344,37 @@ mod tests {
             "expected forbidden file to be masked with /dev/null: {args:?}"
         );
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn argv_masks_forbidden_symlink_and_its_canonical_target() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("agent-mask-canon-{}", std::process::id()));
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).ok();
+
+        let mut policy = test_policy();
+        policy.forbidden_paths = vec![link.clone()];
+        let args = args_with(&policy, None);
+
+        let link_s = link.to_string_lossy().into_owned();
+        let real_s = std::fs::canonicalize(&link)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            contains_sequence(&args, &["--tmpfs", &link_s]),
+            "configured spelling must be masked: {args:?}"
+        );
+        assert!(
+            real_s == link_s || contains_sequence(&args, &["--tmpfs", &real_s]),
+            "canonical target must also be masked: {args:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
