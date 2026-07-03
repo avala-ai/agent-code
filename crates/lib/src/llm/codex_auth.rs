@@ -1,8 +1,14 @@
 //! Codex ChatGPT authentication support.
 //!
-//! This reuses an existing `codex login` session from CODEX_HOME. It does
-//! not perform browser login and it does not store tokens in agent-code
-//! configuration.
+//! Two entry points, both keyed on `<codex_home>/auth.json` (default `~/.codex`)
+//! so agent-code and the `codex` CLI share one subscription session:
+//!
+//! - [`CodexChatGptAuth`] loads and refreshes an existing session for use as a
+//!   provider (the `codex_chatgpt` auth mode).
+//! - [`browser_login`] runs the "Sign in with ChatGPT" browser OAuth flow (PKCE)
+//!   and writes that session file, so no `codex` CLI install is required.
+//!
+//! Tokens are only ever stored in `auth.json`, never in agent-code config.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +21,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::provider::ProviderError;
+use crate::services::oauth::{
+    CredentialStore, OAuthError, OAuthProviderConfig, OAuthService, TokenSet,
+};
 
 const DEFAULT_CODEX_HOME: &str = ".codex";
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-ID";
@@ -349,6 +358,203 @@ fn refresh_error_message(body: &str) -> String {
         .unwrap_or_else(|| "auth service returned an error".to_string())
 }
 
+// ---- Browser "Sign in with ChatGPT" login ----
+
+const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+/// The exact redirect URI registered with the Codex OAuth app. OpenAI rejects
+/// any other value, so the loopback server must bind this fixed port and path.
+const OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const OAUTH_LOOPBACK_PORT: u16 = 1455;
+
+/// A credential store that discards writes. Codex tokens are persisted to
+/// `<codex_home>/auth.json` for interop with the `codex` CLI, so the generic
+/// OAuth store must not scatter a second copy of the tokens elsewhere on disk.
+struct DiscardStore;
+
+impl CredentialStore for DiscardStore {
+    fn load(&self, _key: &str) -> Result<Option<TokenSet>, OAuthError> {
+        Ok(None)
+    }
+    fn save(&self, _key: &str, _tokens: &TokenSet) -> Result<(), OAuthError> {
+        Ok(())
+    }
+    fn delete(&self, _key: &str) -> Result<(), OAuthError> {
+        Ok(())
+    }
+}
+
+fn codex_oauth_config() -> OAuthProviderConfig {
+    OAuthProviderConfig {
+        provider_name: "codex".to_string(),
+        authorization_url: AUTHORIZE_URL.to_string(),
+        token_url: REFRESH_TOKEN_URL.to_string(),
+        client_id: CLIENT_ID.to_string(),
+        scopes: vec![
+            "openid".to_string(),
+            "profile".to_string(),
+            "email".to_string(),
+            "offline_access".to_string(),
+        ],
+        redirect_uri: OAUTH_REDIRECT_URI.to_string(),
+        loopback_port: Some(OAUTH_LOOPBACK_PORT),
+        // Tells the issuer to include the ChatGPT account/org claims in the
+        // id_token, which is where the account id is read from.
+        extra_authorize_params: vec![(
+            "id_token_add_organizations".to_string(),
+            "true".to_string(),
+        )],
+        allow_insecure_local: false,
+    }
+}
+
+/// Run the browser "Sign in with ChatGPT" OAuth flow (PKCE) and write the
+/// resulting session to `<codex_home>/auth.json`, the same file the `codex` CLI
+/// uses, so agent-code and the codex CLI share one subscription session. No
+/// `codex` CLI installation is required. Returns the path written.
+pub async fn browser_login(codex_home: Option<&str>) -> Result<PathBuf, ProviderError> {
+    let auth_file = resolve_auth_file(codex_home)?;
+
+    let service = OAuthService::with_store(codex_oauth_config(), Arc::new(DiscardStore))
+        .map_err(|e| ProviderError::Auth(e.to_string()))?;
+    let tokens = service
+        .login()
+        .await
+        .map_err(|e| ProviderError::Auth(format!("ChatGPT sign-in failed: {e}")))?;
+
+    let refresh_token = tokens.refresh_token.ok_or_else(|| {
+        ProviderError::Auth(
+            "sign-in returned no refresh token (offline_access scope missing?)".into(),
+        )
+    })?;
+    let id_token = tokens.id_token.ok_or_else(|| {
+        ProviderError::Auth(
+            "sign-in returned no id_token; cannot resolve the ChatGPT account".into(),
+        )
+    })?;
+    let account_id = account_id_from_id_token(&id_token);
+    // Best-effort: mirror `codex login` by exchanging the id_token for an API
+    // key so auth.json is fully equivalent. A failure leaves the key unset; the
+    // access token (which the codex_chatgpt mode uses) still works.
+    let openai_api_key = obtain_api_key(&id_token).await;
+
+    write_codex_auth_json(
+        &auth_file,
+        &tokens.access_token,
+        &refresh_token,
+        &id_token,
+        account_id.as_deref(),
+        openai_api_key.as_deref(),
+    )?;
+    Ok(auth_file)
+}
+
+fn resolve_auth_file(codex_home: Option<&str>) -> Result<PathBuf, ProviderError> {
+    let home = match codex_home {
+        Some(path) => PathBuf::from(path),
+        None => default_codex_home().ok_or_else(|| {
+            ProviderError::Auth("could not determine Codex home; set CODEX_HOME".into())
+        })?,
+    };
+    Ok(home.join("auth.json"))
+}
+
+fn account_id_from_id_token(id_token: &str) -> Option<String> {
+    jwt_payload(id_token).and_then(|payload| {
+        payload
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_account_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// Exchange the id_token for an `OPENAI_API_KEY` via RFC 8693 token-exchange,
+/// the same step `codex login` performs so `auth.json` carries an API key.
+///
+/// Best-effort: agent-code's `codex_chatgpt` auth mode authenticates with the
+/// access token, so a failure here is non-fatal — the key is simply left unset,
+/// and the written session still works for agent-code. It matters only for
+/// interop with tools (or the `codex` CLI's API-key mode) that read the key.
+async fn obtain_api_key(id_token: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ExchangeResp {
+        access_token: String,
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(REFRESH_TOKEN_URL)
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("client_id", CLIENT_ID),
+            ("requested_token", "openai-api-key"),
+            ("subject_token", id_token),
+            (
+                "subject_token_type",
+                "urn:ietf:params:oauth:token-type:id_token",
+            ),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<ExchangeResp>()
+        .await
+        .ok()
+        .map(|r| r.access_token)
+}
+
+/// Write the codex `auth.json` shape (`{OPENAI_API_KEY, tokens, last_refresh}`)
+/// with `0600` permissions, mirroring [`CodexAuthState::save_to_file`].
+fn write_codex_auth_json(
+    path: &Path,
+    access_token: &str,
+    refresh_token: &str,
+    id_token: &str,
+    account_id: Option<&str>,
+    openai_api_key: Option<&str>,
+) -> Result<(), ProviderError> {
+    let raw = serde_json::json!({
+        // `null` when the API-key exchange did not run or failed; the ChatGPT
+        // access token below is what the codex_chatgpt auth mode uses.
+        "OPENAI_API_KEY": openai_api_key,
+        // Matches `codex login`, so the codex CLI recognizes this session too.
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "account_id": account_id,
+        },
+        "last_refresh": Utc::now().to_rfc3339(),
+    });
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ProviderError::Auth(e.to_string()))?;
+    }
+    let data = serde_json::to_string_pretty(&raw)
+        .map_err(|e| ProviderError::InvalidResponse(e.to_string()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| ProviderError::Auth(e.to_string()))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| ProviderError::Auth(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +622,81 @@ mod tests {
         let state = CodexAuthState::from_raw(raw).unwrap();
 
         assert_eq!(state.account_id.as_deref(), Some("account-from-jwt"));
+    }
+
+    #[test]
+    fn codex_oauth_config_uses_fixed_loopback_and_org_param() {
+        let cfg = codex_oauth_config();
+        assert_eq!(cfg.loopback_port, Some(1455));
+        assert!(cfg.redirect_uri.contains(":1455/auth/callback"));
+        assert!(cfg.scopes.iter().any(|s| s == "offline_access"));
+        assert!(
+            cfg.extra_authorize_params
+                .iter()
+                .any(|(k, v)| k == "id_token_add_organizations" && v == "true"),
+            "the org param is what makes the id_token carry the account id"
+        );
+        // https endpoints + loopback redirect: no insecure-local needed.
+        assert!(!cfg.allow_insecure_local);
+    }
+
+    #[test]
+    fn account_id_from_id_token_reads_chatgpt_claim() {
+        let id_token = jwt_with_payload(
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-xyz"}}"#,
+        );
+        assert_eq!(
+            account_id_from_id_token(&id_token).as_deref(),
+            Some("acct-xyz")
+        );
+    }
+
+    #[test]
+    fn browser_login_writer_produces_a_loadable_auth_json() {
+        // The file the browser flow writes must be the same shape the loader
+        // (and the codex CLI) reads, with account_id resolved from the id_token.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let id_token = jwt_with_payload(
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-roundtrip"}}"#,
+        );
+        write_codex_auth_json(
+            &path,
+            "access-tok",
+            "refresh-tok",
+            &id_token,
+            Some("acct-roundtrip"),
+            Some("sk-test-key"),
+        )
+        .unwrap();
+
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["OPENAI_API_KEY"], "sk-test-key");
+        assert_eq!(raw["auth_mode"], "chatgpt");
+        assert_eq!(raw["tokens"]["access_token"], "access-tok");
+        assert_eq!(raw["tokens"]["account_id"], "acct-roundtrip");
+        assert!(raw.get("last_refresh").and_then(Value::as_str).is_some());
+
+        // A failed/absent API-key exchange writes null, not a missing field.
+        let path2 = dir.path().join("auth2.json");
+        write_codex_auth_json(&path2, "a", "r", &id_token, None, None).unwrap();
+        let raw2: Value = serde_json::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
+        assert!(raw2.get("OPENAI_API_KEY").unwrap().is_null());
+
+        // The loader's own parser must accept it, account_id resolved.
+        let state = CodexAuthState::from_raw(raw).unwrap();
+        assert_eq!(state.account_id.as_deref(), Some("acct-roundtrip"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "auth.json holds tokens; must be private"
+            );
+        }
     }
 
     #[test]

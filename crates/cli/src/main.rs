@@ -195,6 +195,15 @@ enum SubCommand {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Sign in with a provider subscription via the browser (OAuth).
+    Login {
+        /// Provider to sign in to. Currently: `codex` (ChatGPT/Codex subscription).
+        #[arg(default_value = "codex")]
+        provider: String,
+        /// Codex home to write `auth.json` to (default: `$CODEX_HOME` or `~/.codex`).
+        #[arg(long)]
+        codex_home: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -304,6 +313,29 @@ async fn main() -> anyhow::Result<()> {
     // Set working directory if specified.
     if let Some(ref cwd) = cli.cwd {
         std::env::set_current_dir(cwd)?;
+    }
+
+    // `agent login` runs a browser OAuth flow to create a subscription session.
+    // It does not need an LLM provider (it is what produces the credentials).
+    if let Some(SubCommand::Login {
+        ref provider,
+        ref codex_home,
+    }) = cli.command
+    {
+        match provider.as_str() {
+            "codex" | "chatgpt" | "openai" => {
+                eprintln!("Opening your browser to sign in with ChatGPT...");
+                let path = agent_code_lib::llm::codex_auth::browser_login(codex_home.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Signed in. Codex session written to {}", path.display());
+                println!(
+                    "Run agent-code on your subscription with:\n  agent --auth-mode codex_chatgpt --model gpt-5.5"
+                );
+                return Ok(());
+            }
+            other => anyhow::bail!("unknown login provider `{other}` (supported: codex)"),
+        }
     }
 
     // Handle schedule subcommands that don't need an LLM provider.

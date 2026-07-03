@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **`agent login`: sign in with your ChatGPT/Codex subscription in the browser**. Runs the "Sign in with ChatGPT" OAuth flow (PKCE, loopback `localhost:1455/auth/callback`) and writes the session to `~/.codex/auth.json` — the same file the `codex` CLI uses, so the two share one session and no `codex` install is required. Mirrors `codex login`: exchanges the id_token for an `OPENAI_API_KEY` (best-effort) and records `auth_mode`. Then run agent-code on the subscription with `agent --auth-mode codex_chatgpt --model gpt-5.5`. The generic `services::oauth` service gained fixed-loopback-port, extra-authorize-param, and `id_token` support to drive it.
 
 ## [0.24.0] - 2026-07-02
 
