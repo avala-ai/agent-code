@@ -87,8 +87,10 @@ resolved_agent_path() {
 write_guard_to() {
     local rc="$1" flavor="$2" body tmp
 
-    mkdir -p "$(dirname "$rc")"
-    touch "$rc"
+    # Fail early (non-zero) if the rc location can't be prepared, so callers
+    # never report a guard as installed when the write couldn't happen.
+    mkdir -p "$(dirname "$rc")" || return 1
+    touch "$rc" || return 1
 
     if [ "$flavor" = "fish" ]; then
         # Prepend PATH inline rather than with `fish_add_path`, which persists to
@@ -99,8 +101,8 @@ write_guard_to() {
 ${GUARD_BEGIN}
 # Ensures \`agent\` runs agent-code even if another command claims the name.
 # Managed by the agent-code installer. Delete this block to opt out.
-if not contains ${INSTALL_DIR} \$PATH
-    set -gx PATH ${INSTALL_DIR} \$PATH
+if not contains "${INSTALL_DIR}" \$PATH
+    set -gx PATH "${INSTALL_DIR}" \$PATH
 end
 alias agent="${INSTALL_DIR}/agent"
 ${GUARD_END}
@@ -139,8 +141,14 @@ EOF
     ' "$rc" > "$tmp"
 
     # Drop trailing blank lines, then separate the block with one blank line.
-    printf '%s\n\n%s\n' "$(cat "$tmp")" "$body" > "$rc"
+    # Propagate a failed write as non-zero so `install_shell_guard` doesn't
+    # report the guard as written when the rc file is unchanged.
+    if ! printf '%s\n\n%s\n' "$(cat "$tmp")" "$body" > "$rc"; then
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
+    return 0
 }
 
 # Write the name guard into the rc file(s) for the user's shell so `agent`
