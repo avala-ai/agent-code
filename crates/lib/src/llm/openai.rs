@@ -836,18 +836,23 @@ fn merge_chat_usage(usage: &mut Usage, parsed: &Value) {
     let Some(u) = parsed.get("usage").filter(|u| !u.is_null()) else {
         return;
     };
-    if let Some(i) = u.get("prompt_tokens").and_then(Value::as_u64) {
-        usage.input_tokens = i;
-    }
     if let Some(o) = u.get("completion_tokens").and_then(Value::as_u64) {
         usage.output_tokens = o;
     }
-    if let Some(c) = u
+    // OpenAI reports `cached_tokens` as a SUBSET of `prompt_tokens`, but the
+    // cost model bills `input_tokens` and `cache_read_input_tokens`
+    // independently. Split the prompt total so the cached portion is only
+    // charged at the (cheaper) cache-read rate, not twice.
+    let cached = u
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
-    {
-        usage.cache_read_input_tokens = c;
+        .unwrap_or(0);
+    if let Some(prompt) = u.get("prompt_tokens").and_then(Value::as_u64) {
+        usage.input_tokens = prompt.saturating_sub(cached);
+    }
+    if cached > 0 {
+        usage.cache_read_input_tokens = cached;
     }
 }
 
@@ -1121,7 +1126,9 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(usage.input_tokens, 50);
+        // cached_tokens is a subset of prompt_tokens; the non-cached remainder
+        // is input, the cached part is charged only at the cache-read rate.
+        assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 10);
         assert_eq!(usage.cache_read_input_tokens, 40);
     }
