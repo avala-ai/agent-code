@@ -461,7 +461,9 @@ pub fn summarize(report: &BenchReport) -> String {
     // Roll up miss reasons so a run's failure profile is visible at a glance.
     let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
     for c in &missed {
-        *reasons.entry(c.miss_reason.as_deref().unwrap_or("?")).or_insert(0) += 1;
+        *reasons
+            .entry(c.miss_reason.as_deref().unwrap_or("?"))
+            .or_insert(0) += 1;
     }
     if !reasons.is_empty() {
         let parts: Vec<String> = reasons.iter().map(|(r, n)| format!("{r}={n}")).collect();
@@ -591,7 +593,10 @@ mod tests {
 
     #[test]
     fn judge_prompt_includes_target_and_findings() {
-        let p = judge_prompt(&case("CWE-89", "users.py"), &[finding("CWE-89", "users.py")]);
+        let p = judge_prompt(
+            &case("CWE-89", "users.py"),
+            &[finding("CWE-89", "users.py")],
+        );
         assert!(p.contains("CWE-89"));
         assert!(p.contains("users.py"));
         assert!(p.contains("YES or NO"));
