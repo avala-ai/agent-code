@@ -170,7 +170,7 @@ pub fn security_profile() -> Profile {
             vec![
                 Python, JavaScript, TypeScript, Go, Java, Ruby, Php, CSharp, Scala, Kotlin,
             ],
-            r"(execute|executemany|executescript|query|rawQuery|prepare)\s*\(",
+            r"(execute|executemany|executescript|query|raw|rawQuery|prepare)\s*\(",
         ),
         lex(
             "sqli.fstring",
@@ -555,6 +555,16 @@ mod tests {
         assert!(
             !hit,
             "selector `{unwanted}` should NOT fire on {path}: {text:?}"
+        );
+    }
+
+    #[test]
+    fn raw_sql_sink_is_selected() {
+        // Django `.raw(sql)` / knex `db.raw(sql)` — the bare `raw(` sink.
+        fires(
+            "app/models.py",
+            "rows = Model.objects.raw(user_sql)\n",
+            "sqli.raw_query",
         );
     }
 
