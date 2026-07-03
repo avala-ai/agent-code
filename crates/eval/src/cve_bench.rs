@@ -61,7 +61,7 @@ pub struct ScanReport {
     #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default)]
-    pub chains: Vec<serde_json::Value>,
+    pub chains: Vec<Chain>,
     #[serde(default)]
     pub cost_usd: f64,
     #[serde(default)]
@@ -83,6 +83,17 @@ pub struct Finding {
     pub title: String,
     #[serde(default)]
     pub evidence: String,
+}
+
+/// A cross-shard attack chain the REDUCE stage composed. The scanner's gate
+/// counts a chain as a reportable item, so a vuln surfaced only as a chain
+/// must be gradable too — not just standalone findings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chain {
+    #[serde(default)]
+    pub narrative: String,
+    #[serde(default)]
+    pub member_finding_ids: Vec<String>,
 }
 
 /// A finding trimmed to the fields worth keeping in the benchmark report, so a
@@ -204,20 +215,47 @@ pub fn heuristic_found(case: &CveCase, findings: &[Finding]) -> bool {
     })
 }
 
-/// Build the LLM judge prompt: given the target and the findings, decide match.
-pub fn judge_prompt(case: &CveCase, findings: &[Finding]) -> String {
+/// A composed attack chain covers the target when its narrative names the
+/// target file. The scanner's gate treats a chain as a reportable item, so a
+/// vuln surfaced only as a chain (its members individually sub-threshold) would
+/// otherwise be scored a miss. REDUCE has already vetted the chain as a real
+/// composed vuln, so the file being named in the narrative is a strong signal.
+pub fn chain_covers(case: &CveCase, chains: &[Chain]) -> bool {
+    let base = Path::new(&case.file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(case.file.as_str());
+    if base.is_empty() {
+        return false;
+    }
+    chains
+        .iter()
+        .any(|c| c.narrative.contains(base) || c.narrative.contains(&case.file))
+}
+
+/// Deterministic recall over the whole report (standalone findings + chains).
+pub fn heuristic_found_in_report(case: &CveCase, report: &ScanReport) -> bool {
+    heuristic_found(case, &report.findings) || chain_covers(case, &report.chains)
+}
+
+/// Build the LLM judge prompt from the target and the full scan report
+/// (standalone findings AND composed attack chains).
+pub fn judge_prompt(case: &CveCase, findings: &[Finding], chains: &[Chain]) -> String {
     let findings_json = serde_json::to_string_pretty(findings).unwrap_or_else(|_| "[]".into());
+    let chains_json = serde_json::to_string_pretty(chains).unwrap_or_else(|_| "[]".into());
     format!(
         "You are grading a security scanner. TARGET VULNERABILITY:\n\
          - CWE: {cwe}\n- file: {file}\n- description: {desc}\n\n\
          SCANNER FINDINGS (JSON):\n{findings}\n\n\
-         Does ANY finding describe the TARGET vulnerability — the same class of \
-         bug in roughly the same location? Ignore unrelated findings. Answer with \
-         a single word: YES or NO.",
+         SCANNER ATTACK CHAINS (JSON):\n{chains}\n\n\
+         Does ANY finding OR attack chain describe the TARGET vulnerability — the \
+         same class of bug in roughly the same location? Ignore unrelated \
+         findings. Answer with a single word: YES or NO.",
         cwe = case.cwe,
         file = case.file,
         desc = case.description,
         findings = findings_json,
+        chains = chains_json,
     )
 }
 
@@ -339,14 +377,14 @@ pub async fn run_case(
     result.findings = report.findings.iter().map(FindingBrief::from).collect();
 
     result.found = match grader {
-        Grader::Heuristic => heuristic_found(case, &report.findings),
-        Grader::Llm => match llm_judge(agent_binary, case, &report.findings, model, env).await {
+        Grader::Heuristic => heuristic_found_in_report(case, &report),
+        Grader::Llm => match llm_judge(agent_binary, case, &report, model, env).await {
             Ok(v) => v,
             Err(e) => {
                 result.error = Some(format!("judge: {e}"));
                 // Fall back to the deterministic grader so a judge outage does
                 // not silently zero the case.
-                heuristic_found(case, &report.findings)
+                heuristic_found_in_report(case, &report)
             }
         },
     };
@@ -357,11 +395,11 @@ pub async fn run_case(
     result
 }
 
-/// Ask an LLM (via `agent -p`) whether any finding matches the target.
+/// Ask an LLM (via `agent -p`) whether any finding or chain matches the target.
 async fn llm_judge(
     agent_binary: &str,
     case: &CveCase,
-    findings: &[Finding],
+    report: &ScanReport,
     model: Option<&str>,
     env: &[(&str, &str)],
 ) -> Result<bool> {
@@ -369,13 +407,23 @@ async fn llm_judge(
     if let Some(m) = model {
         cmd.args(["--model", m]);
     }
-    cmd.args(["-p", &judge_prompt(case, findings)]);
+    cmd.args(["-p", &judge_prompt(case, &report.findings, &report.chains)]);
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let out = cmd.output().await.context("spawning judge")?;
+    // A judge subprocess that exits non-zero (bad credentials, rate limit,
+    // provider error) has not answered — surface it as an error so the caller
+    // falls back to the deterministic grader instead of recording a false miss.
+    if !out.status.success() {
+        anyhow::bail!(
+            "judge exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     let answer = String::from_utf8_lossy(&out.stdout).to_uppercase();
     Ok(answer.contains("YES"))
 }
@@ -592,14 +640,46 @@ mod tests {
     }
 
     #[test]
-    fn judge_prompt_includes_target_and_findings() {
+    fn judge_prompt_includes_target_findings_and_chains() {
+        let chain = Chain {
+            narrative: "unauth id disclosure in users.py chained to RCE".into(),
+            member_finding_ids: vec!["F1".into(), "F2".into()],
+        };
         let p = judge_prompt(
             &case("CWE-89", "users.py"),
             &[finding("CWE-89", "users.py")],
+            &[chain],
         );
         assert!(p.contains("CWE-89"));
         assert!(p.contains("users.py"));
+        assert!(p.contains("ATTACK CHAINS"));
+        assert!(p.contains("chained to RCE"));
         assert!(p.contains("YES or NO"));
+    }
+
+    #[test]
+    fn chain_covers_matches_target_file_in_narrative() {
+        let c = case("CWE-918", "backend/app/retrieval/web/utils.py");
+        let hit = Chain {
+            narrative: "SSRF in utils.py composed with an auth bypass into a P0".into(),
+            member_finding_ids: vec![],
+        };
+        let miss = Chain {
+            narrative: "unrelated chain in some/other/module.py".into(),
+            member_finding_ids: vec![],
+        };
+        assert!(chain_covers(&c, std::slice::from_ref(&hit)));
+        assert!(!chain_covers(&c, std::slice::from_ref(&miss)));
+        // Whole-report grader credits a chain-only surfacing.
+        let report = ScanReport {
+            findings: vec![],
+            chains: vec![hit],
+            cost_usd: 0.0,
+            worker_failures: 0,
+            scanned_files: 10,
+            shards: 2,
+        };
+        assert!(heuristic_found_in_report(&c, &report));
     }
 
     #[test]
