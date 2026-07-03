@@ -1,1 +1,502 @@
-[]
+[
+  {
+    "id": "CVE-2025-61765",
+    "cwe": "CWE-502",
+    "language": "python",
+    "repo": "https://github.com/miguelgrinberg/python-socketio",
+    "commit": "a59c6f520059eb095ab4472e5192ce3e486875d9",
+    "file": "src/socketio/pubsub_manager.py",
+    "description": "Unsafe pickle.loads() of messages from the message-queue backend allows RCE in multi-server deployments",
+    "published": "2025-10-03"
+  },
+  {
+    "id": "CVE-2025-64459",
+    "cwe": "CWE-89",
+    "language": "python",
+    "repo": "https://github.com/django/django",
+    "commit": "4f5d904b63751dea9ffc3b0e046404a7fa5881ac",
+    "file": "django/db/models/query_utils.py",
+    "description": "SQL injection in Q/QuerySet filter/exclude/get via a crafted dict expanded into the _connector keyword argument",
+    "published": "2025-11-05"
+  },
+  {
+    "id": "CVE-2025-65958",
+    "cwe": "CWE-918",
+    "language": "python",
+    "repo": "https://github.com/open-webui/open-webui",
+    "commit": "6cdb13d5cb26b7bceebfe0b85723d8a61aebae3b",
+    "file": "backend/open_webui/retrieval/web/utils.py",
+    "description": "SSRF: user-supplied URL in /api/v1/retrieval/process/web is fetched without blocking private IPs / cloud metadata endpoints",
+    "published": "2025-12-04"
+  },
+  {
+    "id": "CVE-2025-55295",
+    "cwe": "CWE-22",
+    "language": "python",
+    "repo": "https://github.com/StuffAnThings/qbit_manage",
+    "commit": "9ee3527853faf308750cdbcb0b61ddd913481ec7",
+    "file": "modules/web_api.py",
+    "description": "Path traversal in restore_config_from_backup: backup_id/backup_filename lets an authenticated user read arbitrary files",
+    "published": "2025-08-19"
+  },
+  {
+    "id": "CVE-2025-57820",
+    "cwe": "CWE-1321",
+    "language": "javascript",
+    "repo": "https://github.com/sveltejs/devalue",
+    "commit": "02d20e8a792e5daa387b23816aba0170fec7437e",
+    "file": "src/parse.js",
+    "description": "devalue.parse allows __proto__ assignment during unflattening, enabling prototype pollution",
+    "published": "2025-08-26"
+  },
+  {
+    "id": "CVE-2025-25285",
+    "cwe": "CWE-1333",
+    "language": "typescript",
+    "repo": "https://github.com/octokit/endpoint.js",
+    "commit": "0a80e82d6d5e57e21d16bd484762efd84ec7c508",
+    "file": "src/parse.ts",
+    "description": "Catastrophic backtracking in the accept-header preview regex causes ReDoS",
+    "published": "2025-02-14"
+  },
+  {
+    "id": "CVE-2025-27152",
+    "cwe": "CWE-918",
+    "language": "javascript",
+    "repo": "https://github.com/axios/axios",
+    "commit": "98120457559e573024862e2925d56295a965ad7e",
+    "file": "lib/adapters/http.js",
+    "description": "Absolute request URL overrides baseURL, causing SSRF and credential leakage",
+    "published": "2025-03-07"
+  },
+  {
+    "id": "CVE-2025-68428",
+    "cwe": "CWE-22",
+    "language": "javascript",
+    "repo": "https://github.com/parallax/jsPDF",
+    "commit": "a504e973eeebac633351b41860945ca2a2cdf096",
+    "file": "src/modules/fileloading.js",
+    "description": "loadFile reads arbitrary local files via fs.readFileSync with no path restriction (Node builds)",
+    "published": "2026-01-05"
+  },
+  {
+    "id": "CVE-2025-27610",
+    "cwe": "CWE-22",
+    "language": "ruby",
+    "repo": "https://github.com/rack/rack",
+    "commit": "2db5cfb37479af9d503ee85500e5bfb1f3f3ddd4",
+    "file": "lib/rack/static.rb",
+    "description": "Rack::Static does not fully resolve/sanitize the request path before serving, allowing encoded path traversal to read files outside the static root",
+    "published": "2025-03-10"
+  },
+  {
+    "id": "CVE-2026-44161",
+    "cwe": "CWE-918",
+    "language": "ruby",
+    "repo": "https://github.com/fluent/fluentd",
+    "commit": "f5f2b7cddf8aab3932e6dec9fa367a5f3eb27e10",
+    "file": "lib/fluent/plugin/out_http.rb",
+    "description": "out_http expands untrusted placeholders into the endpoint host without host validation, enabling SSRF to arbitrary internal services",
+    "published": "2026-06-26"
+  },
+  {
+    "id": "CVE-2025-67202",
+    "cwe": "CWE-79",
+    "language": "ruby",
+    "repo": "https://github.com/sidekiq-cron/sidekiq-cron",
+    "commit": "11535a5940171513b4ff4ff44d4300e608f4b5cc",
+    "file": "lib/sidekiq/cron/views/cron.erb",
+    "description": "Reflected XSS in the Sidekiq Web UI: @current_namespace is emitted into the cron view unescaped",
+    "published": "2026-05-07"
+  },
+  {
+    "id": "CVE-2025-30207",
+    "cwe": "CWE-22",
+    "language": "php",
+    "repo": "https://github.com/getkirby/kirby",
+    "commit": "95a51480a426a8ed0df799cc017403be9b987ced",
+    "file": "router.php",
+    "description": "Path traversal in the PHP built-in-server router: unsanitized REQUEST_URI is urldecoded and concatenated to DOCUMENT_ROOT in file_exists(), letting ../ sequences probe files outside the install",
+    "published": "2025-05-13"
+  },
+  {
+    "id": "CVE-2025-46337",
+    "cwe": "CWE-89",
+    "language": "php",
+    "repo": "https://github.com/ADOdb/ADOdb",
+    "commit": "8659a3e34b5b144a54c24827e94e94f1ccf9492c",
+    "file": "drivers/adodb-postgres64.inc.php",
+    "description": "SQL injection in the PostgreSQL driver's pg_insert_id() method due to improper escaping of a user-supplied query parameter",
+    "published": "2025-05-01"
+  },
+  {
+    "id": "CVE-2025-22131",
+    "cwe": "CWE-79",
+    "language": "php",
+    "repo": "https://github.com/PHPOffice/PhpSpreadsheet",
+    "commit": "51b1d1c3a2d2aa71f18cec8e653ad812a4b13621",
+    "file": "src/PhpSpreadsheet/Writer/Html.php",
+    "description": "Stored XSS in the HTML writer's generateNavigation(): unsanitized worksheet names are injected into HTML output during spreadsheet-to-HTML conversion",
+    "published": "2025-01-18"
+  },
+  {
+    "id": "CVE-2025-22133",
+    "cwe": "CWE-434",
+    "language": "php",
+    "repo": "https://github.com/LabRedesCefetRJ/WeGIA",
+    "commit": "21176917cd63e0bf7c55676a0b090a954b718753",
+    "file": "html/socio/sistema/controller/controla_xlsx.php",
+    "description": "Unrestricted file upload in the xlsx import controller: validation bypass (e.g. .phar with spoofed magic bytes) drops an executable file, leading to RCE",
+    "published": "2025-01-07"
+  },
+  {
+    "id": "CVE-2025-10543",
+    "cwe": "CWE-190",
+    "language": "go",
+    "repo": "https://github.com/eclipse-paho/paho.mqtt.golang",
+    "commit": "04fb4dcd24c11ff4752a485f32f2e98a0fe0c3fa",
+    "file": "packets/packets.go",
+    "description": "UTF-8 string length narrowed from int64/int32 to int16 without overflow check, corrupting MQTT packets when a field exceeds 65535 bytes",
+    "published": "2025-12-02"
+  },
+  {
+    "id": "CVE-2026-33064",
+    "cwe": "CWE-476",
+    "language": "go",
+    "repo": "https://github.com/free5gc/udm",
+    "commit": "504b14458d156558b3c0ade7107b86b3d5e72998",
+    "file": "internal/sbi/processor/notifier.go",
+    "description": "Nil pointer dereference in the UDM DataChangeNotification procedure causes a panic (DoS)",
+    "published": "2026-03-20"
+  },
+  {
+    "id": "CVE-2026-52806",
+    "cwe": "CWE-77",
+    "language": "go",
+    "repo": "https://github.com/gogs/gogs",
+    "commit": "b9a0093e9cd1b2b3c7f42f9feca396dc772c4f1b",
+    "file": "internal/database/pull.go",
+    "description": "RCE via git rebase --exec argument injection through a crafted branch name during pull request merge",
+    "published": "2026-06-23"
+  },
+  {
+    "id": "CVE-2026-28406",
+    "cwe": "CWE-22",
+    "language": "go",
+    "repo": "https://github.com/chainguard-dev/kaniko",
+    "commit": "263fa1e4ab8b8639406798415bf404c77abea592",
+    "file": "pkg/util/fs_util.go",
+    "description": "Tar build-context extraction uses filepath.Join(dest, name) without confining the result to dest, allowing file writes outside the destination (path traversal)",
+    "published": "2026-02-27"
+  },
+  {
+    "id": "CVE-2025-4574",
+    "cwe": "CWE-415",
+    "language": "rust",
+    "repo": "https://github.com/crossbeam-rs/crossbeam",
+    "commit": "423e46fe204718785af99a2d68a52092463d0167",
+    "file": "crossbeam-channel/src/flavors/list.rs",
+    "description": "Race in the list-channel Drop path lets discard_all_messages free head.block twice, causing a double-free (memory corruption)",
+    "published": "2025-04-10"
+  },
+  {
+    "id": "CVE-2025-55159",
+    "cwe": "CWE-125",
+    "language": "rust",
+    "repo": "https://github.com/tokio-rs/slab",
+    "commit": "6a1b675665ee141ab68fd3e4f82b3cb3efc09e01",
+    "file": "src/lib.rs",
+    "description": "Slab::get_disjoint_mut checks indices against capacity instead of length, allowing out-of-bounds access to uninitialized memory",
+    "published": "2025-08-11"
+  },
+  {
+    "id": "CVE-2025-4366",
+    "cwe": "CWE-444",
+    "language": "rust",
+    "repo": "https://github.com/cloudflare/pingora",
+    "commit": "a1baa60d5ab39c35804f5b98f0b0322e6cf94535",
+    "file": "pingora-core/src/protocols/http/v1/server.rs",
+    "description": "pingora-proxy does not drain the downstream HTTP/1.1 request body on cache hits, enabling request smuggling / cache poisoning",
+    "published": "2025-06-20"
+  },
+  {
+    "id": "CVE-2026-0810",
+    "cwe": "CWE-135",
+    "language": "rust",
+    "repo": "https://github.com/GitoxideLabs/gitoxide",
+    "commit": "7a2e8f122badc3688d7a6877b153c7ca4917a107",
+    "file": "gix-date/src/parse/mod.rs",
+    "description": "gix_date::parse::TimeBuf::as_str can return a &str containing non-UTF-8 bytes, violating the str safety invariant and causing undefined behavior",
+    "published": "2026-01-05"
+  },
+  {
+    "id": "CVE-2025-9900",
+    "cwe": "CWE-787",
+    "language": "c",
+    "repo": "https://github.com/libsdl-org/libtiff",
+    "commit": "0061c782f7c457b428a750352dbe75eec8cc5f65",
+    "file": "libtiff/tif_getimage.c",
+    "description": "Out-of-bounds write in TIFFReadRGBAImageOriented() due to unchecked raster pointer offset when img.height exceeds rheight",
+    "published": "2025-09-23"
+  },
+  {
+    "id": "CVE-2025-32415",
+    "cwe": "CWE-125",
+    "language": "c",
+    "repo": "https://github.com/GNOME/libxml2",
+    "commit": "1039cd53bc5761f1eb30afc3510f92a57d88ce5a",
+    "file": "xmlschemas.c",
+    "description": "Heap-based buffer under-read in xmlSchemaIDCFillNodeTables via a stale local variable during schema identity-constraint validation",
+    "published": "2025-04-17"
+  },
+  {
+    "id": "CVE-2025-49844",
+    "cwe": "CWE-416",
+    "language": "c",
+    "repo": "https://github.com/redis/redis",
+    "commit": "9829bdbfd9e7eeb8fb6c79ce36bcc77a681824b1",
+    "file": "deps/lua/src/lparser.c",
+    "description": "Use-after-free in the bundled Lua parser reachable via a crafted Lua script, potentially leading to RCE (RediShell)",
+    "published": "2025-10-03"
+  },
+  {
+    "id": "CVE-2026-32776",
+    "cwe": "CWE-476",
+    "language": "c",
+    "repo": "https://github.com/libexpat/libexpat",
+    "commit": "2d689ff60483b47aa1492e876bf4ae6c0c6376f9",
+    "file": "expat/lib/xmlparse.c",
+    "description": "NULL function-pointer dereference on empty external parameter entity content",
+    "published": "2026-03-17"
+  },
+  {
+    "id": "CVE-2025-70067",
+    "cwe": "CWE-787",
+    "language": "cpp",
+    "repo": "https://github.com/assimp/assimp",
+    "commit": "392a658f9c271be965271f45e7521a1b80ea4392",
+    "file": "code/Material/MaterialSystem.cpp",
+    "description": "FBX importer copies a property key string into a fixed-size heap buffer with strcpy without length validation, causing a heap buffer overflow",
+    "published": "2026-05-04"
+  },
+  {
+    "id": "CVE-2025-48073",
+    "cwe": "CWE-476",
+    "language": "cpp",
+    "repo": "https://github.com/AcademySoftwareFoundation/openexr",
+    "commit": "928f9a4dd71152e09a6957f974fea5e1dcc9d406",
+    "file": "src/lib/OpenEXR/ImfDeepScanLineInputFile.cpp",
+    "description": "Reading a deep scanline image with a large sample count in reduceMemory mode triggers a NULL pointer write in ScanLineProcess::run_fill",
+    "published": "2025-07-31"
+  },
+  {
+    "id": "CVE-2025-48072",
+    "cwe": "CWE-125",
+    "language": "cpp",
+    "repo": "https://github.com/AcademySoftwareFoundation/openexr",
+    "commit": "2df7802a6421bf39ed73a607392f01b3c6da4e4a",
+    "file": "src/lib/OpenEXRCore/internal_dwa_decoder.h",
+    "description": "Bad pointer arithmetic in LossyDctDecoder_execute causes an out-of-bounds heap read when decompressing DWAA-packed scanline EXR files",
+    "published": "2025-07-31"
+  },
+  {
+    "id": "CVE-2025-14847",
+    "cwe": "CWE-130",
+    "language": "cpp",
+    "repo": "https://github.com/mongodb/mongo",
+    "commit": "9cf8bd8b5a3e14ed412d26abaed477d4bdafb17a",
+    "file": "src/mongo/transport/message_compressor_zlib.cpp",
+    "description": "zlib message decompressor returns the allocated buffer size instead of the actual decompressed length, exposing adjacent uninitialized heap memory (MongoBleed)",
+    "published": "2025-12-19"
+  },
+  {
+    "id": "CVE-2025-6544",
+    "cwe": "CWE-502",
+    "language": "java",
+    "repo": "https://github.com/h2oai/h2o-3",
+    "commit": "56fca16b30e46c0b852a2666d22e9cd7315acdfa",
+    "file": "h2o-core/src/main/java/water/jdbc/SQLManager.java",
+    "description": "Deserialization RCE via crafted JDBC connection parameters (double URL-encoding bypasses regex validation) in H2O-3 ImportSQLTable",
+    "published": "2025-09-22"
+  },
+  {
+    "id": "CVE-2025-64518",
+    "cwe": "CWE-611",
+    "language": "java",
+    "repo": "https://github.com/CycloneDX/cyclonedx-core-java",
+    "commit": "1d9ecdb55b4c0a6b7011dfe27ea9d50177bb274e",
+    "file": "src/main/java/org/cyclonedx/CycloneDxSchema.java",
+    "description": "XXE injection during BOM XML schema validation because SchemaFactory is not configured to disable external entity/DTD resolution",
+    "published": "2025-11-10"
+  },
+  {
+    "id": "CVE-2025-67640",
+    "cwe": "CWE-78",
+    "language": "java",
+    "repo": "https://github.com/jenkinsci/git-client-plugin",
+    "commit": "85be38a00f23624149babd84cd6728682d57db64",
+    "file": "src/main/java/org/jenkinsci/plugins/gitclient/CliGitAPIImpl.java",
+    "description": "OS command injection: workspace directory path not escaped when embedded in a generated temporary SSH_ASKPASS shell script",
+    "published": "2025-12-10"
+  },
+  {
+    "id": "CVE-2025-70952",
+    "cwe": "CWE-22",
+    "language": "java",
+    "repo": "https://github.com/pf4j/pf4j",
+    "commit": "2ed63d16c4610779eb36f54c2e2df572a94ea2b7",
+    "file": "pf4j/src/main/java/org/pf4j/util/Unzip.java",
+    "description": "Path traversal / Zip Slip in extract() due to missing normalization/validation of zip entry names",
+    "published": "2026-03-25"
+  },
+  {
+    "id": "CVE-2026-48796",
+    "cwe": "CWE-22",
+    "language": "csharp",
+    "repo": "https://github.com/cefsharp/CefSharp",
+    "commit": "b5fef3bb4bc58798c95170078c41de92cfe9066e",
+    "file": "CefSharp/SchemeHandler/FolderSchemeHandlerFactory.cs",
+    "description": "FolderSchemeHandlerFactory uses a raw string-prefix check instead of directory-boundary validation, allowing path traversal outside the configured root folder",
+    "published": "2026-06-30"
+  },
+  {
+    "id": "CVE-2025-59050",
+    "cwe": "CWE-502",
+    "language": "csharp",
+    "repo": "https://github.com/greenshot/greenshot",
+    "commit": "c1ad1d4a9309cab26143ad4ee8b239ff1686c491",
+    "file": "src/Greenshot/Helpers/CopyData.cs",
+    "description": "WndProc handling WM_COPYDATA deserializes attacker-controlled bytes with BinaryFormatter.Deserialize, enabling local code execution",
+    "published": "2025-09-16"
+  },
+  {
+    "id": "CVE-2026-50194",
+    "cwe": "CWE-288",
+    "language": "csharp",
+    "repo": "https://github.com/SteeltoeOSS/Steeltoe",
+    "commit": "081a0907a7295e753e7f50c250eb643fc0ca6146",
+    "file": "src/Management/src/EndpointCore/ManagementPort/ManagementPortMiddleware.cs",
+    "description": "ManagementPortMiddleware restricts endpoints using the spoofable HTTP Host-header port instead of the real socket port, allowing management-port isolation bypass",
+    "published": "2026-07-02"
+  },
+  {
+    "id": "CVE-2026-45153",
+    "cwe": "CWE-287",
+    "language": "kotlin",
+    "repo": "https://github.com/nextcloud/android",
+    "commit": "ac26ffdc457327137d6e4a2e8b48d504cb18bb01",
+    "file": "app/src/main/java/com/owncloud/android/ui/activity/PassCodeActivity.kt",
+    "description": "PIN-lock bypass in the Nextcloud Files Android app: the back button after unlocking the device bypasses the app PassCode/PIN",
+    "published": "2026-05-12"
+  },
+  {
+    "id": "CVE-2024-49580",
+    "cwe": "CWE-524",
+    "language": "kotlin",
+    "repo": "https://github.com/ktorio/ktor",
+    "commit": "e307968d65b59bfe0b7fa23a970b288a08f49205",
+    "file": "ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCache.kt",
+    "description": "Ktor client HttpCache plugin caches responses containing sensitive information, leaking data across requests/users",
+    "published": "2024-10-17"
+  },
+  {
+    "id": "CVE-2022-31018",
+    "cwe": "CWE-400",
+    "language": "scala",
+    "repo": "https://github.com/playframework/playframework",
+    "commit": "195b4cd1778c55b63ea4a196f73e78273326e28d",
+    "file": "core/play/src/main/scala/play/api/data/Form.scala",
+    "description": "Denial of service when binding deeply-nested JSON to a Play form (unbounded recursion depth)",
+    "published": "2022-06-03"
+  },
+  {
+    "id": "CVE-2022-31023",
+    "cwe": "CWE-209",
+    "language": "scala",
+    "repo": "https://github.com/playframework/playframework",
+    "commit": "f6722f1e57544cc95cc5eaee587e278eee420b50",
+    "file": "core/play/src/main/scala/play/api/http/HttpErrorHandler.scala",
+    "description": "Dev-mode exception stack traces leak into production error responses via DefaultHttpErrorHandler",
+    "published": "2022-06-03"
+  },
+  {
+    "id": "CVE-2025-59822",
+    "cwe": "CWE-444",
+    "language": "scala",
+    "repo": "https://github.com/http4s/http4s",
+    "commit": "aa5a5ea969d9edfd529d57edf578587165139c8a",
+    "file": "ember-core/shared/src/main/scala/org/http4s/ember/core/Parser.scala",
+    "description": "HTTP request smuggling via lenient whitespace handling around header/trailer field names in the Ember parser",
+    "published": "2025-09-23"
+  },
+  {
+    "id": "CVE-2026-27704",
+    "cwe": "CWE-22",
+    "language": "dart",
+    "repo": "https://github.com/dart-lang/pub",
+    "commit": "5e24336e71a05a96b558d496953ebed223f6e40a",
+    "file": "lib/src/io.dart",
+    "description": "Zip-slip: pub tar.gz extraction writes files outside the cache dir via symlink/path traversal",
+    "published": "2026-02-25"
+  },
+  {
+    "id": "CVE-2026-28898",
+    "cwe": "CWE-444",
+    "language": "swift",
+    "repo": "https://github.com/apple/swift-nio-http2",
+    "commit": "81cc18264f92cd307ff98430f89372711d4f6fe9",
+    "file": "Sources/NIOHTTP2/HTTP2ToHTTP1Codec.swift",
+    "description": "HTTP/2-to-HTTP/1 request smuggling via unvalidated CR/LF/NUL in :path and other pseudo-headers",
+    "published": "2026-06-12"
+  },
+  {
+    "id": "CVE-2026-28975",
+    "cwe": "CWE-409",
+    "language": "swift",
+    "repo": "https://github.com/apple/swift-nio-extras",
+    "commit": "2aa26cddeabf674a551c383430ea5d444fd45487",
+    "file": "Sources/NIOHTTPCompression/HTTPRequestDecompressor.swift",
+    "description": "NIOHTTPRequestDecompressor ratio limit bypass via attacker-controlled Content-Length (decompression bomb DoS)",
+    "published": "2026-06-12"
+  },
+  {
+    "id": "CVE-2026-49762",
+    "cwe": "CWE-400",
+    "language": "elixir",
+    "repo": "https://github.com/elixir-lang/elixir",
+    "commit": "eacf0a9baf7e1cd2b28174524f28c3ca25c7247b",
+    "file": "lib/elixir/lib/version.ex",
+    "description": "Unbounded integer parsing in Version.parse/match? enables single-request CPU/memory exhaustion DoS",
+    "published": "2026-06-09"
+  },
+  {
+    "id": "CVE-2026-55700",
+    "cwe": "CWE-22",
+    "language": "typescript",
+    "repo": "https://github.com/pnpm/pnpm",
+    "commit": "bf1b731ee6c0ea98709e671ff0f46bf654480ab8",
+    "file": "releasing/commands/src/stage/download.ts",
+    "description": "pnpm stage download derives filenames from registry manifest name/version, allowing path traversal write outside the download dir",
+    "published": "2026-06-26"
+  },
+  {
+    "id": "CVE-2026-44578",
+    "cwe": "CWE-918",
+    "language": "typescript",
+    "repo": "https://github.com/vercel/next.js",
+    "commit": "6c72e0b4ee096643b42c742f35e0de84c41d190d",
+    "file": "packages/next/src/server/lib/router-server.ts",
+    "description": "Pre-auth SSRF in the Next.js WebSocket upgrade/proxy handler via crafted absolute-URL upgrade requests",
+    "published": "2026-05-11"
+  },
+  {
+    "id": "CVE-2025-46548",
+    "cwe": "CWE-287",
+    "language": "scala",
+    "repo": "https://github.com/apache/pekko-management",
+    "commit": "3b45c44fc42eb134366590832bb22664106144fa",
+    "file": "management/src/main/scala/org/apache/pekko/management/scaladsl/PekkoManagement.scala",
+    "description": "Basic Authentication bypass: authenticator not effectively applied to the Management API (Java DSL path)",
+    "published": "2025-06-03"
+  }
+]
