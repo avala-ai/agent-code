@@ -503,4 +503,26 @@ mod tests {
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].cwe, "CWE-89");
     }
+
+    #[test]
+    fn shipped_manifest_is_well_formed() {
+        // The curated benchmark that ships in this crate must always parse and
+        // meet the basic invariants the harness relies on.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benchmarks/security-scan-cves.json");
+        let cases = load_cases(&path).unwrap();
+        assert_eq!(cases.len(), 50, "expected 50 curated cases");
+        for c in &cases {
+            assert!(c.id.starts_with("CVE-"), "bad id: {}", c.id);
+            assert!(
+                !normalize_cwe(&c.cwe).is_empty(),
+                "case {} has no numeric CWE",
+                c.id
+            );
+            assert_eq!(c.commit.len(), 40, "case {} commit is not a full SHA", c.id);
+            assert!(c.commit.chars().all(|ch| ch.is_ascii_hexdigit()));
+            assert!(c.repo.starts_with("https://github.com/"), "case {}", c.id);
+            assert!(!c.file.is_empty(), "case {} has empty file", c.id);
+        }
+    }
 }
