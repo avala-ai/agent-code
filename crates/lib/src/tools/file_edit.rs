@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use similar::TextDiff;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -113,6 +114,29 @@ fn normalize_eol(text: &str, eol: &str) -> String {
     } else {
         lf
     }
+}
+
+/// Pick the search/replacement pair and its occurrence count.
+///
+/// Exact matches win: if the raw `old` already appears in `content`, the raw
+/// strings are used verbatim so a mixed-ending file isn't disturbed and the
+/// exact snippet the caller supplied is the one edited. Only when the raw
+/// search finds nothing do we normalize both strings to the file's dominant
+/// line ending and retry — the common "model sent LF, file is CRLF" case.
+fn select_match<'a>(
+    content: &str,
+    old: &'a str,
+    new: &'a str,
+) -> (Cow<'a, str>, Cow<'a, str>, usize) {
+    let raw = content.matches(old).count();
+    if raw > 0 {
+        return (Cow::Borrowed(old), Cow::Borrowed(new), raw);
+    }
+    let eol = dominant_eol(content);
+    let old_n = normalize_eol(old, eol);
+    let new_n = normalize_eol(new, eol);
+    let occ = content.matches(old_n.as_str()).count();
+    (Cow::Owned(old_n), Cow::Owned(new_n), occ)
 }
 
 #[async_trait]
@@ -219,15 +243,14 @@ impl Tool for FileEditTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {file_path}: {e}")))?;
 
-        // Match and replace using the file's own line ending. Model-supplied
-        // strings use bare LF, so on a CRLF file a raw match would fail and a
-        // raw write would leave mixed endings. Any leading BOM is part of
-        // `content` and is preserved untouched by the string replacement.
-        let eol = dominant_eol(&content);
-        let old_owned = normalize_eol(old_string, eol);
-        let new_owned = normalize_eol(new_string, eol);
-        let old_string = old_owned.as_str();
-        let new_string = new_owned.as_str();
+        // Prefer an exact match on the raw strings; only fall back to
+        // line-ending normalization when the raw search finds nothing, so an
+        // exact match in a mixed-ending file is never skipped (see
+        // `select_match`). Any leading BOM is part of `content` and is
+        // preserved untouched by the string replacement.
+        let (old_cow, new_cow, occurrences) = select_match(&content, old_string, new_string);
+        let old_string = old_cow.as_ref();
+        let new_string = new_cow.as_ref();
 
         // The up-front `old_string == new_string` check ran on the raw inputs.
         // Normalizing line endings can make them equal (e.g. old `"a\r\nb"` and
@@ -240,8 +263,6 @@ impl Tool for FileEditTool {
                     .into(),
             ));
         }
-
-        let occurrences = content.matches(old_string).count();
 
         if occurrences == 0 {
             return Err(ToolError::InvalidInput(format!(
@@ -326,6 +347,32 @@ mod tests {
         let file = "let x = 1;\r\nlet y = 2;\r\n";
         let search = normalize_eol("let x = 1;\nlet y = 2;", dominant_eol(file));
         assert!(file.contains(&search));
+    }
+
+    #[test]
+    fn select_match_prefers_raw_exact_over_normalization() {
+        // Mixed-ending file with an exact LF block and a logically identical
+        // CRLF block, CRLF dominant. A raw LF `old` must match the LF block
+        // exactly (borrowed, no normalization), not be rewritten to CRLF and
+        // matched against the other block.
+        let content = "a\r\nb\r\nfoo\nbar\r\n";
+        let (old, new, occ) = select_match(content, "foo\nbar", "X");
+        assert!(
+            matches!(old, Cow::Borrowed(_)),
+            "raw match must be borrowed"
+        );
+        assert_eq!(occ, 1);
+        assert_eq!(new, "X");
+    }
+
+    #[test]
+    fn select_match_normalizes_only_on_miss() {
+        // No raw match (model sent LF, file is CRLF): fall back to normalized
+        // matching, which finds the block.
+        let content = "let x = 1;\r\nlet y = 2;\r\n";
+        let (old, _new, occ) = select_match(content, "let x = 1;\nlet y = 2;", "z");
+        assert!(matches!(old, Cow::Owned(_)), "fallback must be owned");
+        assert_eq!(occ, 1);
     }
 
     #[test]
