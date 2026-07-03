@@ -35,6 +35,12 @@ pub enum Lang {
     C,
     Cpp,
     Php,
+    CSharp,
+    Scala,
+    Kotlin,
+    Swift,
+    Dart,
+    Elixir,
 }
 
 impl Lang {
@@ -53,6 +59,12 @@ impl Lang {
             "c" | "h" => Lang::C,
             "cc" | "cpp" | "cxx" | "hpp" | "hh" => Lang::Cpp,
             "php" | "php5" | "phtml" => Lang::Php,
+            "cs" => Lang::CSharp,
+            "scala" | "sc" => Lang::Scala,
+            "kt" | "kts" => Lang::Kotlin,
+            "swift" => Lang::Swift,
+            "dart" => Lang::Dart,
+            "ex" | "exs" => Lang::Elixir,
             _ => return None,
         })
     }
