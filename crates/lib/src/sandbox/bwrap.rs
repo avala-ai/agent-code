@@ -7,14 +7,9 @@
 //! - `/dev` and `/proc` are overlaid with clean views
 //! - the project directory and every `allowed_write_paths` entry are
 //!   rw-bind-mounted on top of the read-only base
+//! - every `forbidden_paths` entry is shadowed so its contents are
+//!   unreadable even though `/` is bound read-only (see [`mask_path`])
 //! - `--die-with-parent` ensures the sandbox dies with the agent
-//!
-//! Forbidden-path masking (`~/.ssh` etc.) is deferred to a follow-up
-//! PR — bwrap does not support the seatbelt `subpath` deny model
-//! directly and needs per-file handling. For now, forbidden paths are
-//! logged but not enforced by this strategy; callers that need secret
-//! masking should rely on the in-process permission system until the
-//! follow-up lands.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -110,6 +105,14 @@ pub(super) fn build_args(
         bind_rw(&mut out, p);
     }
 
+    // Shadow forbidden paths (`~/.ssh`, `~/.aws`, ...) so their contents are
+    // unreadable inside the sandbox. Applied AFTER the rw binds so a forbidden
+    // entry wins over an overlapping writable path (e.g. a secret file that
+    // happens to live under the project dir).
+    for p in &policy.forbidden_paths {
+        mask_path(&mut out, p);
+    }
+
     // Working directory inside the namespace.
     if let Some(dir) = chdir {
         push_flag(&mut out, "--chdir");
@@ -140,6 +143,31 @@ fn bind_rw(out: &mut Vec<OsString>, path: &Path) {
         push_flag(out, "--bind");
         push_path(out, &canonical);
         push_path(out, &canonical);
+    }
+}
+
+/// Shadow a forbidden path so its contents cannot be read inside the sandbox.
+///
+/// The base `--ro-bind / /` exposes the whole host read-only, so a forbidden
+/// path must be overlaid with something empty:
+/// - a regular file is masked with a read-only bind of `/dev/null` (an empty
+///   file mount point must itself be a file);
+/// - a directory — or a path that does not exist — is masked with an empty
+///   `--tmpfs` (a directory mount point).
+///
+/// `/dev/null` is resolved from the host, so it is available regardless of the
+/// `--dev` overlay applied earlier.
+fn mask_path(out: &mut Vec<OsString>, path: &Path) {
+    if std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        push_flag(out, "--ro-bind");
+        push_path(out, Path::new("/dev/null"));
+        push_path(out, path);
+    } else {
+        push_flag(out, "--tmpfs");
+        push_path(out, path);
     }
 }
 
@@ -274,6 +302,56 @@ mod tests {
         assert_eq!(args[dash_idx + 1], "bash");
         assert_eq!(args[dash_idx + 2], "-c");
         assert_eq!(args[dash_idx + 3], "echo hi");
+    }
+
+    #[test]
+    fn argv_masks_forbidden_directory_with_tmpfs() {
+        // A non-existent path is treated as a directory mount point.
+        let mut policy = test_policy();
+        policy.forbidden_paths = vec![PathBuf::from("/home/alice/.ssh")];
+        let args = args_with(&policy, None);
+        assert!(
+            contains_sequence(&args, &["--tmpfs", "/home/alice/.ssh"]),
+            "expected forbidden dir to be masked with tmpfs: {args:?}"
+        );
+    }
+
+    #[test]
+    fn argv_masks_forbidden_file_with_dev_null() {
+        // A real file must be masked with a /dev/null bind, not a tmpfs
+        // (tmpfs cannot mount over a regular file).
+        let tmp = std::env::temp_dir().join(format!("agent-forbidden-{}", std::process::id()));
+        std::fs::write(&tmp, b"secret").unwrap();
+        let mut policy = test_policy();
+        policy.forbidden_paths = vec![tmp.clone()];
+        let args = args_with(&policy, None);
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        assert!(
+            contains_sequence(&args, &["--ro-bind", "/dev/null", &tmp_str]),
+            "expected forbidden file to be masked with /dev/null: {args:?}"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn argv_masks_forbidden_path_after_rw_binds() {
+        // Forbidden masking must come after the project rw-bind so it wins
+        // when a forbidden path overlaps a writable location.
+        let mut policy = test_policy();
+        policy.forbidden_paths = vec![PathBuf::from("/work/repo/.env")];
+        let args = args_with(&policy, None);
+        let project_bind = args
+            .windows(3)
+            .position(|w| w == ["--bind", "/work/repo", "/work/repo"])
+            .expect("project bind present");
+        let mask = args
+            .iter()
+            .position(|a| a == "/work/repo/.env")
+            .expect("forbidden mask present");
+        assert!(
+            mask > project_bind,
+            "mask must come after rw bind: {args:?}"
+        );
     }
 
     #[test]
