@@ -78,6 +78,12 @@ pub struct SandboxExecutor {
     /// Bash tool parameter) is permitted. Derived from
     /// `security.disable_bypass_permissions == false`.
     allow_bypass: bool,
+    /// True when a real strategy was requested (`enabled` and not the explicit
+    /// `"none"`) but none is available on this platform, so it degraded to a
+    /// no-op. Distinct from intentionally running without a sandbox.
+    degraded: bool,
+    /// Fail closed: when `degraded`, refuse to run rather than run unsandboxed.
+    fail_closed: bool,
 }
 
 impl SandboxExecutor {
@@ -105,11 +111,25 @@ impl SandboxExecutor {
         let policy = SandboxPolicy::from_config(config, project_dir);
         let strategy = pick_strategy(&config.strategy);
 
-        if config.enabled && strategy.name() == "noop" {
-            warn!(
-                "sandbox enabled in config but no working strategy on this platform; \
-                 running without OS-level isolation"
-            );
+        // A real strategy was requested but none is available: the sandbox
+        // silently degraded to a no-op. `"none"` is an explicit opt-out and
+        // is therefore not treated as degradation.
+        let requested_real = config.strategy != "none";
+        let degraded = config.enabled && requested_real && strategy.name() == "noop";
+        if degraded {
+            if config.fail_closed {
+                warn!(
+                    "sandbox enabled but no working strategy on this platform; \
+                     failing closed (subprocesses will be refused). Install the \
+                     sandbox backend, set sandbox.enabled=false, or set \
+                     sandbox.fail_closed=false to run without isolation."
+                );
+            } else {
+                warn!(
+                    "sandbox enabled but no working strategy on this platform; \
+                     running WITHOUT OS-level isolation (sandbox.fail_closed=false)"
+                );
+            }
         }
 
         Self {
@@ -117,6 +137,8 @@ impl SandboxExecutor {
             policy,
             enabled: config.enabled,
             allow_bypass,
+            degraded,
+            fail_closed: config.fail_closed,
         }
     }
 
@@ -138,6 +160,19 @@ impl SandboxExecutor {
     /// Whether sandboxing is active (config enabled *and* a real strategy is selected).
     pub fn is_active(&self) -> bool {
         self.enabled && self.strategy.name() != "noop"
+    }
+
+    /// True when a real sandbox strategy was requested but degraded to a no-op
+    /// because none is available on this platform.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// True when a degraded sandbox must block execution instead of silently
+    /// running unsandboxed (fail-closed). Callers that spawn subprocesses
+    /// should refuse the call when this returns `true`.
+    pub fn must_block_when_degraded(&self) -> bool {
+        self.degraded && self.fail_closed
     }
 
     /// Access the resolved policy for diagnostics.
@@ -189,6 +224,8 @@ impl SandboxExecutor {
             },
             enabled: false,
             allow_bypass: true,
+            degraded: false,
+            fail_closed: true,
         }
     }
 }
@@ -258,6 +295,7 @@ mod tests {
             allowed_write_paths: vec![],
             forbidden_paths: vec![],
             allow_network: false,
+            fail_closed: true,
         }
     }
 
@@ -380,6 +418,44 @@ mod tests {
         let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
         assert!(!exec.is_active());
         assert_eq!(exec.strategy_name(), "noop");
+    }
+
+    #[test]
+    fn strategy_none_is_not_treated_as_degraded() {
+        // Explicit "none" is an opt-out, not a degradation: never block.
+        let cfg = sample_config(true, "none");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(!exec.is_degraded());
+        assert!(!exec.must_block_when_degraded());
+    }
+
+    #[test]
+    fn disabled_sandbox_is_not_degraded() {
+        let cfg = sample_config(false, "auto");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(!exec.is_degraded());
+        assert!(!exec.must_block_when_degraded());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn degraded_requested_strategy_blocks_when_fail_closed() {
+        // seatbelt is unavailable off macOS, so an enabled seatbelt config
+        // degrades to noop. With fail_closed (default), it must block.
+        let cfg = sample_config(true, "seatbelt");
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(exec.is_degraded());
+        assert!(exec.must_block_when_degraded());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn degraded_does_not_block_when_fail_open() {
+        let mut cfg = sample_config(true, "seatbelt");
+        cfg.fail_closed = false;
+        let exec = SandboxExecutor::from_config(&cfg, std::path::Path::new("/tmp"));
+        assert!(exec.is_degraded());
+        assert!(!exec.must_block_when_degraded());
     }
 
     #[test]

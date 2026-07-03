@@ -178,6 +178,11 @@ pub struct SandboxConfig {
     pub forbidden_paths: Vec<String>,
     /// Whether subprocesses in the sandbox can open network sockets.
     pub allow_network: bool,
+    /// Fail closed: when the sandbox is enabled but no working strategy is
+    /// available on this platform (e.g. `bwrap` is not installed), refuse to
+    /// run subprocesses rather than silently running them without isolation.
+    /// Set to `false` to allow degrading to an unsandboxed run.
+    pub fail_closed: bool,
 }
 
 impl Default for SandboxConfig {
@@ -192,6 +197,7 @@ impl Default for SandboxConfig {
                 "~/.gnupg".to_string(),
             ],
             allow_network: true,
+            fail_closed: true,
         }
     }
 }

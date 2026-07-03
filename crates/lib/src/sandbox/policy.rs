@@ -121,6 +121,7 @@ mod tests {
             allowed_write_paths: vec!["/tmp".to_string(), "~/.cache/agent-code".to_string()],
             forbidden_paths: vec!["~/.ssh".to_string()],
             allow_network: false,
+            fail_closed: true,
         };
         let policy = SandboxPolicy::from_config(&cfg, Path::new("/work/repo"));
         assert_eq!(policy.project_dir, PathBuf::from("/work/repo"));

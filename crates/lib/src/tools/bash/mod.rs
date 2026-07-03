@@ -251,6 +251,18 @@ impl Tool for BashTool {
                         "dangerouslyDisableSandbox ignored: security.disable_bypass_permissions is set"
                     );
                 }
+                // Fail closed: the sandbox was requested but degraded to no
+                // isolation on this platform. Refuse rather than silently
+                // running the command unsandboxed.
+                if sandbox.must_block_when_degraded() {
+                    return Err(ToolError::PermissionDenied(
+                        "Sandbox is enabled but no working strategy is available on this \
+                         platform, so the command was not run (fail-closed). Install the \
+                         sandbox backend (e.g. `bwrap` on Linux), set `sandbox.enabled = false`, \
+                         or set `sandbox.fail_closed = false` to allow running without isolation."
+                            .to_string(),
+                    ));
+                }
                 sandbox.wrap(base)
             }
         } else {
