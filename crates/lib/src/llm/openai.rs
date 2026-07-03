@@ -447,23 +447,21 @@ fn spawn_chat_completions_stream(
                         Err(_) => continue,
                     };
 
+                    // Usage may arrive on its own trailing chunk (choices: [])
+                    // or attached to the final delta/finish chunk. Record it
+                    // whenever it is present, independently of the delta match
+                    // below — otherwise providers that send usage alongside the
+                    // finish chunk (e.g. OpenRouter) are silently undercounted
+                    // to zero, which also zeroes the derived cost.
+                    merge_chat_usage(&mut usage, &parsed);
+
                     let delta = match parsed
                         .get("choices")
                         .and_then(|c| c.get(0))
                         .and_then(|c| c.get("delta"))
                     {
                         Some(d) => d,
-                        None => {
-                            if let Some(u) = parsed.get("usage") {
-                                usage.input_tokens =
-                                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                usage.output_tokens = u
-                                    .get("completion_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                            }
-                            continue;
-                        }
+                        None => continue,
                     };
 
                     if let Some(content) = delta.get("content").and_then(|c| c.as_str())
@@ -829,22 +827,56 @@ fn responses_stop_reason(response: Option<&Value>) -> Option<StopReason> {
     None
 }
 
+/// Merge OpenAI-style chat streaming usage from one parsed SSE chunk into
+/// `usage`, if the chunk carries a non-null `usage` object. Providers differ
+/// on where the token counts ride — a dedicated trailing chunk with an empty
+/// `choices` array, or the same chunk as the finish delta — so this is called
+/// on every chunk rather than only when a delta is absent.
+fn merge_chat_usage(usage: &mut Usage, parsed: &Value) {
+    let Some(u) = parsed.get("usage").filter(|u| !u.is_null()) else {
+        return;
+    };
+    if let Some(o) = u.get("completion_tokens").and_then(Value::as_u64) {
+        usage.output_tokens = o;
+    }
+    // OpenAI reports `cached_tokens` as a SUBSET of `prompt_tokens`, but the
+    // cost model bills `input_tokens` and `cache_read_input_tokens`
+    // independently. Split the prompt total so the cached portion is only
+    // charged at the (cheaper) cache-read rate, not twice.
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if let Some(prompt) = u.get("prompt_tokens").and_then(Value::as_u64) {
+        usage.input_tokens = prompt.saturating_sub(cached);
+    }
+    if cached > 0 {
+        usage.cache_read_input_tokens = cached;
+    }
+}
+
 fn responses_usage(usage: &Value) -> Usage {
+    // `cached_tokens` is a subset of `input_tokens`; the cost model bills input
+    // and cache-read independently, so split them to avoid charging the cached
+    // portion twice (once at the input rate, once at the cache-read rate).
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Usage {
         input_tokens: usage
             .get("input_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            .saturating_sub(cached),
         output_tokens: usage
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        cache_read_input_tokens: cached,
     }
 }
 
@@ -1063,8 +1095,59 @@ mod tests {
             "input_tokens_details": {"cached_tokens": 80}
         }));
 
-        assert_eq!(usage.input_tokens, 100);
+        // Cached is a subset of input_tokens; the non-cached remainder (20) is
+        // billed as input, the cached 80 only at the cache-read rate.
+        assert_eq!(usage.input_tokens, 20);
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cache_read_input_tokens, 80);
+    }
+
+    #[test]
+    fn merge_chat_usage_reads_usage_on_finish_chunk() {
+        // OpenRouter-style: usage rides on the same chunk as the finish
+        // delta, not a separate choices:[] chunk.
+        let mut usage = Usage::default();
+        merge_chat_usage(
+            &mut usage,
+            &serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1200, "completion_tokens": 340}
+            }),
+        );
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 340);
+    }
+
+    #[test]
+    fn merge_chat_usage_reads_trailing_usage_only_chunk() {
+        // OpenAI-style: a trailing chunk with empty choices and usage.
+        let mut usage = Usage::default();
+        merge_chat_usage(
+            &mut usage,
+            &serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 40}
+                }
+            }),
+        );
+        // cached_tokens is a subset of prompt_tokens; the non-cached remainder
+        // is input, the cached part is charged only at the cache-read rate.
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 40);
+    }
+
+    #[test]
+    fn merge_chat_usage_ignores_chunks_without_usage() {
+        let mut usage = Usage::default();
+        merge_chat_usage(
+            &mut usage,
+            &serde_json::json!({"choices": [{"delta": {"content": "hi"}}]}),
+        );
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
     }
 }
