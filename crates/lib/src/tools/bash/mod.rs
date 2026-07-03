@@ -218,6 +218,32 @@ impl Tool for BashTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Honor a tool-call-level `dangerouslyDisableSandbox: true` by
+        // skipping the sandbox wrapper. This path is blocked entirely
+        // when the session has `security.disable_bypass_permissions = true`.
+        let disable_sandbox_requested = input
+            .get("dangerouslyDisableSandbox")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Fail closed BEFORE dispatch — including the background path, which
+        // spawns bash directly and skips the sandbox wrapper. Fail-closed is a
+        // hard guarantee: a tool-supplied `dangerouslyDisableSandbox` must NOT
+        // defeat it (otherwise prompt injection could opt out of the admin's
+        // isolation requirement). The only escape is the operator setting
+        // `sandbox.fail_closed = false`.
+        if let Some(ref sandbox) = ctx.sandbox
+            && sandbox.must_block_when_degraded()
+        {
+            return Err(ToolError::PermissionDenied(
+                "Sandbox is enabled but no working strategy is available on this \
+                 platform, so the command was not run (fail-closed). Install the \
+                 sandbox backend (e.g. `bwrap` on Linux), set `sandbox.enabled = false`, \
+                 or set `sandbox.fail_closed = false` to allow running without isolation."
+                    .to_string(),
+            ));
+        }
+
         // Background execution: spawn and return immediately.
         if run_in_background {
             return run_background(command, &ctx.cwd, ctx.task_manager.as_ref()).await;
@@ -231,14 +257,6 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Honor a tool-call-level `dangerouslyDisableSandbox: true` by
-        // skipping the sandbox wrapper. This path is blocked entirely
-        // when the session has `security.disable_bypass_permissions = true`.
-        let disable_sandbox_requested = input
-            .get("dangerouslyDisableSandbox")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         let mut cmd = if let Some(ref sandbox) = ctx.sandbox {
             if disable_sandbox_requested && sandbox.allow_bypass() {
                 tracing::warn!(
@@ -251,6 +269,7 @@ impl Tool for BashTool {
                         "dangerouslyDisableSandbox ignored: security.disable_bypass_permissions is set"
                     );
                 }
+                // Fail-closed refusal is handled before dispatch, above.
                 sandbox.wrap(base)
             }
         } else {

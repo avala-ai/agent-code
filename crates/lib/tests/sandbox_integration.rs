@@ -87,6 +87,7 @@ async fn seatbelt_blocks_writes_outside_project_dir() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
 
@@ -137,6 +138,7 @@ async fn seatbelt_allows_writes_inside_project_dir() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
 
@@ -182,6 +184,7 @@ async fn dangerously_disable_sandbox_bypasses_when_allowed() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
     if !exec.is_active() {
@@ -225,6 +228,7 @@ async fn dangerously_disable_sandbox_is_ignored_when_bypass_denied() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config_with_bypass(
         &cfg,
@@ -275,6 +279,7 @@ async fn sandboxed_bash_preserves_cwd() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
     if !exec.is_active() {
@@ -312,6 +317,7 @@ async fn sandboxed_bash_can_write_to_allowed_path() {
         allowed_write_paths: vec![extra.path().display().to_string()],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
     if !exec.is_active() {
@@ -356,6 +362,7 @@ fn bwrap_cfg(allowed_write_paths: Vec<String>) -> SandboxConfig {
         // Leave network on so package-manager-style commands in bash
         // do not appear to hang while CI runs these tests.
         allow_network: true,
+        fail_closed: true,
     }
 }
 
@@ -568,6 +575,7 @@ async fn sandboxed_bash_reads_remain_broadly_allowed() {
         allowed_write_paths: vec![],
         forbidden_paths: vec![],
         allow_network: false,
+        fail_closed: true,
     };
     let exec = Arc::new(SandboxExecutor::from_config(&cfg, tmp.path()));
     if !exec.is_active() {
