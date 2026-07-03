@@ -86,6 +86,35 @@ fn unified_diff(file_path: &str, old: &str, new: &str) -> String {
     out
 }
 
+/// The dominant line ending in `content`.
+///
+/// Returns `"\r\n"` when the file uses CRLF at least as often as bare LF,
+/// otherwise `"\n"`. Files with no newline default to LF.
+fn dominant_eol(content: &str) -> &'static str {
+    let crlf = content.matches("\r\n").count();
+    let bare_lf = content.matches('\n').count().saturating_sub(crlf);
+    if crlf > 0 && crlf >= bare_lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Rewrite the line endings in `text` to `eol` without doubling existing CRLF.
+///
+/// Model-supplied strings almost always use bare LF; matching them against a
+/// CRLF file would fail, and writing them into one would leave mixed endings.
+/// Normalizing both the search and replacement text to the file's own ending
+/// keeps edits working and the file internally consistent.
+fn normalize_eol(text: &str, eol: &str) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if eol == "\r\n" {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
 #[async_trait]
 impl Tool for FileEditTool {
     fn name(&self) -> &'static str {
@@ -190,6 +219,16 @@ impl Tool for FileEditTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {file_path}: {e}")))?;
 
+        // Match and replace using the file's own line ending. Model-supplied
+        // strings use bare LF, so on a CRLF file a raw match would fail and a
+        // raw write would leave mixed endings. Any leading BOM is part of
+        // `content` and is preserved untouched by the string replacement.
+        let eol = dominant_eol(&content);
+        let old_owned = normalize_eol(old_string, eol);
+        let new_owned = normalize_eol(new_string, eol);
+        let old_string = old_owned.as_str();
+        let new_string = new_owned.as_str();
+
         let occurrences = content.matches(old_string).count();
 
         if occurrences == 0 {
@@ -228,5 +267,52 @@ impl Tool for FileEditTool {
         Ok(ToolResult::success(format!(
             "Replaced {replaced} occurrence(s) in {file_path}\n\n{diff}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dominant_eol_detects_crlf() {
+        assert_eq!(dominant_eol("a\r\nb\r\nc"), "\r\n");
+    }
+
+    #[test]
+    fn dominant_eol_detects_lf() {
+        assert_eq!(dominant_eol("a\nb\nc"), "\n");
+    }
+
+    #[test]
+    fn dominant_eol_defaults_lf_without_newlines() {
+        assert_eq!(dominant_eol("no newline here"), "\n");
+    }
+
+    #[test]
+    fn dominant_eol_picks_majority_on_mixed() {
+        // Two CRLF vs one bare LF -> CRLF wins.
+        assert_eq!(dominant_eol("a\r\nb\r\nc\nd"), "\r\n");
+    }
+
+    #[test]
+    fn normalize_eol_lf_to_crlf_without_doubling() {
+        assert_eq!(normalize_eol("x\ny", "\r\n"), "x\r\ny");
+        // Already-CRLF input must not become CRCRLF.
+        assert_eq!(normalize_eol("x\r\ny", "\r\n"), "x\r\ny");
+    }
+
+    #[test]
+    fn normalize_eol_crlf_to_lf() {
+        assert_eq!(normalize_eol("x\r\ny", "\n"), "x\ny");
+    }
+
+    #[test]
+    fn normalize_eol_matches_model_lf_against_crlf_file() {
+        // A model-supplied LF search string, normalized to the CRLF file's
+        // ending, must be found in the file content.
+        let file = "let x = 1;\r\nlet y = 2;\r\n";
+        let search = normalize_eol("let x = 1;\nlet y = 2;", dominant_eol(file));
+        assert!(file.contains(&search));
     }
 }
