@@ -11,6 +11,7 @@ mod acp;
 mod attach;
 mod commands;
 mod daemon;
+mod harden;
 mod output;
 mod security_scan;
 mod serve;
@@ -269,6 +270,10 @@ fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Harden the process before anything sensitive is loaded: drop code-
+    // injection env vars, disable core dumps, and block ptrace-attach.
+    harden::harden_process();
+
     let cli = Cli::parse();
     let cli_auth_mode = cli
         .auth_mode
