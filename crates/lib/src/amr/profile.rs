@@ -274,9 +274,12 @@ pub fn security_profile() -> Profile {
         // --- Regular-expression denial of service -----------------------
         lex(
             "redos.regex",
-            "Dynamically built or nested-quantifier regex (ReDoS surface)",
+            "Dynamically built regex (ReDoS surface)",
             vec![JavaScript, TypeScript, Python, Ruby, Java, Scala, Elixir],
-            r"(new\s+RegExp\s*\(|re\.compile\s*\(|Pattern\.compile\s*\(|Regex\.new|~r\(|\([^)\n]*[+*][^)\n]*\)\s*[+*])",
+            // Explicit regex constructors only. A lexical nested-quantifier
+            // heuristic (e.g. `(a+)+`) can't be told apart from ordinary
+            // arithmetic like `(a * b) + c`, so it is deliberately omitted.
+            r"(new\s+RegExp\s*\(|re\.compile\s*\(|Pattern\.compile\s*\(|Regex\.new|~r/)",
         ),
         // --- Memory safety (Rust / C / C++) -----------------------------
         lex(
@@ -294,9 +297,11 @@ pub fn security_profile() -> Profile {
         // --- Integer overflow / narrowing -------------------------------
         lex(
             "int.narrowing_cast",
-            "Narrowing integer cast (overflow/truncation surface)",
+            "Narrowing integer cast to 8/16 bits (truncation surface)",
             vec![Go, Rust, C, Cpp],
-            r"(\b(u?int(8|16|32)|i(8|16|32)|u(8|16|32))\s*\(|\bas\s+[iu](8|16|32)\b|\(\s*(short|u?int(8|16)_t)\s*\))",
+            // Only 8/16-bit targets — 32-bit conversions are ubiquitous and
+            // almost always benign, so they would flood without signal.
+            r"(\b(u?int(8|16)|[iu](8|16))\s*\(|\bas\s+[iu](8|16)\b|\(\s*(short|u?int(8|16)_t)\s*\))",
         ),
         // --- Template injection ----------------------------------------
         lex(
@@ -537,6 +542,44 @@ mod tests {
             "char buf[256];\nstrcpy(buf, prop->mKey.data);\n",
             "mem.c_unsafe_fn",
         );
+    }
+
+    /// Assert that scanning `text` at `path` produces NO signal from `unwanted`.
+    fn does_not_fire(path: &str, text: &str, unwanted: &str) {
+        let p = security_profile();
+        let hit = p
+            .selectors
+            .iter()
+            .flat_map(|s| s.scan_text(Path::new(path), text))
+            .any(|s| s.selector_id == unwanted);
+        assert!(
+            !hit,
+            "selector `{unwanted}` should NOT fire on {path}: {text:?}"
+        );
+    }
+
+    #[test]
+    fn redos_flags_constructors_not_arithmetic() {
+        fires(
+            "src/router.js",
+            "const re = new RegExp(userSuppliedPattern);\n",
+            "redos.regex",
+        );
+        // Ordinary arithmetic must not be mistaken for a nested quantifier.
+        does_not_fire("src/math.js", "const z = (a * b) + c;\n", "redos.regex");
+    }
+
+    #[test]
+    fn narrowing_cast_flags_8_16_not_32() {
+        fires(
+            "packets/packets.go",
+            "n := int16(length)\n",
+            "int.narrowing_cast",
+        );
+        fires("src/lib.rs", "let b = value as u8;\n", "int.narrowing_cast");
+        // 32-bit conversions are ubiquitous and benign — must not flood.
+        does_not_fire("main.go", "count := int32(total)\n", "int.narrowing_cast");
+        does_not_fire("src/lib.rs", "let n = len as i32;\n", "int.narrowing_cast");
     }
 
     #[test]
