@@ -148,13 +148,22 @@ fn bind_rw(out: &mut Vec<OsString>, path: &Path) {
 
 /// Shadow a forbidden path so its contents cannot be read inside the sandbox.
 ///
-/// The base `--ro-bind / /` exposes the whole host read-only under *every*
-/// spelling of a path, so masking only the configured spelling is not enough:
-/// if a component is a symlink (a symlinked `$HOME`, or `/var/run -> /run`) the
-/// secret is still reachable via the canonical path. So the canonical variant
-/// is masked too, mirroring [`bind_rw`]'s symlink handling.
+/// Only paths that actually exist are masked. A mount point below the
+/// read-only `--ro-bind / /` cannot be created, so emitting a mask for an
+/// absent path (e.g. a default `~/.aws` on a host that has none) makes bwrap
+/// fail with "Read-only file system" and every sandboxed command errors out.
+/// A path that doesn't exist has nothing to read anyway.
+///
+/// The base `--ro-bind / /` exposes the host under *every* spelling of a path,
+/// so masking only the configured spelling is not enough: if a component is a
+/// symlink (a symlinked `$HOME`, or `/var/run -> /run`) the secret is still
+/// reachable via the canonical path. So the canonical variant is masked too,
+/// mirroring [`bind_rw`]'s symlink handling. `canonicalize` only succeeds for
+/// existing paths, so that branch is already existence-gated.
 fn mask_path(out: &mut Vec<OsString>, path: &Path) {
-    mask_one(out, path);
+    if path.exists() {
+        mask_one(out, path);
+    }
     if let Ok(canonical) = std::fs::canonicalize(path)
         && canonical != path
     {
@@ -162,11 +171,11 @@ fn mask_path(out: &mut Vec<OsString>, path: &Path) {
     }
 }
 
-/// Overlay a single path with an empty mount so its contents are unreadable:
+/// Overlay a single existing path with an empty mount so its contents are
+/// unreadable:
 /// - a regular file is masked with a read-only bind of `/dev/null` (an empty
 ///   file mount point must itself be a file);
-/// - a directory — or a path that does not exist — is masked with an empty
-///   `--tmpfs` (a directory mount point).
+/// - a directory is masked with an empty `--tmpfs` (a directory mount point).
 ///
 /// `/dev/null` is resolved from the host, so it is available regardless of the
 /// `--dev` overlay applied earlier.
@@ -319,13 +328,30 @@ mod tests {
 
     #[test]
     fn argv_masks_forbidden_directory_with_tmpfs() {
-        // A non-existent path is treated as a directory mount point.
+        // An existing directory is masked with an empty tmpfs.
+        let dir = std::env::temp_dir().join(format!("agent-forbidden-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let mut policy = test_policy();
-        policy.forbidden_paths = vec![PathBuf::from("/home/alice/.ssh")];
+        policy.forbidden_paths = vec![dir.clone()];
+        let args = args_with(&policy, None);
+        let dir_s = dir.to_string_lossy().into_owned();
+        assert!(
+            contains_sequence(&args, &["--tmpfs", &dir_s]),
+            "expected forbidden dir to be masked with tmpfs: {args:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn argv_skips_absent_forbidden_path() {
+        // A path that does not exist must NOT be masked: bwrap cannot create a
+        // mount point under the read-only root, which would fail every command.
+        let mut policy = test_policy();
+        policy.forbidden_paths = vec![PathBuf::from("/no/such/forbidden/path")];
         let args = args_with(&policy, None);
         assert!(
-            contains_sequence(&args, &["--tmpfs", "/home/alice/.ssh"]),
-            "expected forbidden dir to be masked with tmpfs: {args:?}"
+            !args.iter().any(|a| a == "/no/such/forbidden/path"),
+            "absent forbidden path must be skipped, not masked: {args:?}"
         );
     }
 
@@ -381,21 +407,26 @@ mod tests {
     fn argv_masks_forbidden_path_after_rw_binds() {
         // Forbidden masking must come after the project rw-bind so it wins
         // when a forbidden path overlaps a writable location.
+        let secret =
+            std::env::temp_dir().join(format!("agent-forbidden-order-{}", std::process::id()));
+        std::fs::write(&secret, b"secret").unwrap();
         let mut policy = test_policy();
-        policy.forbidden_paths = vec![PathBuf::from("/work/repo/.env")];
+        policy.forbidden_paths = vec![secret.clone()];
         let args = args_with(&policy, None);
+        let secret_s = secret.to_string_lossy().into_owned();
         let project_bind = args
             .windows(3)
             .position(|w| w == ["--bind", "/work/repo", "/work/repo"])
             .expect("project bind present");
         let mask = args
             .iter()
-            .position(|a| a == "/work/repo/.env")
+            .position(|a| *a == secret_s)
             .expect("forbidden mask present");
         assert!(
             mask > project_bind,
             "mask must come after rw bind: {args:?}"
         );
+        std::fs::remove_file(&secret).ok();
     }
 
     #[test]
