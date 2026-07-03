@@ -28,8 +28,14 @@
 const INJECTION_VARS: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES"];
 
 /// Additional loader search-path variables that are cleared defensively but do
-/// not, on their own, indicate code injection.
-const SEARCH_PATH_VARS: &[&str] = &["DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH"];
+/// not, on their own, indicate code injection. Clearing `LD_LIBRARY_PATH`
+/// stops later dynamic loads (and child processes / subagents) from resolving
+/// libraries out of a user-controlled directory on Linux.
+const SEARCH_PATH_VARS: &[&str] = &[
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+];
 
 /// Sentinel marking a process that already re-exec'd, so we never loop.
 const REEXEC_SENTINEL: &str = "AGENT_CODE_HARDENED";
