@@ -43,6 +43,20 @@ struct Cli {
     /// Write results to this JSONL file.
     #[arg(long)]
     results: Option<PathBuf>,
+
+    /// Run the CVE-recall security-scan benchmark from this manifest (a JSON
+    /// array of cases) instead of the behavioral evals.
+    #[arg(long)]
+    bench: Option<PathBuf>,
+
+    /// Grader for `--bench`: `heuristic` (deterministic, free) or `llm`
+    /// (semantic judge; costs tokens).
+    #[arg(long, default_value = "heuristic")]
+    grader: String,
+
+    /// Model for the scan and judge (defaults to the agent's configured model).
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[tokio::main]
@@ -59,6 +73,10 @@ async fn main() -> Result<()> {
     if cli.list {
         runner::list_evals();
         return Ok(());
+    }
+
+    if let Some(manifest) = cli.bench.clone() {
+        return run_cve_bench(&cli, &manifest).await;
     }
 
     let policy_filter = cli.policy.as_deref().map(|p| match p {
@@ -96,5 +114,33 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Run the CVE-recall security-scan benchmark.
+async fn run_cve_bench(cli: &Cli, manifest: &std::path::Path) -> Result<()> {
+    use agent_code_eval::cve_bench::{self, Grader};
+
+    let grader = match cli.grader.as_str() {
+        "heuristic" => Grader::Heuristic,
+        "llm" => Grader::Llm,
+        other => anyhow::bail!("unknown grader `{other}` (use `heuristic` or `llm`)"),
+    };
+    let cases = cve_bench::load_cases(manifest)?;
+    eprintln!(
+        "CVE benchmark: {} case(s), grader={grader:?}, model={}",
+        cases.len(),
+        cli.model.as_deref().unwrap_or("<agent default>")
+    );
+
+    let env: Vec<(&str, &str)> = Vec::new();
+    let report =
+        cve_bench::run_bench(&cases, &cli.agent, grader, cli.model.as_deref(), &env).await;
+
+    print!("{}", cve_bench::summarize(&report));
+    if let Some(path) = cli.results.as_ref() {
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+        eprintln!("Wrote report to {}", path.display());
+    }
     Ok(())
 }
