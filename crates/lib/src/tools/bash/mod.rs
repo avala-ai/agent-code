@@ -227,12 +227,13 @@ impl Tool for BashTool {
             .unwrap_or(false);
 
         // Fail closed BEFORE dispatch — including the background path, which
-        // spawns bash directly and skips the sandbox wrapper. A degraded,
-        // fail-closed sandbox must never run a command unsandboxed unless an
-        // explicit, permitted bypass was requested.
+        // spawns bash directly and skips the sandbox wrapper. Fail-closed is a
+        // hard guarantee: a tool-supplied `dangerouslyDisableSandbox` must NOT
+        // defeat it (otherwise prompt injection could opt out of the admin's
+        // isolation requirement). The only escape is the operator setting
+        // `sandbox.fail_closed = false`.
         if let Some(ref sandbox) = ctx.sandbox
             && sandbox.must_block_when_degraded()
-            && !(disable_sandbox_requested && sandbox.allow_bypass())
         {
             return Err(ToolError::PermissionDenied(
                 "Sandbox is enabled but no working strategy is available on this \

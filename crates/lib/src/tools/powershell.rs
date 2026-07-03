@@ -61,6 +61,22 @@ impl Tool for PowerShellTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("'command' is required".into()))?;
 
+        // Fail closed: if the sandbox is enabled but degraded to no isolation
+        // (e.g. Windows has no sandbox strategy today), refuse rather than run
+        // PowerShell unsandboxed — mirroring the Bash tool. The only escape is
+        // the operator setting `sandbox.fail_closed = false`.
+        if let Some(ref sandbox) = ctx.sandbox
+            && sandbox.must_block_when_degraded()
+        {
+            return Err(ToolError::PermissionDenied(
+                "Sandbox is enabled but no working strategy is available on this \
+                 platform, so the command was not run (fail-closed). Set \
+                 `sandbox.enabled = false` or `sandbox.fail_closed = false` to allow \
+                 running without isolation."
+                    .to_string(),
+            ));
+        }
+
         let timeout_ms = input
             .get("timeout")
             .and_then(|v| v.as_u64())
