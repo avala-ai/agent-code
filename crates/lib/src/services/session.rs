@@ -234,13 +234,18 @@ pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
     list_session_summaries_in(&dir, limit)
 }
 
-/// A cached lite summary plus the source file's modification time, keyed by
+/// A cached lite summary plus the source file's validity stamp, keyed by
 /// session id in the on-disk index.
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedSummary {
-    /// Source file mtime in milliseconds since the Unix epoch. The cache entry
-    /// is only trusted while this matches the file on disk.
-    mtime_ms: u64,
+    /// Source file mtime in nanoseconds since the Unix epoch. Combined with
+    /// `size`, this is the cache-validity stamp: the entry is only trusted
+    /// while both still match the file on disk. Nanosecond resolution plus the
+    /// size guard makes a same-instant stale hit (e.g. a rename/tag within one
+    /// mtime tick) far less likely than a millisecond stamp alone.
+    mtime_ns: u128,
+    /// Source file size in bytes, part of the validity stamp.
+    size: u64,
     cwd: String,
     model: String,
     updated_at: String,
@@ -251,14 +256,21 @@ struct IndexedSummary {
     tags: Vec<String>,
 }
 
-/// Name of the sidecar index inside the sessions directory.
-const INDEX_FILE: &str = "index.json";
+/// Name of the sidecar index inside the sessions directory. Deliberately not a
+/// `.json` file so it can never collide with a `<id>.json` session (a session
+/// id of `index` used to clobber it) and is naturally skipped by the scan.
+const INDEX_FILE: &str = "index.cache";
 
-/// File modification time in milliseconds since the Unix epoch.
-fn mtime_ms(path: &std::path::Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(dur.as_millis() as u64)
+/// The cache-validity stamp for a file: `(mtime_ns, size)`.
+fn file_stamp(path: &std::path::Path) -> Option<(u128, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let ns = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((ns, md.len()))
 }
 
 /// Testable core of [`list_session_summaries`].
@@ -300,11 +312,13 @@ fn list_session_summaries_in(dir: &std::path::Path, limit: usize) -> Vec<Session
         else {
             continue;
         };
-        let disk_mtime = mtime_ms(&path);
+        let disk_stamp = file_stamp(&path);
         present.insert(id.clone());
 
-        // Fast path: a cached entry whose mtime still matches the file.
-        let cached = index.get(&id).filter(|e| Some(e.mtime_ms) == disk_mtime);
+        // Fast path: a cached entry whose (mtime_ns, size) still matches.
+        let cached = index
+            .get(&id)
+            .filter(|e| Some((e.mtime_ns, e.size)) == disk_stamp);
         let entry_summary = if let Some(hit) = cached {
             hit.clone()
         } else {
@@ -315,8 +329,10 @@ fn list_session_summaries_in(dir: &std::path::Path, limit: usize) -> Vec<Session
             let Some(m) = serde_json::from_str::<SessionMetaLite>(&content).ok() else {
                 continue;
             };
+            let (mtime_ns, size) = disk_stamp.unwrap_or((0, 0));
             let fresh = IndexedSummary {
-                mtime_ms: disk_mtime.unwrap_or(0),
+                mtime_ns,
+                size,
                 cwd: m.cwd,
                 model: m.model,
                 updated_at: m.updated_at,
@@ -619,6 +635,25 @@ mod tests {
     }
 
     #[test]
+    fn index_does_not_collide_with_session_named_index() {
+        // A session id of "index" must not be shadowed or clobbered by the
+        // sidecar cache, which is a separate non-`.json` file.
+        let dir = std::env::temp_dir().join(format!("agent-sess-idx-col-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_session_file(&dir, "index", "2026-06-30T10:00:00Z");
+        write_session_file(&dir, "other", "2026-06-30T11:00:00Z");
+
+        let out = list_session_summaries_in(&dir, 10);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|s| s.id == "index"));
+        // The session file and the sidecar coexist as distinct files.
+        assert!(dir.join("index.json").exists());
+        assert!(dir.join(INDEX_FILE).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn index_reparses_on_mtime_mismatch() {
         let dir = std::env::temp_dir().join(format!("agent-sess-idx-mt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -630,7 +665,8 @@ mod tests {
         stale.insert(
             "a".to_string(),
             IndexedSummary {
-                mtime_ms: 0,
+                mtime_ns: 0,
+                size: 0,
                 cwd: "/old".to_string(),
                 model: "old-model".to_string(),
                 updated_at: "2000-01-01T00:00:00Z".to_string(),
