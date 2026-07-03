@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use similar::TextDiff;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -84,6 +85,59 @@ fn unified_diff(file_path: &str, old: &str, new: &str) -> String {
     }
 
     out
+}
+
+/// The dominant line ending in `content`.
+///
+/// Returns `"\r\n"` when the file uses CRLF at least as often as bare LF,
+/// otherwise `"\n"`. Files with no newline default to LF.
+fn dominant_eol(content: &str) -> &'static str {
+    let crlf = content.matches("\r\n").count();
+    let bare_lf = content.matches('\n').count().saturating_sub(crlf);
+    if crlf > 0 && crlf >= bare_lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Rewrite the line endings in `text` to `eol` without doubling existing CRLF.
+///
+/// Model-supplied strings almost always use bare LF; matching them against a
+/// CRLF file would fail, and writing them into one would leave mixed endings.
+/// Normalizing both the search and replacement text to the file's own ending
+/// keeps edits working and the file internally consistent.
+fn normalize_eol(text: &str, eol: &str) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if eol == "\r\n" {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
+/// Pick the search text and normalized replacement, plus the occurrence count.
+///
+/// Two separate concerns:
+/// - **Search**: the raw `old` wins if it already appears in `content`, so an
+///   exact match in a mixed-ending file is edited in place and never rewritten
+///   to the wrong block. Only on a raw miss is `old` normalized to the file's
+///   dominant ending and retried (the "model sent LF, file is CRLF" case).
+/// - **Replacement**: `new` is *always* normalized to the file's dominant
+///   ending, even when `old` matched raw — otherwise a single-line `old` that
+///   matches a CRLF file, replaced with a multi-line LF `new`, would still
+///   write mixed endings.
+fn select_match<'a>(content: &str, old: &'a str, new: &str) -> (Cow<'a, str>, Cow<'a, str>, usize) {
+    let eol = dominant_eol(content);
+    let new_norm = Cow::Owned(normalize_eol(new, eol));
+
+    let raw = content.matches(old).count();
+    if raw > 0 {
+        return (Cow::Borrowed(old), new_norm, raw);
+    }
+    let old_n = normalize_eol(old, eol);
+    let occ = content.matches(old_n.as_str()).count();
+    (Cow::Owned(old_n), new_norm, occ)
 }
 
 #[async_trait]
@@ -190,7 +244,26 @@ impl Tool for FileEditTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {file_path}: {e}")))?;
 
-        let occurrences = content.matches(old_string).count();
+        // Prefer an exact match on the raw strings; only fall back to
+        // line-ending normalization when the raw search finds nothing, so an
+        // exact match in a mixed-ending file is never skipped (see
+        // `select_match`). Any leading BOM is part of `content` and is
+        // preserved untouched by the string replacement.
+        let (old_cow, new_cow, occurrences) = select_match(&content, old_string, new_string);
+        let old_string = old_cow.as_ref();
+        let new_string = new_cow.as_ref();
+
+        // The up-front `old_string == new_string` check ran on the raw inputs.
+        // Normalizing line endings can make them equal (e.g. old `"a\r\nb"` and
+        // new `"a\nb"` on an LF file), which would write an identical file yet
+        // report success. Reject that no-op explicitly.
+        if old_string == new_string {
+            return Err(ToolError::InvalidInput(
+                "old_string and new_string are identical after normalizing line \
+                 endings, so the edit would make no change"
+                    .into(),
+            ));
+        }
 
         if occurrences == 0 {
             return Err(ToolError::InvalidInput(format!(
@@ -228,5 +301,99 @@ impl Tool for FileEditTool {
         Ok(ToolResult::success(format!(
             "Replaced {replaced} occurrence(s) in {file_path}\n\n{diff}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dominant_eol_detects_crlf() {
+        assert_eq!(dominant_eol("a\r\nb\r\nc"), "\r\n");
+    }
+
+    #[test]
+    fn dominant_eol_detects_lf() {
+        assert_eq!(dominant_eol("a\nb\nc"), "\n");
+    }
+
+    #[test]
+    fn dominant_eol_defaults_lf_without_newlines() {
+        assert_eq!(dominant_eol("no newline here"), "\n");
+    }
+
+    #[test]
+    fn dominant_eol_picks_majority_on_mixed() {
+        // Two CRLF vs one bare LF -> CRLF wins.
+        assert_eq!(dominant_eol("a\r\nb\r\nc\nd"), "\r\n");
+    }
+
+    #[test]
+    fn normalize_eol_lf_to_crlf_without_doubling() {
+        assert_eq!(normalize_eol("x\ny", "\r\n"), "x\r\ny");
+        // Already-CRLF input must not become CRCRLF.
+        assert_eq!(normalize_eol("x\r\ny", "\r\n"), "x\r\ny");
+    }
+
+    #[test]
+    fn normalize_eol_crlf_to_lf() {
+        assert_eq!(normalize_eol("x\r\ny", "\n"), "x\ny");
+    }
+
+    #[test]
+    fn normalize_eol_matches_model_lf_against_crlf_file() {
+        // A model-supplied LF search string, normalized to the CRLF file's
+        // ending, must be found in the file content.
+        let file = "let x = 1;\r\nlet y = 2;\r\n";
+        let search = normalize_eol("let x = 1;\nlet y = 2;", dominant_eol(file));
+        assert!(file.contains(&search));
+    }
+
+    #[test]
+    fn select_match_prefers_raw_exact_over_normalization() {
+        // Mixed-ending file with an exact LF block and a logically identical
+        // CRLF block, CRLF dominant. A raw LF `old` must match the LF block
+        // exactly (borrowed, no normalization), not be rewritten to CRLF and
+        // matched against the other block.
+        let content = "a\r\nb\r\nfoo\nbar\r\n";
+        let (old, new, occ) = select_match(content, "foo\nbar", "X");
+        assert!(
+            matches!(old, Cow::Borrowed(_)),
+            "raw match must be borrowed"
+        );
+        assert_eq!(occ, 1);
+        assert_eq!(new, "X");
+    }
+
+    #[test]
+    fn select_match_normalizes_replacement_even_on_raw_match() {
+        // CRLF file, single-line `old` matches raw, but `new` has LF breaks:
+        // the replacement must still be normalized to CRLF so the write stays
+        // internally consistent.
+        let content = "alpha\r\nTARGET\r\nomega\r\n";
+        let (old, new, occ) = select_match(content, "TARGET", "one\ntwo");
+        assert!(matches!(old, Cow::Borrowed(_)), "search matched raw");
+        assert_eq!(occ, 1);
+        assert_eq!(new, "one\r\ntwo", "replacement normalized to CRLF");
+    }
+
+    #[test]
+    fn select_match_normalizes_only_on_miss() {
+        // No raw match (model sent LF, file is CRLF): fall back to normalized
+        // matching, which finds the block.
+        let content = "let x = 1;\r\nlet y = 2;\r\n";
+        let (old, _new, occ) = select_match(content, "let x = 1;\nlet y = 2;", "z");
+        assert!(matches!(old, Cow::Owned(_)), "fallback must be owned");
+        assert_eq!(occ, 1);
+    }
+
+    #[test]
+    fn strings_differing_only_by_eol_collapse_to_equal_on_lf_file() {
+        // Regression guard for the no-op case: on an LF file, old `"a\r\nb"`
+        // and new `"a\nb"` both normalize to `"a\nb"`, so a real edit must be
+        // rejected rather than silently writing an unchanged file.
+        let eol = dominant_eol("a\nb\n");
+        assert_eq!(normalize_eol("a\r\nb", eol), normalize_eol("a\nb", eol));
     }
 }
