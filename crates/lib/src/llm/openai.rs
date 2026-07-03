@@ -857,21 +857,26 @@ fn merge_chat_usage(usage: &mut Usage, parsed: &Value) {
 }
 
 fn responses_usage(usage: &Value) -> Usage {
+    // `cached_tokens` is a subset of `input_tokens`; the cost model bills input
+    // and cache-read independently, so split them to avoid charging the cached
+    // portion twice (once at the input rate, once at the cache-read rate).
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Usage {
         input_tokens: usage
             .get("input_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            .saturating_sub(cached),
         output_tokens: usage
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        cache_read_input_tokens: cached,
     }
 }
 
@@ -1090,7 +1095,9 @@ mod tests {
             "input_tokens_details": {"cached_tokens": 80}
         }));
 
-        assert_eq!(usage.input_tokens, 100);
+        // Cached is a subset of input_tokens; the non-cached remainder (20) is
+        // billed as input, the cached 80 only at the cache-read rate.
+        assert_eq!(usage.input_tokens, 20);
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cache_read_input_tokens, 80);
     }
