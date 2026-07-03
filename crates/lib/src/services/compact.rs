@@ -422,12 +422,37 @@ pub fn build_compact_summary_prompt(messages: &[Message]) -> String {
         }
     }
 
-    format!(
-        "Summarize this conversation concisely, preserving key decisions, \
-         file changes made, and important context. Focus on what the user \
-         was trying to accomplish and what was done.\n\n{context}"
-    )
+    format!("{SUMMARY_TEMPLATE}\n\n---\n\n{context}")
 }
+
+/// Fixed template for the compaction summary.
+///
+/// A structured template (rather than a free-form "summarize this" instruction)
+/// keeps summaries consistent turn to turn and makes them easy to update in
+/// place on the next compaction: each section has a stable heading, so the
+/// model refreshes an anchored summary instead of writing a fresh prose blob.
+const SUMMARY_TEMPLATE: &str = "\
+Summarize the conversation below so work can continue without the original \
+history. Preserve information faithfully — do not invent progress. Use exactly \
+these sections, each on its own line, omitting none (write \"(none)\" if empty):
+
+## Goal
+What the user is ultimately trying to accomplish.
+
+## Constraints
+Requirements, preferences, and rules stated by the user.
+
+## Progress
+What has been done so far, including outcomes.
+
+## Decisions
+Choices made and the reasoning behind them.
+
+## Next steps
+Concrete remaining work, in order.
+
+## Files
+Files created or modified, with a one-line note on each.";
 
 /// Build the recovery message injected when max-output-tokens is hit.
 pub fn max_output_recovery_message() -> Message {
@@ -916,6 +941,25 @@ mod tests {
         let messages = vec![user_message("hello"), user_message("world")];
         let prompt = build_compact_summary_prompt(&messages);
         assert!(prompt.contains("Summarize"));
+    }
+
+    #[test]
+    fn compact_summary_prompt_uses_structured_template() {
+        use crate::llm::message::*;
+        let messages = vec![user_message("hi")];
+        let prompt = build_compact_summary_prompt(&messages);
+        for section in [
+            "## Goal",
+            "## Constraints",
+            "## Progress",
+            "## Decisions",
+            "## Next steps",
+            "## Files",
+        ] {
+            assert!(prompt.contains(section), "missing section {section}");
+        }
+        // The conversation context is still appended after the template.
+        assert!(prompt.contains("User: hi"));
     }
 
     #[test]
