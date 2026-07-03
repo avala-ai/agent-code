@@ -167,7 +167,9 @@ pub fn security_profile() -> Profile {
         lex(
             "sqli.raw_query",
             "Raw SQL execution with possible string building",
-            vec![Python, JavaScript, TypeScript, Go, Java, Ruby, Php, CSharp, Scala, Kotlin],
+            vec![
+                Python, JavaScript, TypeScript, Go, Java, Ruby, Php, CSharp, Scala, Kotlin,
+            ],
             r"(execute|executemany|executescript|query|rawQuery|prepare)\s*\(",
         ),
         lex(
