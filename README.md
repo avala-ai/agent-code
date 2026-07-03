@@ -60,8 +60,10 @@ Works with any LLM. Set one env var and go:
 
 Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080/v1`
 
-Already signed in with OpenAI Codex? Run `codex login`, then start agent-code with
-`agent --auth-mode codex_chatgpt --model gpt-5.4` to reuse that ChatGPT session.
+**Use your ChatGPT/Codex subscription instead of an API key.** Run `agent login`
+to sign in with ChatGPT in your browser (no `codex` CLI required), then start
+agent-code with `agent --auth-mode codex_chatgpt --model gpt-5.5`. Already signed
+in via the `codex` CLI? agent-code reuses that `~/.codex` session automatically.
 
 ## Input Modes
 

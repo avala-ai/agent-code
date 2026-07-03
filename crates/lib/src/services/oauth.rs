@@ -61,7 +61,7 @@ pub const LOOPBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-provider OAuth configuration. Pure data — no network
 /// behavior is encoded here. The same struct is reused for
 /// every provider; differences are URLs and scopes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OAuthProviderConfig {
     /// Short, file-system-safe identifier used to namespace
     /// the credential store entry. Must be unique per
@@ -72,12 +72,20 @@ pub struct OAuthProviderConfig {
     pub token_url: String,
     pub client_id: String,
     pub scopes: Vec<String>,
-    /// Redirect URI registered with the provider. The
-    /// `port` part is replaced at runtime with the
-    /// loopback port the OS hands us; pass any placeholder
-    /// (e.g. `http://127.0.0.1/callback`) — we only use
-    /// the path component.
+    /// Redirect URI registered with the provider. By default only its path
+    /// component is used and the host/port are replaced at runtime with the
+    /// loopback address the OS hands us (pass any placeholder host/port). When
+    /// [`Self::loopback_port`] is set, the provider requires an *exact*
+    /// pre-registered redirect (e.g. `http://localhost:1455/auth/callback` for
+    /// Codex/ChatGPT), and this string is sent verbatim.
     pub redirect_uri: String,
+    /// When set, bind the loopback callback server to this fixed port and send
+    /// [`Self::redirect_uri`] verbatim, instead of using an OS-assigned port.
+    /// Required by providers that only accept an exact registered redirect URI.
+    pub loopback_port: Option<u16>,
+    /// Extra query parameters appended to the authorization URL, for
+    /// provider-specific flags such as Codex's `id_token_add_organizations=true`.
+    pub extra_authorize_params: Vec<(String, String)>,
     /// Allow `http://localhost` and `http://127.0.0.1` for
     /// `authorization_url` and `token_url`. Off by default —
     /// RFC 6749 §3.1 requires HTTPS for OAuth endpoints, and
@@ -181,6 +189,11 @@ pub struct TokenSet {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// OpenID Connect ID token, when the provider issues one (e.g. an OAuth
+    /// flow with the `openid` scope). Carries identity claims some providers
+    /// need (Codex reads the ChatGPT account id from it).
+    #[serde(default)]
+    pub id_token: Option<String>,
     /// Absolute UTC instant at which `access_token` expires,
     /// or `None` if the provider did not specify an expiry.
     #[serde(default)]
@@ -192,6 +205,7 @@ impl std::fmt::Debug for TokenSet {
         f.debug_struct("TokenSet")
             .field("access_token", &"***")
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("id_token", &self.id_token.as_ref().map(|_| "***"))
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -479,16 +493,28 @@ impl OAuthService {
         let _guard = self.state.lock().await;
 
         let pkce = PkcePair::generate();
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| OAuthError::LoopbackFailed(e.to_string()))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| OAuthError::LoopbackFailed(e.to_string()))?
-            .port();
-
-        let redirect_path = self.config.redirect_path();
-        let redirect_uri = format!("http://127.0.0.1:{port}{redirect_path}");
+        let (listener, redirect_uri) = match self.config.loopback_port {
+            // Provider requires an exact pre-registered redirect URI (Codex):
+            // bind that specific port and send the configured URI verbatim.
+            Some(fixed) => {
+                let listener = TcpListener::bind(("127.0.0.1", fixed))
+                    .await
+                    .map_err(|e| OAuthError::LoopbackFailed(e.to_string()))?;
+                (listener, self.config.redirect_uri.clone())
+            }
+            // Default: OS-assigned loopback port, reuse only the registered path.
+            None => {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| OAuthError::LoopbackFailed(e.to_string()))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|e| OAuthError::LoopbackFailed(e.to_string()))?
+                    .port();
+                let redirect_path = self.config.redirect_path();
+                (listener, format!("http://127.0.0.1:{port}{redirect_path}"))
+            }
+        };
         let state = random_url_token(16);
 
         let auth_url =
@@ -619,6 +645,8 @@ fn merge_refresh(prev: TokenSet, new: TokenSet) -> TokenSet {
         // Some providers return a fresh refresh token on
         // every refresh; others rotate it only on login.
         refresh_token: new.refresh_token.or(prev.refresh_token),
+        // Likewise, a refresh may or may not return a new id token.
+        id_token: new.id_token.or(prev.id_token),
         expires_at: new.expires_at,
     }
 }
@@ -909,6 +937,12 @@ fn build_authorization_url(
         url_encode(state),
         url_encode(code_challenge),
     ));
+    for (key, value) in &cfg.extra_authorize_params {
+        url.push('&');
+        url.push_str(&url_encode(key));
+        url.push('=');
+        url.push_str(&url_encode(value));
+    }
     url
 }
 
@@ -933,6 +967,8 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
     expires_in: Option<i64>,
 }
 
@@ -941,6 +977,7 @@ impl From<TokenResponse> for TokenSet {
         TokenSet {
             access_token: t.access_token,
             refresh_token: t.refresh_token,
+            id_token: t.id_token,
             expires_at: t
                 .expires_in
                 .map(|secs| Utc::now() + chrono::Duration::seconds(secs)),
@@ -1233,6 +1270,8 @@ mod tests {
     #[test]
     fn redirect_path_falls_back_to_default() {
         let cfg = OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "p".into(),
             authorization_url: "https://x/auth".into(),
             token_url: "https://x/token".into(),
@@ -1247,6 +1286,8 @@ mod tests {
     #[test]
     fn build_authorization_url_includes_pkce_and_state() {
         let cfg = OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "p".into(),
             authorization_url: "https://x/auth".into(),
             token_url: "https://x/token".into(),
@@ -1269,6 +1310,8 @@ mod tests {
     #[test]
     fn build_authorization_url_appends_to_existing_query_string() {
         let cfg = OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "p".into(),
             authorization_url: "https://x/auth?audience=api".into(),
             token_url: "https://x/token".into(),
@@ -1326,6 +1369,7 @@ mod tests {
     #[test]
     fn token_set_debug_redacts_secrets() {
         let ts = TokenSet {
+            id_token: None,
             access_token: "REAL_ACCESS_DO_NOT_LEAK".into(),
             refresh_token: Some("REAL_REFRESH_DO_NOT_LEAK".into()),
             expires_at: None,
@@ -1339,6 +1383,7 @@ mod tests {
     #[test]
     fn token_set_is_stale_uses_refresh_skew() {
         let mut t = TokenSet {
+            id_token: None,
             access_token: "x".into(),
             refresh_token: None,
             expires_at: Some(Utc::now() + chrono::Duration::seconds(30)),
@@ -1355,11 +1400,13 @@ mod tests {
     #[test]
     fn merge_refresh_keeps_old_refresh_token_if_new_omits_it() {
         let prev = TokenSet {
+            id_token: None,
             access_token: "a1".into(),
             refresh_token: Some("r1".into()),
             expires_at: None,
         };
         let new = TokenSet {
+            id_token: None,
             access_token: "a2".into(),
             refresh_token: None,
             expires_at: None,
@@ -1443,6 +1490,8 @@ mod tests {
 
     fn cfg_with_token_url(token_url: &str) -> OAuthProviderConfig {
         OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "stub".into(),
             // Loopback HTTP is allowed for the
             // authorization URL only when
@@ -1550,6 +1599,7 @@ mod tests {
             spawn_fake_token_server(vec![(429, r#"{"error":"slow_down"}"#.into())]).await;
         let store = Arc::new(InMemoryStore::default());
         let initial = TokenSet {
+            id_token: None,
             access_token: "stale".into(),
             refresh_token: Some("rt".into()),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
@@ -1585,6 +1635,7 @@ mod tests {
         let (url, _handle) = spawn_fake_token_server(vec![(503, "outage".into())]).await;
         let store = Arc::new(InMemoryStore::default());
         let initial = TokenSet {
+            id_token: None,
             access_token: "stale".into(),
             refresh_token: Some("rt".into()),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
@@ -1616,6 +1667,7 @@ mod tests {
         .await;
         let store = Arc::new(InMemoryStore::default());
         let initial = TokenSet {
+            id_token: None,
             access_token: "stale".into(),
             refresh_token: Some("rt".into()),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
@@ -1643,6 +1695,7 @@ mod tests {
             spawn_fake_token_server(vec![(401, r#"{"error":"invalid_grant"}"#.into())]).await;
         let store = Arc::new(InMemoryStore::default());
         let initial = TokenSet {
+            id_token: None,
             access_token: "stale".into(),
             refresh_token: Some("rt".into()),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
@@ -1675,6 +1728,7 @@ mod tests {
             .save(
                 "agent-code:stub",
                 &TokenSet {
+                    id_token: None,
                     access_token: "x".into(),
                     refresh_token: None,
                     expires_at: None,
@@ -1713,6 +1767,8 @@ mod tests {
         // URL since validation rejects any non-https
         // endpoint that is not loopback.
         let cfg = OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "stub".into(),
             authorization_url: "http://127.0.0.1/auth".into(),
             token_url,
@@ -1796,6 +1852,7 @@ mod tests {
         assert!(store.load("agent-code:p").unwrap().is_none());
 
         let ts = TokenSet {
+            id_token: None,
             access_token: "a".into(),
             refresh_token: Some("r".into()),
             expires_at: None,
@@ -1838,6 +1895,8 @@ mod tests {
         redirect_uri: &str,
     ) -> OAuthProviderConfig {
         OAuthProviderConfig {
+            loopback_port: None,
+            extra_authorize_params: Vec::new(),
             provider_name: "p".into(),
             authorization_url: authorization_url.into(),
             token_url: token_url.into(),
