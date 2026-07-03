@@ -134,8 +134,7 @@ async fn run_cve_bench(cli: &Cli, manifest: &std::path::Path) -> Result<()> {
     );
 
     let env: Vec<(&str, &str)> = Vec::new();
-    let report =
-        cve_bench::run_bench(&cases, &cli.agent, grader, cli.model.as_deref(), &env).await;
+    let report = cve_bench::run_bench(&cases, &cli.agent, grader, cli.model.as_deref(), &env).await;
 
     print!("{}", cve_bench::summarize(&report));
     if let Some(path) = cli.results.as_ref() {
