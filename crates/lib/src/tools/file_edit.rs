@@ -140,6 +140,69 @@ fn select_match<'a>(content: &str, old: &'a str, new: &str) -> (Cow<'a, str>, Co
     (Cow::Owned(old_n), new_norm, occ)
 }
 
+/// Whitespace-tolerant, line-aligned search for `needle` within `haystack`.
+///
+/// Model-supplied `old_string`s frequently differ from the file only in
+/// leading/trailing whitespace (indentation, trailing spaces) — the single
+/// most common cause of a failed exact match. This compares whole lines with
+/// their surrounding whitespace trimmed.
+///
+/// Returns the byte range `(start, end)` of the one matching run, or `None`
+/// when there are **zero or more than one** matches. Ambiguity is treated as
+/// no-match on purpose: the tool must never guess which occurrence to edit.
+fn line_trimmed_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_lines: Vec<&str> = needle.lines().map(str::trim).collect();
+    if needle_lines.is_empty() {
+        return None;
+    }
+
+    // For every line: its start byte, its body end (*excluding* the trailing
+    // terminator), its full end (*including* the terminator), and its trimmed
+    // content.
+    let mut hay: Vec<(usize, usize, usize, &str)> = Vec::new();
+    let mut idx = 0;
+    for line in haystack.split_inclusive('\n') {
+        let start = idx;
+        idx += line.len();
+        let full_end = idx;
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        hay.push((start, start + body.len(), full_end, body.trim()));
+    }
+
+    let n = needle_lines.len();
+    if n > hay.len() {
+        return None;
+    }
+
+    // Mirror exact-match semantics for the trailing terminator: if `needle`
+    // ends with a newline it "owns" the terminator of its last line, so the
+    // matched range must include it — otherwise the original newline is kept
+    // *and* the replacement brings its own, inserting an extra blank line.
+    let needle_owns_terminator = needle.ends_with('\n');
+
+    let mut found: Option<(usize, usize)> = None;
+    for window in hay.windows(n) {
+        if window
+            .iter()
+            .zip(&needle_lines)
+            .all(|((_, _, _, h), needle)| h == needle)
+        {
+            if found.is_some() {
+                return None; // ambiguous — refuse to guess
+            }
+            let last = &window[n - 1];
+            let end = if needle_owns_terminator {
+                last.2
+            } else {
+                last.1
+            };
+            found = Some((window[0].0, end));
+        }
+    }
+    found
+}
+
 #[async_trait]
 impl Tool for FileEditTool {
     fn name(&self) -> &'static str {
@@ -265,12 +328,6 @@ impl Tool for FileEditTool {
             ));
         }
 
-        if occurrences == 0 {
-            return Err(ToolError::InvalidInput(format!(
-                "old_string not found in {file_path}"
-            )));
-        }
-
         if occurrences > 1 && !replace_all {
             return Err(ToolError::InvalidInput(format!(
                 "old_string has {occurrences} occurrences in {file_path}. \
@@ -279,10 +336,32 @@ impl Tool for FileEditTool {
             )));
         }
 
-        let new_content = if replace_all {
-            content.replace(old_string, new_string)
+        let (new_content, replaced) = if occurrences >= 1 {
+            let count = if replace_all { occurrences } else { 1 };
+            let updated = if replace_all {
+                content.replace(old_string, new_string)
+            } else {
+                content.replacen(old_string, new_string, 1)
+            };
+            (updated, count)
         } else {
-            content.replacen(old_string, new_string, 1)
+            // Exact and EOL-normalized matches both failed. Fall back to a
+            // whitespace-tolerant, line-aligned match, but only when it is
+            // unambiguous.
+            match line_trimmed_match(&content, old_string) {
+                Some((start, end)) => {
+                    let mut updated = String::with_capacity(content.len() + new_string.len());
+                    updated.push_str(&content[..start]);
+                    updated.push_str(new_string);
+                    updated.push_str(&content[end..]);
+                    (updated, 1)
+                }
+                None => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "old_string not found in {file_path}"
+                    )));
+                }
+            }
         };
 
         tokio::fs::write(file_path, &new_content)
@@ -296,7 +375,6 @@ impl Tool for FileEditTool {
         }
 
         // Build a unified diff so the model/user sees exactly what changed.
-        let replaced = if replace_all { occurrences } else { 1 };
         let diff = unified_diff(file_path, &content, &new_content);
         Ok(ToolResult::success(format!(
             "Replaced {replaced} occurrence(s) in {file_path}\n\n{diff}"
@@ -395,5 +473,57 @@ mod tests {
         // rejected rather than silently writing an unchanged file.
         let eol = dominant_eol("a\nb\n");
         assert_eq!(normalize_eol("a\r\nb", eol), normalize_eol("a\nb", eol));
+    }
+
+    fn apply(haystack: &str, needle: &str, replacement: &str) -> Option<String> {
+        line_trimmed_match(haystack, needle)
+            .map(|(s, e)| format!("{}{}{}", &haystack[..s], replacement, &haystack[e..]))
+    }
+
+    #[test]
+    fn line_trimmed_matches_despite_indentation() {
+        let file = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        assert!(line_trimmed_match(file, "let x = 1;\nlet y = 2;").is_some());
+        let out = apply(file, "let x = 1;\nlet y = 2;", "    let z = 3;").unwrap();
+        assert_eq!(out, "fn main() {\n    let z = 3;\n}\n");
+    }
+
+    #[test]
+    fn line_trimmed_preserves_trailing_newline_without_doubling() {
+        // old_string ends with a newline, so it owns the last line's
+        // terminator; replacing must not leave an extra blank line.
+        let file = "  foo\n  bar\n";
+        let out = apply(file, "foo\nbar\n", "baz\n").unwrap();
+        assert_eq!(out, "baz\n");
+    }
+
+    #[test]
+    fn line_trimmed_without_trailing_newline_keeps_structure() {
+        let file = "  foo\n  bar\nkeep\n";
+        let out = apply(file, "foo\nbar", "baz").unwrap();
+        assert_eq!(out, "baz\nkeep\n");
+    }
+
+    #[test]
+    fn line_trimmed_ignores_trailing_whitespace() {
+        let file = "alpha  \nbeta\t\ngamma\n";
+        assert!(line_trimmed_match(file, "alpha\nbeta").is_some());
+    }
+
+    #[test]
+    fn line_trimmed_refuses_ambiguous_match() {
+        // Two identical trimmed runs -> ambiguous -> None (never guess).
+        let file = "  x\n\n  x\n";
+        assert_eq!(line_trimmed_match(file, "x"), None);
+    }
+
+    #[test]
+    fn line_trimmed_returns_none_when_absent() {
+        assert_eq!(line_trimmed_match("a\nb\nc\n", "zzz"), None);
+    }
+
+    #[test]
+    fn line_trimmed_none_when_needle_longer_than_file() {
+        assert_eq!(line_trimmed_match("a\n", "a\nb\nc"), None);
     }
 }
