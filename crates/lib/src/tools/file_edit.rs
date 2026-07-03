@@ -116,27 +116,28 @@ fn normalize_eol(text: &str, eol: &str) -> String {
     }
 }
 
-/// Pick the search/replacement pair and its occurrence count.
+/// Pick the search text and normalized replacement, plus the occurrence count.
 ///
-/// Exact matches win: if the raw `old` already appears in `content`, the raw
-/// strings are used verbatim so a mixed-ending file isn't disturbed and the
-/// exact snippet the caller supplied is the one edited. Only when the raw
-/// search finds nothing do we normalize both strings to the file's dominant
-/// line ending and retry — the common "model sent LF, file is CRLF" case.
-fn select_match<'a>(
-    content: &str,
-    old: &'a str,
-    new: &'a str,
-) -> (Cow<'a, str>, Cow<'a, str>, usize) {
+/// Two separate concerns:
+/// - **Search**: the raw `old` wins if it already appears in `content`, so an
+///   exact match in a mixed-ending file is edited in place and never rewritten
+///   to the wrong block. Only on a raw miss is `old` normalized to the file's
+///   dominant ending and retried (the "model sent LF, file is CRLF" case).
+/// - **Replacement**: `new` is *always* normalized to the file's dominant
+///   ending, even when `old` matched raw — otherwise a single-line `old` that
+///   matches a CRLF file, replaced with a multi-line LF `new`, would still
+///   write mixed endings.
+fn select_match<'a>(content: &str, old: &'a str, new: &str) -> (Cow<'a, str>, Cow<'a, str>, usize) {
+    let eol = dominant_eol(content);
+    let new_norm = Cow::Owned(normalize_eol(new, eol));
+
     let raw = content.matches(old).count();
     if raw > 0 {
-        return (Cow::Borrowed(old), Cow::Borrowed(new), raw);
+        return (Cow::Borrowed(old), new_norm, raw);
     }
-    let eol = dominant_eol(content);
     let old_n = normalize_eol(old, eol);
-    let new_n = normalize_eol(new, eol);
     let occ = content.matches(old_n.as_str()).count();
-    (Cow::Owned(old_n), Cow::Owned(new_n), occ)
+    (Cow::Owned(old_n), new_norm, occ)
 }
 
 #[async_trait]
@@ -363,6 +364,18 @@ mod tests {
         );
         assert_eq!(occ, 1);
         assert_eq!(new, "X");
+    }
+
+    #[test]
+    fn select_match_normalizes_replacement_even_on_raw_match() {
+        // CRLF file, single-line `old` matches raw, but `new` has LF breaks:
+        // the replacement must still be normalized to CRLF so the write stays
+        // internally consistent.
+        let content = "alpha\r\nTARGET\r\nomega\r\n";
+        let (old, new, occ) = select_match(content, "TARGET", "one\ntwo");
+        assert!(matches!(old, Cow::Borrowed(_)), "search matched raw");
+        assert_eq!(occ, 1);
+        assert_eq!(new, "one\r\ntwo", "replacement normalized to CRLF");
     }
 
     #[test]
