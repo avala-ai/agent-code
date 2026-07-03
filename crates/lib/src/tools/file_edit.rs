@@ -229,6 +229,18 @@ impl Tool for FileEditTool {
         let old_string = old_owned.as_str();
         let new_string = new_owned.as_str();
 
+        // The up-front `old_string == new_string` check ran on the raw inputs.
+        // Normalizing line endings can make them equal (e.g. old `"a\r\nb"` and
+        // new `"a\nb"` on an LF file), which would write an identical file yet
+        // report success. Reject that no-op explicitly.
+        if old_string == new_string {
+            return Err(ToolError::InvalidInput(
+                "old_string and new_string are identical after normalizing line \
+                 endings, so the edit would make no change"
+                    .into(),
+            ));
+        }
+
         let occurrences = content.matches(old_string).count();
 
         if occurrences == 0 {
@@ -314,5 +326,14 @@ mod tests {
         let file = "let x = 1;\r\nlet y = 2;\r\n";
         let search = normalize_eol("let x = 1;\nlet y = 2;", dominant_eol(file));
         assert!(file.contains(&search));
+    }
+
+    #[test]
+    fn strings_differing_only_by_eol_collapse_to_equal_on_lf_file() {
+        // Regression guard for the no-op case: on an LF file, old `"a\r\nb"`
+        // and new `"a\nb"` both normalize to `"a\nb"`, so a real edit must be
+        // rejected rather than silently writing an unchanged file.
+        let eol = dominant_eol("a\nb\n");
+        assert_eq!(normalize_eol("a\r\nb", eol), normalize_eol("a\nb", eol));
     }
 }
