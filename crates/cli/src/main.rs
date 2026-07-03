@@ -268,12 +268,20 @@ fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Harden the process before anything sensitive is loaded: drop code-
-    // injection env vars, disable core dumps, and block ptrace-attach.
+fn main() -> anyhow::Result<()> {
+    // Harden the process BEFORE the async runtime starts, while the process is
+    // still single-threaded: hardening mutates the environment (unsound once
+    // Tokio worker threads exist) and may re-exec into a clean environment to
+    // escape an injected library that the loader already mapped in.
     harden::harden_process();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cli_auth_mode = cli
         .auth_mode
