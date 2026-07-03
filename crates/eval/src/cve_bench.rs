@@ -66,6 +66,11 @@ pub struct ScanReport {
     pub cost_usd: f64,
     #[serde(default)]
     pub worker_failures: usize,
+    /// Files the selectors routed to a MAP worker (coverage numerator).
+    #[serde(default)]
+    pub scanned_files: usize,
+    #[serde(default)]
+    pub shards: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +85,25 @@ pub struct Finding {
     pub evidence: String,
 }
 
+/// A finding trimmed to the fields worth keeping in the benchmark report, so a
+/// result is diagnosable (why did a case miss?) without re-running the scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct FindingBrief {
+    pub cwe: Option<String>,
+    pub file: String,
+    pub title: String,
+}
+
+impl From<&Finding> for FindingBrief {
+    fn from(f: &Finding) -> Self {
+        FindingBrief {
+            cwe: f.cwe.clone(),
+            file: f.file.clone(),
+            title: f.title.clone(),
+        }
+    }
+}
+
 /// Per-case outcome.
 #[derive(Debug, Clone, Serialize)]
 pub struct CaseResult {
@@ -88,9 +112,40 @@ pub struct CaseResult {
     pub found: bool,
     pub num_findings: usize,
     pub cost_usd: f64,
+    /// Files the scan actually analyzed — a coverage signal. A miss with a low
+    /// count is a selector gap; a miss with high coverage is a depth/recall gap.
+    pub scanned_files: usize,
+    pub shards: usize,
+    pub worker_failures: usize,
+    /// When the case missed, a short reason so results are triageable in bulk.
+    pub miss_reason: Option<String>,
+    /// The scan's findings (trimmed), for offline analysis.
+    pub findings: Vec<FindingBrief>,
     /// Set when the case could not be evaluated (clone/scan error). A case with
     /// an error counts as not-found (it did not surface the vuln).
     pub error: Option<String>,
+}
+
+/// Classify why a case missed, from the target and the scan findings. Returns
+/// `None` when the case was found. Used only for triage — not for scoring.
+pub fn classify_miss(case: &CveCase, findings: &[Finding]) -> Option<&'static str> {
+    if heuristic_found(case, findings) {
+        return None;
+    }
+    if findings.is_empty() {
+        return Some("no-findings");
+    }
+    let file_hit = findings.iter().any(|f| file_matches(&f.file, &case.file));
+    let cwe_hit = findings
+        .iter()
+        .any(|f| f.cwe.as_deref().is_some_and(|c| cwe_matches(c, &case.cwe)));
+    Some(match (file_hit, cwe_hit) {
+        // Right file, right class somewhere, but not on the same finding.
+        (true, true) => "file-and-cwe-split-across-findings",
+        (true, false) => "right-file-wrong-cwe",
+        (false, true) => "right-cwe-wrong-file",
+        (false, false) => "unrelated-findings",
+    })
 }
 
 /// Aggregate benchmark report.
@@ -246,6 +301,11 @@ pub async fn run_case(
         found: false,
         num_findings: 0,
         cost_usd: 0.0,
+        scanned_files: 0,
+        shards: 0,
+        worker_failures: 0,
+        miss_reason: None,
+        findings: Vec::new(),
         error: None,
     };
 
@@ -253,11 +313,13 @@ pub async fn run_case(
         Ok(t) => t,
         Err(e) => {
             result.error = Some(format!("tempdir: {e}"));
+            result.miss_reason = Some("error".into());
             return result;
         }
     };
     if let Err(e) = checkout_case(case, tmp.path()) {
         result.error = Some(format!("checkout: {e}"));
+        result.miss_reason = Some("error".into());
         return result;
     }
 
@@ -265,11 +327,16 @@ pub async fn run_case(
         Ok(r) => r,
         Err(e) => {
             result.error = Some(format!("scan: {e}"));
+            result.miss_reason = Some("error".into());
             return result;
         }
     };
     result.num_findings = report.findings.len();
     result.cost_usd = report.cost_usd;
+    result.scanned_files = report.scanned_files;
+    result.shards = report.shards;
+    result.worker_failures = report.worker_failures;
+    result.findings = report.findings.iter().map(FindingBrief::from).collect();
 
     result.found = match grader {
         Grader::Heuristic => heuristic_found(case, &report.findings),
@@ -283,6 +350,10 @@ pub async fn run_case(
             }
         },
     };
+    // Triage tag for misses (heuristic-based; independent of the grader used).
+    if !result.found && result.error.is_none() {
+        result.miss_reason = classify_miss(case, &report.findings).map(String::from);
+    }
     result
 }
 
@@ -372,14 +443,29 @@ pub fn summarize(report: &BenchReport) -> String {
     for (lang, (f, t)) in &report.per_language {
         s.push_str(&format!("  {lang}: {f}/{t}\n"));
     }
-    let missed: Vec<&str> = report
-        .cases
-        .iter()
-        .filter(|c| !c.found)
-        .map(|c| c.id.as_str())
-        .collect();
+    let missed: Vec<&CaseResult> = report.cases.iter().filter(|c| !c.found).collect();
     if !missed.is_empty() {
-        s.push_str(&format!("  missed: {}\n", missed.join(", ")));
+        s.push_str("  missed:\n");
+        for c in &missed {
+            s.push_str(&format!(
+                "    {:<18} {:<12} reason={} coverage={}f/{}sh findings={}\n",
+                c.id,
+                c.language,
+                c.miss_reason.as_deref().unwrap_or("?"),
+                c.scanned_files,
+                c.shards,
+                c.num_findings,
+            ));
+        }
+    }
+    // Roll up miss reasons so a run's failure profile is visible at a glance.
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in &missed {
+        *reasons.entry(c.miss_reason.as_deref().unwrap_or("?")).or_insert(0) += 1;
+    }
+    if !reasons.is_empty() {
+        let parts: Vec<String> = reasons.iter().map(|(r, n)| format!("{r}={n}")).collect();
+        s.push_str(&format!("  miss profile: {}\n", parts.join(", ")));
     }
     s
 }
@@ -445,33 +531,28 @@ mod tests {
         assert!(!heuristic_found(&c, &[]));
     }
 
+    fn case_result(id: &str, language: &str, found: bool, cost_usd: f64) -> CaseResult {
+        CaseResult {
+            id: id.into(),
+            language: language.into(),
+            found,
+            num_findings: 0,
+            cost_usd,
+            scanned_files: 0,
+            shards: 0,
+            worker_failures: 0,
+            miss_reason: None,
+            findings: Vec::new(),
+            error: None,
+        }
+    }
+
     #[test]
     fn aggregate_computes_recall_and_per_language() {
         let results = vec![
-            CaseResult {
-                id: "a".into(),
-                language: "python".into(),
-                found: true,
-                num_findings: 2,
-                cost_usd: 1.0,
-                error: None,
-            },
-            CaseResult {
-                id: "b".into(),
-                language: "python".into(),
-                found: false,
-                num_findings: 0,
-                cost_usd: 0.5,
-                error: None,
-            },
-            CaseResult {
-                id: "c".into(),
-                language: "go".into(),
-                found: true,
-                num_findings: 1,
-                cost_usd: 2.0,
-                error: None,
-            },
+            case_result("a", "python", true, 1.0),
+            case_result("b", "python", false, 0.5),
+            case_result("c", "go", true, 2.0),
         ];
         let r = aggregate(results);
         assert_eq!((r.total, r.found), (3, 2));
@@ -479,6 +560,33 @@ mod tests {
         assert!((r.total_cost_usd - 3.5).abs() < 1e-9);
         assert_eq!(r.per_language["python"], (1, 2));
         assert_eq!(r.per_language["go"], (1, 1));
+    }
+
+    #[test]
+    fn classify_miss_categorizes_by_file_and_cwe() {
+        let c = case("CWE-22", "lib/rack/static.rb");
+        // Found on the right file + CWE -> not a miss.
+        assert_eq!(
+            classify_miss(&c, &[finding("CWE-22", "lib/rack/static.rb")]),
+            None
+        );
+        // No findings at all.
+        assert_eq!(classify_miss(&c, &[]), Some("no-findings"));
+        // Right CWE class but a different file (the real rack pilot miss).
+        assert_eq!(
+            classify_miss(&c, &[finding("CWE-22", "lib/rack/directory.rb")]),
+            Some("right-cwe-wrong-file")
+        );
+        // Right file but a different CWE.
+        assert_eq!(
+            classify_miss(&c, &[finding("CWE-79", "lib/rack/static.rb")]),
+            Some("right-file-wrong-cwe")
+        );
+        // Findings exist but relate to neither the file nor the class.
+        assert_eq!(
+            classify_miss(&c, &[finding("CWE-89", "app/db.rb")]),
+            Some("unrelated-findings")
+        );
     }
 
     #[test]
