@@ -40,7 +40,7 @@ pub struct CodexChatGptAuth {
     state: Arc<Mutex<CodexAuthState>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CodexAuthState {
     raw: Value,
     access_token: String,
@@ -50,11 +50,35 @@ struct CodexAuthState {
     is_fedramp_account: bool,
 }
 
-#[derive(Debug, Deserialize)]
+// Manual Debug: never print the tokens or `raw` (the full auth.json), so a
+// stray `{:?}` in a log or error cannot leak the ChatGPT session.
+impl std::fmt::Debug for CodexAuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexAuthState")
+            .field("access_token", &"***")
+            .field("refresh_token", &"***")
+            .field("account_id", &self.account_id)
+            .field("last_refresh", &self.last_refresh)
+            .field("is_fedramp_account", &self.is_fedramp_account)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
 struct RefreshResponse {
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
+}
+
+impl std::fmt::Debug for RefreshResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshResponse")
+            .field("id_token", &self.id_token.as_ref().map(|_| "***"))
+            .field("access_token", &self.access_token.as_ref().map(|_| "***"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,6 +662,27 @@ mod tests {
         );
         // https endpoints + loopback redirect: no insecure-local needed.
         assert!(!cfg.allow_insecure_local);
+    }
+
+    #[test]
+    fn debug_never_prints_tokens() {
+        let raw = serde_json::json!({
+            "tokens": {
+                "access_token": "SECRET-ACCESS-abc",
+                "refresh_token": "SECRET-REFRESH-xyz",
+            }
+        });
+        let state = CodexAuthState::from_raw(raw).unwrap();
+        let dbg = format!("{state:?}");
+        assert!(
+            !dbg.contains("SECRET-ACCESS-abc"),
+            "access token leaked in Debug"
+        );
+        assert!(
+            !dbg.contains("SECRET-REFRESH-xyz"),
+            "refresh token leaked in Debug"
+        );
+        assert!(dbg.contains("***"));
     }
 
     #[test]
