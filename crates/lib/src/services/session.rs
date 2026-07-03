@@ -456,6 +456,16 @@ pub(crate) fn prune_older_than_in(
             stats.kept += 1;
         }
     }
+    // The sidecar index caches per-session metadata (cwd/model/label/tags).
+    // Pruning deletes session files directly, so drop the whole index when
+    // anything was removed — otherwise a pruned session's metadata would
+    // linger on disk (undermining the cleanup/privacy guarantee) until the
+    // next listing rebuilds the index. The index is pure cache and rebuilds
+    // lazily, so removing it is safe and cheap.
+    if stats.removed > 0 {
+        let _ = std::fs::remove_file(dir.join(INDEX_FILE));
+    }
+
     debug!(
         "Session prune: removed {} kept {} (threshold {} days)",
         stats.removed, stats.kept, days
@@ -630,6 +640,33 @@ mod tests {
         let out = list_session_summaries_in(&dir, 10);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_clears_the_sidecar_index() {
+        // Pruning must not leave a pruned session's cached metadata behind.
+        let dir = std::env::temp_dir().join(format!("agent-sess-idx-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_session_file(&dir, "old", "2000-01-01T00:00:00Z");
+
+        // Build the index, then confirm it cached the (soon-pruned) session.
+        let _ = list_session_summaries_in(&dir, 10);
+        assert!(dir.join(INDEX_FILE).exists());
+        assert!(
+            std::fs::read_to_string(dir.join(INDEX_FILE))
+                .unwrap()
+                .contains("old")
+        );
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stats = prune_older_than_in(&dir, 1, now).unwrap();
+        assert_eq!(stats.removed, 1);
+        // The sidecar is dropped so the pruned session's metadata is gone.
+        assert!(!dir.join(INDEX_FILE).exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
