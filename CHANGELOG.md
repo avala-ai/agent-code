@@ -7,9 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+*No changes yet.*
+
+## [0.25.0] - 2026-07-03
+
 ### Added
 
-- **`agent login`: sign in with your ChatGPT/Codex subscription in the browser**. Runs the "Sign in with ChatGPT" OAuth flow (PKCE, loopback `localhost:1455/auth/callback`) and writes the session to `~/.codex/auth.json` — the same file the `codex` CLI uses, so the two share one session and no `codex` install is required. Mirrors `codex login`: exchanges the id_token for an `OPENAI_API_KEY` (best-effort) and records `auth_mode`. Then run agent-code on the subscription with `agent --auth-mode codex_chatgpt --model gpt-5.5`. The generic `services::oauth` service gained fixed-loopback-port, extra-authorize-param, and `id_token` support to drive it.
+- **`agent login`: sign in with your ChatGPT/Codex subscription in the browser** (#340). Runs the "Sign in with ChatGPT" OAuth flow (PKCE, loopback `localhost:1455/auth/callback`) and writes the session to `~/.codex/auth.json` — the same file the `codex` CLI uses, so the two share one session and no `codex` install is required. Mirrors `codex login`: exchanges the id_token for an `OPENAI_API_KEY` (best-effort) and records `auth_mode`. Then run agent-code on the subscription with `agent --auth-mode codex_chatgpt --model gpt-5.5`. The generic `services::oauth` service gained fixed-loopback-port, extra-authorize-param, and `id_token` support to drive it.
+- **Broader `security-scan` language and vulnerability coverage** (#374): the deterministic selectors now span C#, Scala, Kotlin, Swift, Dart, and Elixir in addition to Python/JS/TS/Go/Rust/Ruby/Java/PHP/C/C++, and cover more vulnerability classes — prototype pollution, ReDoS, memory-safety (Rust `unsafe`, C unbounded buffer ops), integer narrowing, XXE, unescaped-output XSS, and per-language path-traversal / SSRF / command-injection / deserialization sinks. Vulnerable files in more languages now reach a MAP worker instead of being dropped before analysis.
+- **CVE-recall benchmark for the security scanner** (#366): a new `crates/eval` benchmark (`--bench`) that measures scan recall against 50 real, git-verified post-cutoff CVEs across 16 languages, with a deterministic grader and an LLM-judge grader. Development tooling; not part of the shipped binary.
+- **Whitespace-tolerant `FileEdit` fallback** (#373): when an exact match fails, `FileEdit` retries with a whitespace-tolerant match so edits are more robust to indentation differences.
+- **Structured compaction summaries** (#371): context compaction now uses a structured template for its summaries.
+- **Startup process hardening** (#369): the process applies additional hardening at startup.
+
+### Changed
+
+- **Faster session listing** (#372): session listing is backed by a rebuildable index.
+
+### Fixed
+
+- **Streaming usage and cost captured for OpenAI-compatible providers** (#375): token usage that rides on the finish chunk (as OpenRouter and some others send it) is now recorded, so token counts and the derived cost are no longer reported as zero. Cached prompt tokens are no longer double-counted against input.
+- **`FileEdit` preserves the file's original line endings** (#370).
+- **Sandbox fails closed when an enabled sandbox is unavailable** (#368) and **masks forbidden paths inside the Linux sandbox** (#367).
+- **Installer claims the `agent` name and hardens directory handling** (#339).
 
 ## [0.24.0] - 2026-07-02
 
@@ -485,7 +505,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/avala-ai/agent-code/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/avala-ai/agent-code/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/avala-ai/agent-code/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/avala-ai/agent-code/compare/v0.22.0...v0.22.1
