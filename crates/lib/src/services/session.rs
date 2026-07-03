@@ -174,6 +174,11 @@ pub fn list_sessions(limit: usize) -> Vec<SessionSummary> {
         _ => return Vec::new(),
     };
 
+    // Drop sidecar entries for sessions that no longer exist, so a session's
+    // cached metadata never outlives its file — this full-read path (used by
+    // `/sessions` and the resume picker) does not otherwise touch the index.
+    reconcile_index(&dir);
+
     let mut sessions: Vec<SessionSummary> = std::fs::read_dir(&dir)
         .ok()
         .into_iter()
@@ -260,6 +265,41 @@ struct IndexedSummary {
 /// `.json` file so it can never collide with a `<id>.json` session (a session
 /// id of `index` used to clobber it) and is naturally skipped by the scan.
 const INDEX_FILE: &str = "index.cache";
+
+/// Drop sidecar-index entries whose `<id>.json` session file no longer exists,
+/// so the cache never persists metadata for a deleted session. A no-op when
+/// there is no index. Cheap: it stats the directory names only, not contents.
+fn reconcile_index(dir: &std::path::Path) {
+    let index_path = dir.join(INDEX_FILE);
+    let Ok(text) = std::fs::read_to_string(&index_path) else {
+        return;
+    };
+    let Ok(mut index) =
+        serde_json::from_str::<std::collections::HashMap<String, IndexedSummary>>(&text)
+    else {
+        return;
+    };
+    let present: std::collections::HashSet<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let before = index.len();
+    index.retain(|id, _| present.contains(id));
+    if index.len() != before {
+        let _ = std::fs::write(
+            &index_path,
+            serde_json::to_string(&index).unwrap_or_default(),
+        );
+    }
+}
 
 /// The cache-validity stamp for a file: `(mtime_ns, size)`.
 fn file_stamp(path: &std::path::Path) -> Option<(u128, u64)> {
@@ -641,6 +681,34 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "a");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_index_drops_metadata_for_deleted_sessions() {
+        // Simulates a session deleted out-of-band (or via a full-read list
+        // path): its cached metadata must not survive in the sidecar.
+        let dir = std::env::temp_dir().join(format!("agent-sess-idx-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_session_file(&dir, "keep", "2026-06-30T10:00:00Z");
+        write_session_file(&dir, "gone", "2026-06-30T11:00:00Z");
+        let _ = list_session_summaries_in(&dir, 10); // build index with both
+        assert!(
+            std::fs::read_to_string(dir.join(INDEX_FILE))
+                .unwrap()
+                .contains("gone")
+        );
+
+        // Delete one file and reconcile (what list_sessions now does).
+        std::fs::remove_file(dir.join("gone.json")).unwrap();
+        reconcile_index(&dir);
+
+        let idx = std::fs::read_to_string(dir.join(INDEX_FILE)).unwrap();
+        assert!(idx.contains("keep"));
+        assert!(
+            !idx.contains("gone"),
+            "deleted session metadata must be dropped"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
