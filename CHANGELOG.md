@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.25.3] - 2026-07-07
+
+### Security
+
+- **`ask` permission mode now actually prompts** (#383): with `[permissions] default_mode = "ask"`, mutating tools (`FileWrite`, `Bash`, …) previously executed with no prompt because the interactive CLI never installed a permission prompter, so the engine's `Ask` decision fell through to auto-allow. The interactive TUI now shows the permission modal before a mutating tool runs; dismissing it with `Esc`/`q` denies (rather than falling through to the highlighted default). One-shot/`-p` runs are unchanged.
+
+### Fixed
+
+- **One-shot `agent -p` exits non-zero on total API failure** (#383): LLM retries no longer consume `--max-turns` slots, so a persistently failing provider now returns an error (non-zero exit) instead of silently exhausting the turn budget and exiting 0 with empty output. The retry warning now logs the actual error/status, the OpenAI-compatible provider honors the `Retry-After` header on 429, and unattended capacity-retries stay bounded by `max_turns` instead of looping forever.
+
+### Changed
+
+- **`schedule_run_no_api_key` test is now hermetic** (#383): it strips every inherited `*_API_KEY` rather than three hardcoded names, so it no longer makes a real request (and spuriously passes/fails) on a machine with e.g. `OPENROUTER_API_KEY` exported. Development tooling; not part of the shipped binary.
+
 ## [0.25.2] - 2026-07-07
 
 ### Fixed
@@ -522,7 +536,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.2...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.3...HEAD
+[0.25.3]: https://github.com/avala-ai/agent-code/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/avala-ai/agent-code/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/avala-ai/agent-code/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/avala-ai/agent-code/compare/v0.24.0...v0.25.0
