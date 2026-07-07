@@ -369,11 +369,19 @@ fn schedule_run_no_api_key() {
         .success();
 
     // Running requires an API key — should fail, not panic.
-    agent_with_home(&home)
-        .env_remove("AGENT_CODE_API_KEY")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .args(["schedule", "run", "run-me"])
+    // Strip every provider key that could be inherited from the developer's
+    // or CI shell, not just the three built-ins: the agent auto-detects any
+    // of ~15 provider keys (OPENROUTER_API_KEY, GROQ_API_KEY, …), so on a box
+    // with one of those exported the run would actually succeed and this test
+    // would spuriously fail (and bill a real request). Removing everything
+    // matching the key pattern keeps the test hermetic as providers are added.
+    let mut cmd = agent_with_home(&home);
+    for (key, _) in std::env::vars() {
+        if key.ends_with("_API_KEY") || key == "AZURE_OPENAI_AD_TOKEN" {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.args(["schedule", "run", "run-me"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("API key"));
