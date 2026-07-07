@@ -1054,6 +1054,12 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     // characters render bare at column 0 until Ctrl+L. An empty external
     // print rides rustyline's clear+repaint path (the same one Ctrl+L uses),
     // restoring the prompt; outside readline it writes nothing.
+    //
+    // Unix-only: `tokio::signal::unix` exists solely on Unix targets, and
+    // SIGWINCH is a Unix concept. On Windows, conhost/Windows Terminal reflow
+    // the prompt on resize without leaving it stranded, so no watcher is
+    // needed there.
+    #[cfg(unix)]
     {
         use rustyline::ExternalPrinter as _;
         if let Ok(mut winch_printer) = rl.create_external_printer() {
