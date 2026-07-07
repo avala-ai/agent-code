@@ -662,9 +662,16 @@ impl QueryEngine {
         let retry_config = crate::llm::retry::RetryConfig::default();
         let mut max_output_recovery_count = 0u32;
 
+        // Session-cumulative turn base: `turn` below is the 0-based iteration
+        // index within THIS user exchange (and gates the per-query max_turns
+        // budget), but `turn_count` is a whole-session accumulator surfaced in
+        // the footer, /cost, the exit summary, and the saved session. Snapshot
+        // the prior total so each exchange adds to it rather than overwriting.
+        let base_turns = self.state.turn_count;
+
         // Agent loop: budget check → normalize → compact → call LLM → execute tools → repeat.
         for turn in 0..max_turns {
-            self.state.turn_count = turn + 1;
+            self.state.turn_count = base_turns + turn + 1;
             self.state.is_query_active = true;
             sink.on_turn_start(turn + 1);
 
