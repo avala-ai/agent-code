@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.25.1] - 2026-07-07
+
+### Changed
+
+- **Bumped `ignore` from 0.4.26 to 0.4.27** (#378).
+- **Bumped `indicatif` from 0.18.5 to 0.18.6** (#379).
+
 ## [0.25.0] - 2026-07-03
 
 ### Added
@@ -505,7 +512,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.1...HEAD
+[0.25.1]: https://github.com/avala-ai/agent-code/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/avala-ai/agent-code/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/avala-ai/agent-code/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/avala-ai/agent-code/compare/v0.22.1...v0.23.0
