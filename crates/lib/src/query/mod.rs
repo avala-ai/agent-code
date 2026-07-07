@@ -180,6 +180,16 @@ impl QueryEngine {
         }
     }
 
+    /// Install the interactive permission prompter.
+    ///
+    /// Without this, an `Ask` permission decision falls through to auto-allow
+    /// (see `tools::executor`), so the interactive TUI would silently execute
+    /// mutating tools under `ask` mode. The CLI installs a prompter on the
+    /// interactive path only; one-shot/non-interactive runs leave it unset.
+    pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
+        self.permission_prompter = Some(prompter);
+    }
+
     /// Load hooks from configuration into the registry.
     pub fn load_hooks(&mut self, hook_defs: &[crate::hooks::HookDefinition]) {
         for def in hook_defs {
@@ -670,7 +680,7 @@ impl QueryEngine {
         let base_turns = self.state.turn_count;
 
         // Agent loop: budget check → normalize → compact → call LLM → execute tools → repeat.
-        for turn in 0..max_turns {
+        'turn: for turn in 0..max_turns {
             self.state.turn_count = base_turns + turn + 1;
             self.state.is_query_active = true;
             sink.on_turn_start(turn + 1);
@@ -895,107 +905,130 @@ impl QueryEngine {
             if cache_suppressed {
                 self.state.break_cache_next = false;
             }
-            let request = ProviderRequest {
-                messages: self.state.history().to_vec(),
-                system_prompt: system_prompt.clone(),
-                tools: tool_schemas.clone(),
-                model: model.clone(),
-                max_tokens: effective_tokens,
-                temperature: None,
-                enable_caching: self.state.config.features.prompt_caching && !cache_suppressed,
-                tool_choice: Default::default(),
-                metadata: None,
-                cancel: self.cancel.clone(),
-            };
+            // Acquire the response stream, retrying transient failures IN PLACE
+            // ('acquire loop) so a network retry or model fallback does NOT burn
+            // one of the agent's max_turns — previously each retry `continue`d
+            // the outer turn loop, so with a small --max-turns a run of 429s
+            // silently exhausted the budget and returned Ok(()) (exit 0, empty
+            // output). Only size-recovery, which mutates the message history,
+            // falls back to a full outer turn iteration (`continue 'turn`).
+            let mut rx = 'acquire: loop {
+                let request = ProviderRequest {
+                    messages: self.state.history().to_vec(),
+                    system_prompt: system_prompt.clone(),
+                    tools: tool_schemas.clone(),
+                    model: model.clone(),
+                    max_tokens: effective_tokens,
+                    temperature: None,
+                    enable_caching: self.state.config.features.prompt_caching && !cache_suppressed,
+                    tool_choice: Default::default(),
+                    metadata: None,
+                    cancel: self.cancel.clone(),
+                };
 
-            let mut rx = match self.llm.stream(&request).await {
-                Ok(rx) => {
-                    retry_state.reset();
-                    rx
-                }
-                Err(e) => {
-                    let retryable = match &e {
-                        ProviderError::RateLimited { retry_after_ms } => {
-                            crate::llm::retry::RetryableError::RateLimited {
-                                retry_after: *retry_after_ms,
+                match self.llm.stream(&request).await {
+                    Ok(rx) => {
+                        retry_state.reset();
+                        break 'acquire rx;
+                    }
+                    Err(e) => {
+                        let retryable = match &e {
+                            ProviderError::RateLimited { retry_after_ms } => {
+                                crate::llm::retry::RetryableError::RateLimited {
+                                    retry_after: *retry_after_ms,
+                                }
                             }
-                        }
-                        ProviderError::Overloaded => crate::llm::retry::RetryableError::Overloaded,
-                        ProviderError::Network(_) => {
-                            crate::llm::retry::RetryableError::StreamInterrupted
-                        }
-                        other => crate::llm::retry::RetryableError::NonRetryable(other.to_string()),
-                    };
-
-                    match retry_state.next_action(&retryable, &retry_config) {
-                        crate::llm::retry::RetryAction::Retry { after } => {
-                            warn!("Retrying in {}ms", after.as_millis());
-                            tokio::time::sleep(after).await;
-                            continue;
-                        }
-                        crate::llm::retry::RetryAction::FallbackModel => {
-                            // Switch to a smaller/cheaper model for this turn.
-                            let fallback = get_fallback_model(&model);
-                            sink.on_warning(&format!("Falling back from {model} to {fallback}"));
-                            model = fallback;
-                            continue;
-                        }
-                        crate::llm::retry::RetryAction::Abort(reason) => {
-                            // Unattended retry: in non-interactive mode, retry
-                            // capacity errors with longer backoff instead of aborting.
-                            if self.config.unattended
-                                && self.state.config.features.unattended_retry
-                                && matches!(
-                                    &e,
-                                    ProviderError::Overloaded | ProviderError::RateLimited { .. }
-                                )
-                            {
-                                warn!("Unattended retry: waiting 30s for capacity");
-                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                                continue;
+                            ProviderError::Overloaded => {
+                                crate::llm::retry::RetryableError::Overloaded
                             }
-                            // Before giving up, try reactive compact for size errors.
-                            // Two-stage recovery: context collapse first, then microcompact.
-                            if let ProviderError::RequestTooLarge(body) = &e {
-                                let gap = compact::parse_prompt_too_long_gap(body);
+                            ProviderError::Network(_) => {
+                                crate::llm::retry::RetryableError::StreamInterrupted
+                            }
+                            other => {
+                                crate::llm::retry::RetryableError::NonRetryable(other.to_string())
+                            }
+                        };
 
-                                // Stage 1: Context collapse (snip middle messages).
-                                let effective = compact::effective_context_window(&model);
-                                if let Some(collapse) =
-                                    crate::services::context_collapse::collapse_to_budget(
-                                        self.state.history(),
-                                        effective,
+                        match retry_state.next_action(&retryable, &retry_config) {
+                            crate::llm::retry::RetryAction::Retry { after } => {
+                                // Log the actual cause + status, not a bare
+                                // "Retrying" — otherwise a persistent 402/429/500
+                                // is invisible even at RUST_LOG=debug.
+                                warn!("LLM call failed ({e}); retrying in {}ms", after.as_millis());
+                                tokio::time::sleep(after).await;
+                                continue 'acquire;
+                            }
+                            crate::llm::retry::RetryAction::FallbackModel => {
+                                // Switch to a smaller/cheaper model for this turn.
+                                let fallback = get_fallback_model(&model);
+                                sink.on_warning(&format!(
+                                    "Falling back from {model} to {fallback}"
+                                ));
+                                model = fallback;
+                                continue 'acquire;
+                            }
+                            crate::llm::retry::RetryAction::Abort(reason) => {
+                                // Unattended retry: in non-interactive mode, retry
+                                // capacity errors with longer backoff instead of
+                                // aborting. In place, so it doesn't consume turns.
+                                if self.config.unattended
+                                    && self.state.config.features.unattended_retry
+                                    && matches!(
+                                        &e,
+                                        ProviderError::Overloaded
+                                            | ProviderError::RateLimited { .. }
                                     )
                                 {
-                                    info!(
-                                        "Reactive collapse: snipped {} messages, freed ~{} tokens",
-                                        collapse.snipped_count, collapse.tokens_freed
-                                    );
-                                    self.state.messages = collapse.api_messages;
-                                    sink.on_compact(collapse.tokens_freed);
-                                    continue;
+                                    warn!("Unattended retry: waiting 30s for capacity");
+                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                    continue 'acquire;
                                 }
+                                // Before giving up, try reactive compact for size
+                                // errors. Two-stage recovery: context collapse
+                                // first, then microcompact. These mutate the
+                                // message history, so re-run the full turn setup
+                                // via `continue 'turn`.
+                                if let ProviderError::RequestTooLarge(body) = &e {
+                                    let gap = compact::parse_prompt_too_long_gap(body);
 
-                                // Stage 2: Aggressive microcompact.
-                                let freed = compact::microcompact(&mut self.state.messages, 1);
-                                if freed > 0 {
-                                    sink.on_compact(freed);
-                                    info!(
-                                        "Reactive microcompact freed ~{freed} tokens (gap: {gap:?})"
-                                    );
-                                    continue;
+                                    // Stage 1: Context collapse (snip middle messages).
+                                    let effective = compact::effective_context_window(&model);
+                                    if let Some(collapse) =
+                                        crate::services::context_collapse::collapse_to_budget(
+                                            self.state.history(),
+                                            effective,
+                                        )
+                                    {
+                                        info!(
+                                            "Reactive collapse: snipped {} messages, freed ~{} tokens",
+                                            collapse.snipped_count, collapse.tokens_freed
+                                        );
+                                        self.state.messages = collapse.api_messages;
+                                        sink.on_compact(collapse.tokens_freed);
+                                        continue 'turn;
+                                    }
+
+                                    // Stage 2: Aggressive microcompact.
+                                    let freed = compact::microcompact(&mut self.state.messages, 1);
+                                    if freed > 0 {
+                                        sink.on_compact(freed);
+                                        info!(
+                                            "Reactive microcompact freed ~{freed} tokens (gap: {gap:?})"
+                                        );
+                                        continue 'turn;
+                                    }
                                 }
+                                sink.on_error(&reason);
+                                self.state.is_query_active = false;
+                                // Error hooks fire once per turn that
+                                // exits in an unrecoverable error, so
+                                // audit logs / pagers / failover glue
+                                // don't need to tail stderr.
+                                let _ = self
+                                    .fire_error_hooks("llm_call_failed", &e.to_string())
+                                    .await;
+                                return Err(crate::error::Error::Other(e.to_string()));
                             }
-                            sink.on_error(&reason);
-                            self.state.is_query_active = false;
-                            // Error hooks fire once per turn that
-                            // exits in an unrecoverable error, so
-                            // audit logs / pagers / failover glue
-                            // don't need to tail stderr.
-                            let _ = self
-                                .fire_error_hooks("llm_call_failed", &e.to_string())
-                                .await;
-                            return Err(crate::error::Error::Other(e.to_string()));
                         }
                     }
                 }

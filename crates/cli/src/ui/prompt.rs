@@ -88,6 +88,49 @@ pub fn ask_permission_detailed(
     }
 }
 
+/// Adapter that lets the lib engine drive this interactive permission prompt.
+///
+/// Installed on the interactive path only (see `run_repl`); one-shot/`-p` runs
+/// leave the engine's prompter unset (auto-allow, unchanged). `ask()` is called
+/// from inside the running turn (the tool executor) while the REPL's
+/// escape-watcher thread holds the terminal in raw mode reading keypresses for
+/// steering. To keep the two from reading stdin at once, `ask()` raises
+/// `input_gate` so the watcher backs off, runs the blocking selector, restores
+/// raw mode (the selector turns it off on exit) and lowers the gate.
+pub struct TuiPrompter {
+    pub input_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl agent_code_lib::tools::PermissionPrompter for TuiPrompter {
+    fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input_preview: Option<&str>,
+    ) -> agent_code_lib::tools::PermissionResponse {
+        use agent_code_lib::tools::PermissionResponse as Lib;
+        use std::sync::atomic::Ordering;
+
+        // Signal the escape watcher to release stdin, then wait past its 100ms
+        // poll window so any in-flight read returns before we own the terminal.
+        self.input_gate.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        let response = ask_permission_detailed(tool_name, description, input_preview);
+
+        // The selector disables raw mode on exit; the watcher still needs it for
+        // the rest of the turn, so restore it before handing stdin back.
+        let _ = crossterm::terminal::enable_raw_mode();
+        self.input_gate.store(false, Ordering::SeqCst);
+
+        match response {
+            PermissionResponse::AllowOnce => Lib::AllowOnce,
+            PermissionResponse::AllowSession => Lib::AllowSession,
+            PermissionResponse::Deny => Lib::Deny,
+        }
+    }
+}
+
 /// Display a diff with theme-colored lines.
 pub fn print_colored_diff(diff: &str) {
     let t = super::theme::current();

@@ -9,7 +9,7 @@ use futures::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::codex_auth::CodexChatGptAuth;
 use super::message::{ContentBlock, Message, StopReason, Usage};
@@ -311,11 +311,14 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // Read Retry-After before text() consumes the response.
+            let ra_ms = retry_after_ms(&response, 1000);
             let body_text = response.text().await.unwrap_or_default();
+            warn!("OpenAI chat/completions API error {status}: {body_text}");
             return match status.as_u16() {
                 401 | 403 => Err(ProviderError::Auth(body_text)),
                 429 => Err(ProviderError::RateLimited {
-                    retry_after_ms: 1000,
+                    retry_after_ms: ra_ms,
                 }),
                 529 => Err(ProviderError::Overloaded),
                 413 => Err(ProviderError::RequestTooLarge(body_text)),
@@ -353,11 +356,14 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // Read Retry-After before text() consumes the response.
+            let ra_ms = retry_after_ms(&response, 1000);
             let body_text = response.text().await.unwrap_or_default();
+            warn!("OpenAI responses API error {status}: {body_text}");
             return match status.as_u16() {
                 401 | 403 => Err(ProviderError::Auth(body_text)),
                 429 => Err(ProviderError::RateLimited {
-                    retry_after_ms: 1000,
+                    retry_after_ms: ra_ms,
                 }),
                 529 => Err(ProviderError::Overloaded),
                 413 => Err(ProviderError::RequestTooLarge(body_text)),
@@ -384,6 +390,22 @@ impl Provider for OpenAiProvider {
             OpenAiApi::Responses => self.stream_responses(request).await,
         }
     }
+}
+
+/// Parse the `Retry-After` header (delta-seconds; integer or fractional) into
+/// milliseconds, so a 429 backoff honors the server's requested wait instead of
+/// a fixed guess. HTTP-date form is not parsed (unusual for LLM APIs); falls
+/// back to `default_ms` when the header is absent or unparseable. Must be called
+/// before `response.text()`, which consumes the response.
+fn retry_after_ms(response: &reqwest::Response, default_ms: u64) -> u64 {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|secs| *secs >= 0.0)
+        .map(|secs| (secs * 1000.0) as u64)
+        .unwrap_or(default_ms)
 }
 
 fn spawn_chat_completions_stream(

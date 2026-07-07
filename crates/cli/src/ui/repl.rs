@@ -847,7 +847,10 @@ impl StreamSink for TerminalSink {
 /// Returns a guard that stops the watcher on drop (restoring terminal state).
 /// Uses crossterm raw mode only while actively polling, and yields quickly
 /// to avoid competing with rustyline for stdin.
-fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
+fn spawn_escape_watcher(
+    engine: &QueryEngine,
+    input_gate: Arc<std::sync::atomic::AtomicBool>,
+) -> EscapeWatcherGuard {
     let cancel_token = engine.cancel_token();
     let steer = engine.steer_sender();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -869,6 +872,13 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
         let mut steer_buf = String::new();
 
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            // While a permission prompt owns the terminal, release stdin so the
+            // prompt's selector receives the keypresses instead of us stealing
+            // them (both read crossterm events in raw mode).
+            if input_gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
             // Poll with a short timeout to check the stop flag frequently.
             if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
                 && let Ok(Event::Key(KeyEvent {
@@ -1046,6 +1056,16 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     )));
     rl.set_helper(Some(CommandCompleter {
         model_ctx: model_ctx.clone(),
+    }));
+
+    // Interactive permission prompting. Installing a prompter makes `ask` mode
+    // actually prompt before mutating tools run — without it the engine's
+    // no-prompter fallback silently auto-allows. `input_gate` coordinates stdin
+    // between that prompt (run from inside the turn) and the per-turn escape
+    // watcher so the two don't both consume keypresses.
+    let input_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine.set_permission_prompter(std::sync::Arc::new(super::prompt::TuiPrompter {
+        input_gate: input_gate.clone(),
     }));
 
     // Repaint the prompt on terminal resize. rustyline consumes SIGWINCH
@@ -1544,7 +1564,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 }
 
                 // Run the agent turn with Escape key watcher for cancellation.
-                let esc_guard = spawn_escape_watcher(engine);
+                let esc_guard = spawn_escape_watcher(engine, input_gate.clone());
                 sink.start_indicator();
                 if let Err(e) = engine.run_turn_with_sink(input, &sink).await {
                     {
