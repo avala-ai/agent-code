@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.25.2] - 2026-07-07
+
+### Fixed
+
+- **Streamed replies no longer lose their leading characters** (#381): the activity spinner cleared its line from a background task after a 400ms delay, overwriting text that had already streamed onto that row. `stop()` now clears synchronously before the first delta is written.
+- **The input prompt survives terminal resize** (#381): after a resize the `❯` prompt was wiped and typed characters rendered bare at column 0 until `Ctrl+L`. A `SIGWINCH` watcher (Unix) now repaints the prompt on resize.
+- **Text typed while a turn is streaming is no longer discarded** (#381): keystrokes entered mid-turn are carried over and pre-filled into the next prompt instead of being dropped when the turn ends.
+- **The session turn counter is now cumulative** (#381): the footer, `/cost`, the exit summary, and the saved session previously showed `turn 1` every exchange while tokens and cost were session totals. The counter now accumulates across the session; the per-query `max_turns` budget is unchanged.
+- **Empty submissions no longer restack the status divider** (#381): pressing `Enter` on an empty line or toggling `?` redraws the divider only when the turn counter advances.
+
 ## [0.25.1] - 2026-07-07
 
 ### Changed
@@ -512,7 +522,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.1...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.2...HEAD
+[0.25.2]: https://github.com/avala-ai/agent-code/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/avala-ai/agent-code/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/avala-ai/agent-code/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/avala-ai/agent-code/compare/v0.23.0...v0.24.0
