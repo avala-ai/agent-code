@@ -22,13 +22,55 @@ pub struct SelectOption {
 }
 
 /// Show an interactive selector and return the chosen value.
+///
+/// Esc/`q` cancel by returning the currently-highlighted value (legacy
+/// behavior kept for non-security callers). For prompts where cancel must NOT
+/// fall through to a default action (e.g. permission modals), use
+/// [`select_cancellable`] instead.
 pub fn select(options: &[SelectOption]) -> String {
     if options.is_empty() {
         return String::new();
     }
+    let (index, _cancelled) = select_index(options);
+    print_choice("→", &options[index].label);
+    options[index].value.clone()
+}
 
+/// Like [`select`], but returns `None` when the user cancels with Esc/`q`
+/// instead of falling through to the highlighted option. Callers that gate a
+/// side effect on the result (permission prompts) must use this so a dismissed
+/// modal cannot silently pick the default.
+pub fn select_cancellable(options: &[SelectOption]) -> Option<String> {
+    if options.is_empty() {
+        return None;
+    }
+    let (index, cancelled) = select_index(options);
+    if cancelled {
+        print_choice("✕", "cancelled");
+        None
+    } else {
+        print_choice("→", &options[index].label);
+        Some(options[index].value.clone())
+    }
+}
+
+/// Print the confirmed/cancelled line under a dismissed selector.
+fn print_choice(marker: &str, label: &str) {
+    let t = super::theme::current();
+    println!(
+        "    {} {}\r",
+        marker.with(t.accent),
+        label.to_string().bold()
+    );
+}
+
+/// Core selector loop. Returns `(selected_index, cancelled)` where `cancelled`
+/// is true only when dismissed with Esc/`q` (as opposed to Enter or a letter
+/// hotkey).
+fn select_index(options: &[SelectOption]) -> (usize, bool) {
     let has_preview = options.iter().any(|o| o.preview.is_some());
     let mut selected = 0usize;
+    let mut cancelled = false;
 
     terminal::enable_raw_mode().expect("failed to enable raw mode");
 
@@ -52,7 +94,10 @@ pub fn select(options: &[SelectOption]) -> String {
                     };
                 }
                 KeyCode::Enter => break,
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    cancelled = true;
+                    break;
+                }
                 KeyCode::Char(c) => {
                     let idx = c.to_ascii_lowercase() as usize - 'a' as usize;
                     if idx < options.len() {
@@ -71,15 +116,8 @@ pub fn select(options: &[SelectOption]) -> String {
     terminal::disable_raw_mode().expect("failed to disable raw mode");
 
     clear_all(options.len(), has_preview);
-    let chosen = &options[selected];
-    let t = super::theme::current();
-    println!(
-        "    {} {}\r",
-        "→".with(t.accent),
-        chosen.label.clone().bold()
-    );
 
-    options[selected].value.clone()
+    (selected, cancelled)
 }
 
 /// Preview lines count (fixed height so the UI doesn't jump).

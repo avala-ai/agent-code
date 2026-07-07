@@ -979,9 +979,16 @@ impl QueryEngine {
                                             | ProviderError::RateLimited { .. }
                                     )
                                 {
+                                    // `continue 'turn`, NOT 'acquire: retry_state
+                                    // is already exhausted here, so retrying in
+                                    // place would immediately re-hit this arm and
+                                    // loop forever (one-shot runs set unattended).
+                                    // Consuming a turn keeps `max_turns` as the
+                                    // bound, so a persistently-down provider still
+                                    // terminates instead of hanging.
                                     warn!("Unattended retry: waiting 30s for capacity");
                                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                                    continue 'acquire;
+                                    continue 'turn;
                                 }
                                 // Before giving up, try reactive compact for size
                                 // errors. Two-stage recovery: context collapse

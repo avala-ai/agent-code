@@ -60,7 +60,9 @@ pub fn ask_permission_detailed(
 
     eprintln!();
 
-    let choice = super::selector::select(&[
+    // Cancellable: dismissing the modal with Esc/q must Deny, not fall through
+    // to the highlighted default (which is Allow) and execute the tool.
+    let choice = super::selector::select_cancellable(&[
         super::selector::SelectOption {
             label: "Allow".into(),
             description: "allow this action".into(),
@@ -81,9 +83,10 @@ pub fn ask_permission_detailed(
         },
     ]);
 
-    match choice.as_str() {
-        "allow_once" => PermissionResponse::AllowOnce,
-        "allow_session" => PermissionResponse::AllowSession,
+    match choice.as_deref() {
+        Some("allow_once") => PermissionResponse::AllowOnce,
+        Some("allow_session") => PermissionResponse::AllowSession,
+        // None (Esc/q cancel) or "deny" → deny.
         _ => PermissionResponse::Deny,
     }
 }
@@ -116,11 +119,16 @@ impl agent_code_lib::tools::PermissionPrompter for TuiPrompter {
         self.input_gate.store(true, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(120));
 
+        // The selector toggles raw mode on then off. Restore it only if it was
+        // already on — i.e. a watcher owns the terminal (the normal steered
+        // turn). For a command-generated turn (e.g. a slash command that runs a
+        // turn without spawning the watcher) raw mode was off and must stay off,
+        // or the next rustyline prompt would be stuck in raw mode.
+        let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
         let response = ask_permission_detailed(tool_name, description, input_preview);
-
-        // The selector disables raw mode on exit; the watcher still needs it for
-        // the rest of the turn, so restore it before handing stdin back.
-        let _ = crossterm::terminal::enable_raw_mode();
+        if was_raw {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
         self.input_gate.store(false, Ordering::SeqCst);
 
         match response {
