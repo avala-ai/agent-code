@@ -853,12 +853,12 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
 
-    let handle = std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || -> String {
         use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
         // Enable raw mode so we can capture individual keypresses.
         if crossterm::terminal::enable_raw_mode().is_err() {
-            return;
+            return String::new();
         }
 
         // Accumulates text typed during the turn. On Enter it is injected
@@ -911,6 +911,10 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
         }
 
         let _ = crossterm::terminal::disable_raw_mode();
+
+        // Return any text typed during the turn but not submitted with Enter,
+        // so the caller can seed it into the next prompt instead of losing it.
+        steer_buf
     });
 
     EscapeWatcherGuard {
@@ -922,7 +926,23 @@ fn spawn_escape_watcher(engine: &QueryEngine) -> EscapeWatcherGuard {
 /// RAII guard that stops the escape watcher thread and restores terminal state.
 struct EscapeWatcherGuard {
     stop: Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<String>>,
+}
+
+impl EscapeWatcherGuard {
+    /// Stop the watcher and return the still-unsubmitted typed text, so the
+    /// REPL can pre-fill it into the next prompt. Consumes the guard; `Drop`
+    /// remains as the panic/early-return fallback that only restores raw mode.
+    fn finish(mut self) -> String {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let leftover = self
+            .handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let _ = crossterm::terminal::disable_raw_mode();
+        leftover
+    }
 }
 
 impl Drop for EscapeWatcherGuard {
@@ -1027,6 +1047,28 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     rl.set_helper(Some(CommandCompleter {
         model_ctx: model_ctx.clone(),
     }));
+
+    // Repaint the prompt on terminal resize. rustyline consumes SIGWINCH
+    // internally but skips its line refresh at an idle prompt, so after a
+    // resize the "❯" prompt row is wiped by the terminal's reflow and typed
+    // characters render bare at column 0 until Ctrl+L. An empty external
+    // print rides rustyline's clear+repaint path (the same one Ctrl+L uses),
+    // restoring the prompt; outside readline it writes nothing.
+    {
+        use rustyline::ExternalPrinter as _;
+        if let Ok(mut winch_printer) = rl.create_external_printer() {
+            tokio::spawn(async move {
+                let Ok(mut winch) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                else {
+                    return;
+                };
+                while winch.recv().await.is_some() {
+                    let _ = winch_printer.print(String::new());
+                }
+            });
+        }
+    }
 
     // Generate a session ID for persistence. Clone for later use since
     // Stylize methods consume the String.
@@ -1162,6 +1204,12 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
     );
 
     let mut ctrl_c_pending = false;
+    // Text typed during the previous turn but not submitted with Enter,
+    // carried over to pre-fill the next prompt (see esc_guard.finish()).
+    let mut pending_input = String::new();
+    // Turn number of the last status divider printed, so empty submissions
+    // and other no-output re-prompts don't restack a duplicate divider.
+    let mut last_statusline_turn: u64 = 0;
 
     loop {
         let sink = TerminalSink::new(verbose);
@@ -1175,7 +1223,14 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
         {
             let state = engine.state();
             let statusline_cfg = &state.config.ui.statusline;
-            if state.turn_count > 0 && statusline_cfg.enabled {
+            // Only redraw the divider when the turn counter has advanced since
+            // the last one; an empty submit or `?` toggle re-enters the loop
+            // without a new turn and must not stack another divider.
+            if state.turn_count > 0
+                && statusline_cfg.enabled
+                && state.turn_count as u64 != last_statusline_turn
+            {
+                last_statusline_turn = state.turn_count as u64;
                 let term_w = crossterm::terminal::size()
                     .map(|(w, _)| w as usize)
                     .unwrap_or(80)
@@ -1243,7 +1298,15 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
             ctx.1 = engine.state().config.api.base_url.clone();
         }
 
-        match rl.readline(&prompt) {
+        // Pre-fill the prompt with any text carried over from typing during
+        // the previous turn; taken once so later prompts start empty.
+        let seed = std::mem::take(&mut pending_input);
+        let readline_result = if seed.is_empty() {
+            rl.readline(&prompt)
+        } else {
+            rl.readline_with_initial(&prompt, (&seed, ""))
+        };
+        match readline_result {
             Ok(line) => {
                 ctrl_c_pending = false;
                 let mut input_buf = line.clone();
@@ -1475,7 +1538,7 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                 }
 
                 // Run the agent turn with Escape key watcher for cancellation.
-                let _esc_guard = spawn_escape_watcher(engine);
+                let esc_guard = spawn_escape_watcher(engine);
                 sink.start_indicator();
                 if let Err(e) = engine.run_turn_with_sink(input, &sink).await {
                     {
@@ -1486,7 +1549,8 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                         ));
                     }
                 }
-                drop(_esc_guard);
+                // Carry any typed-but-unsubmitted text into the next prompt.
+                pending_input = esc_guard.finish();
                 sink.ensure_newline();
                 println!();
 
