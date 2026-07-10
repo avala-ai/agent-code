@@ -264,11 +264,12 @@ enum ScheduleAction {
 }
 
 fn run_setup_wizard() {
-    if let Some(result) = ui::setup::run_setup()
-        && !result.api_key.is_empty()
-    {
-        // SAFETY: single-threaded, before async runtime work.
-        unsafe { std::env::set_var("AGENT_CODE_API_KEY", &result.api_key) };
+    if let Some(result) = ui::setup::run_setup() {
+        // Subscription auth has no API key; only seed the env for key mode.
+        if result.auth_mode == "api_key" && !result.api_key.is_empty() {
+            // SAFETY: single-threaded, before async runtime work.
+            unsafe { std::env::set_var("AGENT_CODE_API_KEY", &result.api_key) };
+        }
     }
 }
 
@@ -544,11 +545,15 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // Determine the effective API key: CLI flag > env var (in config) > config file.
-    // If nothing found and interactive, run the setup wizard.
+    // Determine whether auth is ready: API key (CLI/env/config) or a
+    // subscription mode (ChatGPT/Codex OAuth session). If nothing found and
+    // interactive, run the setup wizard (which now offers both).
     let has_key = cli.api_key.is_some()
         || config.api.api_key.is_some()
-        || config.api.auth_mode == ApiAuthMode::CodexChatgpt;
+        || config.api.auth_mode == ApiAuthMode::CodexChatgpt
+        || std::env::var("AGENT_CODE_AUTH_MODE")
+            .map(|v| matches!(v.as_str(), "codex_chatgpt" | "chatgpt"))
+            .unwrap_or(false);
 
     // The setup wizard reads from stdin via arrow-key prompts. Run it
     // only when we're actually in an interactive REPL context — i.e.

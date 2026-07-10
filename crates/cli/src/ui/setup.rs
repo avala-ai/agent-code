@@ -106,24 +106,32 @@ pub fn run_setup() -> Option<SetupResult> {
     ]);
     println!();
 
-    // Step 2: Provider.
-    println!("  {} AI provider:\n", "2.".dark_cyan().bold());
+    // Step 2: Provider / auth method.
+    // Subscription OAuth sits first so new users with a ChatGPT plan
+    // don't have to know about API keys (or `agent login`).
+    println!("  {} AI provider / sign-in:\n", "2.".dark_cyan().bold());
     let provider_choice = select(&[
         SelectOption {
-            label: "OpenAI (GPT)".into(),
-            description: "GPT-5.4, GPT-4.1".into(),
+            label: "ChatGPT / Codex subscription".into(),
+            description: "Sign in with OpenAI account in browser (no API key)".into(),
+            value: "codex_subscription".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "OpenAI API key".into(),
+            description: "GPT-5.4, GPT-4.1 — paste OPENAI_API_KEY".into(),
             value: "openai".into(),
             preview: None,
         },
         SelectOption {
             label: "Anthropic (Claude)".into(),
-            description: "Opus, Sonnet, Haiku".into(),
+            description: "Opus, Sonnet, Haiku — API key".into(),
             value: "anthropic".into(),
             preview: None,
         },
         SelectOption {
-            label: "xAI (Grok)".into(),
-            description: "Grok-3, Grok-2".into(),
+            label: "xAI (Grok) API key".into(),
+            description: "Grok models — paste XAI_API_KEY (no subscription OAuth yet)".into(),
             value: "xai".into(),
             preview: None,
         },
@@ -176,6 +184,58 @@ pub fn run_setup() -> Option<SetupResult> {
             preview: None,
         },
     ]);
+
+    // ---- ChatGPT / Codex subscription (browser OAuth) ----
+    if provider_choice == "codex_subscription" {
+        println!();
+        println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
+        let permission_mode = select_permission_mode();
+        println!();
+        print_safety_notes(4);
+
+        println!(
+            "  {} Opening browser for ChatGPT / Codex sign-in…\n",
+            "→".dark_cyan().bold()
+        );
+        println!(
+            "    Complete the flow in your browser. This reuses the same session as the Codex CLI.\n"
+        );
+
+        match run_codex_browser_login() {
+            Ok(path) => {
+                println!(
+                    "    {} Signed in. Session saved to {}",
+                    "✓".green(),
+                    path.display()
+                );
+            }
+            Err(e) => {
+                println!("    {} Browser sign-in failed: {e}", "✗".red());
+                println!("    {}", "You can retry later with: agent login".yellow());
+                println!();
+                return None;
+            }
+        }
+        println!();
+
+        let result = SetupResult {
+            api_key: String::new(),
+            auth_mode: "codex_chatgpt".into(),
+            provider: "openai".into(),
+            base_url: Some("https://chatgpt.com/backend-api/codex".into()),
+            model: Some("gpt-5.5".into()),
+            theme: theme.clone(),
+            permission_mode,
+        };
+        write_config(&result);
+        println!(
+            "  {} Configured for ChatGPT subscription. Type {} to start.",
+            "Ready!".green().bold(),
+            "agent".bold(),
+        );
+        println!();
+        return Some(result);
+    }
 
     let (env_var, default_url, default_model) = match provider_choice.as_str() {
         "anthropic" => (
@@ -321,6 +381,7 @@ pub fn run_setup() -> Option<SetupResult> {
 
         let result = SetupResult {
             api_key: "ollama".to_string(),
+            auth_mode: "api_key".into(),
             provider: "ollama".to_string(),
             base_url: Some(default_url.to_string()),
             model: Some(ollama_model_name),
@@ -406,51 +467,15 @@ pub fn run_setup() -> Option<SetupResult> {
 
     // Step 3: Permission mode.
     println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
-    let permission_mode = select(&[
-        SelectOption {
-            label: "Ask before changes".into(),
-            description: "(recommended) confirms before edits and commands".into(),
-            value: "ask".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Auto-approve edits".into(),
-            description: "file changes automatic, commands still ask".into(),
-            value: "accept_edits".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Trust fully".into(),
-            description: "everything runs without asking".into(),
-            value: "allow".into(),
-            preview: None,
-        },
-    ]);
+    let permission_mode = select_permission_mode();
     println!();
 
     // Step 4: Safety notes.
-    println!("  {} Quick safety notes:\n", "4.".dark_cyan().bold());
-    println!(
-        "    {} The agent can read, write, and delete files",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} It can run shell commands on your machine",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} Destructive commands trigger warnings",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} Use /plan mode for read-only exploration",
-        "•".dark_grey()
-    );
-    println!("    {} No telemetry is collected", "•".dark_grey());
-    println!();
+    print_safety_notes(4);
 
     let result = SetupResult {
         api_key,
+        auth_mode: "api_key".into(),
         provider: provider_choice,
         base_url: Some(base_url),
         model: Some(model),
@@ -488,9 +513,13 @@ fn render_config_toml(result: &SetupResult) -> String {
     let mut api = toml::value::Table::new();
     api.insert("base_url".into(), base_url.into());
     api.insert("model".into(), model.into());
+    if result.auth_mode != "api_key" && !result.auth_mode.is_empty() {
+        api.insert("auth_mode".into(), result.auth_mode.clone().into());
+    }
     // Include the API key only when it's a real, persistable secret.
     // Ollama needs no key, and an empty key must not be written.
-    if !result.api_key.is_empty() && result.api_key != "ollama" {
+    // Subscription (codex_chatgpt) auth has no API key field.
+    if result.auth_mode == "api_key" && !result.api_key.is_empty() && result.api_key != "ollama" {
         api.insert("api_key".into(), result.api_key.clone().into());
     }
 
@@ -559,11 +588,81 @@ pub fn write_config(result: &SetupResult) {
 
 pub struct SetupResult {
     pub api_key: String,
+    /// `"api_key"` (default) or `"codex_chatgpt"` for ChatGPT subscription.
+    pub auth_mode: String,
     pub provider: String,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub theme: String,
     pub permission_mode: String,
+}
+
+fn select_permission_mode() -> String {
+    select(&[
+        SelectOption {
+            label: "Ask before changes".into(),
+            description: "(recommended) confirms before edits and commands".into(),
+            value: "ask".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Auto-approve edits".into(),
+            description: "file changes automatic, commands still ask".into(),
+            value: "accept_edits".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Trust fully".into(),
+            description: "everything runs without asking".into(),
+            value: "allow".into(),
+            preview: None,
+        },
+    ])
+}
+
+fn print_safety_notes(step: u8) {
+    println!(
+        "  {} Quick safety notes:\n",
+        format!("{step}.").dark_cyan().bold()
+    );
+    println!(
+        "    {} The agent can read, write, and delete files",
+        "•".dark_grey()
+    );
+    println!(
+        "    {} It can run shell commands on your machine",
+        "•".dark_grey()
+    );
+    println!(
+        "    {} Destructive commands trigger warnings",
+        "•".dark_grey()
+    );
+    println!(
+        "    {} Use /plan mode for read-only exploration",
+        "•".dark_grey()
+    );
+    println!("    {} No telemetry is collected", "•".dark_grey());
+    println!();
+}
+
+/// Run the ChatGPT/Codex browser OAuth flow on a dedicated runtime thread.
+///
+/// Setup is sync and may already be running under the main Tokio runtime
+/// (`block_on` from a worker would panic), so we always use a fresh thread.
+fn run_codex_browser_login() -> Result<std::path::PathBuf, String> {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(async {
+            agent_code_lib::llm::codex_auth::browser_login(None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| Err("login thread panicked".into()))
 }
 
 #[cfg(test)]
@@ -573,12 +672,30 @@ mod tests {
     fn result_with_key(api_key: &str) -> SetupResult {
         SetupResult {
             api_key: api_key.to_string(),
+            auth_mode: "api_key".into(),
             provider: "custom".to_string(),
             base_url: Some("https://api.openai.com/v1".to_string()),
             model: Some("gpt-5.4".to_string()),
             theme: "midnight".to_string(),
             permission_mode: "ask".to_string(),
         }
+    }
+
+    #[test]
+    fn codex_subscription_writes_auth_mode_not_api_key() {
+        let result = SetupResult {
+            api_key: String::new(),
+            auth_mode: "codex_chatgpt".into(),
+            provider: "openai".into(),
+            base_url: Some("https://chatgpt.com/backend-api/codex".into()),
+            model: Some("gpt-5.5".into()),
+            theme: "midnight".into(),
+            permission_mode: "ask".into(),
+        };
+        let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
+        assert_eq!(doc["api"]["auth_mode"].as_str(), Some("codex_chatgpt"));
+        assert_eq!(doc["api"]["model"].as_str(), Some("gpt-5.5"));
+        assert!(doc["api"].get("api_key").is_none());
     }
 
     /// Read the `api.api_key` field back out of a rendered config the
