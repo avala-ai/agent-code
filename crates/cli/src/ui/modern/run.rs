@@ -33,7 +33,7 @@ use agent_code_lib::tools::PermissionResponse;
 
 use super::app::App;
 use super::render;
-use super::sink::{ChannelSink, EngineEvent, ModernPrompter};
+use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -62,6 +62,9 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     // default), which must never happen in an interactive surface.
     let (eng_tx, eng_rx) = mpsc::unbounded_channel::<EngineEvent>();
     engine.set_permission_prompter(ModernPrompter::new(eng_tx.clone()));
+    // Route AskUserQuestion through a UI modal instead of stdin (which would
+    // hang under the alt-screen raw mode).
+    engine.set_question_asker(ModernQuestionAsker::new(eng_tx.clone()));
 
     let session = Session::new(engine);
     let mut app = App::new(model, cwd, session_id);
@@ -413,20 +416,45 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Permission modal captures all input until answered. Esc/Ctrl+C mean
     // deny (never cancel/quit from inside the modal).
     if app.phase == super::app::Phase::Permission {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Char('y')) | (_, KeyCode::Char('1')) => {
-                app.resolve_permission(PermissionResponse::AllowOnce);
-            }
-            (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
-                app.resolve_permission(PermissionResponse::AllowSession);
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('c'))
-            | (_, KeyCode::Esc)
-            | (_, KeyCode::Char('n'))
-            | (_, KeyCode::Char('3')) => {
-                app.resolve_permission(PermissionResponse::Deny);
-            }
-            _ => {}
+        use super::app::Modal;
+        match app.front_modal() {
+            Some(Modal::Permission(_)) => match (key.modifiers, key.code) {
+                (_, KeyCode::Char('y')) | (_, KeyCode::Char('1')) => {
+                    app.resolve_permission(PermissionResponse::AllowOnce);
+                }
+                (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
+                    app.resolve_permission(PermissionResponse::AllowSession);
+                }
+                (KeyModifiers::CONTROL, KeyCode::Char('c'))
+                | (_, KeyCode::Esc)
+                | (_, KeyCode::Char('n'))
+                | (_, KeyCode::Char('3')) => {
+                    app.resolve_permission(PermissionResponse::Deny);
+                }
+                _ => {}
+            },
+            Some(Modal::Plan(_)) => match (key.modifiers, key.code) {
+                (_, KeyCode::Char('a')) => {
+                    app.resolve_plan(true, false);
+                }
+                (_, KeyCode::Char('k')) => {
+                    app.resolve_plan(false, true);
+                }
+                (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+                    app.resolve_plan(false, false);
+                }
+                _ => {}
+            },
+            Some(Modal::Question(_)) => match (key.modifiers, key.code) {
+                (_, KeyCode::Up) => app.question_move(-1),
+                (_, KeyCode::Down) => app.question_move(1),
+                (_, KeyCode::Enter) => app.question_select(None),
+                (_, KeyCode::Char(c)) if c.is_ascii_digit() && c != '0' => {
+                    app.question_select(Some((c as usize - '1' as usize).min(8)));
+                }
+                _ => {}
+            },
+            None => {}
         }
         return;
     }

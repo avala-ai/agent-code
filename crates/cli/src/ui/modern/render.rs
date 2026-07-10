@@ -58,10 +58,137 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_input(frame, chunks[4], app);
 
     if app.phase == Phase::Permission
-        && let Some(pending) = app.front_permission().cloned()
+        && let Some(modal) = app.front_modal().cloned()
     {
-        draw_permission_modal(frame, area, &pending, app.pending_modal_count());
+        let behind = app.pending_modal_count();
+        match modal {
+            crate::ui::modern::app::Modal::Permission(p) => {
+                draw_permission_modal(frame, area, &p, behind)
+            }
+            crate::ui::modern::app::Modal::Plan(p) => draw_plan_modal(frame, area, &p, behind),
+            crate::ui::modern::app::Modal::Question(q) => {
+                draw_question_modal(frame, area, &q, behind)
+            }
+        }
     }
+}
+
+/// Plan-approval modal: renders the plan markdown with approve/keep/dismiss.
+fn draw_plan_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    plan: &crate::ui::modern::app::PlanReview,
+    pending_behind: usize,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if pending_behind > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {pending_behind} more pending"),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
+    }
+    // Show up to a bounded slice of the rendered plan markdown.
+    let rendered = super::markdown::render_markdown(&plan.plan_md).lines;
+    let max_body = area.height.saturating_sub(8) as usize;
+    let total = rendered.len();
+    for l in rendered.into_iter().take(max_body) {
+        lines.push(l);
+    }
+    if total > max_body {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more lines", total - max_body),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[a] approve & start   [k] keep planning   [Esc] dismiss",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let title = match &plan.path {
+        Some(p) => format!(" plan · {p} "),
+        None => " plan · proposed ".to_string(),
+    };
+    draw_modal_box(frame, area, lines, &title, Color::Cyan);
+}
+
+/// Ask-user question overlay: the current question + numbered options.
+fn draw_question_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    q: &crate::ui::modern::app::QuestionState,
+    pending_behind: usize,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if q.questions.len() > 1 {
+        lines.push(Line::from(Span::styled(
+            format!("question {} of {}", q.current + 1, q.questions.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let cur = &q.questions[q.current];
+    lines.push(Line::from(Span::styled(
+        cur.question.clone(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    for (i, opt) in cur.options.iter().enumerate() {
+        let selected = i == q.cursor;
+        let marker = if selected { "❯" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {}. {opt}", i + 1),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ move · 1–9 pick · Enter select",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let _ = pending_behind;
+    draw_modal_box(frame, area, lines, " question ", Color::Magenta);
+}
+
+/// Shared centered modal box with a border + title.
+fn draw_modal_box(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    title: &str,
+    border: Color,
+) {
+    let width = area.width.saturating_sub(6).clamp(24, 76);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(title.to_string());
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 /// Queue chips row: `⧉ queued: ❶ "…" ❷ "…"` above the prompt (plan §M5).
@@ -496,6 +623,49 @@ mod tests {
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
         assert!(s.contains("allow once"), "buffer:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn plan_and_question_modals_render() {
+        // Plan modal.
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        app.modals.push_back(crate::ui::modern::app::Modal::Plan(
+            crate::ui::modern::app::PlanReview {
+                plan_md: "# Ship it\n\n- step one".into(),
+                path: Some("/tmp/plans/ship.md".into()),
+            },
+        ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("plan · /tmp/plans/ship.md"), "plan title:\n{s}");
+        assert!(s.contains("approve & start"), "plan buttons:\n{s}");
+
+        // Question modal.
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Question(
+                crate::ui::modern::app::QuestionState {
+                    questions: vec![crate::ui::modern::sink::UiQuestion {
+                        question: "Which approach?".into(),
+                        options: vec!["MVP first".into(), "Risk first".into()],
+                    }],
+                    current: 0,
+                    cursor: 0,
+                    answers: vec![],
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("Which approach?"), "question text:\n{s}");
+        assert!(s.contains("MVP first"), "option text:\n{s}");
     }
 
     #[test]

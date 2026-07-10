@@ -8,8 +8,17 @@ use std::sync::Arc;
 
 use agent_code_lib::llm::message::Usage;
 use agent_code_lib::query::StreamSink;
-use agent_code_lib::tools::{PermissionPrompter, PermissionResponse, ToolResult};
+use agent_code_lib::tools::{
+    PermissionPrompter, PermissionResponse, QuestionAsker, ToolResult, UserQuestion,
+};
 use tokio::sync::mpsc;
+
+/// A question relayed to the UI (flattened from the engine's `UserQuestion`).
+#[derive(Debug, Clone)]
+pub struct UiQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+}
 
 /// Events emitted by the engine toward the UI.
 #[derive(Debug, Clone)]
@@ -59,6 +68,19 @@ pub enum EngineEvent {
         input_preview: Option<String>,
         respond: std::sync::mpsc::Sender<PermissionResponse>,
     },
+    /// A plan was proposed via ExitPlanMode (plan §M6). Fire-and-forget:
+    /// the UI shows it for review; the agent has already exited plan mode.
+    PlanProposed {
+        plan_md: String,
+        path: Option<String>,
+    },
+    /// The agent asked the user a multiple-choice question (AskUserQuestion).
+    /// The turn task blocks until one label per question is sent on `respond`
+    /// (dropping it fails the tool, per the QuestionAsker contract).
+    QuestionAsk {
+        questions: Vec<UiQuestion>,
+        respond: std::sync::mpsc::Sender<Vec<String>>,
+    },
 }
 
 /// Permission prompter that surfaces engine asks inside the TUI.
@@ -102,6 +124,40 @@ impl PermissionPrompter for ModernPrompter {
             return PermissionResponse::Deny;
         }
         resp_rx.recv().unwrap_or(PermissionResponse::Deny)
+    }
+}
+
+/// Question asker that surfaces `AskUserQuestion` as a UI modal instead of
+/// blocking on stdin (which would hang under the alt-screen raw mode). Like
+/// [`ModernPrompter`] it blocks the turn task on a response channel and
+/// fails closed if the UI is gone.
+pub struct ModernQuestionAsker {
+    tx: mpsc::UnboundedSender<EngineEvent>,
+}
+
+impl ModernQuestionAsker {
+    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>) -> Arc<Self> {
+        Arc::new(Self { tx })
+    }
+}
+
+impl QuestionAsker for ModernQuestionAsker {
+    fn ask(&self, questions: &[UserQuestion]) -> Result<Vec<String>, String> {
+        let ui: Vec<UiQuestion> = questions
+            .iter()
+            .map(|q| UiQuestion {
+                question: q.question.clone(),
+                options: q.options.iter().map(|o| o.label.clone()).collect(),
+            })
+            .collect();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(EngineEvent::QuestionAsk {
+                questions: ui,
+                respond: resp_tx,
+            })
+            .map_err(|_| "UI closed".to_string())?;
+        resp_rx.recv().map_err(|_| "no answer".to_string())
     }
 }
 
@@ -190,6 +246,13 @@ impl StreamSink for ChannelSink {
             agent_id: agent_id.to_string(),
             state: state.to_string(),
             headline: headline.to_string(),
+        });
+    }
+
+    fn on_plan_proposed(&self, plan_md: &str, path: Option<&str>) {
+        self.send(EngineEvent::PlanProposed {
+            plan_md: plan_md.to_string(),
+            path: path.map(str::to_string),
         });
     }
 }

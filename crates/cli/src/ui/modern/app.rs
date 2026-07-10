@@ -22,13 +22,36 @@ pub struct PendingPermission {
     pub respond: std::sync::mpsc::Sender<PermissionResponse>,
 }
 
+/// A plan proposed via ExitPlanMode, shown for review (plan §M6). Fire-and-
+/// forget — the agent has already exited plan mode; approving just closes
+/// the modal (and optionally switches out of Plan mode).
+#[derive(Debug, Clone)]
+pub struct PlanReview {
+    pub plan_md: String,
+    pub path: Option<String>,
+}
+
+/// An in-progress multi-question ask. Answers accumulate one label per
+/// question; when the last is answered, `respond` receives the full vec.
+#[derive(Debug, Clone)]
+pub struct QuestionState {
+    pub questions: Vec<super::sink::UiQuestion>,
+    /// Index of the question currently shown.
+    pub current: usize,
+    /// Highlighted option in the current question.
+    pub cursor: usize,
+    /// Chosen labels so far (one per answered question).
+    pub answers: Vec<String>,
+    pub respond: std::sync::mpsc::Sender<Vec<String>>,
+}
+
 /// A modal awaiting user input. Displayed FIFO — the front is shown; the
-/// rest wait behind a "⚠ N pending" badge (plan §M6). Currently only
-/// permission asks; plan-approval and ask-user overlays extend this enum
-/// once the engine emits their events.
+/// rest wait behind a "⚠ N pending" badge (plan §M6).
 #[derive(Debug, Clone)]
 pub enum Modal {
     Permission(PendingPermission),
+    Plan(PlanReview),
+    Question(QuestionState),
 }
 
 /// One row in the scrollable transcript.
@@ -307,14 +330,124 @@ impl App {
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
+            EngineEvent::PlanProposed { plan_md, path } => {
+                self.modals
+                    .push_back(Modal::Plan(PlanReview { plan_md, path }));
+                self.phase = Phase::Permission;
+                self.waiting_on = WaitingOn::UserInput;
+            }
+            EngineEvent::QuestionAsk { questions, respond } => {
+                if questions.is_empty() {
+                    let _ = respond.send(Vec::new());
+                } else {
+                    self.modals.push_back(Modal::Question(QuestionState {
+                        questions,
+                        current: 0,
+                        cursor: 0,
+                        answers: Vec::new(),
+                        respond,
+                    }));
+                    self.phase = Phase::Permission;
+                    self.waiting_on = WaitingOn::UserInput;
+                }
+            }
         }
     }
 
-    /// The permission ask currently displayed (front of the modal queue).
+    /// The modal currently displayed (front of the FIFO queue).
+    pub fn front_modal(&self) -> Option<&Modal> {
+        self.modals.front()
+    }
+
+    /// The permission ask currently displayed, if the front modal is one.
     pub fn front_permission(&self) -> Option<&PendingPermission> {
         match self.modals.front() {
             Some(Modal::Permission(p)) => Some(p),
-            None => None,
+            _ => None,
+        }
+    }
+
+    /// After a modal is answered, close it and return to the turn if the
+    /// queue is now empty.
+    fn advance_modal_phase(&mut self) {
+        if self.modals.is_empty() && self.phase == Phase::Permission {
+            self.phase = Phase::Streaming;
+            self.waiting_on = WaitingOn::Model;
+        }
+        self.dirty = true;
+    }
+
+    /// Resolve a plan-review modal (plan §M6): approve leaves plan behind (and
+    /// switches Plan→AcceptEdits so the follow-up can execute); keep-planning
+    /// re-enters Plan; dismiss just closes. Returns true if a plan modal was
+    /// at the front.
+    pub fn resolve_plan(&mut self, approve: bool, keep_planning: bool) -> bool {
+        if !matches!(self.modals.front(), Some(Modal::Plan(_))) {
+            return false;
+        }
+        let Some(Modal::Plan(p)) = self.modals.pop_front() else {
+            return false;
+        };
+        if approve {
+            self.transcript
+                .push(TranscriptItem::System("plan approved".into()));
+            if self.mode == SessionMode::Plan {
+                self.mode = SessionMode::AcceptEdits;
+            }
+        } else if keep_planning {
+            self.transcript
+                .push(TranscriptItem::System("staying in plan mode".into()));
+            self.mode = SessionMode::Plan;
+        } else {
+            self.transcript
+                .push(TranscriptItem::System("plan dismissed".into()));
+        }
+        // Keep the plan in the transcript for reference.
+        let _ = &p.plan_md;
+        self.advance_modal_phase();
+        true
+    }
+
+    /// Move the question cursor within the current question.
+    pub fn question_move(&mut self, delta: i32) {
+        if let Some(Modal::Question(q)) = self.modals.front_mut() {
+            let n = q.questions[q.current].options.len().max(1);
+            let cur = q.cursor as i32;
+            q.cursor = (cur + delta).rem_euclid(n as i32) as usize;
+            self.dirty = true;
+        }
+    }
+
+    /// Select the highlighted (or numbered) option for the current question,
+    /// advancing to the next question or sending all answers when done.
+    pub fn question_select(&mut self, index: Option<usize>) {
+        let done_answers = {
+            let Some(Modal::Question(q)) = self.modals.front_mut() else {
+                return;
+            };
+            let opts = &q.questions[q.current].options;
+            if opts.is_empty() {
+                return;
+            }
+            let pick = index.unwrap_or(q.cursor).min(opts.len() - 1);
+            q.answers.push(opts[pick].clone());
+            q.current += 1;
+            q.cursor = 0;
+            if q.current >= q.questions.len() {
+                Some(q.answers.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(answers) = done_answers
+            && let Some(Modal::Question(q)) = self.modals.pop_front()
+        {
+            let _ = q.respond.send(answers);
+            self.transcript
+                .push(TranscriptItem::System("answered".into()));
+            self.advance_modal_phase();
+        } else {
+            self.dirty = true;
         }
     }
 
@@ -343,9 +476,12 @@ impl App {
         self.dirty = true;
     }
 
-    /// Answer the front permission ask and advance the modal queue. When the
-    /// queue empties, focus returns to the running turn.
+    /// Answer the front permission ask and advance the modal queue. No-op if
+    /// the front modal is not a permission ask (so a mixed queue is safe).
     pub fn resolve_permission(&mut self, resp: PermissionResponse) {
+        if !matches!(self.modals.front(), Some(Modal::Permission(_))) {
+            return;
+        }
         let Some(Modal::Permission(p)) = self.modals.pop_front() else {
             return;
         };
@@ -356,18 +492,21 @@ impl App {
         };
         let _ = p.respond.send(resp);
         self.transcript.push(TranscriptItem::System(note));
-        if self.modals.is_empty() && self.phase == Phase::Permission {
-            self.phase = Phase::Streaming;
-            self.waiting_on = WaitingOn::Model;
-        }
-        self.dirty = true;
+        self.advance_modal_phase();
     }
 
-    /// Deny every queued modal (used on shutdown so blocked turn tasks in
-    /// the prompter never deadlock the join).
+    /// Fail-close every queued modal (used on shutdown so turn tasks blocked
+    /// in the prompter/asker never deadlock the join). Permission asks get
+    /// Deny; question asks get their channel dropped (recv fails closed);
+    /// plan modals are fire-and-forget.
     pub fn deny_all_modals(&mut self) {
-        while let Some(Modal::Permission(p)) = self.modals.pop_front() {
-            let _ = p.respond.send(PermissionResponse::Deny);
+        while let Some(m) = self.modals.pop_front() {
+            match m {
+                Modal::Permission(p) => {
+                    let _ = p.respond.send(PermissionResponse::Deny);
+                }
+                Modal::Question(_) | Modal::Plan(_) => {}
+            }
         }
     }
 
@@ -989,6 +1128,65 @@ mod tests {
             app.transcript.last(),
             Some(TranscriptItem::System(t)) if t.contains("allowed Bash once")
         ));
+    }
+
+    #[test]
+    fn plan_proposed_opens_modal_and_approve_switches_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.mode = SessionMode::Plan;
+        app.apply_engine(EngineEvent::TurnStart(1));
+        app.apply_engine(EngineEvent::PlanProposed {
+            plan_md: "# Plan\n\ndo the thing".into(),
+            path: Some("/tmp/plans/x.md".into()),
+        });
+        assert_eq!(app.phase, Phase::Permission);
+        assert!(matches!(app.front_modal(), Some(Modal::Plan(_))));
+        // Approve → leaves plan mode into AcceptEdits so the follow-up can run.
+        assert!(app.resolve_plan(true, false));
+        assert_eq!(app.mode, SessionMode::AcceptEdits);
+        assert_eq!(app.phase, Phase::Streaming);
+    }
+
+    #[test]
+    fn question_flow_collects_one_label_per_question() {
+        use super::super::sink::UiQuestion;
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        let (respond, rx) = std::sync::mpsc::channel();
+        app.apply_engine(EngineEvent::QuestionAsk {
+            questions: vec![
+                UiQuestion {
+                    question: "pick a".into(),
+                    options: vec!["a1".into(), "a2".into()],
+                },
+                UiQuestion {
+                    question: "pick b".into(),
+                    options: vec!["b1".into(), "b2".into()],
+                },
+            ],
+            respond,
+        });
+        assert_eq!(app.phase, Phase::Permission);
+        // Answer Q1 with option 2, Q2 by moving cursor then Enter.
+        app.question_select(Some(1)); // "a2"
+        assert!(matches!(app.front_modal(), Some(Modal::Question(_))));
+        app.question_move(1); // cursor → "b2"
+        app.question_select(None); // "b2"
+        let answers = rx.try_recv().unwrap();
+        assert_eq!(answers, vec!["a2".to_string(), "b2".to_string()]);
+        assert_eq!(app.phase, Phase::Streaming);
+    }
+
+    #[test]
+    fn empty_question_set_answers_immediately() {
+        let mut app = App::new("m", "/tmp", "s");
+        let (respond, rx) = std::sync::mpsc::channel();
+        app.apply_engine(EngineEvent::QuestionAsk {
+            questions: vec![],
+            respond,
+        });
+        assert!(rx.try_recv().unwrap().is_empty());
+        assert!(app.modals.is_empty());
     }
 
     #[test]
