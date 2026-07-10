@@ -1,7 +1,8 @@
 //! Ratatui drawing for the modern TUI.
 //!
-//! Pure function of [`App`] + area — used by both the live terminal and
-//! the `TestBackend` visual tests.
+//! `draw` takes `&mut App` only so the virtualized [`super::layout::LayoutCache`]
+//! can update during layout — the one mutation the view model permits. No I/O
+//! happens here; used by both the live terminal and the `TestBackend` tests.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,10 +10,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::app::{App, PendingPermission, Phase, TranscriptItem};
+use super::app::{App, PendingPermission, Phase};
 use super::mode::SessionMode;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -30,9 +31,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_input(frame, chunks[3], app);
 
     if app.phase == Phase::Permission
-        && let Some(ref pending) = app.pending_permission
+        && let Some(pending) = app.pending_permission.clone()
     {
-        draw_permission_modal(frame, area, pending);
+        draw_permission_modal(frame, area, &pending);
     }
 }
 
@@ -130,104 +131,74 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(title).block(block), area);
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for item in &app.transcript {
-        match item {
-            TranscriptItem::User(t) => {
-                lines.push(Line::from(vec![
-                    Span::styled("❯ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(t.clone(), Style::default().fg(Color::White)),
-                ]));
-                lines.push(Line::from(""));
-            }
-            TranscriptItem::Assistant(t) => {
-                for row in t.lines() {
-                    lines.push(Line::from(Span::raw(row.to_string())));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptItem::Thinking(t) => {
-                let preview: String = t.chars().take(120).collect();
-                lines.push(Line::from(Span::styled(
-                    format!("  thinking… {preview}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-            TranscriptItem::Tool {
-                name,
-                detail,
-                result,
-                is_error,
-            } => {
-                let color = if *is_error { Color::Red } else { Color::Yellow };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(" {name} "),
-                        Style::default().fg(Color::Black).bg(color),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(detail.clone(), Style::default().fg(Color::DarkGray)),
-                ]));
-                if let Some(r) = result {
-                    lines.push(Line::from(Span::styled(
-                        format!("   ↳ {r}"),
-                        Style::default().fg(if *is_error {
-                            Color::Red
-                        } else {
-                            Color::DarkGray
-                        }),
-                    )));
-                }
-            }
-            TranscriptItem::System(t) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  · {t}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            TranscriptItem::Error(t) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ✗ {t}"),
-                    Style::default().fg(Color::Red),
-                )));
-            }
-            TranscriptItem::Warning(t) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ! {t}"),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-        }
+/// Draw the transcript. Populates `app.layout` (the one permitted view-model
+/// side effect), then renders only the virtualized viewport slice — off-screen
+/// blocks are never copied. The `app` is `&mut` so the cache can update.
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    // Reserve the top row for the title/spinner.
+    let inner = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    let height = inner.height as usize;
+
+    // Rebuild only the changed blocks at this width; record metrics for the
+    // scroll-key handlers that run before the next draw.
+    app.layout.sync(&app.transcript, inner.width);
+    app.viewport_h = height;
+    let total = app.layout.total_lines();
+    let top = app.scroll.top(total, height);
+    let view = app.layout.viewport(top, height);
+
+    let title_block =
+        Block::default()
+            .borders(Borders::NONE)
+            .title(if app.phase == Phase::Streaming {
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let f = frames[(app.tick as usize) % frames.len()];
+                format!(" {f} streaming ")
+            } else {
+                " transcript ".into()
+            });
+    // Lines are pre-wrapped by the layout cache; no widget wrapping.
+    frame.render_widget(Paragraph::new(view).block(title_block), area);
+
+    // Jump-to-bottom pill when reading above the live tail (plan §M2).
+    let below = app.scroll.lines_below(total, height);
+    if below > 0 {
+        draw_jump_pill(frame, inner, below);
     }
+}
 
-    // Stick to bottom unless user scrolled up.
-    let height = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_off = total.saturating_sub(height);
-    let off = (app.scroll_offset as usize).min(max_off);
-    let start = total.saturating_sub(height + off);
-    let end = total.saturating_sub(off);
-    let view: Vec<Line<'static>> = lines
-        .into_iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect();
-
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .title(if app.phase == Phase::Streaming {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let f = frames[(app.tick as usize) % frames.len()];
-            format!(" {f} streaming ")
-        } else {
-            " transcript ".into()
-        });
+/// Floating "↓ N new" pill anchored bottom-right of the transcript area.
+fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
+    let label = if n > 99 {
+        " ↓ 99+ new ".to_string()
+    } else {
+        format!(" ↓ {n} new ")
+    };
+    let w = label.chars().count() as u16;
+    if area.width < w + 1 || area.height < 1 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width - w - 1,
+        y: area.y + area.height.saturating_sub(1),
+        width: w,
+        height: 1,
+    };
+    frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(view).block(block).wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        rect,
     );
 }
 
@@ -331,6 +302,7 @@ pub fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::modern::app::TranscriptItem;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -338,8 +310,8 @@ mod tests {
     fn idle_frame_contains_branding_and_mode() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        let app = App::new("gpt-5.4", "/home/user/project", "abc12345");
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = App::new("gpt-5.4", "/home/user/project", "abc12345");
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("agent-code"), "buffer:\n{s}");
         assert!(s.contains("NORMAL"), "buffer:\n{s}");
@@ -355,7 +327,7 @@ mod tests {
         app.mode = SessionMode::Plan;
         app.transcript
             .push(TranscriptItem::User("design auth".into()));
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("PLAN"), "buffer:\n{s}");
         assert!(s.contains("design auth"), "buffer:\n{s}");
@@ -374,7 +346,7 @@ mod tests {
             input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
             respond,
         });
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
         assert!(s.contains("allow once"), "buffer:\n{s}");
@@ -397,7 +369,7 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.mode = SessionMode::Plan;
         app.mode_pending = true;
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("PLAN*"), "buffer:\n{s}");
     }
@@ -413,9 +385,32 @@ mod tests {
             result: Some("ok".into()),
             is_error: false,
         });
-        term.draw(|f| draw(f, &app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("Bash"), "buffer:\n{s}");
         assert!(s.contains("cargo test"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn jump_pill_shows_when_scrolled_up() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..200 {
+            app.transcript
+                .push(TranscriptItem::System(format!("row {i}")));
+        }
+        // First draw records the viewport height, then scroll up into Free.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.scroll_up(50);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("new"), "expected jump pill; buffer:\n{s}");
+        // Following (bottom) shows no pill.
+        app.scroll_to_bottom();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s2 = buffer_to_string(term.backend().buffer());
+        assert!(!s2.contains("↓"), "no pill while following; buffer:\n{s2}");
     }
 }

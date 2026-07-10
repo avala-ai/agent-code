@@ -31,6 +31,8 @@ termimad = "0.34"
 syntect = "5"
 pulldown-cmark = "0.13"
 indicatif = "0.18"
+unicode-width = "0.2"
+unicode-segmentation = "1"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

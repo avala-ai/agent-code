@@ -4,9 +4,11 @@
 //! or `[ui] tui = "modern"`. See `docs/design/tui-modern-overhaul.md`.
 
 mod app;
+mod layout;
 mod mode;
 mod render;
 mod run;
+mod scroll;
 mod sink;
 mod stream_buffer;
 

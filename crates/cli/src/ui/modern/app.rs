@@ -5,7 +5,9 @@
 
 use agent_code_lib::tools::PermissionResponse;
 
+use super::layout::LayoutCache;
 use super::mode::SessionMode;
+use super::scroll::ScrollState;
 use super::sink::EngineEvent;
 use super::stream_buffer::StreamBuffer;
 
@@ -19,7 +21,7 @@ pub struct PendingPermission {
 }
 
 /// One row in the scrollable transcript.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -65,8 +67,14 @@ pub struct App {
     pub pending_permission: Option<PendingPermission>,
 
     pub transcript: Vec<TranscriptItem>,
-    /// Scroll offset from the bottom (0 = stick to latest).
-    pub scroll_offset: u16,
+    /// Follow/Free scroll anchor for the transcript (plan §M2).
+    pub scroll: ScrollState,
+    /// Virtualized per-block rendered-line cache. Populated during draw
+    /// (the one permitted side effect in the otherwise-pure view model).
+    pub layout: LayoutCache,
+    /// Transcript viewport height in rows, recorded on the last draw so
+    /// scroll-key handlers (which run before the next draw) have metrics.
+    pub viewport_h: usize,
 
     pub input: String,
     pub cursor: usize,
@@ -115,7 +123,9 @@ impl App {
             transcript: vec![TranscriptItem::System(
                 "Modern TUI · Shift+Tab mode · Ctrl+C cancel turn / quit · Esc clear prompt · Enter send".into(),
             )],
-            scroll_offset: 0,
+            scroll: ScrollState::Follow,
+            layout: LayoutCache::default(),
+            viewport_h: 0,
             input: String::new(),
             cursor: 0,
             turn_count: 0,
@@ -364,7 +374,34 @@ impl App {
         self.cursor = 0;
         self.pending_submit = Some(text);
         self.phase = Phase::Streaming;
-        self.scroll_offset = 0;
+        // Jump back to the live tail when the user sends.
+        self.scroll = ScrollState::Follow;
+    }
+
+    /// Scroll the transcript up by `n` display lines (enters Free).
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll
+            .scroll_up(n, self.layout.total_lines(), self.viewport_h);
+        self.dirty = true;
+    }
+
+    /// Scroll down by `n` lines (re-enters Follow at the bottom).
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll
+            .scroll_down(n, self.layout.total_lines(), self.viewport_h);
+        self.dirty = true;
+    }
+
+    /// Jump to the top of the transcript.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll.go_top();
+        self.dirty = true;
+    }
+
+    /// Jump to the bottom and resume following the live tail.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll.go_bottom();
+        self.dirty = true;
     }
 
     pub fn cycle_mode_forward(&mut self) {
@@ -410,6 +447,68 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Build a transcript tall enough to scroll, then prime layout metrics as
+    // the draw would (one System block = one wrapped line each here).
+    fn app_with_lines(n: usize, viewport_h: usize) -> App {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..n {
+            app.transcript
+                .push(TranscriptItem::System(format!("line {i}")));
+        }
+        app.layout.sync(&app.transcript, 80);
+        app.viewport_h = viewport_h;
+        app
+    }
+
+    #[test]
+    fn scroll_up_enters_free_and_shows_pill() {
+        let mut app = app_with_lines(100, 20);
+        assert!(app.scroll.is_following());
+        app.scroll_up(30);
+        assert!(!app.scroll.is_following(), "upward scroll enters Free");
+        // Lines are now hidden below the viewport → the pill would show.
+        assert!(
+            app.scroll
+                .lines_below(app.layout.total_lines(), app.viewport_h)
+                > 0
+        );
+    }
+
+    #[test]
+    fn new_content_while_free_does_not_move_viewport() {
+        let mut app = app_with_lines(100, 20);
+        app.scroll_up(40);
+        let top_before = app.scroll.top(app.layout.total_lines(), app.viewport_h);
+        // Stream 50 more lines in while the user reads.
+        for i in 0..50 {
+            app.apply_engine(EngineEvent::Text(format!("stream {i}\n")));
+        }
+        app.flush_stream();
+        app.layout.sync(&app.transcript, 80);
+        let top_after = app.scroll.top(app.layout.total_lines(), app.viewport_h);
+        assert_eq!(top_before, top_after, "viewport must not move while Free");
+    }
+
+    #[test]
+    fn end_key_returns_to_follow() {
+        let mut app = app_with_lines(100, 20);
+        app.scroll_up(30);
+        assert!(!app.scroll.is_following());
+        app.scroll_to_bottom();
+        assert!(app.scroll.is_following());
+    }
+
+    #[test]
+    fn submit_returns_to_follow() {
+        let mut app = app_with_lines(100, 20);
+        app.scroll_up(30);
+        app.input = "hi".into();
+        app.cursor = 2;
+        app.submit();
+        assert!(app.scroll.is_following(), "sending jumps back to the tail");
+    }
 
     #[test]
     fn idle_flush_does_not_dirty() {

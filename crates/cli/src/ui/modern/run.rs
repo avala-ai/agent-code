@@ -382,18 +382,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Backspace) => app.backspace(),
         (_, KeyCode::Left) => app.move_left(),
         (_, KeyCode::Right) => app.move_right(),
-        (_, KeyCode::Up) => {
-            app.scroll_offset = app.scroll_offset.saturating_add(1);
-        }
-        (_, KeyCode::Down) => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(1);
-        }
-        (_, KeyCode::PageUp) => {
-            app.scroll_offset = app.scroll_offset.saturating_add(10);
-        }
-        (_, KeyCode::PageDown) => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-        }
+        // Transcript scrolling. Up/wheel enters Free; End/Home jump.
+        (_, KeyCode::Up) => app.scroll_up(1),
+        (_, KeyCode::Down) => app.scroll_down(1),
+        (_, KeyCode::PageUp) => app.scroll_up(app.viewport_h.max(1)),
+        (_, KeyCode::PageDown) => app.scroll_down(app.viewport_h.max(1)),
+        (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.scroll_up(app.viewport_h / 2),
+        (_, KeyCode::Home) => app.scroll_to_top(),
+        (_, KeyCode::End) => app.scroll_to_bottom(),
         // Only plain / shifted characters type into the prompt; Ctrl/Alt
         // chords must not fall through as literal input.
         (m, KeyCode::Char(c))
