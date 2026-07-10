@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.26.0] - 2026-07-10
+
+### Added
+
+- **Modern full-screen TUI is now the default** (#415, #419): interactive sessions open a ratatui alt-screen UI (virtualized transcript, stream coalescing, permission/question/plan modals, queue chips, tasks pane, classic theme accent). Opt into the classic rustyline REPL with `--tui classic`, `AGENT_CODE_TUI=classic`, or `[ui] tui = "classic"`.
+- **TUI engine surface** (#416): `StreamSink` / `Session::spawn_turn` / live mode + HITL permission and question prompters, `ApplyPatch` tool, and plan-mode tools that stream plan events without holding the UI on the engine lock.
+- **SuperGrok / X Premium subscription login** (#415): `agent login xai` (device-code OAuth), `--auth-mode xai_oauth`, first-run setup subscription rows, and reuse of an existing official `grok login` session at `~/.grok/auth.json`. ChatGPT/Codex subscription login remains available via `agent login codex` / setup.
+- **Mintlify docs site config** (#417): `docs/docs.json` for agent-code.org (replaces `mint.json`).
+
+### Fixed
+
+- **Modern TUI dogfood polish** (#419): skill slash expansion (honors `disable_skill_shell_execution`), `/model` list and switch without a broken stdin selector, Ctrl+C / Esc interrupt and double-press quit, bracketed paste, sticky permission key hints (`[y]` / `[a]` / `[n]`), and classic purple accent highlight color.
+
 ## [0.25.3] - 2026-07-07
 
 ### Security
@@ -536,7 +549,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.25.3...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/avala-ai/agent-code/compare/v0.25.3...v0.26.0
 [0.25.3]: https://github.com/avala-ai/agent-code/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/avala-ai/agent-code/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/avala-ai/agent-code/compare/v0.25.0...v0.25.1
