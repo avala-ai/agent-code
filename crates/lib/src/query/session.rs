@@ -13,31 +13,62 @@
 //! `Session` only owns the turn's *lifecycle*.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{QueryEngine, StreamSink, TurnStatus};
+use crate::config::PermissionMode;
 use crate::error::{Error, Result};
+use crate::permissions::PermissionChecker;
 
 /// Owns a [`QueryEngine`] behind a shared async mutex so turns can run
 /// on detached tasks.
 #[derive(Clone)]
 pub struct Session {
     engine: Arc<Mutex<QueryEngine>>,
+    /// Lock-free plan-mode flag (same Arc the engine uses).
+    live_plan_mode: Arc<AtomicBool>,
+    /// Live permission checker (same Arc the tool executor uses).
+    permissions: Arc<PermissionChecker>,
 }
 
 impl Session {
     /// Wrap an engine for spawnable-turn execution.
     pub fn new(engine: QueryEngine) -> Self {
+        let live_plan_mode = engine.live_plan_mode_handle();
+        let permissions = engine.permissions_handle();
         Self {
             engine: Arc::new(Mutex::new(engine)),
+            live_plan_mode,
+            permissions,
         }
     }
 
     /// Access the shared engine (e.g. to read state between turns).
     pub fn engine(&self) -> Arc<Mutex<QueryEngine>> {
         self.engine.clone()
+    }
+
+    /// Apply session interaction mode without waiting on the turn mutex.
+    ///
+    /// Mid-turn Shift+Tab must take effect at the **next** permission
+    /// decision; the turn task holds `engine` exclusively, so this path
+    /// mutates the shared live handles only.
+    pub fn apply_live_mode(&self, plan_mode: bool, permission_mode: PermissionMode) {
+        self.live_plan_mode.store(plan_mode, Ordering::SeqCst);
+        self.permissions.set_default_mode(permission_mode);
+    }
+
+    /// Shared permission checker (for tests / advanced UI wiring).
+    pub fn permissions(&self) -> Arc<PermissionChecker> {
+        self.permissions.clone()
+    }
+
+    /// Whether live plan mode is currently enabled.
+    pub fn live_plan_mode(&self) -> bool {
+        self.live_plan_mode.load(Ordering::SeqCst)
     }
 
     /// Subscribe to the engine's turn-status stream.

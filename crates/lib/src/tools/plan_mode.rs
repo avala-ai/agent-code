@@ -183,7 +183,7 @@ impl Tool for ExitPlanModeTool {
         input: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let plan_path = if let Some(p) = input.get("plan_path").and_then(|v| v.as_str()) {
+        let mut plan_path = if let Some(p) = input.get("plan_path").and_then(|v| v.as_str()) {
             PathBuf::from(p)
         } else {
             match active_plan_path() {
@@ -201,7 +201,12 @@ impl Tool for ExitPlanModeTool {
         // the write path that remains available while plan_mode blocks
         // FileWrite/FileEdit/Bash (query loop sets plan_mode immediately after
         // EnterPlanMode succeeds).
+        //
+        // Security: only allow writes under the session plan directory so
+        // ExitPlanMode cannot be used as an unprompted arbitrary file write
+        // (it is classified read-only for executor purposes).
         if let Some(plan_md) = input.get("plan").and_then(|v| v.as_str()) {
+            plan_path = ensure_path_under_plan_dir(&plan_path)?;
             if let Some(parent) = plan_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -211,8 +216,6 @@ impl Tool for ExitPlanModeTool {
                     plan_path.display()
                 ))
             })?;
-            // Keep the active pointer aligned when the model wrote via `plan`
-            // without having an active session pointer (explicit plan_path).
             let _ = set_active_plan_path(&plan_path);
         }
 
@@ -276,6 +279,58 @@ fn plan_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agent-code")
         .join("plans")
+}
+
+/// Reject plan_path values that escape the plans directory.
+fn ensure_path_under_plan_dir(path: &Path) -> Result<PathBuf, ToolError> {
+    let root = plan_dir();
+    let _ = std::fs::create_dir_all(&root);
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| ToolError::ExecutionFailed(format!("plan dir unavailable: {e}")))?;
+
+    // Absolute paths must resolve under root; relative paths are joined under root.
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root_canon.join(path)
+    };
+
+    // For non-existent files, canonicalize the parent and re-join the name.
+    let checked = if candidate.exists() {
+        candidate.canonicalize().map_err(|e| {
+            ToolError::ExecutionFailed(format!("invalid plan path {}: {e}", candidate.display()))
+        })?
+    } else {
+        let parent = candidate.parent().unwrap_or(Path::new("."));
+        let file = candidate
+            .file_name()
+            .ok_or_else(|| ToolError::ExecutionFailed("plan path missing file name".into()))?;
+        let parent_canon = if parent.exists() {
+            parent.canonicalize().map_err(|e| {
+                ToolError::ExecutionFailed(format!("invalid plan parent {}: {e}", parent.display()))
+            })?
+        } else if parent == Path::new("") || parent == Path::new(".") {
+            root_canon.clone()
+        } else {
+            // Refuse creating nested dirs outside the plan root.
+            return Err(ToolError::ExecutionFailed(format!(
+                "plan path must be inside {}: {}",
+                root_canon.display(),
+                candidate.display()
+            )));
+        };
+        parent_canon.join(file)
+    };
+
+    if !checked.starts_with(&root_canon) {
+        return Err(ToolError::ExecutionFailed(format!(
+            "plan path must be inside {}: {}",
+            root_canon.display(),
+            checked.display()
+        )));
+    }
+    Ok(checked)
 }
 
 fn active_plan_pointer() -> PathBuf {
@@ -516,5 +571,25 @@ mod tests {
         let legacy = "# Plan\n\n(describe what needs to be accomplished)\n\
                       (outline the steps)\n(list files and what changes each needs)\n";
         assert!(looks_like_template(legacy));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_rejects_write_outside_plan_dir() {
+        let ctx = test_ctx();
+        let outside = std::env::temp_dir().join(format!(
+            "agent-code-plan-escape-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+        let exit = ExitPlanModeTool
+            .call(
+                json!({
+                    "plan_path": outside.to_string_lossy(),
+                    "plan": "# Plan\n\nshould not land outside plan dir\n",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(exit.is_err() || exit.as_ref().unwrap().is_error);
+        assert!(!outside.exists(), "must not write outside plan dir");
     }
 }

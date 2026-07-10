@@ -87,9 +87,16 @@ pub struct QueryEngine {
     /// steered input is injected as a user message before the next LLM
     /// call (see [`Self::run_turn_inner`]).
     steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Live plan-mode flag readable at every tool decision without the
+    /// engine mutex (mid-turn Shift+Tab / EnterPlanMode).
+    live_plan_mode: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Callback for streaming events to the UI.
+///
+/// New methods are optional with defaults so classic REPL / JSON / serve /
+/// modern adapters keep compiling. Prefer implementing the call-id variants
+/// when correlating tool cards in a fullscreen pager (M0 surface).
 pub trait StreamSink: Send + Sync {
     fn on_text(&self, text: &str);
     fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value);
@@ -102,6 +109,34 @@ pub trait StreamSink: Send + Sync {
     fn on_usage(&self, _usage: &Usage) {}
     fn on_compact(&self, _freed_tokens: u64) {}
     fn on_warning(&self, _msg: &str) {}
+
+    /// Tool started with stable `call_id` for UI card correlation.
+    /// Default forwards to [`Self::on_tool_start`].
+    fn on_tool_call_start(&self, _call_id: &str, tool_name: &str, input: &serde_json::Value) {
+        self.on_tool_start(tool_name, input);
+    }
+
+    /// Tool finished with `call_id`. Default forwards to [`Self::on_tool_result`].
+    fn on_tool_call_result(
+        &self,
+        _call_id: &str,
+        tool_name: &str,
+        result: &crate::tools::ToolResult,
+    ) {
+        self.on_tool_result(tool_name, result);
+    }
+
+    /// Streaming tool stdout/stderr chunk (bash-like tools). Default no-op.
+    fn on_tool_output(&self, _call_id: &str, _chunk: &str) {}
+
+    /// Cheap running context meter (used, max). UI must not re-scan history.
+    fn on_context_usage(&self, _used: u64, _max: u64) {}
+
+    /// Background / typed subagent lifecycle update.
+    fn on_subagent_update(&self, _agent_id: &str, _state: &str, _headline: &str) {}
+
+    /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
+    fn on_turn_outcome(&self, _turn: usize, _outcome: &str) {}
 }
 
 /// A no-op stream sink for non-interactive mode.
@@ -151,6 +186,7 @@ impl QueryEngine {
         let cancel = CancellationToken::new();
         let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let live_plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(state.plan_mode));
         Self {
             llm,
             tools,
@@ -177,7 +213,41 @@ impl QueryEngine {
             turn_status: tokio::sync::watch::channel(TurnStatus::Idle).0,
             steer_tx,
             steer_rx,
+            live_plan_mode,
         }
+    }
+
+    /// Shared permission checker (same Arc the tool executor uses).
+    pub fn permissions_handle(&self) -> Arc<PermissionChecker> {
+        self.permissions.clone()
+    }
+
+    /// Live plan-mode flag (lock-free mid-turn updates).
+    pub fn live_plan_mode_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.live_plan_mode.clone()
+    }
+
+    /// Set plan mode for the next permission / executor check without
+    /// needing exclusive access to conversation state.
+    pub fn set_live_plan_mode(&self, enabled: bool) {
+        self.live_plan_mode
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Effective plan mode: live flag wins, then AppState.
+    pub fn effective_plan_mode(&self) -> bool {
+        self.live_plan_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.state.plan_mode
+    }
+
+    /// Emit a cheap context-usage estimate to the sink (used/max).
+    fn emit_context_usage(&self, sink: &dyn StreamSink) {
+        let used = crate::services::tokens::estimate_context_tokens(&self.state.messages);
+        // Model context windows vary; a fixed ceiling is enough for a
+        // status-bar ratio until a per-model table is wired.
+        const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+        sink.on_context_usage(used, DEFAULT_CONTEXT_WINDOW);
     }
 
     /// Install the interactive permission prompter.
@@ -1071,7 +1141,7 @@ impl QueryEngine {
                                     ref input,
                                 } = block
                                 {
-                                    sink.on_tool_start(name, input);
+                                    sink.on_tool_call_start(id, name, input);
 
                                     // Start read-only tools immediately during streaming.
                                     if let Some(tool) = self.tools.get(name)
@@ -1163,6 +1233,7 @@ impl QueryEngine {
 
             if cancelled {
                 sink.on_warning("Cancelled");
+                sink.on_turn_outcome(turn + 1, "cancelled");
                 self.state.is_query_active = false;
                 return Ok(());
             }
@@ -1179,6 +1250,7 @@ impl QueryEngine {
             });
             self.state.push_message(assistant_msg);
             self.state.record_usage(&usage, &model);
+            self.emit_context_usage(sink);
 
             // Token budget tracking per turn.
             if self.state.config.features.token_budget && usage.total() > 0 {
@@ -1275,6 +1347,7 @@ impl QueryEngine {
                 // No tools requested — turn is complete.
                 info!("Turn complete (no tool calls)");
                 sink.on_turn_complete(turn + 1);
+                sink.on_turn_outcome(turn + 1, "done");
                 self.state.is_query_active = false;
 
                 // PostTurn hooks fire on successful completion. Not fired
@@ -1335,7 +1408,7 @@ impl QueryEngine {
                 cancel: self.cancel.clone(),
                 permission_checker: self.permissions.clone(),
                 verbose: self.config.verbose,
-                plan_mode: self.state.plan_mode,
+                plan_mode: self.effective_plan_mode(),
                 file_cache: Some(self.file_cache.clone()),
                 denial_tracker: Some(self.denial_tracker.clone()),
                 task_manager: Some(self.state.task_manager.clone()),
@@ -1498,17 +1571,19 @@ impl QueryEngine {
                     match result.tool_name.as_str() {
                         "EnterPlanMode" => {
                             self.state.plan_mode = true;
+                            self.set_live_plan_mode(true);
                             info!("Plan mode enabled");
                         }
                         "ExitPlanMode" => {
                             self.state.plan_mode = false;
+                            self.set_live_plan_mode(false);
                             info!("Plan mode disabled");
                         }
                         _ => {}
                     }
                 }
 
-                sink.on_tool_result(&result.tool_name, &result.result);
+                sink.on_tool_call_result(&result.tool_use_id, &result.tool_name, &result.result);
 
                 // Fire post-tool-use hooks.
                 self.hooks
@@ -1549,6 +1624,7 @@ impl QueryEngine {
 
         warn!("Max turns ({max_turns}) reached");
         sink.on_warning(&format!("Agent stopped after {max_turns} turns"));
+        sink.on_turn_outcome(max_turns, "max_turns");
         self.state.is_query_active = false;
         Ok(())
     }
