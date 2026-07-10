@@ -370,6 +370,9 @@ async fn async_main() -> anyhow::Result<()> {
                 println!(
                     "Run agent-code on your subscription with:\n  agent --auth-mode xai_oauth --model grok-build-0.1"
                 );
+                println!(
+                    "(Also works if you already ran `grok login` — agent-code reuses ~/.grok/auth.json.)"
+                );
                 return Ok(());
             }
             other => {

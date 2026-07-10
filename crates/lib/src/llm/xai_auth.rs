@@ -54,32 +54,47 @@ pub struct XaiOauthAuth {
 }
 
 impl XaiOauthAuth {
-    /// Load tokens from the default config-dir store (or `path` override).
+    /// Load tokens from, in order:
+    /// 1. explicit `path` if given
+    /// 2. agent-code store (`~/.config/agent-code/xai_auth.json`)
+    /// 3. official Grok CLI store (`~/.grok/auth.json`) — same client id
+    ///
+    /// So `grok login` sessions work with `agent --auth-mode xai_oauth`
+    /// without a second sign-in (mirrors Codex reusing `~/.codex`).
     pub fn load(path: Option<&Path>) -> Result<Self, ProviderError> {
-        let path = match path {
-            Some(p) => p.to_path_buf(),
-            None => default_auth_path()?,
+        let candidates: Vec<PathBuf> = if let Some(p) = path {
+            vec![p.to_path_buf()]
+        } else {
+            let mut v = Vec::new();
+            if let Ok(p) = default_auth_path() {
+                v.push(p);
+            }
+            if let Some(p) = grok_cli_auth_path() {
+                v.push(p);
+            }
+            v
         };
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            ProviderError::Auth(format!(
-                "xAI Grok OAuth not found at {}: {e}. Run `agent login xai` first.",
-                path.display()
-            ))
-        })?;
-        let tokens: StoredTokens = serde_json::from_str(&raw).map_err(|e| {
-            ProviderError::Auth(format!("invalid xAI OAuth file {}: {e}", path.display()))
-        })?;
-        if tokens.access_token.is_empty() || tokens.refresh_token.is_empty() {
-            return Err(ProviderError::Auth(format!(
-                "xAI OAuth file {} is missing tokens. Run `agent login xai`.",
-                path.display()
-            )));
+
+        let mut last_err = String::from(
+            "no xAI OAuth session found. Run `agent login xai` or `grok login`, then retry.",
+        );
+        for path in &candidates {
+            if !path.exists() {
+                continue;
+            }
+            match load_tokens_from_file(path) {
+                Ok(tokens) => {
+                    debug!("loaded xAI OAuth session from {}", path.display());
+                    return Ok(Self {
+                        path: path.clone(),
+                        tokens: Mutex::new(tokens),
+                        http: reqwest::Client::new(),
+                    });
+                }
+                Err(e) => last_err = e.to_string(),
+            }
         }
-        Ok(Self {
-            path,
-            tokens: Mutex::new(tokens),
-            http: reqwest::Client::new(),
-        })
+        Err(ProviderError::Auth(last_err))
     }
 
     /// Return a valid access token, refreshing if near expiry.
@@ -177,7 +192,18 @@ impl XaiOauthAuth {
             if let Some(secs) = expires_in {
                 g.expires_at = Some(now_unix().saturating_add(secs));
             }
-            persist_tokens(&self.path, &g)?;
+            // Never rewrite the official Grok CLI multi-entry auth.json as
+            // our flat format — persist refreshed tokens into agent-code's
+            // own store instead.
+            let write_path = if is_grok_cli_auth_path(&self.path) {
+                default_auth_path()?
+            } else {
+                self.path.clone()
+            };
+            if let Some(parent) = write_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            persist_tokens(&write_path, &g)?;
         }
         debug!("refreshed xAI OAuth access token");
         Ok(())
@@ -199,23 +225,27 @@ pub async fn device_code_login(open_browser: bool) -> Result<PathBuf, ProviderEr
         .clone()
         .unwrap_or_else(|| device.verification_uri.clone());
 
+    // Match official `grok login` UX so headless/SSH is obvious.
     eprintln!();
-    eprintln!("To continue SuperGrok / X Premium sign-in:");
-    eprintln!("  1. Open: {verification_url}");
-    eprintln!("  2. If prompted, enter code: {}", device.user_code);
+    eprintln!("To sign in, open this URL in your browser:");
+    eprintln!();
+    eprintln!("  {verification_url}");
+    eprintln!();
+    eprintln!("Confirm this code in your browser:");
+    eprintln!();
+    eprintln!("  {}", device.user_code);
+    eprintln!();
+    eprintln!("Only continue with a code you requested. Don't share it with anyone.");
+    eprintln!();
     if open_browser {
         match try_open_browser(&verification_url) {
-            Ok(()) => eprintln!("  (Opened browser)"),
+            Ok(()) => {}
             Err(e) => {
                 warn!("could not open browser automatically: {e}");
-                eprintln!("  (Could not open browser — use the URL above)");
             }
         }
     }
-    eprintln!(
-        "Waiting for approval (polling every {}s)...",
-        device.interval.max(1)
-    );
+    eprintln!("Waiting for authorization...");
 
     let tokens = poll_device_token(
         &http,
@@ -252,6 +282,129 @@ fn default_auth_path() -> Result<PathBuf, ProviderError> {
         ProviderError::Auth("could not resolve agent-code config directory".into())
     })?;
     Ok(dir.join("xai_auth.json"))
+}
+
+/// Official Grok CLI auth file (`grok login` / `grok login --device-auth`).
+fn grok_cli_auth_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        let p = PathBuf::from(home).join("auth.json");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".grok").join("auth.json"))
+}
+
+fn is_grok_cli_auth_path(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("auth.json")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == ".grok" || n.contains("grok"))
+}
+
+/// Parse either our flat `StoredTokens` JSON or the Grok CLI multi-entry map.
+fn load_tokens_from_file(path: &Path) -> Result<StoredTokens, ProviderError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ProviderError::Auth(format!("read {}: {e}", path.display())))?;
+    // 1) agent-code shape
+    if let Ok(tokens) = serde_json::from_str::<StoredTokens>(&raw)
+        && !tokens.access_token.is_empty()
+        && !tokens.refresh_token.is_empty()
+    {
+        return Ok(tokens);
+    }
+    // 2) Grok CLI shape: { "https://auth.x.ai::<client_id>": { key, refresh_token, expires_at, ... } }
+    if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+        && let Some(tokens) = parse_grok_cli_auth_map(&map)
+    {
+        return Ok(tokens);
+    }
+    Err(ProviderError::Auth(format!(
+        "unrecognized xAI OAuth file format at {} (expected agent-code or grok CLI auth.json)",
+        path.display()
+    )))
+}
+
+fn parse_grok_cli_auth_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<StoredTokens> {
+    // Prefer the entry for our known client id; else first usable entry.
+    let preferred_key = format!("{ISSUER}::{CLIENT_ID}");
+    let order: Vec<&String> = {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort_by_key(|k| if *k == &preferred_key { 0 } else { 1 });
+        keys
+    };
+    for k in order {
+        let Some(entry) = map.get(k).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        // Grok CLI stores the access token under `key`.
+        let Some(access) = entry
+            .get("key")
+            .or_else(|| entry.get("access_token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(refresh) = entry
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let expires_at = entry
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_unix)
+            .or_else(|| entry.get("expires_at").and_then(|v| v.as_u64()));
+        let token_endpoint = entry
+            .get("oidc_issuer")
+            .and_then(|v| v.as_str())
+            .map(|iss| format!("{}/oauth2/token", iss.trim_end_matches('/')))
+            .or_else(|| Some(format!("{ISSUER}/oauth2/token")));
+        return Some(StoredTokens {
+            access_token: access.to_string(),
+            refresh_token: refresh.to_string(),
+            id_token: entry
+                .get("id_token")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            expires_at,
+            token_endpoint,
+            base_url: Some(DEFAULT_INFERENCE_BASE.to_string()),
+        });
+    }
+    None
+}
+
+fn parse_rfc3339_unix(s: &str) -> Option<u64> {
+    // Accept "2026-07-10T12:17:28.383999638Z" — chrono if available, else rough parse.
+    // Prefer chrono since the crate already depends on it elsewhere in lib.
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp().max(0) as u64)
+        .or_else(|| {
+            // Truncate fractional seconds if too long for chrono
+            let trimmed = if let Some((main, rest)) = s.split_once('.') {
+                let frac: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .take(6)
+                    .collect();
+                let tz = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+                format!("{main}.{frac}{tz}")
+            } else {
+                s.to_string()
+            };
+            chrono::DateTime::parse_from_rfc3339(&trimmed)
+                .ok()
+                .map(|dt| dt.timestamp().max(0) as u64)
+        })
 }
 
 fn now_unix() -> u64 {
@@ -494,5 +647,35 @@ mod tests {
         let g = auth.tokens.lock().unwrap();
         assert_eq!(g.access_token, "access");
         assert_eq!(g.refresh_token, "refresh");
+    }
+
+    #[test]
+    fn load_grok_cli_auth_json_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Shape produced by official `grok login` (redacted values).
+        let body = serde_json::json!({
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "key": "access-token-from-grok-cli",
+                "auth_mode": "oidc",
+                "refresh_token": "refresh-token-from-grok-cli",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "oidc_issuer": "https://auth.x.ai",
+                "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828"
+            }
+        });
+        std::fs::write(&path, body.to_string()).unwrap();
+        let auth = XaiOauthAuth::load(Some(&path)).unwrap();
+        let g = auth.tokens.lock().unwrap();
+        assert_eq!(g.access_token, "access-token-from-grok-cli");
+        assert_eq!(g.refresh_token, "refresh-token-from-grok-cli");
+        assert!(g.expires_at.unwrap() > now_unix());
+    }
+
+    #[test]
+    fn parse_rfc3339_with_long_fractional_nanos() {
+        // Grok CLI emits nanosecond fractions longer than chrono's default.
+        let ts = parse_rfc3339_unix("2026-07-10T12:17:28.383999638Z");
+        assert!(ts.is_some());
     }
 }

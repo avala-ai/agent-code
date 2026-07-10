@@ -73,7 +73,8 @@ agent --auth-mode xai_oauth --model grok-build-0.1
 ```
 
 First-run setup also offers both subscription options. Already signed in via the
-`codex` CLI? agent-code reuses that `~/.codex` session automatically.
+`codex` CLI? agent-code reuses that `~/.codex` session. Already ran `grok login`?
+agent-code reuses `~/.grok/auth.json` the same way.
 
 ## Input Modes
 
