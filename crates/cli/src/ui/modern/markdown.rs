@@ -19,6 +19,8 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use super::colors::palette;
+
 /// A clickable link discovered while rendering (line index + column range +
 /// destination). Consumed by mouse/OSC-8 handling in a later milestone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +116,9 @@ impl Builder {
             s = s.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.link.is_some() {
-            s = s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+            s = s
+                .fg(palette().accent)
+                .add_modifier(Modifier::UNDERLINED);
         }
         s
     }
@@ -192,7 +196,7 @@ impl Builder {
             }
             Event::TaskListMarker(done) => {
                 let mark = if done { "[x] " } else { "[ ] " };
-                self.push_text(mark, Style::default().fg(Color::Cyan));
+                self.push_text(mark, Style::default().fg(palette().accent));
             }
             _ => {}
         }
@@ -225,7 +229,7 @@ impl Builder {
                     _ => "• ".to_string(),
                 };
                 self.push_text(&indent, Style::default());
-                self.push_text(&marker, Style::default().fg(Color::Cyan));
+                self.push_text(&marker, Style::default().fg(palette().accent));
             }
             Tag::BlockQuote(_) => self.quote_depth += 1,
             Tag::CodeBlock(kind) => {
