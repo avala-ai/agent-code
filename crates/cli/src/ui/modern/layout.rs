@@ -66,15 +66,32 @@ impl LayoutCache {
         if width_changed {
             self.blocks.clear();
         }
-        // Truncate to current length (blocks removed, e.g. /clear).
-        self.blocks.truncate(items.len());
 
-        for (i, item) in items.iter().enumerate() {
-            let hash = hash_item(item);
+        // Fold consecutive read-only successes into groups (plan §M4); the
+        // cache is keyed by display block, not raw item, so a group's hash
+        // changes if any member does.
+        let display = super::toolcard::plan_display(items);
+        self.blocks.truncate(display.len());
+
+        for (i, d) in display.iter().enumerate() {
+            let (hash, render): (u64, Box<dyn Fn() -> Vec<Line<'static>>>) = match d {
+                super::toolcard::Display::Single(idx) => {
+                    let item = &items[*idx];
+                    (hash_item(item), Box::new(move || render_item(item)))
+                }
+                super::toolcard::Display::Group(idxs) => {
+                    let mut h = DefaultHasher::new();
+                    "group".hash(&mut h);
+                    for &idx in idxs {
+                        items[idx].hash(&mut h);
+                    }
+                    (h.finish(), Box::new(move || render_group(items, idxs)))
+                }
+            };
             match self.blocks.get(i) {
                 Some(c) if c.hash == hash => {} // fresh
                 _ => {
-                    let lines = wrap_lines(render_item(item), width);
+                    let lines = wrap_lines(render(), width);
                     let entry = Cached { hash, lines };
                     if i < self.blocks.len() {
                         self.blocks[i] = entry;
@@ -165,27 +182,7 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
             detail,
             result,
             is_error,
-        } => {
-            let color = if *is_error { Color::Red } else { Color::Yellow };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {name} "),
-                    Style::default().fg(Color::Black).bg(color),
-                ),
-                Span::raw(" "),
-                Span::styled(detail.clone(), Style::default().fg(Color::DarkGray)),
-            ]));
-            if let Some(r) = result {
-                lines.push(Line::from(Span::styled(
-                    format!("   ↳ {r}"),
-                    Style::default().fg(if *is_error {
-                        Color::Red
-                    } else {
-                        Color::DarkGray
-                    }),
-                )));
-            }
-        }
+        } => lines.extend(render_tool_card(name, detail, result.as_deref(), *is_error)),
         TranscriptItem::System(t) => {
             lines.push(Line::from(Span::styled(
                 format!("  · {t}"),
@@ -206,6 +203,81 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// Render a typed tool card (plan §M4): kind icon + label + status glyph,
+/// with the result line dim on success and red (kept visible) on error.
+fn render_tool_card(
+    name: &str,
+    detail: &str,
+    result: Option<&str>,
+    is_error: bool,
+) -> Vec<Line<'static>> {
+    use super::toolcard::ToolKind;
+    let kind = ToolKind::classify(name);
+    let (glyph, status_color) = match (result, is_error) {
+        (None, _) => ("⚡", Color::Yellow),      // running
+        (Some(_), false) => ("✓", Color::Green), // ok
+        (Some(_), true) => ("✗", Color::Red),    // failed
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(status_color)),
+        Span::styled(
+            format!("{} {} ", kind.icon(), kind.label()),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("· ", Style::default().fg(Color::DarkGray)),
+        Span::styled(detail.to_string(), Style::default().fg(Color::Gray)),
+    ])];
+    // Errors keep their output visible; successes show a dim one-line summary.
+    if let Some(r) = result
+        && !r.is_empty()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("   ↳ {r}"),
+            Style::default().fg(if is_error {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        )));
+    }
+    lines
+}
+
+/// Render a folded read-only group as a single summary line (plan §M4):
+/// `▸ read N (first, second, …)`.
+fn render_group(items: &[TranscriptItem], idxs: &[usize]) -> Vec<Line<'static>> {
+    let details: Vec<String> = idxs
+        .iter()
+        .filter_map(|&i| match &items[i] {
+            TranscriptItem::Tool { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .collect();
+    let shown = details
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if details.len() > 2 { ", …" } else { "" };
+    let n = idxs.len();
+    vec![Line::from(vec![
+        Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("read {n} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({shown}{more})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])]
 }
 
 /// Wrap logical lines to `width` display columns, unicode-width aware.
@@ -319,6 +391,53 @@ mod tests {
                 assert!(w <= width, "line width {w} exceeds {width}");
             }
         }
+    }
+
+    fn read_ok(detail: &str) -> TranscriptItem {
+        TranscriptItem::Tool {
+            name: "FileRead".into(),
+            detail: detail.into(),
+            result: Some("42 lines".into()),
+            is_error: false,
+        }
+    }
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn three_reads_render_as_one_group_line() {
+        let mut c = LayoutCache::default();
+        let items = vec![read_ok("a.rs"), read_ok("b.rs"), read_ok("c.rs")];
+        c.sync(&items, 80);
+        // One folded block → one display line "▸ read 3 (a.rs, b.rs, …)".
+        assert_eq!(c.total_lines(), 1);
+        let text = line_text(&c.viewport(0, 1)[0]);
+        assert!(text.contains("read 3"), "{text}");
+        assert!(text.contains("a.rs"), "{text}");
+    }
+
+    #[test]
+    fn typed_tool_card_shows_kind_and_status() {
+        let mut c = LayoutCache::default();
+        // A single failed bash card: red ✗, expanded result kept.
+        let items = vec![TranscriptItem::Tool {
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            result: Some("exit 1".into()),
+            is_error: true,
+        }];
+        c.sync(&items, 80);
+        let all: String = c
+            .viewport(0, c.total_lines())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("bash"), "kind label missing:\n{all}");
+        assert!(all.contains('✗'), "error glyph missing:\n{all}");
+        assert!(all.contains("exit 1"), "error output hidden:\n{all}");
     }
 
     #[test]

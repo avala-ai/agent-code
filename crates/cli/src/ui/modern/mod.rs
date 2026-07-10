@@ -12,6 +12,7 @@ mod run;
 mod scroll;
 mod sink;
 mod stream_buffer;
+mod toolcard;
 
 pub use run::run_modern_tui;
 

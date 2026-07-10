@@ -202,9 +202,11 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
     );
 }
 
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let tokens = app.tokens_in + app.tokens_out;
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" turn {} ", app.turn_count),
             Style::default().fg(Color::DarkGray),
@@ -220,17 +222,36 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("│"),
-        Span::styled(
+    ];
+
+    // Waiting-on spinner while a turn runs (plan §M4); otherwise the last
+    // status message.
+    if app.phase == Phase::Streaming {
+        let glyph = SPINNER[(app.tick as usize) % SPINNER.len()];
+        let (glyph_color, text_color) = match app.waiting_on {
+            super::app::WaitingOn::UserInput => (Color::Yellow, Color::Yellow),
+            _ => (Color::Cyan, Color::Gray),
+        };
+        spans.push(Span::styled(
+            format!(" {glyph} "),
+            Style::default().fg(glyph_color),
+        ));
+        spans.push(Span::styled(
+            format!("{} ", app.waiting_on.label()),
+            Style::default().fg(text_color),
+        ));
+    } else {
+        spans.push(Span::styled(
             format!(" {} ", app.status_message),
             Style::default().fg(Color::Gray),
-        ),
-        Span::raw("│"),
-        Span::styled(
-            format!(" sid {} ", truncate_mid(&app.session_id, 12)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+        ));
+    }
+    spans.push(Span::raw("│"));
+    spans.push(Span::styled(
+        format!(" sid {} ", truncate_mid(&app.session_id, 12)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -387,8 +408,22 @@ mod tests {
         });
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("Bash"), "buffer:\n{s}");
+        // Typed card: kind label + status glyph + detail.
+        assert!(s.contains("bash"), "kind label missing; buffer:\n{s}");
+        assert!(s.contains('✓'), "ok glyph missing; buffer:\n{s}");
         assert!(s.contains("cargo test"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn waiting_on_spinner_shows_running_tool() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.waiting_on = crate::ui::modern::app::WaitingOn::Tool("Bash".into());
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("running Bash"), "buffer:\n{s}");
     }
 
     #[test]

@@ -37,6 +37,30 @@ pub enum TranscriptItem {
     Warning(String),
 }
 
+/// What a running turn is currently blocked on, for the spinner detail
+/// (plan §M4 waiting-on).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WaitingOn {
+    /// Waiting on the model to produce tokens.
+    #[default]
+    Model,
+    /// A tool is executing.
+    Tool(String),
+    /// Blocked on the user (permission / question).
+    UserInput,
+}
+
+impl WaitingOn {
+    /// Spinner label (the glyph is prepended by the renderer).
+    pub fn label(&self) -> String {
+        match self {
+            WaitingOn::Model => "thinking…".to_string(),
+            WaitingOn::Tool(name) => format!("running {name}"),
+            WaitingOn::UserInput => "waiting on your input".to_string(),
+        }
+    }
+}
+
 /// High-level UI phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -63,6 +87,8 @@ pub struct App {
     /// (the turn task holds the engine lock). The badge shows a `*`.
     pub mode_pending: bool,
     pub phase: Phase,
+    /// What the running turn is blocked on (drives the status-bar spinner).
+    pub waiting_on: WaitingOn,
     /// Permission ask currently displayed as a modal (engine blocked on it).
     pub pending_permission: Option<PendingPermission>,
 
@@ -119,6 +145,7 @@ impl App {
             mode: SessionMode::Normal,
             mode_pending: false,
             phase: Phase::Idle,
+            waiting_on: WaitingOn::Model,
             pending_permission: None,
             transcript: vec![TranscriptItem::System(
                 "Modern TUI · Shift+Tab mode · Ctrl+C cancel turn / quit · Esc clear prompt · Enter send".into(),
@@ -167,6 +194,7 @@ impl App {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
             EngineEvent::ToolStart { name, detail } => {
+                self.waiting_on = WaitingOn::Tool(name.clone());
                 self.transcript.push(TranscriptItem::Tool {
                     name,
                     detail,
@@ -193,9 +221,12 @@ impl App {
                     *result = Some(content.lines().next().unwrap_or("").to_string());
                     *err = is_error;
                 }
+                // Back to waiting on the model once a tool returns.
+                self.waiting_on = WaitingOn::Model;
             }
             EngineEvent::TurnStart(n) => {
                 self.phase = Phase::Streaming;
+                self.waiting_on = WaitingOn::Model;
                 self.turn_count = n;
                 self.status_message = format!("turn {n}");
             }
@@ -243,6 +274,7 @@ impl App {
                     respond,
                 });
                 self.phase = Phase::Permission;
+                self.waiting_on = WaitingOn::UserInput;
             }
         }
     }
@@ -281,6 +313,7 @@ impl App {
         self.transcript.push(TranscriptItem::System(note));
         if self.phase == Phase::Permission {
             self.phase = Phase::Streaming;
+            self.waiting_on = WaitingOn::Model;
         }
         self.dirty = true;
     }
@@ -630,6 +663,41 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn waiting_on_tracks_tool_lifecycle() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        assert_eq!(app.waiting_on, WaitingOn::Model);
+        app.apply_engine(EngineEvent::ToolStart {
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+        });
+        assert_eq!(app.waiting_on, WaitingOn::Tool("Bash".into()));
+        app.apply_engine(EngineEvent::ToolResult {
+            name: "Bash".into(),
+            content: "ok".into(),
+            is_error: false,
+        });
+        assert_eq!(app.waiting_on, WaitingOn::Model);
+    }
+
+    #[test]
+    fn waiting_on_user_input_during_permission() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.apply_engine(EngineEvent::PermissionAsk {
+            name: "Bash".into(),
+            description: "d".into(),
+            input_preview: None,
+            respond,
+        });
+        assert_eq!(app.waiting_on, WaitingOn::UserInput);
+        assert_eq!(app.waiting_on.label(), "waiting on your input");
+        app.resolve_permission(PermissionResponse::AllowOnce);
+        assert_eq!(app.waiting_on, WaitingOn::Model);
     }
 
     #[test]
