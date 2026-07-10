@@ -1,10 +1,9 @@
 //! Terminal UI layer.
 //!
-//! Provides the interactive REPL, markdown rendering, and streaming
-//! output display. Built on crossterm and rustyline.
-//!
-//! The **modern** full-screen TUI (`modern` module) is the alt-screen
-//! pager overhaul; opt in with `--tui modern`. Classic REPL remains the default.
+//! The interactive surface is the full-screen **modern** TUI
+//! (`modern` module — alt-screen ratatui pager). Classic rustyline
+//! REPL was removed. Supporting modules here cover theming, setup,
+//! and shared helpers used by modern and slash-command paths.
 
 pub mod activity;
 pub mod color_emit;
@@ -14,7 +13,6 @@ pub mod modern;
 pub mod onboarding;
 pub mod prompt;
 pub mod render;
-pub mod repl;
 pub mod selector;
 pub mod setup;
 pub mod terminal_query;

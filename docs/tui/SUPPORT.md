@@ -6,7 +6,7 @@
 ## How to record a result
 
 1. Open the terminal under test (native, not nested unless testing tmux).
-2. `cargo build -p agent-code --release && ./target/release/agent --tui modern`
+2. `cargo build -p agent-code --release && ./target/release/agent`
 3. Run the ACCEPTANCE checklist (10–20 minutes).
 4. Fill one row below: `Y` = pass, `N` = fail, `-` = skip/N/A, `?` = not run.
 5. Paste a short notes line (version strings, fail details, tmux config).
@@ -54,7 +54,7 @@ set -g set-clipboard on
 |---|---|
 | Linux GPU host, `TERM=dumb` (agent harness) | **Cannot dogfood** interactive fullscreen — no real TTY. Engine unit tests + `cargo clippy/test` only. |
 
-Classic REPL remains the fallback: `--tui classic` / `ui.tui = "classic"`.
+Classic rustyline REPL has been removed; modern is the only interactive surface.
 
 ---
 

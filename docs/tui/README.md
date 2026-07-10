@@ -1,6 +1,6 @@
 # agent-code modern TUI
 
-Docs for the fullscreen pager track (`--tui modern` / `ui.tui = "modern"`).
+Docs for the fullscreen pager track (default interactive UI; `ui.tui = "modern"`).
 
 | Doc | Purpose |
 |---|---|
@@ -32,4 +32,4 @@ Shared interface: additive `StreamSink` / `QuestionAsker` / `PermissionPrompter`
 
 1. Fill [SUPPORT.md](./SUPPORT.md) matrix on real terminals  
 2. Green [ACCEPTANCE.md](./ACCEPTANCE.md) product bar  
-3. Only then change default `ui.tui` / auto from classic → modern
+3. Default is already modern; classic REPL has been removed

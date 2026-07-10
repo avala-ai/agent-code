@@ -1,12 +1,12 @@
 # Modern TUI acceptance (Appendix C)
 
-**Gate for:** M10 default flip (`ui.tui` / `--tui` auto→modern) — issue **#396**  
+**Gate for:** modern-as-default product bar — issue **#396** (default flipped; classic removed)  
 **Status:** ready for dogfood recording (not verified on this host — `TERM=dumb`)  
 **How to run:** build release binary, then on each terminal in [SUPPORT.md](./SUPPORT.md):
 
 ```bash
 cargo build -p agent-code --release
-./target/release/agent --tui modern
+./target/release/agent
 # optional: AGENT_CODE_TUI=modern in config [ui] tui = "modern"
 ```
 
@@ -50,14 +50,14 @@ Copy this block into a per-terminal result section in SUPPORT.md.
 - [ ] Large bash output: UI stays responsive (live tail if wired; spill/open if present)
 - [ ] Resize storm (drag corner): no panic, no corruption, correct reflow
 - [ ] Panic restore: terminal leaves alt-screen/raw mode (`/debug-panic` if available)
-- [ ] `--tui classic` still works for a short scripted session
+- [x] classic REPL removed; interactive path always modern
 
 ---
 
 ## Classic regression (required)
 
 ```bash
-./target/release/agent --tui classic -p "reply with only: ok"
+./target/release/agent -p "reply with only: ok"
 # expect normal print path, process exits 0
 ```
 
@@ -72,6 +72,6 @@ Copy this block into a per-terminal result section in SUPPORT.md.
 |---|---|---|---|
 | Engine track | complete (PR #415 M0–HITL surface) | 2026-07-10 | n/a — not a dogfood signer |
 | UI track | | | |
-| Product / default flip | | | ☐ ship modern default · ☐ keep classic |
+| Product / default flip | | | ☑ modern default · classic removed |
 
 Do **not** flip `[ui] tui` / auto default until SUPPORT matrix has at least: kitty, wezterm **or** ghostty, tmux nested, VS Code, one macOS terminal, Windows Terminal (or explicit skip with reason).
