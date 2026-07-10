@@ -8,6 +8,7 @@ mod mode;
 mod render;
 mod run;
 mod sink;
+mod stream_buffer;
 
 pub use run::run_modern_tui;
 

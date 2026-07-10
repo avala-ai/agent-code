@@ -5,16 +5,20 @@
 //! engine lock.
 
 use std::io::{Stdout, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
+
+/// Second Ctrl+C within this window (on an empty prompt) quits.
+const QUIT_ARM_WINDOW: Duration = Duration::from_millis(1500);
 
 use agent_code_lib::config::PermissionMode;
 use agent_code_lib::query::{QueryEngine, Session, TurnHandle};
@@ -130,13 +134,21 @@ async fn event_loop(
     bypass_disabled: bool,
 ) -> anyhow::Result<()> {
     let mut turn: Option<TurnHandle> = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(80));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut term_events = EventStream::new();
+
+    // Spinner animation (~12 fps) and coalescer flush deadline (~10 fps).
+    // Both are only *polled* while a turn is live / text is buffered, so an
+    // idle session never wakes on them.
+    let mut anim_tick = tokio::time::interval(Duration::from_millis(80));
+    anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut flush_tick = tokio::time::interval(super::stream_buffer::FLUSH_INTERVAL);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Sync SessionMode with the engine when it changes. Only advance
     // `last_mode` after a successful apply — if the turn task holds the
     // engine mutex, retry on a later loop iteration.
     let mut last_mode = app.mode;
+    let mut quit_armed_at: Option<Instant> = None;
 
     loop {
         // Apply session mode → engine (best-effort).
@@ -152,6 +164,7 @@ async fn event_loop(
             {
                 last_mode = app.mode;
             }
+            app.dirty = true;
         }
         app.mode_pending = app.mode != last_mode;
 
@@ -163,6 +176,7 @@ async fn event_loop(
             let handle = session.spawn_turn(prompt, sink).await;
             turn = Some(handle);
             app.phase = super::app::Phase::Streaming;
+            app.dirty = true;
         }
 
         // Cancel if requested.
@@ -171,11 +185,6 @@ async fn event_loop(
                 h.cancel();
             }
             app.cancel_requested = false;
-        }
-
-        // Drain engine events without blocking.
-        while let Ok(ev) = eng_rx.try_recv() {
-            app.apply_engine(ev);
         }
 
         // Reap finished turn.
@@ -233,24 +242,63 @@ async fn event_loop(
             }
         }
 
-        terminal.draw(|f| render::draw(f, app))?;
+        // Draw only when something changed. An idle session with no events
+        // and no pending deltas never repaints (plan §2.2 rule 1).
+        if app.dirty {
+            terminal.draw(|f| render::draw(f, app))?;
+            app.dirty = false;
+        }
 
         if app.should_quit {
             break;
         }
 
+        // A turn is "live" while its handle exists or text is still buffered.
+        // The flush + spinner timers are only polled while live, so an idle
+        // session parks on the two channel branches with zero wakeups.
+        let live = turn.is_some() || app.stream_buf.has_pending();
+
         tokio::select! {
-            _ = tick.tick() => {
-                if app.phase == super::app::Phase::Streaming {
-                    app.tick();
+            // Terminal input.
+            maybe_ev = term_events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(key))) => {
+                        // Disarm a stale quit before routing the key so a late
+                        // second Ctrl+C re-arms instead of quitting.
+                        if app.quit_armed
+                            && quit_armed_at.map(|t| t.elapsed() > QUIT_ARM_WINDOW).unwrap_or(true)
+                        {
+                            app.quit_armed = false;
+                            quit_armed_at = None;
+                        }
+                        let was_armed = app.quit_armed;
+                        handle_key(app, key);
+                        app.dirty = true;
+                        // Track when the quit arm was raised so it can expire.
+                        if app.quit_armed && !was_armed {
+                            quit_armed_at = Some(Instant::now());
+                        } else if !app.quit_armed {
+                            quit_armed_at = None;
+                        }
+                    }
+                    Some(Ok(Event::Resize(_, _))) => { app.dirty = true; }
+                    Some(Ok(_)) => {}
+                    // Stream closed or errored: stop the UI cleanly.
+                    Some(Err(_)) | None => { app.should_quit = true; }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                // Poll crossterm without blocking the runtime for long.
-                while event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key(app, key);
-                    }
+            // Engine → UI events.
+            Some(ev) = eng_rx.recv() => {
+                app.apply_engine(ev);
+            }
+            // Coalescer flush deadline (only while text is buffered).
+            _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
+                app.flush_stream();
+            }
+            // Spinner animation (only while a turn is live).
+            _ = anim_tick.tick(), if live => {
+                if app.phase == super::app::Phase::Streaming {
+                    app.tick();
                 }
             }
         }
@@ -299,12 +347,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Any keypress other than the arming Ctrl+C disarms quit; capture the
+    // prior arm state so a second Ctrl+C can act on it (§5 Ctrl+C machine).
+    let was_armed = app.quit_armed;
+    app.quit_armed = false;
+
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             if app.phase == super::app::Phase::Streaming {
+                // Ctrl+C is the ONLY cancel (Esc never cancels a turn).
                 app.request_cancel();
-            } else {
+            } else if !app.input.is_empty() {
+                app.clear_prompt();
+            } else if was_armed {
                 app.should_quit = true;
+            } else {
+                app.quit_armed = true;
+                app.status_message = "press Ctrl+C again to quit".into();
             }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) if app.input.is_empty() => {
@@ -314,7 +373,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.cycle_mode_forward();
         }
         (_, KeyCode::Esc) => {
-            app.request_cancel();
+            // Navigation only: clear the prompt; NEVER cancel a running turn.
+            app.clear_prompt();
         }
         (_, KeyCode::Enter) => {
             app.submit();
@@ -366,4 +426,90 @@ async fn apply_mode_to_engine(
     state.plan_mode = matches!(mode, super::mode::SessionMode::Plan);
     state.config.permissions.default_mode = mode.permission_hint().unwrap_or(base_permission_mode);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::modern::app::Phase;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_c_while_streaming_cancels_not_quits() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.cancel_requested);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_text_clears_prompt_not_quit() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello".into();
+        app.cursor = 5;
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+        assert!(!app.quit_armed);
+    }
+
+    #[test]
+    fn ctrl_c_double_press_arms_then_quits() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit_armed, "first Ctrl+C arms");
+        assert!(!app.should_quit);
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.should_quit, "second Ctrl+C quits");
+    }
+
+    #[test]
+    fn any_key_disarms_quit() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit_armed);
+        // A non-inserting key (leaves the prompt empty) still disarms.
+        handle_key(&mut app, key(KeyCode::Left));
+        assert!(!app.quit_armed);
+        // A subsequent lone Ctrl+C should only re-arm, not quit.
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit_armed);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_clears_prompt_never_cancels_turn() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.input = "typed while running".into();
+        app.cursor = app.input.len();
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.input.is_empty(), "Esc clears the prompt");
+        assert!(!app.cancel_requested, "Esc must NEVER cancel a turn");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn permission_modal_esc_denies_without_quitting() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, rx) = std::sync::mpsc::channel();
+        app.pending_permission = Some(crate::ui::modern::app::PendingPermission {
+            name: "Bash".into(),
+            description: "d".into(),
+            input_preview: None,
+            respond,
+        });
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Deny)));
+        assert!(!app.should_quit);
+        assert!(app.pending_permission.is_none());
+    }
 }

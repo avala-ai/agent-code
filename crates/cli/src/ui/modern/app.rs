@@ -7,6 +7,7 @@ use agent_code_lib::tools::PermissionResponse;
 
 use super::mode::SessionMode;
 use super::sink::EngineEvent;
+use super::stream_buffer::StreamBuffer;
 
 /// A permission ask the engine is blocked on, awaiting the user's answer.
 #[derive(Debug, Clone)]
@@ -81,9 +82,19 @@ pub struct App {
     pub pending_submit: Option<String>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
+    /// Ctrl+C on an empty idle prompt arms quit; a second press within
+    /// [`super::run::QUIT_ARM_WINDOW`] quits. The run loop disarms on expiry.
+    pub quit_armed: bool,
 
     /// Spinner frame index while streaming.
     pub tick: u64,
+
+    /// Coalesces streaming text deltas so heavy streaming repaints at
+    /// ≤10 fps instead of once per delta (plan §2.2).
+    pub stream_buf: StreamBuffer,
+    /// Set whenever visible state changed and the frame must be redrawn.
+    /// Idle (no events, no pending deltas) leaves this false → zero frames.
+    pub dirty: bool,
 }
 
 impl App {
@@ -102,7 +113,7 @@ impl App {
             phase: Phase::Idle,
             pending_permission: None,
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Shift+Tab cycle mode · Esc cancel turn · Ctrl+C cancel/quit · Enter send".into(),
+                "Modern TUI · Shift+Tab mode · Ctrl+C cancel turn / quit · Esc clear prompt · Enter send".into(),
             )],
             scroll_offset: 0,
             input: String::new(),
@@ -115,20 +126,36 @@ impl App {
             should_quit: false,
             pending_submit: None,
             cancel_requested: false,
+            quit_armed: false,
             tick: 0,
+            stream_buf: StreamBuffer::new(),
+            // Draw the first frame.
+            dirty: true,
         }
     }
 
     pub fn apply_engine(&mut self, ev: EngineEvent) {
+        // Any state change must repaint.
+        self.dirty = true;
+
+        // Text/thinking deltas are coalesced; everything else is a "barrier"
+        // event that must flush buffered text first so ordering is preserved
+        // (plan §2.2 rule 3: deltas never reorder around tool/turn events).
         match ev {
-            EngineEvent::Text(t) => self.push_or_append_assistant(&t),
-            EngineEvent::Thinking(t) => {
-                if let Some(TranscriptItem::Thinking(buf)) = self.transcript.last_mut() {
-                    buf.push_str(&t);
-                } else {
-                    self.transcript.push(TranscriptItem::Thinking(t));
-                }
+            EngineEvent::Text(t) => {
+                self.stream_buf.push_assistant(&t);
+                return;
             }
+            EngineEvent::Thinking(t) => {
+                self.stream_buf.push_thinking(&t);
+                return;
+            }
+            _ => self.flush_stream(),
+        }
+
+        match ev {
+            // Deltas handled above.
+            EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
             EngineEvent::ToolStart { name, detail } => {
                 self.transcript.push(TranscriptItem::Tool {
                     name,
@@ -210,6 +237,26 @@ impl App {
         }
     }
 
+    /// Drain any buffered streaming text into the transcript. Called before
+    /// applying a non-delta event and on the coalescer's flush deadline.
+    pub fn flush_stream(&mut self) {
+        if !self.stream_buf.has_pending() {
+            return;
+        }
+        let out = self.stream_buf.flush();
+        if !out.thinking.is_empty() {
+            if let Some(TranscriptItem::Thinking(buf)) = self.transcript.last_mut() {
+                buf.push_str(&out.thinking);
+            } else {
+                self.transcript.push(TranscriptItem::Thinking(out.thinking));
+            }
+        }
+        if !out.assistant.is_empty() {
+            self.push_or_append_assistant(&out.assistant);
+        }
+        self.dirty = true;
+    }
+
     /// Answer the pending permission ask (if any) and unblock the turn.
     pub fn resolve_permission(&mut self, resp: PermissionResponse) {
         let Some(p) = self.pending_permission.take() else {
@@ -225,6 +272,7 @@ impl App {
         if self.phase == Phase::Permission {
             self.phase = Phase::Streaming;
         }
+        self.dirty = true;
     }
 
     fn push_or_append_assistant(&mut self, t: &str) {
@@ -299,8 +347,8 @@ impl App {
         }
         if text == "/help" {
             self.transcript.push(TranscriptItem::System(
-                "Keys: Enter send · Shift+Tab mode · Esc cancel turn · Ctrl+C cancel/quit · \
-                 permission prompt: y once / a session / n deny · /clear /exit"
+                "Keys: Enter send · Shift+Tab mode · Ctrl+C cancel turn (then quit) · \
+                 Esc clear prompt · permission prompt: y once / a session / n deny · /clear /exit"
                     .into(),
             ));
             self.input.clear();
@@ -308,7 +356,7 @@ impl App {
             return;
         }
         if self.phase == Phase::Streaming {
-            self.status_message = "turn in progress — cancel with Esc first".into();
+            self.status_message = "turn in progress — Ctrl+C to cancel".into();
             return;
         }
         self.transcript.push(TranscriptItem::User(text.clone()));
@@ -339,19 +387,54 @@ impl App {
         }
     }
 
+    /// Clear the prompt editor (Esc / Ctrl+C navigation — never cancels a turn).
+    pub fn clear_prompt(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
     pub fn mark_turn_idle(&mut self) {
+        // Any text still buffered when the turn ends must land now.
+        self.flush_stream();
         self.phase = Phase::Idle;
         self.cancel_requested = false;
+        self.dirty = true;
     }
 
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.dirty = true;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_flush_does_not_dirty() {
+        // Zero-frame invariant: with nothing buffered, a flush must not mark
+        // the frame dirty, so an idle loop never repaints.
+        let mut app = App::new("m", "/tmp", "s");
+        app.dirty = false;
+        app.flush_stream();
+        assert!(!app.dirty, "empty flush must not request a redraw");
+        assert!(!app.stream_buf.has_pending());
+    }
+
+    #[test]
+    fn deltas_dirty_but_do_not_touch_transcript_until_flush() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.dirty = false;
+        let before = app.transcript.len();
+        app.apply_engine(EngineEvent::Text("x".into()));
+        assert!(app.dirty, "a delta requests a redraw");
+        assert_eq!(
+            app.transcript.len(),
+            before,
+            "delta is buffered, not applied"
+        );
+    }
 
     #[test]
     fn submit_queues_prompt_and_clears_input() {
@@ -379,14 +462,42 @@ mod tests {
     }
 
     #[test]
-    fn engine_text_appends() {
+    fn engine_text_coalesces_and_flushes() {
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::Text("Hel".into()));
         app.apply_engine(EngineEvent::Text("lo".into()));
+        // Deltas are buffered, not yet in the transcript.
+        assert!(app.stream_buf.has_pending());
+        assert!(!matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Assistant(_))
+        ));
+        app.flush_stream();
         match app.transcript.last() {
             Some(TranscriptItem::Assistant(t)) => assert_eq!(t, "Hello"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn non_delta_event_flushes_buffered_text_first() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::Text("partial answer".into()));
+        // A tool start is a barrier: it must flush the text before it applies,
+        // so the assistant text lands *before* the tool card in the transcript.
+        app.apply_engine(EngineEvent::ToolStart {
+            name: "Bash".into(),
+            detail: "ls".into(),
+        });
+        let n = app.transcript.len();
+        assert!(
+            matches!(&app.transcript[n - 2], TranscriptItem::Assistant(t) if t == "partial answer")
+        );
+        assert!(matches!(
+            &app.transcript[n - 1],
+            TranscriptItem::Tool { .. }
+        ));
+        assert!(!app.stream_buf.has_pending());
     }
 
     #[test]
