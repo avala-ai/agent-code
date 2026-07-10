@@ -15,6 +15,49 @@ use super::terminal_caps::TerminalCaps;
 // `app::Modal` / `app::PendingPermission` paths keep working.
 pub use super::modal::{Modal, PendingPermission, PlanReview, QuestionState};
 
+/// Expand a user-invocable skill slash (`/commit`, `/review foo`) to its
+/// prompt body. Returns `None` for non-slash input, modern-local commands,
+/// or unknown skill names (those pass through as normal prompts).
+///
+/// Mirrors classic REPL: `commands::execute` skill branch → `skill.expand`.
+pub(crate) fn try_expand_skill_slash(input: &str, cwd: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let rest = trimmed.trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    let (cmd, args) = match rest.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, Some(a.trim())),
+        None => (rest, None),
+    };
+    // Local modern commands are handled before we get here; still skip them
+    // so a skill never shadows `/help` etc.
+    if matches!(
+        cmd,
+        "exit"
+            | "quit"
+            | "clear"
+            | "help"
+            | "terminal-setup"
+            | "minimal"
+            | "fullscreen"
+            | "stats"
+    ) {
+        return None;
+    }
+    let registry =
+        agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(cwd)));
+    let skill = registry.find(cmd)?;
+    // Only user-invocable skills are slash-callable (same as classic /help).
+    if !skill.metadata.user_invocable {
+        return None;
+    }
+    Some(skill.expand(args))
+}
+
 /// One row in the scrollable transcript.
 #[derive(Debug, Clone, Hash)]
 pub enum TranscriptItem {
@@ -449,7 +492,8 @@ impl App {
             self.transcript.push(TranscriptItem::System(
                 "Keys: Enter send · Shift+Tab mode · Ctrl+C cancel turn (then quit) · \
                  Esc clear prompt · Ctrl+T tasks · permission prompt: y once / a session / n deny · \
-                 /clear /terminal-setup /exit"
+                 Skills: /commit /review /test /… (same as classic) · \
+                 /clear /terminal-setup /stats /exit"
                     .into(),
             ));
             self.input.clear();
@@ -489,6 +533,8 @@ impl App {
             return;
         }
         // Mid-turn: queue the prompt instead of dropping it (plan §M5).
+        // Skill expansion happens when the queue head is dispatched so the
+        // expanded body is what the engine sees.
         if self.phase == Phase::Streaming {
             self.queue.push_back(text);
             self.input.clear();
@@ -496,13 +542,28 @@ impl App {
             self.status_message = format!("{} queued", self.queue.len());
             return;
         }
-        self.transcript.push(TranscriptItem::User(text.clone()));
+        self.enqueue_turn(text);
+    }
+
+    /// Resolve user text into a turn: expand `/skill` invocations the same
+    /// way classic REPL does via `commands::execute` skill lookup.
+    fn enqueue_turn(&mut self, text: String) {
+        let (display, prompt) = match try_expand_skill_slash(&text, &self.cwd) {
+            Some(expanded) => {
+                // Keep the slash visible in the transcript; send the expanded
+                // skill body to the engine as the real user message.
+                (text, expanded)
+            }
+            None => (text.clone(), text),
+        };
+        self.transcript.push(TranscriptItem::User(display));
         self.input.clear();
         self.cursor = 0;
-        self.pending_submit = Some(text);
+        self.pending_submit = Some(prompt);
         self.phase = Phase::Streaming;
         // Jump back to the live tail when the user sends.
         self.scroll = ScrollState::Follow;
+        self.dirty = true;
     }
 
     /// Dispatch the head of the queue as the next turn, if idle and non-empty.
@@ -513,11 +574,7 @@ impl App {
             return;
         }
         if let Some(text) = self.queue.pop_front() {
-            self.transcript.push(TranscriptItem::User(text.clone()));
-            self.pending_submit = Some(text);
-            self.phase = Phase::Streaming;
-            self.scroll = ScrollState::Follow;
-            self.dirty = true;
+            self.enqueue_turn(text);
         }
     }
 
@@ -707,6 +764,47 @@ mod tests {
         app.cursor = 2;
         app.submit();
         assert!(app.scroll.is_following(), "sending jumps back to the tail");
+    }
+
+    #[test]
+    fn try_expand_skill_slash_expands_bundled_user_invocable() {
+        // Bundled skills load without a project dir.
+        let expanded = try_expand_skill_slash("/verify", "/tmp");
+        assert!(
+            expanded.is_some(),
+            "bundled /verify skill should expand in modern TUI"
+        );
+        let body = expanded.unwrap();
+        assert!(
+            !body.starts_with('/'),
+            "expanded body should be the skill prompt, not the slash"
+        );
+        assert!(body.len() > 20, "skill body should be non-trivial");
+    }
+
+    #[test]
+    fn try_expand_skill_slash_ignores_plain_text_and_local_commands() {
+        assert!(try_expand_skill_slash("hello", "/tmp").is_none());
+        assert!(try_expand_skill_slash("/help", "/tmp").is_none());
+        assert!(try_expand_skill_slash("/clear", "/tmp").is_none());
+        assert!(try_expand_skill_slash("/not-a-real-skill-xyz", "/tmp").is_none());
+    }
+
+    #[test]
+    fn submit_skill_slash_queues_expanded_prompt() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/verify".into();
+        app.cursor = app.input.len();
+        app.submit();
+        match app.transcript.last() {
+            Some(TranscriptItem::User(s)) => assert_eq!(s, "/verify"),
+            other => panic!("expected User(/verify), got {other:?}"),
+        }
+        let pending = app.pending_submit.expect("skill should produce a turn");
+        assert!(
+            !pending.starts_with('/'),
+            "engine must receive the expanded skill body, got: {pending}"
+        );
     }
 
     #[test]
