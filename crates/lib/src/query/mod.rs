@@ -1142,6 +1142,9 @@ impl QueryEngine {
                                 } = block
                                 {
                                     sink.on_tool_call_start(id, name, input);
+                                    if name == "Agent" {
+                                        emit_agent_subagent_update(sink, input, "working");
+                                    }
 
                                     // Start read-only tools immediately during streaming.
                                     if let Some(tool) = self.tools.get(name)
@@ -1584,6 +1587,9 @@ impl QueryEngine {
                 }
 
                 sink.on_tool_call_result(&result.tool_use_id, &result.tool_name, &result.result);
+                if result.tool_name == "Agent" {
+                    emit_agent_result_update(sink, &result.result);
+                }
 
                 // Fire post-tool-use hooks.
                 self.hooks
@@ -1696,12 +1702,72 @@ fn last_assistant_text(messages: &[crate::llm::message::Message]) -> Option<Stri
 /// Tool names whose `PostToolUse` should also fire a `FileChanged`
 /// event. Keep this list in sync with the `file_path`-input-shape
 /// tools in `crates/lib/src/tools/`.
-const FILE_MUTATING_TOOLS: &[&str] = &["FileWrite", "FileEdit", "MultiEdit", "NotebookEdit"];
+const FILE_MUTATING_TOOLS: &[&str] = &[
+    "FileWrite",
+    "FileEdit",
+    "MultiEdit",
+    "NotebookEdit",
+    "ApplyPatch",
+];
 
 /// Whether a tool name indicates a file mutation that should fire
 /// `FileChanged`. Pure so tests can probe without an engine.
 fn is_file_mutating_tool(name: &str) -> bool {
     FILE_MUTATING_TOOLS.contains(&name)
+}
+
+/// Emit a subagent lifecycle event from an Agent tool input payload.
+fn emit_agent_subagent_update(sink: &dyn StreamSink, input: &serde_json::Value, state: &str) {
+    let agent_id = input
+        .get("subagent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent")
+                .chars()
+                .take(32)
+                .collect()
+        });
+    let headline = input
+        .get("description")
+        .and_then(|v| v.as_str())
+        .or_else(|| input.get("prompt").and_then(|v| v.as_str()))
+        .unwrap_or(state);
+    let headline: String = headline.chars().take(120).collect();
+    let type_hint = input
+        .get("subagent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("general-purpose");
+    let full_headline = format!("[{type_hint}] {headline}");
+    sink.on_subagent_update(&agent_id, state, &full_headline);
+}
+
+fn emit_agent_result_update(sink: &dyn StreamSink, result: &crate::tools::ToolResult) {
+    let state = if result.is_error {
+        "failed"
+    } else if result.content.contains("started in the background") {
+        "working"
+    } else {
+        "done"
+    };
+    let headline = result.content.lines().next().unwrap_or(state);
+    let headline: String = headline.chars().take(120).collect();
+    let agent_id = result
+        .content
+        .split_whitespace()
+        .find(|w| {
+            w.starts_with("task-")
+                || w.starts_with("agent-")
+                || (w.len() > 8 && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        })
+        .unwrap_or("agent")
+        .trim_end_matches(['.', ',', ';', ':'])
+        .to_string();
+    sink.on_subagent_update(&agent_id, state, &headline);
 }
 
 /// Look up a tool call by its use-id and return the `file_path` input
@@ -2084,6 +2150,7 @@ mod tests {
         assert!(is_file_mutating_tool("FileEdit"));
         assert!(is_file_mutating_tool("MultiEdit"));
         assert!(is_file_mutating_tool("NotebookEdit"));
+        assert!(is_file_mutating_tool("ApplyPatch"));
     }
 
     #[test]

@@ -453,7 +453,7 @@ pub(crate) const PROTECTED_DIRS: &[&str] = &[
 fn is_write_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "FileWrite" | "FileEdit" | "MultiEdit" | "NotebookEdit"
+        "FileWrite" | "FileEdit" | "MultiEdit" | "NotebookEdit" | "ApplyPatch"
     )
 }
 
@@ -916,6 +916,7 @@ mod tests {
         assert!(is_write_tool("FileEdit"));
         assert!(is_write_tool("MultiEdit"));
         assert!(is_write_tool("NotebookEdit"));
+        assert!(is_write_tool("ApplyPatch"));
         assert!(!is_write_tool("FileRead"));
         assert!(!is_write_tool("Bash"));
         assert!(!is_write_tool("Grep"));

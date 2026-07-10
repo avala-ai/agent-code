@@ -7,6 +7,7 @@
 | `FileWrite` | Create or overwrite files. Auto-creates parent dirs. | No | No |
 | `FileEdit` | Search-and-replace. Requires unique match or `replace_all`. | No | No |
 | `MultiEdit` | Batch multiple edits in a single atomic operation. | No | No |
+| `ApplyPatch` | Multi-hunk / multi-file patch (Begin Patch dialect). Prefer over many FileEdits. | No | No |
 | `NotebookEdit` | Edit Jupyter cells (replace, insert, delete). | No | No |
 
 ## Search

@@ -19,6 +19,7 @@
 //! 4. Result mapping (to API format)
 
 pub mod agent;
+pub mod apply_patch;
 pub mod ask_user;
 pub mod bash;
 pub mod bash_parse;
