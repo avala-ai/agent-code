@@ -217,14 +217,16 @@ async fn event_loop(
     let mut flush_tick = tokio::time::interval(super::stream_buffer::FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Sync SessionMode with the engine when it changes. Only advance
-    // `last_mode` after a successful apply — if the turn task holds the
-    // engine mutex, retry on a later loop iteration.
+    // Sync SessionMode with the engine when it changes.
     let mut last_mode = app.mode;
     let mut quit_armed_at: Option<Instant> = None;
 
     loop {
-        // Apply session mode → engine (best-effort).
+        // Apply a mode change to the engine. `apply_live_mode` updates the
+        // lock-free live plan flag + PermissionChecker default, so the change
+        // takes effect at the executor's next decision point *even mid-turn*
+        // while the turn task holds the engine mutex (the exact bug the API
+        // was built to close). The AppState sync is best-effort for observers.
         if app.mode != last_mode {
             if app.mode == super::mode::SessionMode::AlwaysApprove && bypass_disabled {
                 app.transcript.push(super::app::TranscriptItem::Warning(
@@ -232,14 +234,10 @@ async fn event_loop(
                 ));
                 app.mode = super::mode::SessionMode::Normal;
             }
-            if app.mode == last_mode
-                || apply_mode_to_engine(session, app.mode, base_permission_mode).await
-            {
-                last_mode = app.mode;
-            }
+            apply_mode_to_engine(session, app.mode, base_permission_mode);
+            last_mode = app.mode;
             app.dirty = true;
         }
-        app.mode_pending = app.mode != last_mode;
 
         // Start a pending turn if idle.
         if turn.is_none()
@@ -538,27 +536,31 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Apply UI session mode to the engine. Returns `true` if the lock was
-/// acquired and the state was updated; `false` if the engine is busy
-/// (caller should retry without updating its "last applied" tracker).
+/// Apply a UI session mode to the engine so it takes effect immediately —
+/// even mid-turn while the turn task holds the engine mutex.
 ///
-/// Mirrors the `--permission-mode` CLI plumbing: `plan_mode` is the
-/// read-only safety switch, and `permissions.default_mode` carries the
-/// AcceptEdits / AlwaysApprove semantics (Normal restores the mode the
-/// session started with, so user config survives a round-trip).
-async fn apply_mode_to_engine(
+/// `Session::apply_live_mode` updates the lock-free live plan flag and the
+/// `PermissionChecker` default, which the executor reads at its next
+/// decision point (§3.4.2 / AUDIT.md §5) — so Shift+Tab into Plan stops the
+/// next write without waiting for the turn to finish. The `try_lock`
+/// AppState write is only a best-effort sync for observers (the badge and
+/// engine-initiated `EnterPlanMode`); it never gates whether the mode
+/// applied. `Normal` restores the mode the session started with.
+fn apply_mode_to_engine(
     session: &Session,
     mode: super::mode::SessionMode,
     base_permission_mode: PermissionMode,
-) -> bool {
-    let engine_arc = session.engine();
-    let Ok(mut eng) = engine_arc.try_lock() else {
-        return false;
-    };
-    let state = eng.state_mut();
-    state.plan_mode = matches!(mode, super::mode::SessionMode::Plan);
-    state.config.permissions.default_mode = mode.permission_hint().unwrap_or(base_permission_mode);
-    true
+) {
+    let plan = matches!(mode, super::mode::SessionMode::Plan);
+    let perm = mode.permission_hint().unwrap_or(base_permission_mode);
+    // Lock-free — always applies, mid-turn.
+    session.apply_live_mode(plan, perm);
+    // Best-effort AppState sync (do not block the UI loop on the turn's lock).
+    if let Ok(mut eng) = session.engine().try_lock() {
+        let state = eng.state_mut();
+        state.plan_mode = plan;
+        state.config.permissions.default_mode = perm;
+    }
 }
 
 #[cfg(test)]

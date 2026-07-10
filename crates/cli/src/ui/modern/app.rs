@@ -128,9 +128,6 @@ pub struct App {
     pub version: String,
 
     pub mode: SessionMode,
-    /// True while the UI mode has not yet been applied to the engine
-    /// (the turn task holds the engine lock). The badge shows a `*`.
-    pub mode_pending: bool,
     pub phase: Phase,
     /// What the running turn is blocked on (drives the status-bar spinner).
     pub waiting_on: WaitingOn,
@@ -205,7 +202,6 @@ impl App {
             session_id: session_id.into(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode: SessionMode::Normal,
-            mode_pending: false,
             phase: Phase::Idle,
             waiting_on: WaitingOn::Model,
             modals: std::collections::VecDeque::new(),
@@ -723,12 +719,11 @@ impl App {
         self.mode = self.mode.cycle_next();
         self.status_message = format!("mode → {}", self.mode.label());
         if self.mode == SessionMode::Plan {
-            let msg = if self.phase == Phase::Streaming {
-                "Plan mode: applies when the engine is free (badge shows * until then)."
-            } else {
-                "Plan mode: writes blocked until you leave plan mode (Shift+Tab)."
-            };
-            self.transcript.push(TranscriptItem::System(msg.into()));
+            // Live mode applies immediately (even mid-turn) via
+            // Session::apply_live_mode.
+            self.transcript.push(TranscriptItem::System(
+                "Plan mode: writes blocked until you leave plan mode (Shift+Tab).".into(),
+            ));
         }
     }
 

@@ -336,19 +336,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(&app.model, Style::default().fg(Color::White)),
         Span::raw("  "),
-        Span::styled(
-            if app.mode_pending {
-                // `*` = not yet applied to the engine (lock held by the turn).
-                format!(" {}* ", app.mode.short_badge())
-            } else {
-                format!(" {} ", app.mode.short_badge())
-            },
-            if app.mode_pending {
-                mode_style.add_modifier(Modifier::DIM)
-            } else {
-                mode_style
-            },
-        ),
+        Span::styled(format!(" {} ", app.mode.short_badge()), mode_style),
         Span::raw("  "),
         Span::styled(
             truncate_path(&app.cwd, area.width.saturating_sub(40) as usize),
@@ -732,18 +720,6 @@ mod tests {
         assert!(t.chars().count() <= 10, "{t}");
         let m = truncate_mid("日本語のセッション識別子", 6);
         assert!(m.chars().count() <= 6, "{m}");
-    }
-
-    #[test]
-    fn pending_mode_badge_shows_star() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("m", "/tmp", "s");
-        app.mode = SessionMode::Plan;
-        app.mode_pending = true;
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("PLAN*"), "buffer:\n{s}");
     }
 
     #[test]
