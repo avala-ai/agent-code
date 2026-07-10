@@ -3,8 +3,19 @@
 //! Pure data + reducers. Drawing lives in [`super::render`]; I/O in
 //! [`super::run`]. This split keeps visual tests free of a live terminal.
 
+use agent_code_lib::tools::PermissionResponse;
+
 use super::mode::SessionMode;
 use super::sink::EngineEvent;
+
+/// A permission ask the engine is blocked on, awaiting the user's answer.
+#[derive(Debug, Clone)]
+pub struct PendingPermission {
+    pub name: String,
+    pub description: String,
+    pub input_preview: Option<String>,
+    pub respond: std::sync::mpsc::Sender<PermissionResponse>,
+}
 
 /// One row in the scrollable transcript.
 #[derive(Debug, Clone)]
@@ -45,7 +56,12 @@ pub struct App {
     pub version: String,
 
     pub mode: SessionMode,
+    /// True while the UI mode has not yet been applied to the engine
+    /// (the turn task holds the engine lock). The badge shows a `*`.
+    pub mode_pending: bool,
     pub phase: Phase,
+    /// Permission ask currently displayed as a modal (engine blocked on it).
+    pub pending_permission: Option<PendingPermission>,
 
     pub transcript: Vec<TranscriptItem>,
     /// Scroll offset from the bottom (0 = stick to latest).
@@ -82,9 +98,11 @@ impl App {
             session_id: session_id.into(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode: SessionMode::Normal,
+            mode_pending: false,
             phase: Phase::Idle,
+            pending_permission: None,
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Shift+Tab cycle mode · Esc cancel · Ctrl+C quit · Enter send".into(),
+                "Modern TUI · Shift+Tab cycle mode · Esc cancel turn · Ctrl+C cancel/quit · Enter send".into(),
             )],
             scroll_offset: 0,
             input: String::new(),
@@ -122,6 +140,10 @@ impl App {
             EngineEvent::ToolResult {
                 content, is_error, ..
             } => {
+                // Attach to the OLDEST pending tool: the executor runs calls
+                // sequentially in start order, so results arrive in the same
+                // order (rev() paired results with the newest start and
+                // swapped outputs whenever a turn had 2+ tool calls).
                 if let Some(TranscriptItem::Tool {
                     result,
                     is_error: err,
@@ -129,7 +151,6 @@ impl App {
                 }) = self
                     .transcript
                     .iter_mut()
-                    .rev()
                     .find(|i| matches!(i, TranscriptItem::Tool { result: None, .. }))
                 {
                     *result = Some(content.lines().next().unwrap_or("").to_string());
@@ -147,7 +168,9 @@ impl App {
                 self.status_message = format!("turn {n} done");
             }
             EngineEvent::Error(e) => {
-                self.phase = Phase::Idle;
+                // Do NOT flip to Idle here: the engine reports stream errors
+                // mid-turn and keeps going (recovery, tool execution). The
+                // run loop marks Idle when the turn handle actually finishes.
                 self.transcript.push(TranscriptItem::Error(e));
             }
             EngineEvent::Warning(w) => {
@@ -161,6 +184,46 @@ impl App {
                 self.transcript
                     .push(TranscriptItem::System(format!("compacted ~{freed} tokens")));
             }
+            EngineEvent::PermissionAsk {
+                name,
+                description,
+                input_preview,
+                respond,
+            } => {
+                if let Some(prev) = self.pending_permission.take() {
+                    // Tool calls prompt sequentially, so this should not
+                    // happen; fail closed on the older ask if it does.
+                    let _ = prev.respond.send(PermissionResponse::Deny);
+                    self.transcript.push(TranscriptItem::Warning(format!(
+                        "overlapping permission prompts — denied {}",
+                        prev.name
+                    )));
+                }
+                self.pending_permission = Some(PendingPermission {
+                    name,
+                    description,
+                    input_preview,
+                    respond,
+                });
+                self.phase = Phase::Permission;
+            }
+        }
+    }
+
+    /// Answer the pending permission ask (if any) and unblock the turn.
+    pub fn resolve_permission(&mut self, resp: PermissionResponse) {
+        let Some(p) = self.pending_permission.take() else {
+            return;
+        };
+        let note = match resp {
+            PermissionResponse::AllowOnce => format!("allowed {} once", p.name),
+            PermissionResponse::AllowSession => format!("allowed {} for this session", p.name),
+            PermissionResponse::Deny => format!("denied {}", p.name),
+        };
+        let _ = p.respond.send(resp);
+        self.transcript.push(TranscriptItem::System(note));
+        if self.phase == Phase::Permission {
+            self.phase = Phase::Streaming;
         }
     }
 
@@ -236,7 +299,8 @@ impl App {
         }
         if text == "/help" {
             self.transcript.push(TranscriptItem::System(
-                "Keys: Enter send · Shift+Tab mode · Esc cancel turn · Ctrl+C quit · /clear /exit"
+                "Keys: Enter send · Shift+Tab mode · Esc cancel turn · Ctrl+C cancel/quit · \
+                 permission prompt: y once / a session / n deny · /clear /exit"
                     .into(),
             ));
             self.input.clear();
@@ -259,9 +323,12 @@ impl App {
         self.mode = self.mode.cycle_next();
         self.status_message = format!("mode → {}", self.mode.label());
         if self.mode == SessionMode::Plan {
-            self.transcript.push(TranscriptItem::System(
-                "Plan mode: writes blocked until you leave plan mode (Shift+Tab).".into(),
-            ));
+            let msg = if self.phase == Phase::Streaming {
+                "Plan mode: applies when the engine is free (badge shows * until then)."
+            } else {
+                "Plan mode: writes blocked until you leave plan mode (Shift+Tab)."
+            };
+            self.transcript.push(TranscriptItem::System(msg.into()));
         }
     }
 
@@ -320,5 +387,81 @@ mod tests {
             Some(TranscriptItem::Assistant(t)) => assert_eq!(t, "Hello"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_results_attach_in_start_order() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::ToolStart {
+            name: "Bash".into(),
+            detail: "first".into(),
+        });
+        app.apply_engine(EngineEvent::ToolStart {
+            name: "Grep".into(),
+            detail: "second".into(),
+        });
+        app.apply_engine(EngineEvent::ToolResult {
+            name: "Bash".into(),
+            content: "r1".into(),
+            is_error: false,
+        });
+        let n = app.transcript.len();
+        match &app.transcript[n - 2] {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "first");
+                assert_eq!(result.as_deref(), Some("r1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &app.transcript[n - 1] {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "second");
+                assert!(result.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_does_not_end_turn_phase() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        assert_eq!(app.phase, Phase::Streaming);
+        app.apply_engine(EngineEvent::Error("boom".into()));
+        // The engine keeps running after stream errors; only the run
+        // loop's reap (or TurnComplete) may mark the UI idle.
+        assert_eq!(app.phase, Phase::Streaming);
+    }
+
+    #[test]
+    fn permission_ask_opens_modal_and_resolve_unblocks() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        let (respond, rx) = std::sync::mpsc::channel();
+        app.apply_engine(EngineEvent::PermissionAsk {
+            name: "Bash".into(),
+            description: "Bash: run `cargo test`".into(),
+            input_preview: Some("{\"command\": \"cargo test\"}".into()),
+            respond,
+        });
+        assert_eq!(app.phase, Phase::Permission);
+        assert!(app.pending_permission.is_some());
+
+        app.resolve_permission(PermissionResponse::AllowOnce);
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+        assert_eq!(app.phase, Phase::Streaming);
+        assert!(app.pending_permission.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::System(t)) if t.contains("allowed Bash once")
+        ));
+    }
+
+    #[test]
+    fn resolve_permission_without_pending_is_noop() {
+        let mut app = App::new("m", "/tmp", "s");
+        let before = app.transcript.len();
+        app.resolve_permission(PermissionResponse::Deny);
+        assert_eq!(app.transcript.len(), before);
     }
 }

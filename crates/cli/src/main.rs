@@ -985,15 +985,20 @@ async fn async_main() -> anyhow::Result<()> {
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 
+            // Reject bad values instead of silently launching the other
+            // surface (resolve falls back to config/classic for unknowns).
+            if let Some(ref s) = cli.tui
+                && ui::modern::TuiKind::parse(s).is_none()
+            {
+                anyhow::bail!("invalid --tui value '{s}' (expected 'classic' or 'modern')");
+            }
             let tui_kind =
                 ui::modern::resolve_tui_kind(cli.tui.as_deref(), &engine.state().config.ui.tui);
             match tui_kind {
                 ui::modern::TuiKind::Modern => {
-                    // Modern TUI takes ownership of the engine via Session.
+                    // Modern TUI takes ownership of the engine via Session
+                    // and fires SessionStop itself on clean exit.
                     ui::modern::run_modern_tui(engine).await?;
-                    // SessionStop: modern path wraps the engine; hooks that
-                    // need a live engine on clean exit are fired inside when
-                    // we re-acquire — for v1 we skip if already moved.
                 }
                 ui::modern::TuiKind::Classic => {
                     ui::repl::run_repl(&mut engine).await?;

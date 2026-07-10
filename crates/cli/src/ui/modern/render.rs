@@ -7,9 +7,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::app::{App, Phase, TranscriptItem};
+use super::app::{App, PendingPermission, Phase, TranscriptItem};
 use super::mode::SessionMode;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -28,6 +28,66 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_transcript(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
     draw_input(frame, chunks[3], app);
+
+    if app.phase == Phase::Permission
+        && let Some(ref pending) = app.pending_permission
+    {
+        draw_permission_modal(frame, area, pending);
+    }
+}
+
+fn draw_permission_modal(frame: &mut Frame<'_>, area: Rect, pending: &PendingPermission) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        pending.description.clone(),
+        Style::default().fg(Color::White),
+    )));
+    if let Some(ref preview) = pending.input_preview {
+        lines.push(Line::from(""));
+        const MAX_PREVIEW: usize = 10;
+        let total = preview.lines().count();
+        for row in preview.lines().take(MAX_PREVIEW) {
+            lines.push(Line::from(Span::styled(
+                row.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if total > MAX_PREVIEW {
+            lines.push(Line::from(Span::styled(
+                format!("… {} more lines", total - MAX_PREVIEW),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[y] allow once   [a] allow session   [n]/[Esc] deny",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let width = area.width.saturating_sub(6).clamp(24, 70);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(format!(" permission · {} ", pending.name));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -45,7 +105,19 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(&app.model, Style::default().fg(Color::White)),
         Span::raw("  "),
-        Span::styled(format!(" {} ", app.mode.short_badge()), mode_style),
+        Span::styled(
+            if app.mode_pending {
+                // `*` = not yet applied to the engine (lock held by the turn).
+                format!(" {}* ", app.mode.short_badge())
+            } else {
+                format!(" {} ", app.mode.short_badge())
+            },
+            if app.mode_pending {
+                mode_style.add_modifier(Modifier::DIM)
+            } else {
+                mode_style
+            },
+        ),
         Span::raw("  "),
         Span::styled(
             truncate_path(&app.cwd, area.width.saturating_sub(40) as usize),
@@ -220,18 +292,21 @@ fn mode_style(mode: SessionMode) -> Style {
 }
 
 fn truncate_path(path: &str, max: usize) -> String {
-    if max < 4 || path.len() <= max {
+    // Char-based, not byte-based: byte slicing panics on multibyte cwds.
+    let count = path.chars().count();
+    if max < 4 || count <= max {
         return path.to_string();
     }
-    format!("…{}", &path[path.len() - (max - 1)..])
+    let tail: String = path.chars().skip(count - (max - 1)).collect();
+    format!("…{tail}")
 }
 
 fn truncate_mid(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         return s.to_string();
     }
-    let keep = max.saturating_sub(1);
-    format!("{}…", &s[..keep.min(s.len())])
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Dump the terminal buffer to a plain multi-line string for snapshots.
@@ -284,6 +359,47 @@ mod tests {
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("PLAN"), "buffer:\n{s}");
         assert!(s.contains("design auth"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn permission_modal_renders_over_ui() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.pending_permission = Some(PendingPermission {
+            name: "Bash".into(),
+            description: "Bash: run `cargo publish`".into(),
+            input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
+            respond,
+        });
+        term.draw(|f| draw(f, &app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("permission · Bash"), "buffer:\n{s}");
+        assert!(s.contains("allow once"), "buffer:\n{s}");
+        assert!(s.contains("cargo publish"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn truncate_helpers_are_char_safe() {
+        let p = "/home/пользователь/проект-с-длинным-именем";
+        let t = truncate_path(p, 10);
+        assert!(t.chars().count() <= 10, "{t}");
+        let m = truncate_mid("日本語のセッション識別子", 6);
+        assert!(m.chars().count() <= 6, "{m}");
+    }
+
+    #[test]
+    fn pending_mode_badge_shows_star() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.mode = SessionMode::Plan;
+        app.mode_pending = true;
+        term.draw(|f| draw(f, &app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("PLAN*"), "buffer:\n{s}");
     }
 
     #[test]

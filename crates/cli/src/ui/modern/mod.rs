@@ -25,7 +25,7 @@ impl TuiKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "classic" | "repl" | "legacy" => Some(Self::Classic),
-            "modern" | "fullscreen" | "build" | "tui" => Some(Self::Modern),
+            "modern" | "fullscreen" | "tui" => Some(Self::Modern),
             _ => None,
         }
     }

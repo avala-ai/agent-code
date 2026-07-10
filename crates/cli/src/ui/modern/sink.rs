@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agent_code_lib::llm::message::Usage;
 use agent_code_lib::query::StreamSink;
-use agent_code_lib::tools::ToolResult;
+use agent_code_lib::tools::{PermissionPrompter, PermissionResponse, ToolResult};
 use tokio::sync::mpsc;
 
 /// Events emitted by the engine toward the UI.
@@ -38,6 +38,54 @@ pub enum EngineEvent {
     Compact {
         freed: u64,
     },
+    /// A tool call needs interactive permission. The turn task is blocked
+    /// until a [`PermissionResponse`] is sent back on `respond` (dropping
+    /// it counts as deny).
+    PermissionAsk {
+        name: String,
+        description: String,
+        input_preview: Option<String>,
+        respond: std::sync::mpsc::Sender<PermissionResponse>,
+    },
+}
+
+/// Permission prompter that surfaces engine asks inside the TUI.
+///
+/// The classic REPL prompts on stdin; the modern TUI owns the terminal in
+/// raw mode, so `ask()` instead pushes a [`EngineEvent::PermissionAsk`]
+/// onto the event channel and blocks the turn task until the event loop
+/// answers. Fails **closed**: if the UI is gone (channel closed or the
+/// responder dropped), the tool call is denied — without this prompter the
+/// executor's `None` default silently auto-allows every ask.
+pub struct ModernPrompter {
+    tx: mpsc::UnboundedSender<EngineEvent>,
+}
+
+impl ModernPrompter {
+    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>) -> Arc<Self> {
+        Arc::new(Self { tx })
+    }
+}
+
+impl PermissionPrompter for ModernPrompter {
+    fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input_preview: Option<&str>,
+    ) -> PermissionResponse {
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let sent = self.tx.send(EngineEvent::PermissionAsk {
+            name: tool_name.to_string(),
+            description: description.to_string(),
+            input_preview: input_preview.map(str::to_string),
+            respond: resp_tx,
+        });
+        if sent.is_err() {
+            return PermissionResponse::Deny;
+        }
+        resp_rx.recv().unwrap_or(PermissionResponse::Deny)
+    }
 }
 
 /// Sink that forwards every stream callback onto `tx`.
@@ -158,5 +206,54 @@ mod tests {
             EngineEvent::Text(t) => assert_eq!(t, "hello"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompter_denies_when_ui_gone() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let prompter = ModernPrompter::new(tx);
+        drop(rx);
+        let resp = prompter.ask("Bash", "run", None);
+        assert!(matches!(resp, PermissionResponse::Deny));
+    }
+
+    #[test]
+    fn prompter_denies_when_responder_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let prompter = ModernPrompter::new(tx);
+        let worker = std::thread::spawn(move || prompter.ask("Bash", "run", None));
+        // Receive the ask, then drop it (and its responder) unanswered.
+        let ev = loop {
+            match rx.try_recv() {
+                Ok(ev) => break ev,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        drop(ev);
+        assert!(matches!(worker.join().unwrap(), PermissionResponse::Deny));
+    }
+
+    #[test]
+    fn prompter_returns_users_answer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let prompter = ModernPrompter::new(tx);
+        let worker = std::thread::spawn(move || prompter.ask("Bash", "cargo test", Some("{}")));
+        let ev = loop {
+            match rx.try_recv() {
+                Ok(ev) => break ev,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        match ev {
+            EngineEvent::PermissionAsk { name, respond, .. } => {
+                assert_eq!(name, "Bash");
+                respond.send(PermissionResponse::AllowSession).unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            worker.join().unwrap(),
+            PermissionResponse::AllowSession
+        ));
     }
 }
