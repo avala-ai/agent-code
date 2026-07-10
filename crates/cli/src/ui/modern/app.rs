@@ -10,6 +10,7 @@ use super::mode::SessionMode;
 use super::scroll::ScrollState;
 use super::sink::EngineEvent;
 use super::stream_buffer::StreamBuffer;
+use super::tasks::TaskEntry;
 
 /// A permission ask the engine is blocked on, awaiting the user's answer.
 #[derive(Debug, Clone)]
@@ -134,6 +135,11 @@ pub struct App {
     /// [`super::run::QUIT_ARM_WINDOW`] quits. The run loop disarms on expiry.
     pub quit_armed: bool,
 
+    /// Tracked subagents for the tasks pane (plan §M8).
+    pub tasks: Vec<TaskEntry>,
+    /// Whether the tasks pane is shown (Ctrl+T); auto-hidden when no tasks.
+    pub show_tasks: bool,
+
     /// Spinner frame index while streaming.
     pub tick: u64,
 
@@ -180,6 +186,8 @@ impl App {
             queue: std::collections::VecDeque::new(),
             cancel_requested: false,
             quit_armed: false,
+            tasks: Vec::new(),
+            show_tasks: true,
             tick: 0,
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
@@ -270,6 +278,13 @@ impl App {
             }
             EngineEvent::ContextUsage { used, max } => {
                 self.ctx_meter = Some((used, max));
+            }
+            EngineEvent::SubagentUpdate {
+                agent_id,
+                state,
+                headline,
+            } => {
+                super::tasks::upsert(&mut self.tasks, &agent_id, &state, &headline);
             }
             EngineEvent::PermissionAsk {
                 name,
@@ -536,6 +551,18 @@ impl App {
         self.cursor = 0;
     }
 
+    /// Toggle the tasks pane (Ctrl+T). No-op display-wise when no tasks exist,
+    /// since the pane is hidden without any.
+    pub fn toggle_tasks(&mut self) {
+        self.show_tasks = !self.show_tasks;
+        self.dirty = true;
+    }
+
+    /// Whether the tasks pane should render (has tasks and is toggled on).
+    pub fn tasks_visible(&self) -> bool {
+        self.show_tasks && !self.tasks.is_empty()
+    }
+
     pub fn mark_turn_idle(&mut self) {
         // Any text still buffered when the turn ends must land now.
         self.flush_stream();
@@ -788,6 +815,41 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         app.delete_newest_queued();
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn subagent_update_populates_and_orders_tasks() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.tasks_visible(), "no pane without tasks");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "research-1".into(),
+            state: "working".into(),
+            headline: "scanning crates/".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "edit-1".into(),
+            state: "needs input".into(),
+            headline: "confirm write".into(),
+        });
+        assert_eq!(app.tasks.len(), 2);
+        assert!(app.tasks_visible());
+        // needs-input floats to the top.
+        assert_eq!(app.tasks[0].agent_id, "edit-1");
+    }
+
+    #[test]
+    fn ctrl_t_toggles_pane_visibility() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "a".into(),
+            state: "working".into(),
+            headline: "h".into(),
+        });
+        assert!(app.tasks_visible());
+        app.toggle_tasks();
+        assert!(!app.tasks_visible(), "toggled off");
+        app.toggle_tasks();
+        assert!(app.tasks_visible(), "toggled back on");
     }
 
     #[test]

@@ -29,7 +29,28 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     draw_header(frame, chunks[0], app);
-    draw_transcript(frame, chunks[1], app);
+    // Tasks pane (plan §M8): a right split ≥110 wide, else a below-transcript
+    // strip; hidden when there are no tasks.
+    if app.tasks_visible() {
+        let (transcript_area, pane_area) = if chunks[1].width >= 110 {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(20), Constraint::Length(32)])
+                .split(chunks[1]);
+            (cols[0], cols[1])
+        } else {
+            let strip = 5.min(chunks[1].height.saturating_sub(3));
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(strip)])
+                .split(chunks[1]);
+            (rows[0], rows[1])
+        };
+        draw_transcript(frame, transcript_area, app);
+        draw_tasks_pane(frame, pane_area, app);
+    } else {
+        draw_transcript(frame, chunks[1], app);
+    }
     draw_status(frame, chunks[2], app);
     if chips_h > 0 {
         draw_queue_chips(frame, chunks[3], app);
@@ -62,6 +83,39 @@ fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Tasks/agents pane: state-ordered subagent rows (plan §M8).
+fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use super::tasks::TaskState;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let inner_w = area.width.saturating_sub(2) as usize;
+    for t in &app.tasks {
+        let color = match t.state {
+            TaskState::Working => Color::Blue,
+            TaskState::NeedsInput => Color::Yellow,
+            TaskState::Done => Color::Green,
+            TaskState::Failed => Color::Red,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", t.state.glyph()), Style::default().fg(color)),
+            Span::styled(
+                format!("{} ", t.state.word()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // Headline on its own row, truncated to the pane width.
+        let head: String = t.headline.chars().take(inner_w.max(4)).collect();
+        lines.push(Line::from(Span::styled(
+            format!("  {head}"),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(format!(" agents ({}) ", app.tasks.len()));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_permission_modal(
@@ -521,6 +575,24 @@ mod tests {
         assert!(s.contains("queued:"), "chips row missing:\n{s}");
         assert!(s.contains("fix the flaky test"), "chip text missing:\n{s}");
         assert!(s.contains("2 queued"), "status count missing:\n{s}");
+    }
+
+    #[test]
+    fn tasks_pane_renders_when_agents_present() {
+        // Wide terminal → right-split pane.
+        let backend = TestBackend::new(120, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::SubagentUpdate {
+            agent_id: "research-1".into(),
+            state: "working".into(),
+            headline: "scanning crates for StreamSink".into(),
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("agents (1)"), "pane title missing:\n{s}");
+        assert!(s.contains("working"), "state word missing:\n{s}");
+        assert!(s.contains("scanning crates"), "headline missing:\n{s}");
     }
 
     #[test]

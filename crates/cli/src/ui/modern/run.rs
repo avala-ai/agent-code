@@ -396,6 +396,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // into the editor; Alt+- deletes it.
         (KeyModifiers::ALT, KeyCode::Up) => app.pop_newest_queued_to_editor(),
         (KeyModifiers::ALT, KeyCode::Char('-')) => app.delete_newest_queued(),
+        // Toggle the tasks/agents pane (plan §M8).
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) => app.toggle_tasks(),
         (_, KeyCode::Esc) => {
             // Navigation only: clear the prompt; NEVER cancel a running turn.
             app.clear_prompt();

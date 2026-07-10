@@ -44,6 +44,12 @@ pub enum EngineEvent {
         used: u64,
         max: u64,
     },
+    /// Background / typed subagent lifecycle update for the tasks pane (M8).
+    SubagentUpdate {
+        agent_id: String,
+        state: String,
+        headline: String,
+    },
     /// A tool call needs interactive permission. The turn task is blocked
     /// until a [`PermissionResponse`] is sent back on `respond` (dropping
     /// it counts as deny).
@@ -172,6 +178,14 @@ impl StreamSink for ChannelSink {
 
     fn on_context_usage(&self, used: u64, max: u64) {
         self.send(EngineEvent::ContextUsage { used, max });
+    }
+
+    fn on_subagent_update(&self, agent_id: &str, state: &str, headline: &str) {
+        self.send(EngineEvent::SubagentUpdate {
+            agent_id: agent_id.to_string(),
+            state: state.to_string(),
+            headline: headline.to_string(),
+        });
     }
 }
 
