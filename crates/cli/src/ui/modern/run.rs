@@ -418,16 +418,56 @@ async fn event_loop(
     Ok(())
 }
 
+/// True for Ctrl+C / Ctrl+Shift+C / Cmd+C (Super) / raw ETX.
+///
+/// Real terminals often set extra modifier bits (e.g. SHIFT with Ctrl+C) so
+/// exact `KeyModifiers::CONTROL` equality silently drops the key. Classic
+/// REPL uses `.contains(CONTROL)`; modern must do the same.
+fn is_interrupt_chord(key: &KeyEvent) -> bool {
+    match key.code {
+        // Raw ETX (0x03) — some paths deliver the byte without CONTROL.
+        KeyCode::Char('\u{3}') => true,
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => {
+            key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER)
+        }
+        _ => false,
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
-    // Ignore key release / repeat on platforms that emit them.
+    // Ignore key release on platforms that emit them. Accept Repeat so a
+    // held Ctrl+C still counts (double-tap quit / cancel).
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
         return;
     }
 
-    // Permission modal captures all input until answered. Esc/Ctrl+C mean
-    // deny (never cancel/quit from inside the modal).
+    // Permission modal captures all input until answered. Interrupt/Esc mean
+    // deny (and interrupt also cancels the in-flight turn).
     if app.phase == super::app::Phase::Permission {
         use super::app::Modal;
+        if is_interrupt_chord(&key) {
+            match app.front_modal() {
+                Some(Modal::Permission(_)) => {
+                    app.resolve_permission(PermissionResponse::Deny);
+                    // Also stop the turn — "get me out" not just "deny this tool".
+                    app.request_cancel();
+                }
+                Some(Modal::Plan(_)) => {
+                    app.resolve_plan(false, false);
+                }
+                Some(Modal::Question(_)) => {
+                    // Drop respond channel (ask fails closed) and cancel turn.
+                    app.deny_all_modals();
+                    app.phase = super::app::Phase::Streaming;
+                    app.request_cancel();
+                }
+                None => {
+                    app.request_cancel();
+                }
+            }
+            return;
+        }
         match app.front_modal() {
             Some(Modal::Permission(_)) => match (key.modifiers, key.code) {
                 (_, KeyCode::Char('y')) | (_, KeyCode::Char('1')) => {
@@ -436,10 +476,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);
                 }
-                (KeyModifiers::CONTROL, KeyCode::Char('c'))
-                | (_, KeyCode::Esc)
-                | (_, KeyCode::Char('n'))
-                | (_, KeyCode::Char('3')) => {
+                (_, KeyCode::Esc) | (_, KeyCode::Char('n')) | (_, KeyCode::Char('3')) => {
                     app.resolve_permission(PermissionResponse::Deny);
                 }
                 _ => {}
@@ -451,7 +488,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('k')) => {
                     app.resolve_plan(false, true);
                 }
-                (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+                (_, KeyCode::Esc) => {
                     app.resolve_plan(false, false);
                 }
                 _ => {}
@@ -460,6 +497,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Up) => app.question_move(-1),
                 (_, KeyCode::Down) => app.question_move(1),
                 (_, KeyCode::Enter) => app.question_select(None),
+                (_, KeyCode::Esc) => {
+                    app.deny_all_modals();
+                    app.phase = super::app::Phase::Streaming;
+                    app.request_cancel();
+                }
                 (_, KeyCode::Char(c)) if c.is_ascii_digit() && c != '0' => {
                     app.question_select(Some((c as usize - '1' as usize).min(8)));
                 }
@@ -470,26 +512,37 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Any keypress other than the arming Ctrl+C disarms quit; capture the
+    // Any keypress other than the arming interrupt disarms quit; capture the
     // prior arm state so a second Ctrl+C can act on it (§5 Ctrl+C machine).
     let was_armed = app.quit_armed;
     app.quit_armed = false;
 
-    match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-            if app.phase == super::app::Phase::Streaming {
-                // Ctrl+C is the ONLY cancel (Esc never cancels a turn).
-                app.request_cancel();
-            } else if !app.input.is_empty() {
-                app.clear_prompt();
-            } else if was_armed {
-                app.should_quit = true;
-            } else {
-                app.quit_armed = true;
-                app.status_message = "press Ctrl+C again to quit".into();
-            }
+    if is_interrupt_chord(&key) {
+        if app.phase == super::app::Phase::Streaming {
+            // Ctrl+C is the ONLY cancel (Esc never cancels a turn).
+            app.request_cancel();
+            app.transcript.push(super::app::TranscriptItem::System(
+                "interrupted — cancelling turn…".into(),
+            ));
+        } else if !app.input.is_empty() {
+            app.clear_prompt();
+        } else if was_armed {
+            app.should_quit = true;
+        } else {
+            app.quit_armed = true;
+            app.status_message = "press Ctrl+C again to quit".into();
+            // Status bar alone is easy to miss — also pin a transcript line.
+            app.transcript.push(super::app::TranscriptItem::System(
+                "Ctrl+C again to quit · or type /exit · or Ctrl+D".into(),
+            ));
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) if app.input.is_empty() => {
+        return;
+    }
+
+    match (key.modifiers, key.code) {
+        (m, KeyCode::Char('d') | KeyCode::Char('D'))
+            if m.contains(KeyModifiers::CONTROL) && app.input.is_empty() =>
+        {
             app.should_quit = true;
         }
         (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::Tab) => {
@@ -500,7 +553,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyModifiers::ALT, KeyCode::Up) => app.pop_newest_queued_to_editor(),
         (KeyModifiers::ALT, KeyCode::Char('-')) => app.delete_newest_queued(),
         // Toggle the tasks/agents pane (plan §M8).
-        (KeyModifiers::CONTROL, KeyCode::Char('t')) => app.toggle_tasks(),
+        (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
+            app.toggle_tasks()
+        }
         (_, KeyCode::Esc) => {
             // Navigation only: clear the prompt; NEVER cancel a running turn.
             app.clear_prompt();
@@ -516,13 +571,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Down) => app.scroll_down(1),
         (_, KeyCode::PageUp) => app.scroll_up(app.viewport_h.max(1)),
         (_, KeyCode::PageDown) => app.scroll_down(app.viewport_h.max(1)),
-        (KeyModifiers::CONTROL, KeyCode::Char('u')) => app.scroll_up(app.viewport_h / 2),
+        (m, KeyCode::Char('u') | KeyCode::Char('U')) if m.contains(KeyModifiers::CONTROL) => {
+            app.scroll_up(app.viewport_h / 2)
+        }
         (_, KeyCode::Home) => app.scroll_to_top(),
         (_, KeyCode::End) => app.scroll_to_bottom(),
-        // Only plain / shifted characters type into the prompt; Ctrl/Alt
+        // Only plain / shifted characters type into the prompt; Ctrl/Alt/Super
         // chords must not fall through as literal input.
         (m, KeyCode::Char(c))
-            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+            if !m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::ALT)
+                && !m.contains(KeyModifiers::SUPER) =>
         {
             app.insert_char(c);
         }
@@ -588,6 +647,17 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn ctrl_shift(c: char) -> KeyEvent {
+        KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+    }
+
+    fn super_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER)
+    }
+
     #[test]
     fn ctrl_c_while_streaming_cancels_not_quits() {
         let mut app = App::new("m", "/tmp", "s");
@@ -595,6 +665,36 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.cancel_requested);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_shift_c_and_uppercase_still_cancel() {
+        // Terminals often set SHIFT with Ctrl+C; exact-modifier match used to drop these.
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, ctrl_shift('c'));
+        assert!(app.cancel_requested, "Ctrl+Shift+c must cancel");
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, ctrl('C'));
+        assert!(app.cancel_requested, "Ctrl+C (uppercase) must cancel");
+    }
+
+    #[test]
+    fn super_c_interrupts_like_ctrl_c() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, super_key('c'));
+        assert!(app.cancel_requested, "Cmd/Super+C must cancel");
+    }
+
+    #[test]
+    fn raw_etx_cancels_turn() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, key(KeyCode::Char('\u{3}')));
+        assert!(app.cancel_requested);
     }
 
     #[test]
@@ -619,6 +719,15 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_c_double_press_quits() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl_shift('c'));
+        assert!(app.quit_armed);
+        handle_key(&mut app, ctrl_shift('C'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn any_key_disarms_quit() {
         let mut app = App::new("m", "/tmp", "s");
         handle_key(&mut app, ctrl('c'));
@@ -630,6 +739,15 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.quit_armed);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn request_cancel_works_even_when_phase_idle() {
+        // Phase desync must not swallow interrupt.
+        let mut app = App::new("m", "/tmp", "s");
+        assert_eq!(app.phase, Phase::Idle);
+        app.request_cancel();
+        assert!(app.cancel_requested);
     }
 
     #[test]

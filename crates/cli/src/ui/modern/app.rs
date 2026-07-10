@@ -724,11 +724,13 @@ impl App {
         }
     }
 
+    /// Ask the run loop to cancel the in-flight turn (if any). Always sets
+    /// the flag — the loop no-ops when there is no turn handle — so a phase
+    /// desync (e.g. TurnComplete flipped Idle early) cannot swallow Ctrl+C.
     pub fn request_cancel(&mut self) {
-        if self.phase == Phase::Streaming {
-            self.cancel_requested = true;
-            self.status_message = "cancelling…".into();
-        }
+        self.cancel_requested = true;
+        self.status_message = "cancelling…".into();
+        self.dirty = true;
     }
 
     /// Clear the prompt editor (Esc / Ctrl+C navigation — never cancels a turn).
