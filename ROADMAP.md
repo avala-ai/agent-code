@@ -48,7 +48,7 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 - [x] **Custom Skills** — writing, testing, and sharing a custom skill
 - [x] **MCP Integration** — connecting and using MCP servers
 - [x] **Multi-Provider** — switching between LLM providers, configuring fallbacks
-- [x] Tutorials navigation group added to `docs/mint.json`
+- [x] Tutorials navigation group added to `docs/docs.json`
 
 ### 1.4 FAQ — Done
 
@@ -67,7 +67,7 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 - [x] **Tool Execution** — permission flow, batching, streaming executor
 - [x] **Provider Abstraction** — Anthropic/OpenAI normalization
 - [x] **MCP Protocol** — stdio/SSE transports, proxying, resources
-- [x] Architecture navigation group added to `docs/mint.json`
+- [x] Architecture navigation group added to `docs/docs.json`
 
 ### 1.7 Performance Tuning Guide — Done
 
