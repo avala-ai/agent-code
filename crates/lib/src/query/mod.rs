@@ -240,11 +240,19 @@ impl QueryEngine {
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Effective plan mode: live flag wins, then AppState.
+    /// Effective plan mode for tool execution.
+    ///
+    /// The live atomic is authoritative so mid-turn `Session::apply_live_mode`
+    /// (and Shift+Tab out of Plan) can **disable** plan mode even while the
+    /// turn still holds the engine mutex and `state.plan_mode` has not been
+    /// synced yet. An OR with `state.plan_mode` made disable a no-op mid-turn.
+    ///
+    /// Callers that flip `state.plan_mode` without going through live handles
+    /// must also call [`Self::set_live_plan_mode`] (Enter/Exit tools do; classic
+    /// `/plan` and session resume do as well).
     pub fn effective_plan_mode(&self) -> bool {
         self.live_plan_mode
             .load(std::sync::atomic::Ordering::SeqCst)
-            || self.state.plan_mode
     }
 
     /// Emit a cheap context-usage estimate to the sink (used/max).
@@ -1127,6 +1135,10 @@ impl QueryEngine {
 
             // Step 4: Stream response. Start executing read-only tools
             // as their input completes (streaming tool execution).
+            // Tool-event channel is created *before* streaming so concurrent
+            // read-only tools (ExitPlanMode → on_plan_proposed, etc.) can
+            // emit into the same pipe the later executor path drains.
+            let (tool_event_tx, mut tool_event_rx) = crate::tools::event_sink::tool_event_channel();
             let mut content_blocks = Vec::new();
             let mut usage = Usage::default();
             let mut stop_reason: Option<StopReason> = None;
@@ -1172,6 +1184,8 @@ impl QueryEngine {
                                         let perm = self.permissions.clone();
                                         let tool_id = id.clone();
                                         let tool_name = name.clone();
+                                        let tool_events = Some(tool_event_tx.clone());
+                                        let active_call_id = Some(tool_id.clone());
 
                                         let handle = tokio::spawn(async move {
                                             // Enforce permissions on the streaming fast-path too.
@@ -1204,8 +1218,8 @@ impl QueryEngine {
                                                         sandbox: None,
                                                         active_disk_output_style: None,
                                                         agent_limiter: None,
-                                                    tool_events: None,
-                                                    active_call_id: None,
+                                                        tool_events,
+                                                        active_call_id,
                                                     },
                                                 )
                                                 .await
@@ -1424,7 +1438,9 @@ impl QueryEngine {
             // Step 8: Execute tool calls with pre/post hooks.
             info!("Executing {} tool call(s)", tool_calls.len());
             let cwd = PathBuf::from(&self.state.cwd);
-            let (tool_event_tx, mut tool_event_rx) = crate::tools::event_sink::tool_event_channel();
+            // Reuse the channel opened before streaming so ExitPlanMode (and
+            // any other concurrent read-only tool) events already in-flight
+            // land on the same receiver drained below.
             let tool_ctx = ToolContext {
                 cwd: cwd.clone(),
                 cancel: self.cancel.clone(),
@@ -1472,6 +1488,11 @@ impl QueryEngine {
                         result: crate::tools::ToolResult::error(format!("Task failed: {e}")),
                     }),
                 }
+            }
+            // Forward events emitted by streaming tools (e.g. plan proposed)
+            // even when no non-streaming tools remain to execute.
+            while let Ok(evt) = tool_event_rx.try_recv() {
+                forward_tool_event(sink, evt);
             }
 
             let mut vetoed_ids: std::collections::HashSet<String> =
@@ -3230,6 +3251,27 @@ mod tests {
                 .check("Bash", &serde_json::json!({"command": "ls"})),
             crate::permissions::PermissionDecision::Allow
         ));
+    }
+
+    #[test]
+    fn effective_plan_mode_respects_live_disable_while_state_stale() {
+        // Mid-turn Shift+Tab out of Plan only flips the live atomic; the
+        // turn still holds the engine mutex so state.plan_mode stays true
+        // until a best-effort sync. effective_plan_mode must follow live.
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        engine.state.plan_mode = true;
+        engine.set_live_plan_mode(true);
+        assert!(engine.effective_plan_mode());
+
+        engine.set_live_plan_mode(false);
+        assert!(
+            engine.state.plan_mode,
+            "state still true (mutex held by turn)"
+        );
+        assert!(
+            !engine.effective_plan_mode(),
+            "live disable must win over stale state.plan_mode"
+        );
     }
 
     #[tokio::test]

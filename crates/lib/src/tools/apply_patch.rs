@@ -94,15 +94,29 @@ impl Tool for ApplyPatchTool {
             Ok(o) => o,
             Err(e) => return PermissionDecision::Deny(e),
         };
+        // Check *every* path before returning Ask. Returning on the first
+        // Ask would skip later protected-dir Deny checks (e.g. src/a.rs
+        // then .git/config), so the user could approve a prompt that then
+        // writes into a blocked path when call() applies all ops.
+        let mut any_ask: Option<String> = None;
         for op in &ops {
             let path_str = op.path.to_string_lossy();
             let synthetic = json!({ "file_path": path_str });
             match checker.check(self.name(), &synthetic) {
                 PermissionDecision::Allow => {}
-                other => return other,
+                PermissionDecision::Deny(reason) => return PermissionDecision::Deny(reason),
+                PermissionDecision::Ask(prompt) => {
+                    if any_ask.is_none() {
+                        any_ask = Some(prompt);
+                    }
+                }
             }
         }
-        PermissionDecision::Allow
+        if let Some(prompt) = any_ask {
+            PermissionDecision::Ask(prompt)
+        } else {
+            PermissionDecision::Allow
+        }
     }
 
     async fn call(
@@ -628,5 +642,44 @@ mod tests {
         assert_eq!(paths[0], PathBuf::from("src/a.rs"));
         assert_eq!(paths[1], PathBuf::from("src/b.rs"));
         assert_eq!(paths[2], PathBuf::from("src/c.rs"));
+    }
+
+    #[tokio::test]
+    async fn check_permissions_denies_protected_path_even_after_ask_path() {
+        // Ask default mode + first path would Ask; second targets .git/.
+        // Must Deny without prompting so call() cannot write protected dirs.
+        use crate::config::{PermissionMode, PermissionsConfig};
+        use crate::permissions::PermissionChecker;
+
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        });
+        let patch = "\
+*** Begin Patch
+*** Update File: src/a.rs
+@@
+-old
++new
+*** Update File: .git/config
+@@
+-x
++y
+*** End Patch
+";
+        let decision = ApplyPatchTool
+            .check_permissions(&json!({ "patch": patch }), &checker)
+            .await;
+        match decision {
+            PermissionDecision::Deny(msg) => {
+                assert!(
+                    msg.contains("protected") || msg.contains(".git") || msg.contains("blocked"),
+                    "expected protected-path deny, got: {msg}"
+                );
+            }
+            other => panic!("expected Deny for later .git path, got {other:?}"),
+        }
     }
 }
