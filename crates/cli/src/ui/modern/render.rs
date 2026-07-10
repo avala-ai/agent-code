@@ -676,10 +676,12 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
-        assert!(s.contains("allow once"), "buffer:\n{s}");
         assert!(s.contains("[y]"), "key hint [y] missing:\n{s}");
+        assert!(s.contains("once"), "buffer:\n{s}");
         assert!(s.contains("[n]"), "key hint [n] missing:\n{s}");
         assert!(s.contains("[a]"), "key hint [a] missing:\n{s}");
+        assert!(s.contains("session"), "session hint missing:\n{s}");
+        assert!(s.contains("deny"), "deny hint missing:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
         assert!(s.contains("from subagent-2"), "origin line missing:\n{s}");
     }
