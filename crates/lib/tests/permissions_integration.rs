@@ -409,8 +409,9 @@ fn accept_edits_mode_allows_operations() {
         checker.check("FileEdit", &json_file("src/main.rs")),
         PermissionDecision::Allow
     ));
+    // AcceptEdits auto-allows file edits only; shell still asks.
     assert!(matches!(
         checker.check("Bash", &json_cmd("cargo build")),
-        PermissionDecision::Allow
+        PermissionDecision::Ask(_)
     ));
 }

@@ -477,7 +477,18 @@ fn check_protected_path(input: &serde_json::Value) -> Option<String> {
 
 fn mode_to_decision(mode: PermissionMode, tool_name: &str) -> PermissionDecision {
     match mode {
-        PermissionMode::Allow | PermissionMode::AcceptEdits => PermissionDecision::Allow,
+        PermissionMode::Allow => PermissionDecision::Allow,
+        // Auto-allow filesystem edits only; shell / agent / MCP / other
+        // mutations still prompt (docs: "auto-approve file edits, ask for
+        // shell commands"). Treating AcceptEdits as Allow for every tool
+        // would let Shift+Tab into accept-edits silently run Bash.
+        PermissionMode::AcceptEdits => {
+            if is_write_tool(tool_name) {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Ask(format!("Allow {tool_name} to execute?"))
+            }
+        }
         PermissionMode::Deny => {
             PermissionDecision::Deny(format!("Default mode denies {tool_name}"))
         }
@@ -833,6 +844,43 @@ mod tests {
         assert!(matches!(
             checker.check("FileWrite", &serde_json::json!({"file_path": "src/lib.rs"})),
             PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            checker.check("FileEdit", &serde_json::json!({"file_path": "src/main.rs"})),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            checker.check(
+                "ApplyPatch",
+                &serde_json::json!({"patch": "*** Begin Patch\n*** End Patch\n"})
+            ),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_accept_edits_mode_asks_for_non_edit_tools() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::AcceptEdits,
+            rules: vec![],
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+        // Shell / external / agents must still prompt under accept-edits.
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "cargo build"})),
+            PermissionDecision::Ask(_)
+        ));
+        assert!(matches!(
+            checker.check("Agent", &serde_json::json!({"prompt": "do work"})),
+            PermissionDecision::Ask(_)
+        ));
+        assert!(matches!(
+            checker.check(
+                "WebFetch",
+                &serde_json::json!({"url": "https://example.com"})
+            ),
+            PermissionDecision::Ask(_)
         ));
     }
 

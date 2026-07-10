@@ -197,16 +197,17 @@ impl Tool for ExitPlanModeTool {
             }
         };
 
+        // Jail *before* any read or write. ExitPlanMode is classified
+        // read-only (no permission prompt) so without this gate a model
+        // could pass plan_path=/etc/passwd (or a repo .env) and receive
+        // the file body as the "plan".
+        plan_path = ensure_path_under_plan_dir(&plan_path)?;
+
         // Persist plan content from the tool argument when provided. This is
         // the write path that remains available while plan_mode blocks
         // FileWrite/FileEdit/Bash (query loop sets plan_mode immediately after
         // EnterPlanMode succeeds).
-        //
-        // Security: only allow writes under the session plan directory so
-        // ExitPlanMode cannot be used as an unprompted arbitrary file write
-        // (it is classified read-only for executor purposes).
         if let Some(plan_md) = input.get("plan").and_then(|v| v.as_str()) {
-            plan_path = ensure_path_under_plan_dir(&plan_path)?;
             if let Some(parent) = plan_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -537,10 +538,10 @@ mod tests {
     #[tokio::test]
     async fn exit_warns_on_unfilled_template() {
         let ctx = test_ctx();
-        // Isolate from concurrent plan-mode tests: unique path under tempfile,
-        // not the shared data_dir plan slug which other tests may overwrite.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("template-plan.md");
+        // Isolate from concurrent plan-mode tests: unique name under the
+        // jailed plan directory (ExitPlanMode refuses paths outside it).
+        let _ = std::fs::create_dir_all(plan_dir());
+        let path = plan_dir().join(format!("template-plan-{}.md", uuid::Uuid::new_v4()));
         let template = "# Plan\n\n## Context\n\n(why this change is needed)\n\n\
                         ## Approach\n\n(recommended approach — not every alternative)\n\n\
                         ## Critical files\n\n(paths to modify, and what each needs)\n";
@@ -557,13 +558,15 @@ mod tests {
             "exit content: {}",
             exit.content
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn exit_missing_plan_path_errors() {
         let ctx = test_ctx();
-        // Unique non-existent path so concurrent tests cannot create it.
-        let missing = std::env::temp_dir().join(format!(
+        // Unique non-existent path *inside* the plan dir so concurrent tests
+        // cannot create it and the jail check still passes.
+        let missing = plan_dir().join(format!(
             "agent-code-no-such-plan-{}.md",
             uuid::Uuid::new_v4()
         ));
@@ -600,5 +603,33 @@ mod tests {
             .await;
         assert!(exit.is_err() || exit.as_ref().unwrap().is_error);
         assert!(!outside.exists(), "must not write outside plan dir");
+    }
+
+    #[tokio::test]
+    async fn exit_plan_rejects_read_outside_plan_dir() {
+        // ExitPlanMode is read-only (no write prompt). Without a jail on the
+        // read path, plan_path=/etc/passwd (or a repo .env) would be returned
+        // as the "plan" body when no `plan` argument is supplied.
+        let ctx = test_ctx();
+        let outside = std::env::temp_dir().join(format!(
+            "agent-code-secret-plan-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, "TOP SECRET credentials\n").unwrap();
+
+        let err = ExitPlanModeTool
+            .call(json!({ "plan_path": outside.to_string_lossy() }), &ctx)
+            .await
+            .expect_err("must reject path outside plan dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plan path must be inside") || msg.contains("must be inside"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("TOP SECRET"),
+            "must not surface secret contents in the error"
+        );
+        let _ = std::fs::remove_file(&outside);
     }
 }
