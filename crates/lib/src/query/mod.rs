@@ -2975,6 +2975,80 @@ mod tests {
         assert_eq!(final_status, TurnStatus::Aborted);
     }
 
+    /// M0 / #400: cancel must be observed inside the model-stream select
+    /// loop and complete within the 150 ms product budget (virtual time).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_reaches_terminal_within_150ms_virtual() {
+        use std::time::{Duration, Instant};
+
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new(build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        })));
+        let handle = session
+            .spawn_turn("hang".to_string(), Arc::new(NullSink))
+            .await;
+
+        // Advance just enough for the turn task to acquire the engine lock
+        // and enter the stream loop.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(handle.status(), TurnStatus::Running);
+
+        let t0 = Instant::now();
+        handle.cancel();
+
+        // Poll with virtual advances until terminal or budget exceeded.
+        let budget = Duration::from_millis(150);
+        let final_status = loop {
+            if handle.status().is_final() {
+                break handle.status();
+            }
+            if t0.elapsed() > budget {
+                panic!(
+                    "cancel did not reach terminal within {budget:?}; last={:?}",
+                    handle.status()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(5)).await;
+            // Yield so the turn task can observe cancel under paused time.
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(final_status, TurnStatus::Aborted);
+        assert!(
+            t0.elapsed() <= budget,
+            "cancel latency {:?} exceeded {:?}",
+            t0.elapsed(),
+            budget
+        );
+    }
+
+    #[test]
+    fn apply_live_mode_updates_permission_checker_without_engine_lock() {
+        use crate::config::PermissionMode;
+
+        let session = Session::new(build_engine(Arc::new(CompletingProvider)));
+        assert!(!session.live_plan_mode());
+
+        session.apply_live_mode(true, PermissionMode::Plan);
+        assert!(session.live_plan_mode());
+        assert!(matches!(
+            session
+                .permissions()
+                .check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Deny(_)
+        ));
+
+        session.apply_live_mode(false, PermissionMode::Allow);
+        assert!(!session.live_plan_mode());
+        assert!(matches!(
+            session
+                .permissions()
+                .check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Allow
+        ));
+    }
+
     #[tokio::test]
     async fn session_new_turn_does_not_report_prior_turn_completion() {
         // Regression: a reused session's status channel still holds the

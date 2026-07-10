@@ -114,11 +114,38 @@
 ## 5. M0 work items (this track)
 
 1. ✅ This AUDIT + `docs/tui` stubs  
-2. Additive `StreamSink` methods + wire call-id / context usage / turn outcome  
-3. Live mode controls (plan + permission) readable at every tool permission check without waiting for turn unlock  
-4. Session-allow keys: tool + normalized input  
-5. Cancel latency test under `start_paused`  
-6. Constrain `ExitPlanMode` writes to plan dir (security follow-up from PR review)
+2. ✅ Additive `StreamSink` methods + wire call-id / context usage / turn outcome  
+3. ✅ Live mode controls (plan + permission) readable at every tool permission check without waiting for turn unlock  
+4. ✅ Session-allow keys: tool + normalized input  
+5. ✅ Cancel latency test under `start_paused` (`cancel_reaches_terminal_within_150ms_virtual`)  
+6. ✅ Constrain `ExitPlanMode` writes to plan dir (security follow-up from PR review)  
+7. ☐ Wire bash `on_tool_output` chunks (method exists; executor not streaming yet)  
+8. ☐ Emit `on_subagent_update` from Agent tool  
+
+### UI integration recipe — `Session::apply_live_mode`
+
+**Call site** (replaces `try_lock`-only `apply_mode_to_engine` in `ui/modern/run.rs`):
+
+```rust
+// On every Shift+Tab / mode change (including mid-turn):
+let plan = matches!(mode, SessionMode::Plan);
+let perm = mode.permission_hint().unwrap_or(base_permission_mode);
+session.apply_live_mode(plan, perm); // never blocks; always takes effect next tool check
+
+// Optional AppState sync when lock free (badge / EnterPlanMode observers):
+if let Ok(mut eng) = session.engine().try_lock() {
+    eng.state_mut().plan_mode = plan;
+    eng.state_mut().config.permissions.default_mode = perm;
+}
+```
+
+| Handle | Effect |
+|---|---|
+| `session.apply_live_mode(plan, perm)` | Updates `live_plan_mode` AtomicBool + `PermissionChecker::set_default_mode` |
+| `session.permissions()` | Same `Arc` the tool executor uses |
+| `session.live_plan_mode()` | Read current live plan flag |
+
+No existing `StreamSink` / `Session` method signatures were removed; only additive APIs.
 
 ---
 
