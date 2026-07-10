@@ -491,6 +491,24 @@ impl App {
         self.cursor = idx + c.len_utf8();
     }
 
+    /// Insert a pasted string at the cursor (bracketed paste / Event::Paste).
+    /// Same phase gate as [`insert_char`]. Preserves newlines so multi-line
+    /// pastes (code, logs) survive into the next submit.
+    pub fn insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.phase != Phase::Idle && self.phase != Phase::Streaming {
+            return;
+        }
+        // Normalize CRLF → LF so Windows pastes don't leave bare `\r`s.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let idx = self.cursor.min(self.input.len());
+        self.input.insert_str(idx, &normalized);
+        self.cursor = idx + normalized.len();
+        self.dirty = true;
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 || self.input.is_empty() {
             return;
@@ -904,6 +922,32 @@ mod tests {
         assert!(parse_model_slash("/help").is_none());
         assert!(parse_model_slash("model").is_none());
         assert!(parse_model_slash("hello").is_none());
+    }
+
+    #[test]
+    fn insert_str_at_cursor_and_normalizes_crlf() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "ab".into();
+        app.cursor = 1;
+        app.insert_str("X\r\nY\rZ");
+        assert_eq!(app.input, "aX\nY\nZb");
+        assert_eq!(app.cursor, 1 + "X\nY\nZ".len());
+    }
+
+    #[test]
+    fn insert_str_works_while_streaming() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.insert_str("queued paste");
+        assert_eq!(app.input, "queued paste");
+    }
+
+    #[test]
+    fn insert_str_ignored_during_permission_modal() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        app.insert_str("nope");
+        assert!(app.input.is_empty());
     }
 
     #[test]

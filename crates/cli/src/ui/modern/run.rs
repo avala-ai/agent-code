@@ -378,6 +378,15 @@ async fn event_loop(
                             quit_armed_at = None;
                         }
                     }
+                    // Bracketed paste is enabled at setup; without this arm
+                    // pastes are silently dropped (terminals stop emitting
+                    // per-key events for the paste block).
+                    Some(Ok(Event::Paste(text))) => {
+                        app.quit_armed = false;
+                        quit_armed_at = None;
+                        handle_paste(app, &text);
+                        app.dirty = true;
+                    }
                     Some(Ok(Event::Mouse(m))) => handle_mouse(app, m),
                     Some(Ok(Event::Resize(_, _))) => { app.dirty = true; }
                     Some(Ok(_)) => {}
@@ -586,6 +595,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Insert bracketed-paste text into the prompt (or ignore during modals).
+fn handle_paste(app: &mut App, text: &str) {
+    // Modals own the keyboard; don't dump clipboard into the prompt behind them.
+    if app.phase == super::app::Phase::Permission {
+        return;
+    }
+    app.insert_str(text);
+}
+
 /// Route a mouse event (plan §M9). Wheel scrolls the transcript; a left
 /// click on the bottom row (where the jump pill sits) returns to Follow.
 /// Shift/Alt-modified drags are left to the terminal's native selection.
@@ -787,6 +805,22 @@ mod tests {
         assert!(app.quit_armed);
         handle_key(&mut app, ctrl('c'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn paste_inserts_into_prompt() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_paste(&mut app, "hello\nworld");
+        assert_eq!(app.input, "hello\nworld");
+        assert_eq!(app.cursor, "hello\nworld".len());
+    }
+
+    #[test]
+    fn paste_ignored_during_permission() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        handle_paste(&mut app, "secret");
+        assert!(app.input.is_empty());
     }
 
     fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
