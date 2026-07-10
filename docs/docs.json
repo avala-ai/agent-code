@@ -1,0 +1,119 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "agent-code",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#07C983",
+    "dark": "#0D9373"
+  },
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "navbar": {
+    "links": [
+      {
+        "type": "github",
+        "href": "https://github.com/avala-ai/agent-code"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Install",
+      "href": "https://github.com/avala-ai/agent-code#install"
+    }
+  },
+  "navigation": {
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "icon": "github",
+          "href": "https://github.com/avala-ai/agent-code"
+        },
+        {
+          "anchor": "Crates.io",
+          "icon": "box",
+          "href": "https://crates.io/crates/agent-code"
+        }
+      ]
+    },
+    "groups": [
+      {
+        "group": "Getting Started",
+        "pages": ["overview", "quickstart", "installation"]
+      },
+      {
+        "group": "Tutorials",
+        "pages": [
+          "tutorials/first-project",
+          "tutorials/custom-skills",
+          "tutorials/mcp-integration",
+          "tutorials/multi-provider"
+        ]
+      },
+      {
+        "group": "Core Concepts",
+        "pages": [
+          "concepts/agent-loop",
+          "concepts/tools",
+          "concepts/permissions",
+          "concepts/memory",
+          "concepts/sessions"
+        ]
+      },
+      {
+        "group": "Configuration",
+        "pages": [
+          "configuration/settings",
+          "configuration/themes",
+          "configuration/providers",
+          "configuration/mcp-servers",
+          "configuration/hooks"
+        ]
+      },
+      {
+        "group": "Extending",
+        "pages": [
+          "extending/skills",
+          "extending/plugins",
+          "extending/custom-tools",
+          "extending/ide-bridge"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "architecture/compaction",
+          "architecture/tool-execution",
+          "architecture/provider-abstraction",
+          "architecture/mcp-protocol"
+        ]
+      },
+      {
+        "group": "Guides",
+        "pages": ["guides/performance", "guides/security-scan"]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/tools",
+          "reference/commands",
+          "reference/cli-flags",
+          "reference/environment-variables"
+        ]
+      },
+      {
+        "group": "Help",
+        "pages": ["troubleshooting", "faq", "security"]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/avala-ai/agent-code"
+    }
+  }
+}
