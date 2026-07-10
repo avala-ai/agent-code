@@ -323,7 +323,10 @@ fn looks_like_template(content: &str) -> bool {
     hits >= 2
 }
 
-/// Generate a memorable slug for plan files (adjective-noun).
+/// Generate a memorable slug for plan files (adjective-noun + unique suffix).
+///
+/// The UUID suffix avoids collisions when concurrent sessions or tests enter
+/// plan mode in the same nanosecond (time-only slugs raced under Windows CI).
 fn generate_slug() -> String {
     let adjectives = [
         "brave", "calm", "dark", "eager", "fair", "golden", "hidden", "iron", "jade", "keen",
@@ -335,15 +338,14 @@ fn generate_slug() -> String {
         "spark", "tower",
     ];
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
+    let id = uuid::Uuid::new_v4();
+    let bytes = id.as_bytes();
+    let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let adj = adjectives[n % adjectives.len()];
+    let noun = nouns[(n / adjectives.len()) % nouns.len()];
+    let suffix = &id.simple().to_string()[..8];
 
-    let adj = adjectives[(now as usize) % adjectives.len()];
-    let noun = nouns[((now as usize) / adjectives.len()) % nouns.len()];
-
-    format!("{adj}-{noun}")
+    format!("{adj}-{noun}-{suffix}")
 }
 
 #[cfg(test)]
@@ -471,8 +473,15 @@ mod tests {
     #[tokio::test]
     async fn exit_warns_on_unfilled_template() {
         let ctx = test_ctx();
-        let enter = EnterPlanModeTool.call(json!({}), &ctx).await.unwrap();
-        let path = plan_path_from_enter(&enter.content);
+        // Isolate from concurrent plan-mode tests: unique path under tempfile,
+        // not the shared data_dir plan slug which other tests may overwrite.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("template-plan.md");
+        let template = "# Plan\n\n## Context\n\n(why this change is needed)\n\n\
+                        ## Approach\n\n(recommended approach — not every alternative)\n\n\
+                        ## Critical files\n\n(paths to modify, and what each needs)\n";
+        std::fs::write(&path, template).unwrap();
+
         let exit = ExitPlanModeTool
             .call(json!({ "plan_path": path.to_string_lossy() }), &ctx)
             .await
@@ -489,11 +498,13 @@ mod tests {
     #[tokio::test]
     async fn exit_missing_plan_path_errors() {
         let ctx = test_ctx();
+        // Unique non-existent path so concurrent tests cannot create it.
+        let missing = std::env::temp_dir().join(format!(
+            "agent-code-no-such-plan-{}.md",
+            uuid::Uuid::new_v4()
+        ));
         let exit = ExitPlanModeTool
-            .call(
-                json!({ "plan_path": "/tmp/agent-code-no-such-plan-file.md" }),
-                &ctx,
-            )
+            .call(json!({ "plan_path": missing.to_string_lossy() }), &ctx)
             .await
             .unwrap();
         assert!(exit.is_error);
