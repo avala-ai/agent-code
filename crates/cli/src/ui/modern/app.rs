@@ -68,8 +68,14 @@ pub(crate) fn format_model_catalog(current: &str, base_url: &str) -> Vec<String>
 /// prompt body. Returns `None` for non-slash input, modern-local commands,
 /// or unknown skill names (those pass through as normal prompts).
 ///
-/// Mirrors classic REPL: `commands::execute` skill branch → `skill.expand`.
-pub(crate) fn try_expand_skill_slash(input: &str, cwd: &str) -> Option<String> {
+/// Honors `security.disable_skill_shell_execution` via
+/// [`Skill::expand_safe`](agent_code_lib::skills::Skill::expand_safe) so
+/// fenced shell blocks are stripped when that policy is on.
+pub(crate) fn try_expand_skill_slash(
+    input: &str,
+    cwd: &str,
+    disable_skill_shell: bool,
+) -> Option<String> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -104,7 +110,7 @@ pub(crate) fn try_expand_skill_slash(input: &str, cwd: &str) -> Option<String> {
     if !skill.metadata.user_invocable {
         return None;
     }
-    Some(skill.expand(args))
+    Some(skill.expand_safe(args, disable_skill_shell))
 }
 
 /// One row in the scrollable transcript.
@@ -182,6 +188,9 @@ pub struct App {
     pub cwd: String,
     pub session_id: String,
     pub version: String,
+    /// Mirror of `security.disable_skill_shell_execution` for skill slash
+    /// expansion (must not bypass the policy that strips fenced shell).
+    pub disable_skill_shell: bool,
 
     pub mode: SessionMode,
     pub phase: Phase,
@@ -254,11 +263,23 @@ impl App {
         cwd: impl Into<String>,
         session_id: impl Into<String>,
     ) -> Self {
+        Self::new_with_security(model, cwd, session_id, false)
+    }
+
+    /// Like [`Self::new`] but records the skill-shell security policy from
+    /// the engine config (used by the live run loop).
+    pub fn new_with_security(
+        model: impl Into<String>,
+        cwd: impl Into<String>,
+        session_id: impl Into<String>,
+        disable_skill_shell: bool,
+    ) -> Self {
         Self {
             model: model.into(),
             cwd: cwd.into(),
             session_id: session_id.into(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            disable_skill_shell,
             mode: SessionMode::Normal,
             phase: Phase::Idle,
             waiting_on: WaitingOn::Model,
@@ -653,14 +674,15 @@ impl App {
     /// Resolve user text into a turn: expand `/skill` invocations the same
     /// way classic REPL does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
-        let (display, prompt) = match try_expand_skill_slash(&text, &self.cwd) {
-            Some(expanded) => {
-                // Keep the slash visible in the transcript; send the expanded
-                // skill body to the engine as the real user message.
-                (text, expanded)
-            }
-            None => (text.clone(), text),
-        };
+        let (display, prompt) =
+            match try_expand_skill_slash(&text, &self.cwd, self.disable_skill_shell) {
+                Some(expanded) => {
+                    // Keep the slash visible in the transcript; send the expanded
+                    // skill body to the engine as the real user message.
+                    (text, expanded)
+                }
+                None => (text.clone(), text),
+            };
         self.transcript.push(TranscriptItem::User(display));
         self.input.clear();
         self.cursor = 0;
@@ -876,7 +898,7 @@ mod tests {
     #[test]
     fn try_expand_skill_slash_expands_bundled_user_invocable() {
         // Bundled skills load without a project dir.
-        let expanded = try_expand_skill_slash("/verify", "/tmp");
+        let expanded = try_expand_skill_slash("/verify", "/tmp", false);
         assert!(
             expanded.is_some(),
             "bundled /verify skill should expand in modern TUI"
@@ -891,12 +913,41 @@ mod tests {
 
     #[test]
     fn try_expand_skill_slash_ignores_plain_text_and_local_commands() {
-        assert!(try_expand_skill_slash("hello", "/tmp").is_none());
-        assert!(try_expand_skill_slash("/help", "/tmp").is_none());
-        assert!(try_expand_skill_slash("/clear", "/tmp").is_none());
-        assert!(try_expand_skill_slash("/model", "/tmp").is_none());
-        assert!(try_expand_skill_slash("/model grok-4", "/tmp").is_none());
-        assert!(try_expand_skill_slash("/not-a-real-skill-xyz", "/tmp").is_none());
+        assert!(try_expand_skill_slash("hello", "/tmp", false).is_none());
+        assert!(try_expand_skill_slash("/help", "/tmp", false).is_none());
+        assert!(try_expand_skill_slash("/clear", "/tmp", false).is_none());
+        assert!(try_expand_skill_slash("/model", "/tmp", false).is_none());
+        assert!(try_expand_skill_slash("/model grok-4", "/tmp", false).is_none());
+        assert!(try_expand_skill_slash("/not-a-real-skill-xyz", "/tmp", false).is_none());
+    }
+
+    #[test]
+    fn try_expand_skill_slash_strips_shell_when_policy_on() {
+        // Project skill with a fenced bash block must lose the shell body
+        // when disable_skill_shell is true (Codex review #419).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills = dir.path().join(".agent").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("shell-skill.md"),
+            "---\ndescription: test skill with shell\nwhenToUse: tests only\nuserInvocable: true\n---\nRun:\n```bash\necho SECRET_SHELL_CMD\n```\nDone.\n",
+        )
+        .unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let allowed = try_expand_skill_slash("/shell-skill", cwd, false).expect("expand");
+        assert!(
+            allowed.contains("SECRET_SHELL_CMD"),
+            "shell kept when policy off: {allowed}"
+        );
+        let stripped = try_expand_skill_slash("/shell-skill", cwd, true).expect("expand");
+        assert!(
+            !stripped.contains("SECRET_SHELL_CMD"),
+            "shell must be stripped when policy on: {stripped}"
+        );
+        assert!(
+            stripped.contains("Shell execution disabled"),
+            "policy notice missing: {stripped}"
+        );
     }
 
     #[test]

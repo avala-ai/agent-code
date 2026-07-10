@@ -43,6 +43,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let cwd = engine.state().cwd.clone();
     let session_id = engine.state().session_id.clone();
     let base_permission_mode = engine.state().config.permissions.default_mode;
+    let disable_skill_shell = engine.state().config.security.disable_skill_shell_execution;
 
     // Apply theme so any shared color helpers still resolve.
     let configured = engine.state().config.ui.theme.clone();
@@ -66,7 +67,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     engine.set_question_asker(ModernQuestionAsker::new(eng_tx.clone()));
 
     let session = Session::new(engine);
-    let mut app = App::new(model, cwd, session_id);
+    let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
 
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
