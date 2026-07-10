@@ -11,6 +11,7 @@ use super::scroll::ScrollState;
 use super::sink::EngineEvent;
 use super::stream_buffer::StreamBuffer;
 use super::tasks::TaskEntry;
+use super::terminal_caps::TerminalCaps;
 
 /// A permission ask the engine is blocked on, awaiting the user's answer.
 #[derive(Debug, Clone)]
@@ -139,6 +140,8 @@ pub struct App {
     pub tasks: Vec<TaskEntry>,
     /// Whether the tasks pane is shown (Ctrl+T); auto-hidden when no tasks.
     pub show_tasks: bool,
+    /// Detected terminal capabilities, set once at loop start (plan §M7).
+    pub caps: TerminalCaps,
 
     /// Spinner frame index while streaming.
     pub tick: u64,
@@ -188,6 +191,7 @@ impl App {
             quit_armed: false,
             tasks: Vec::new(),
             show_tasks: true,
+            caps: TerminalCaps::default(),
             tick: 0,
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
@@ -440,9 +444,16 @@ impl App {
         if text == "/help" {
             self.transcript.push(TranscriptItem::System(
                 "Keys: Enter send · Shift+Tab mode · Ctrl+C cancel turn (then quit) · \
-                 Esc clear prompt · permission prompt: y once / a session / n deny · /clear /exit"
+                 Esc clear prompt · Ctrl+T tasks · permission prompt: y once / a session / n deny · \
+                 /clear /terminal-setup /exit"
                     .into(),
             ));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/terminal-setup" {
+            self.emit_terminal_setup();
             self.input.clear();
             self.cursor = 0;
             return;
@@ -561,6 +572,31 @@ impl App {
     /// Whether the tasks pane should render (has tasks and is toggled on).
     pub fn tasks_visible(&self) -> bool {
         self.show_tasks && !self.tasks.is_empty()
+    }
+
+    /// Emit the `/terminal-setup` diagnostics into the transcript: a
+    /// capability table plus copyable remediation lines (plan §M7).
+    pub fn emit_terminal_setup(&mut self) {
+        let c = self.caps;
+        let yn = |b: bool| if b { "✓" } else { "✗" };
+        let mut report = String::from("terminal-setup:\n");
+        report.push_str(&format!("  synchronized output : {}\n", yn(c.sync_output)));
+        report.push_str(&format!("  truecolor           : {}\n", yn(c.truecolor)));
+        report.push_str(&format!(
+            "  kitty keyboard      : {}\n",
+            yn(c.kitty_keyboard)
+        ));
+        report.push_str(&format!("  tmux                : {}\n", yn(c.tmux)));
+        let rem = c.remediation();
+        if !rem.is_empty() {
+            report.push_str("  remediation:\n");
+            for line in rem {
+                report.push_str(&format!("    {line}\n"));
+            }
+        }
+        self.transcript
+            .push(TranscriptItem::System(report.trim_end().to_string()));
+        self.dirty = true;
     }
 
     pub fn mark_turn_idle(&mut self) {
@@ -815,6 +851,28 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         app.delete_newest_queued();
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn terminal_setup_reports_caps_and_remediation() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.caps = super::super::terminal_caps::TerminalCaps {
+            sync_output: true,
+            truecolor: false,
+            kitty_keyboard: false,
+            tmux: true,
+        };
+        app.emit_terminal_setup();
+        let last = match app.transcript.last() {
+            Some(TranscriptItem::System(t)) => t.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(last.contains("terminal-setup"));
+        assert!(last.contains("synchronized output : ✓"));
+        assert!(last.contains("tmux                : ✓"));
+        // tmux + no-truecolor + no-kitty → remediation lines present.
+        assert!(last.contains("allow-passthrough"));
+        assert!(last.contains("COLORTERM=truecolor"));
     }
 
     #[test]

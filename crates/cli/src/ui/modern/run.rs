@@ -7,12 +7,18 @@
 use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
+
+use super::terminal_caps::TerminalCaps;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -61,6 +67,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
+    let caps = probe_caps();
 
     let mut terminal = setup_terminal()?;
     let result = event_loop(
@@ -71,6 +78,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
         eng_rx,
         base_permission_mode,
         bypass_disabled,
+        caps,
     )
     .await;
     restore_terminal(&mut terminal)?;
@@ -93,11 +101,23 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
+fn probe_caps() -> TerminalCaps {
+    let enhancement = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    TerminalCaps::detect(|k| std::env::var(k).ok(), enhancement)
+}
+
 fn setup_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
-    if let Err(e) = execute!(out, EnterAlternateScreen) {
-        // Don't leave the shell in raw mode if the alt screen failed.
+    // Enter alt screen and enable focus + bracketed paste reporting. These
+    // are consumed by the loop and disabled on exit so no `^[[I`/`^[[O`
+    // (focus) or paste brackets leak into the shell (plan §M7).
+    if let Err(e) = execute!(
+        out,
+        EnterAlternateScreen,
+        EnableFocusChange,
+        EnableBracketedPaste
+    ) {
         let _ = disable_raw_mode();
         return Err(e.into());
     }
@@ -105,30 +125,65 @@ fn setup_terminal() -> anyhow::Result<Term> {
     match Terminal::new(backend) {
         Ok(terminal) => Ok(terminal),
         Err(e) => {
-            let _ = disable_raw_mode();
-            let _ = execute!(stdout(), LeaveAlternateScreen);
+            restore_stdout_modes();
             Err(e.into())
         }
     }
 }
 
+/// Undo every terminal mode we enabled, in reverse order. Idempotent and
+/// used by both the normal restore and the panic hook.
+fn restore_stdout_modes() {
+    let _ = execute!(
+        stdout(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show,
+    );
+    let _ = disable_raw_mode();
+}
+
 fn restore_terminal(terminal: &mut Term) -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen,
+    )?;
     terminal.show_cursor()?;
+    disable_raw_mode()?;
     Ok(())
 }
 
-/// Chain a panic hook that restores the terminal (raw mode off, leave alt
-/// screen, cursor visible) before the default hook prints the panic, so a
-/// panic in the draw path never leaves the user's shell unusable.
+/// Chain a panic hook that restores the terminal (raw mode off, focus/paste
+/// reporting off, leave alt screen, cursor visible) before the default hook
+/// prints the panic, so a panic never leaves the user's shell unusable or
+/// leaking focus escape sequences.
 fn install_panic_restore_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        restore_stdout_modes();
         prev(info);
     }));
+}
+
+/// Draw one frame, wrapped in a DEC 2026 synchronized update when the
+/// terminal supports it — the tmux/VS Code flicker fix (plan §M7). The
+/// begin/end are best-effort; a terminal that ignores them just renders
+/// normally.
+fn draw_frame(terminal: &mut Term, app: &mut App, caps: TerminalCaps) -> anyhow::Result<()> {
+    if caps.sync_output {
+        let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+    }
+    // Map away the returned CompletedFrame so it doesn't hold a borrow of
+    // `terminal` across the End-sync `execute!` below.
+    let res = terminal.draw(|f| render::draw(f, app)).map(|_| ());
+    if caps.sync_output {
+        let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    }
+    res?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,7 +195,9 @@ async fn event_loop(
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     base_permission_mode: PermissionMode,
     bypass_disabled: bool,
+    caps: TerminalCaps,
 ) -> anyhow::Result<()> {
+    app.caps = caps;
     let mut turn: Option<TurnHandle> = None;
     let mut term_events = EventStream::new();
 
@@ -263,9 +320,10 @@ async fn event_loop(
         }
 
         // Draw only when something changed. An idle session with no events
-        // and no pending deltas never repaints (plan §2.2 rule 1).
+        // and no pending deltas never repaints (plan §2.2 rule 1). The draw
+        // is wrapped in a synchronized update when the terminal supports it.
         if app.dirty {
-            terminal.draw(|f| render::draw(f, app))?;
+            draw_frame(terminal, app, caps)?;
             app.dirty = false;
         }
 
@@ -516,6 +574,32 @@ mod tests {
         assert!(app.input.is_empty(), "Esc clears the prompt");
         assert!(!app.cancel_requested, "Esc must NEVER cancel a turn");
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn restore_sequence_disables_focus_and_paste_reporting() {
+        // The bytes we emit on restore must turn OFF focus reporting and
+        // bracketed paste so no `^[[I`/`^[[O` or paste brackets leak into the
+        // shell after exit (plan §M7). Capture crossterm's command bytes.
+        let mut buf: Vec<u8> = Vec::new();
+        crossterm::execute!(
+            buf,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        )
+        .unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        // Focus reporting off = CSI ?1004l; bracketed paste off = CSI ?2004l.
+        assert!(
+            s.contains("\x1b[?1004l"),
+            "focus reporting not disabled: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[?2004l"),
+            "bracketed paste not disabled: {s:?}"
+        );
     }
 
     #[test]

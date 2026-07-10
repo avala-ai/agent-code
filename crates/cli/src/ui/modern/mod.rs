@@ -13,6 +13,7 @@ mod scroll;
 mod sink;
 mod stream_buffer;
 mod tasks;
+mod terminal_caps;
 mod toolcard;
 
 pub use run::run_modern_tui;
