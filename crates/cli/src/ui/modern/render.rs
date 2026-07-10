@@ -265,6 +265,25 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("│"),
     ];
 
+    // Context meter: yellow ≥70%, red ≥90% (plan §M1/§6).
+    if let Some((used, max)) = app.ctx_meter
+        && max > 0
+    {
+        let pct = ((used as f64 / max as f64) * 100.0).round() as u32;
+        let color = if pct >= 90 {
+            Color::Red
+        } else if pct >= 70 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        spans.push(Span::styled(
+            format!(" ctx {pct}% "),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::raw("│"));
+    }
+
     // Waiting-on spinner while a turn runs (plan §M4); otherwise the last
     // status message.
     if app.phase == Phase::Streaming {
@@ -502,6 +521,48 @@ mod tests {
         assert!(s.contains("queued:"), "chips row missing:\n{s}");
         assert!(s.contains("fix the flaky test"), "chip text missing:\n{s}");
         assert!(s.contains("2 queued"), "status count missing:\n{s}");
+    }
+
+    #[test]
+    fn context_meter_renders_with_percentage() {
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.ctx_meter = Some((41, 100));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("ctx 41%"), "meter missing:\n{s}");
+    }
+
+    #[test]
+    fn context_meter_red_at_high_usage() {
+        // 95% → the "ctx 95%" cells should be red.
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.ctx_meter = Some((95, 100));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let s = buffer_to_string(buf);
+        assert!(s.contains("ctx 95%"), "buffer:\n{s}");
+        // Find a cell of the "ctx" text and assert red fg.
+        let row = 3; // status bar row (header=3 lines, transcript min 5… status is row index after)
+        let _ = row;
+        let mut found_red = false;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "c"
+                    && x + 6 < buf.area().width
+                    && buf[(x + 1, y)].symbol() == "t"
+                    && buf[(x + 2, y)].symbol() == "x"
+                    && cell.style().fg == Some(Color::Red)
+                {
+                    found_red = true;
+                }
+            }
+        }
+        assert!(found_red, "ctx meter should be red at 95%");
     }
 
     #[test]

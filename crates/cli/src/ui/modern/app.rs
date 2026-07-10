@@ -119,6 +119,8 @@ pub struct App {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
+    /// Engine-provided context-window meter (used, max) — plan §3.4.4.
+    pub ctx_meter: Option<(u64, u64)>,
     pub status_message: String,
 
     pub should_quit: bool,
@@ -171,6 +173,7 @@ impl App {
             tokens_in: 0,
             tokens_out: 0,
             cost_usd: 0.0,
+            ctx_meter: None,
             status_message: String::new(),
             should_quit: false,
             pending_submit: None,
@@ -264,6 +267,9 @@ impl App {
             EngineEvent::Compact { freed } => {
                 self.transcript
                     .push(TranscriptItem::System(format!("compacted ~{freed} tokens")));
+            }
+            EngineEvent::ContextUsage { used, max } => {
+                self.ctx_meter = Some((used, max));
             }
             EngineEvent::PermissionAsk {
                 name,
@@ -782,6 +788,17 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         app.delete_newest_queued();
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn context_usage_updates_meter() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(app.ctx_meter.is_none());
+        app.apply_engine(EngineEvent::ContextUsage {
+            used: 41_000,
+            max: 100_000,
+        });
+        assert_eq!(app.ctx_meter, Some((41_000, 100_000)));
     }
 
     #[test]

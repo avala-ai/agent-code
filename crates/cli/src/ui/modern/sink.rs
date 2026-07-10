@@ -38,6 +38,12 @@ pub enum EngineEvent {
     Compact {
         freed: u64,
     },
+    /// Running context-window meter from the engine (plan §3.4.4). The UI
+    /// never re-scans the transcript to compute this.
+    ContextUsage {
+        used: u64,
+        max: u64,
+    },
     /// A tool call needs interactive permission. The turn task is blocked
     /// until a [`PermissionResponse`] is sent back on `respond` (dropping
     /// it counts as deny).
@@ -162,6 +168,10 @@ impl StreamSink for ChannelSink {
         self.send(EngineEvent::Compact {
             freed: freed_tokens,
         });
+    }
+
+    fn on_context_usage(&self, used: u64, max: u64) {
+        self.send(EngineEvent::ContextUsage { used, max });
     }
 }
 
