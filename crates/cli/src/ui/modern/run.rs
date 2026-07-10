@@ -328,11 +328,11 @@ async fn event_loop(
         }
     }
 
-    // Cancel any in-flight turn on exit. Deny a pending permission first:
-    // the turn task is blocked inside the prompter until it gets an
-    // answer, and `join()` below would deadlock otherwise.
+    // Cancel any in-flight turn on exit. Deny every pending permission
+    // first: turn tasks blocked inside the prompter would otherwise
+    // deadlock the `join()` below.
     if let Some(h) = turn.take() {
-        app.resolve_permission(PermissionResponse::Deny);
+        app.deny_all_modals();
         h.cancel();
         let _ = h.join().await;
     }
@@ -521,15 +521,18 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Permission;
         let (respond, rx) = std::sync::mpsc::channel();
-        app.pending_permission = Some(crate::ui::modern::app::PendingPermission {
-            name: "Bash".into(),
-            description: "d".into(),
-            input_preview: None,
-            respond,
-        });
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                crate::ui::modern::app::PendingPermission {
+                    name: "Bash".into(),
+                    description: "d".into(),
+                    input_preview: None,
+                    respond,
+                },
+            ));
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Deny)));
         assert!(!app.should_quit);
-        assert!(app.pending_permission.is_none());
+        assert!(app.front_permission().is_none());
     }
 }

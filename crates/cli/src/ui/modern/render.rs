@@ -37,9 +37,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_input(frame, chunks[4], app);
 
     if app.phase == Phase::Permission
-        && let Some(pending) = app.pending_permission.clone()
+        && let Some(pending) = app.front_permission().cloned()
     {
-        draw_permission_modal(frame, area, &pending);
+        draw_permission_modal(frame, area, &pending, app.pending_modal_count());
     }
 }
 
@@ -64,8 +64,22 @@ fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_permission_modal(frame: &mut Frame<'_>, area: Rect, pending: &PendingPermission) {
+fn draw_permission_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pending: &PendingPermission,
+    pending_behind: usize,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    if pending_behind > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {pending_behind} more pending"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
     lines.push(Line::from(Span::styled(
         pending.description.clone(),
         Style::default().fg(Color::White),
@@ -395,17 +409,44 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Permission;
         let (respond, _rx) = std::sync::mpsc::channel();
-        app.pending_permission = Some(PendingPermission {
-            name: "Bash".into(),
-            description: "Bash: run `cargo publish`".into(),
-            input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
-            respond,
-        });
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: "Bash: run `cargo publish`".into(),
+                    input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
+                    respond,
+                },
+            ));
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
         assert!(s.contains("allow once"), "buffer:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn permission_modal_shows_pending_badge_when_queued() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        for name in ["first", "second", "third"] {
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: name.into(),
+                        description: format!("{name} ask"),
+                        input_preview: None,
+                        respond,
+                    },
+                ));
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("permission · first"), "front modal:\n{s}");
+        assert!(s.contains("2 more pending"), "badge missing:\n{s}");
     }
 
     #[test]

@@ -20,6 +20,15 @@ pub struct PendingPermission {
     pub respond: std::sync::mpsc::Sender<PermissionResponse>,
 }
 
+/// A modal awaiting user input. Displayed FIFO — the front is shown; the
+/// rest wait behind a "⚠ N pending" badge (plan §M6). Currently only
+/// permission asks; plan-approval and ask-user overlays extend this enum
+/// once the engine emits their events.
+#[derive(Debug, Clone)]
+pub enum Modal {
+    Permission(PendingPermission),
+}
+
 /// One row in the scrollable transcript.
 #[derive(Debug, Clone, Hash)]
 pub enum TranscriptItem {
@@ -89,8 +98,9 @@ pub struct App {
     pub phase: Phase,
     /// What the running turn is blocked on (drives the status-bar spinner).
     pub waiting_on: WaitingOn,
-    /// Permission ask currently displayed as a modal (engine blocked on it).
-    pub pending_permission: Option<PendingPermission>,
+    /// FIFO of modals awaiting the user (permission asks, incl. from
+    /// background subagents). The front is displayed (plan §M6).
+    pub modals: std::collections::VecDeque<Modal>,
 
     pub transcript: Vec<TranscriptItem>,
     /// Follow/Free scroll anchor for the transcript (plan §M2).
@@ -148,7 +158,7 @@ impl App {
             mode_pending: false,
             phase: Phase::Idle,
             waiting_on: WaitingOn::Model,
-            pending_permission: None,
+            modals: std::collections::VecDeque::new(),
             transcript: vec![TranscriptItem::System(
                 "Modern TUI · Shift+Tab mode · Ctrl+C cancel turn / quit · Esc clear prompt · Enter send".into(),
             )],
@@ -261,25 +271,31 @@ impl App {
                 input_preview,
                 respond,
             } => {
-                if let Some(prev) = self.pending_permission.take() {
-                    // Tool calls prompt sequentially, so this should not
-                    // happen; fail closed on the older ask if it does.
-                    let _ = prev.respond.send(PermissionResponse::Deny);
-                    self.transcript.push(TranscriptItem::Warning(format!(
-                        "overlapping permission prompts — denied {}",
-                        prev.name
-                    )));
-                }
-                self.pending_permission = Some(PendingPermission {
+                // FIFO: concurrent asks (e.g. lead + background subagent)
+                // queue behind the current one instead of being dropped.
+                self.modals.push_back(Modal::Permission(PendingPermission {
                     name,
                     description,
                     input_preview,
                     respond,
-                });
+                }));
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
         }
+    }
+
+    /// The permission ask currently displayed (front of the modal queue).
+    pub fn front_permission(&self) -> Option<&PendingPermission> {
+        match self.modals.front() {
+            Some(Modal::Permission(p)) => Some(p),
+            None => None,
+        }
+    }
+
+    /// Number of modals still waiting behind the front (for the badge).
+    pub fn pending_modal_count(&self) -> usize {
+        self.modals.len().saturating_sub(1)
     }
 
     /// Drain any buffered streaming text into the transcript. Called before
@@ -302,9 +318,10 @@ impl App {
         self.dirty = true;
     }
 
-    /// Answer the pending permission ask (if any) and unblock the turn.
+    /// Answer the front permission ask and advance the modal queue. When the
+    /// queue empties, focus returns to the running turn.
     pub fn resolve_permission(&mut self, resp: PermissionResponse) {
-        let Some(p) = self.pending_permission.take() else {
+        let Some(Modal::Permission(p)) = self.modals.pop_front() else {
             return;
         };
         let note = match resp {
@@ -314,11 +331,19 @@ impl App {
         };
         let _ = p.respond.send(resp);
         self.transcript.push(TranscriptItem::System(note));
-        if self.phase == Phase::Permission {
+        if self.modals.is_empty() && self.phase == Phase::Permission {
             self.phase = Phase::Streaming;
             self.waiting_on = WaitingOn::Model;
         }
         self.dirty = true;
+    }
+
+    /// Deny every queued modal (used on shutdown so blocked turn tasks in
+    /// the prompter never deadlock the join).
+    pub fn deny_all_modals(&mut self) {
+        while let Some(Modal::Permission(p)) = self.modals.pop_front() {
+            let _ = p.respond.send(PermissionResponse::Deny);
+        }
     }
 
     fn push_or_append_assistant(&mut self, t: &str) {
@@ -817,16 +842,69 @@ mod tests {
             respond,
         });
         assert_eq!(app.phase, Phase::Permission);
-        assert!(app.pending_permission.is_some());
+        assert!(app.front_permission().is_some());
 
         app.resolve_permission(PermissionResponse::AllowOnce);
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
         assert_eq!(app.phase, Phase::Streaming);
-        assert!(app.pending_permission.is_none());
+        assert!(app.front_permission().is_none());
         assert!(matches!(
             app.transcript.last(),
             Some(TranscriptItem::System(t)) if t.contains("allowed Bash once")
         ));
+    }
+
+    #[test]
+    fn concurrent_permission_asks_queue_fifo() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        let (r1, rx1) = std::sync::mpsc::channel();
+        let (r2, rx2) = std::sync::mpsc::channel();
+        // Lead + background subagent ask at the same time.
+        app.apply_engine(EngineEvent::PermissionAsk {
+            name: "Bash".into(),
+            description: "lead".into(),
+            input_preview: None,
+            respond: r1,
+        });
+        app.apply_engine(EngineEvent::PermissionAsk {
+            name: "FileWrite".into(),
+            description: "subagent".into(),
+            input_preview: None,
+            respond: r2,
+        });
+        // Both are queued; front is the first, badge shows 1 behind.
+        assert_eq!(app.front_permission().unwrap().name, "Bash");
+        assert_eq!(app.pending_modal_count(), 1);
+
+        app.resolve_permission(PermissionResponse::AllowOnce);
+        assert!(matches!(rx1.try_recv(), Ok(PermissionResponse::AllowOnce)));
+        // Still in Permission phase — the second modal advances to the front.
+        assert_eq!(app.phase, Phase::Permission);
+        assert_eq!(app.front_permission().unwrap().name, "FileWrite");
+
+        app.resolve_permission(PermissionResponse::Deny);
+        assert!(matches!(rx2.try_recv(), Ok(PermissionResponse::Deny)));
+        assert_eq!(app.phase, Phase::Streaming);
+    }
+
+    #[test]
+    fn deny_all_modals_unblocks_everything() {
+        let mut app = App::new("m", "/tmp", "s");
+        let (r1, rx1) = std::sync::mpsc::channel();
+        let (r2, rx2) = std::sync::mpsc::channel();
+        for (name, respond) in [("a", r1), ("b", r2)] {
+            app.apply_engine(EngineEvent::PermissionAsk {
+                name: name.into(),
+                description: name.into(),
+                input_preview: None,
+                respond,
+            });
+        }
+        app.deny_all_modals();
+        assert!(matches!(rx1.try_recv(), Ok(PermissionResponse::Deny)));
+        assert!(matches!(rx2.try_recv(), Ok(PermissionResponse::Deny)));
+        assert!(app.modals.is_empty());
     }
 
     #[test]
