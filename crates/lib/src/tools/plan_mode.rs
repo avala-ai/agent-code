@@ -181,7 +181,7 @@ impl Tool for ExitPlanModeTool {
     async fn call(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let mut plan_path = if let Some(p) = input.get("plan_path").and_then(|v| v.as_str()) {
             PathBuf::from(p)
@@ -266,6 +266,11 @@ impl Tool for ExitPlanModeTool {
              If they request revisions, re-enter plan mode, update the plan file, and \
              exit again.",
         );
+
+        // Notify the UI (modern modal FIFO) that a plan is ready for approval.
+        if let Some(tx) = ctx.tool_events.as_ref() {
+            tx.emit_plan_proposed(content.trim_end(), Some(&plan_path.to_string_lossy()));
+        }
 
         // Clear the active pointer so a stale plan is not reused later.
         let _ = clear_active_plan_path();
@@ -423,6 +428,8 @@ mod tests {
             subagent_colors: None,
             session_allows: None,
             permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,

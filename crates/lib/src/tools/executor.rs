@@ -137,6 +137,8 @@ pub async fn execute_tool_calls(
                                     subagent_colors: None,
                                     session_allows: None,
                                     permission_prompter: None,
+                                    question_asker: None,
+                                    agent_origin: None,
                                     // Parallel branch only runs read-only, concurrency-safe
                                     // tools — none of them spawn subprocesses, so the
                                     // sandbox would be inert here anyway.
@@ -234,7 +236,12 @@ async fn execute_single_tool(
                 let input_preview = serde_json::to_string_pretty(&call.input).ok();
 
                 let response = if let Some(ref prompter) = ctx.permission_prompter {
-                    prompter.ask(&call.name, &description, input_preview.as_deref())
+                    prompter.ask(
+                        &call.name,
+                        &description,
+                        input_preview.as_deref(),
+                        ctx.agent_origin.as_deref(),
+                    )
                 } else {
                     // No prompter = auto-allow (non-interactive mode).
                     super::PermissionResponse::AllowOnce

@@ -75,6 +75,7 @@ pub struct QueryEngine {
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
+    question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
     cached_system_prompt: Option<(u64, String)>, // (hash, prompt)
     /// Publishes the current turn's [`TurnStatus`] to observers.
@@ -137,6 +138,10 @@ pub trait StreamSink: Send + Sync {
 
     /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
     fn on_turn_outcome(&self, _turn: usize, _outcome: &str) {}
+
+    /// Plan ready for user approval (ExitPlanMode completed with content).
+    /// `path` is the jailed plan file path when known.
+    fn on_plan_proposed(&self, _plan_md: &str, _path: Option<&str>) {}
 }
 
 /// A no-op stream sink for non-interactive mode.
@@ -209,6 +214,7 @@ impl QueryEngine {
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             permission_prompter: None,
+            question_asker: None,
             cached_system_prompt: None,
             turn_status: tokio::sync::watch::channel(TurnStatus::Idle).0,
             steer_tx,
@@ -258,6 +264,14 @@ impl QueryEngine {
     /// interactive path only; one-shot/non-interactive runs leave it unset.
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
+    }
+
+    /// Install the multi-choice question asker (modern TUI modal).
+    ///
+    /// Without this, [`AskUserQuestion`](crate::tools::ask_user::AskUserQuestionTool)
+    /// falls back to stdin — which hangs under alt-screen raw mode.
+    pub fn set_question_asker(&mut self, asker: Arc<dyn crate::tools::QuestionAsker>) {
+        self.question_asker = Some(asker);
     }
 
     /// Load hooks from configuration into the registry.
@@ -1185,6 +1199,8 @@ impl QueryEngine {
                                                         subagent_colors: None,
                                                         session_allows: None,
                                                         permission_prompter: None,
+                                                        question_asker: None,
+                                                        agent_origin: None,
                                                         sandbox: None,
                                                         active_disk_output_style: None,
                                                         agent_limiter: None,
@@ -1421,6 +1437,8 @@ impl QueryEngine {
                 subagent_colors: Some(self.state.subagent_colors.clone()),
                 session_allows: Some(self.session_allows.clone()),
                 permission_prompter: self.permission_prompter.clone(),
+                question_asker: self.question_asker.clone(),
+                agent_origin: None,
                 sandbox: Some(std::sync::Arc::new(
                     crate::sandbox::SandboxExecutor::from_session_config(&self.state.config, &cwd),
                 )),
@@ -1575,22 +1593,14 @@ impl QueryEngine {
                     tokio::select! {
                         biased;
                         Some(evt) = tool_event_rx.recv() => {
-                            match evt {
-                                crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
-                                    sink.on_tool_output(&call_id, &chunk);
-                                }
-                            }
+                            forward_tool_event(sink, evt);
                         }
                         batch = &mut exec => break batch,
                     }
                 };
                 // Drain any trailing events after tools finish.
                 while let Ok(evt) = tool_event_rx.try_recv() {
-                    match evt {
-                        crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
-                            sink.on_tool_output(&call_id, &chunk);
-                        }
-                    }
+                    forward_tool_event(sink, evt);
                 }
                 results.extend(batch_results);
             }
@@ -1742,6 +1752,17 @@ const FILE_MUTATING_TOOLS: &[&str] = &[
 /// `FileChanged`. Pure so tests can probe without an engine.
 fn is_file_mutating_tool(name: &str) -> bool {
     FILE_MUTATING_TOOLS.contains(&name)
+}
+
+fn forward_tool_event(sink: &dyn StreamSink, evt: crate::tools::event_sink::ToolEvent) {
+    match evt {
+        crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
+            sink.on_tool_output(&call_id, &chunk);
+        }
+        crate::tools::event_sink::ToolEvent::PlanProposed { plan_md, path } => {
+            sink.on_plan_proposed(&plan_md, path.as_deref());
+        }
+    }
 }
 
 /// Emit a subagent lifecycle event from an Agent tool input payload.

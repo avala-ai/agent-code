@@ -110,6 +110,7 @@ impl agent_code_lib::tools::PermissionPrompter for TuiPrompter {
         tool_name: &str,
         description: &str,
         input_preview: Option<&str>,
+        origin: Option<&str>,
     ) -> agent_code_lib::tools::PermissionResponse {
         use agent_code_lib::tools::PermissionResponse as Lib;
         use std::sync::atomic::Ordering;
@@ -119,13 +120,18 @@ impl agent_code_lib::tools::PermissionPrompter for TuiPrompter {
         self.input_gate.store(true, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(120));
 
+        let description = match origin {
+            Some(o) if !o.is_empty() => format!("{description} (from {o})"),
+            _ => description.to_string(),
+        };
+
         // The selector toggles raw mode on then off. Restore it only if it was
         // already on — i.e. a watcher owns the terminal (the normal steered
         // turn). For a command-generated turn (e.g. a slash command that runs a
         // turn without spawning the watcher) raw mode was off and must stay off,
         // or the next rustyline prompt would be stuck in raw mode.
         let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        let response = ask_permission_detailed(tool_name, description, input_preview);
+        let response = ask_permission_detailed(tool_name, &description, input_preview);
         if was_raw {
             let _ = crossterm::terminal::enable_raw_mode();
         }

@@ -3,12 +3,16 @@
 //! Allows the agent to ask the user questions and collect structured
 //! responses. Used for gathering preferences, clarifying ambiguity,
 //! and making implementation decisions.
+//!
+//! Under the modern fullscreen TUI, stdin is not available (raw mode /
+//! alt-screen). Install a [`crate::tools::QuestionAsker`] on the
+//! [`crate::query::QueryEngine`] so questions route to a modal instead.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::io::Write;
 
-use super::{Tool, ToolContext, ToolResult};
+use super::{QuestionOption, Tool, ToolContext, ToolResult, UserQuestion};
 use crate::error::ToolError;
 
 pub struct AskUserQuestionTool;
@@ -76,63 +80,70 @@ impl Tool for AskUserQuestionTool {
     async fn call(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let questions = input
+        let questions_json = input
             .get("questions")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ToolError::InvalidInput("'questions' array is required".into()))?;
 
-        let mut answers = Vec::new();
-
-        for q in questions {
-            let question_text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
-
-            let options = q
+        let mut questions = Vec::new();
+        for q in questions_json {
+            let question_text = q
+                .get("question")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidInput("each question needs 'question'".into()))?
+                .to_string();
+            let options_json = q
                 .get("options")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| ToolError::InvalidInput("'options' array required".into()))?;
-
-            // Display the question.
-            eprintln!("\n{question_text}");
-            for (i, opt) in options.iter().enumerate() {
-                let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-                let desc = opt
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let letter = (b'A' + i as u8) as char;
-                eprintln!("  {letter}) {label} — {desc}");
-            }
-            eprint!("Choice: ");
-            let _ = std::io::stderr().flush();
-
-            // Read user input from stdin.
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read input: {e}")))?;
-
-            let choice = line.trim().to_uppercase();
-
-            // Map letter to option label.
-            let selected = if choice.len() == 1 {
-                let idx = choice.as_bytes()[0].wrapping_sub(b'A') as usize;
-                if idx < options.len() {
-                    options[idx]
+            let mut options = Vec::new();
+            for opt in options_json {
+                options.push(QuestionOption {
+                    label: opt
                         .get("label")
                         .and_then(|v| v.as_str())
-                        .unwrap_or(&choice)
-                        .to_string()
-                } else {
-                    choice
-                }
-            } else {
-                choice
-            };
-
-            answers.push(format!("{question_text}={selected}"));
+                        .unwrap_or("?")
+                        .to_string(),
+                    description: opt
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+            if options.len() < 2 {
+                return Err(ToolError::InvalidInput(
+                    "each question needs at least 2 options".into(),
+                ));
+            }
+            questions.push(UserQuestion {
+                question: question_text,
+                options,
+            });
         }
+
+        let labels = if let Some(asker) = ctx.question_asker.as_ref() {
+            asker.ask(&questions).map_err(ToolError::ExecutionFailed)?
+        } else {
+            // Classic REPL / tests: stdin letter choice.
+            ask_via_stdin(&questions)?
+        };
+
+        if labels.len() != questions.len() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "expected {} answers, got {}",
+                questions.len(),
+                labels.len()
+            )));
+        }
+
+        let answers: Vec<String> = questions
+            .iter()
+            .zip(labels.iter())
+            .map(|(q, label)| format!("{}={label}", q.question))
+            .collect();
 
         let result = format!(
             "User has answered your questions: {}. You can now continue with the user's answers in mind.",
@@ -145,4 +156,36 @@ impl Tool for AskUserQuestionTool {
 
         Ok(ToolResult::success(result))
     }
+}
+
+fn ask_via_stdin(questions: &[UserQuestion]) -> Result<Vec<String>, ToolError> {
+    let mut answers = Vec::new();
+    for q in questions {
+        eprintln!("\n{}", q.question);
+        for (i, opt) in q.options.iter().enumerate() {
+            let letter = (b'A' + i as u8) as char;
+            eprintln!("  {letter}) {} — {}", opt.label, opt.description);
+        }
+        eprint!("Choice: ");
+        let _ = std::io::stderr().flush();
+
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read input: {e}")))?;
+
+        let choice = line.trim().to_uppercase();
+        let selected = if choice.len() == 1 {
+            let idx = choice.as_bytes()[0].wrapping_sub(b'A') as usize;
+            if idx < q.options.len() {
+                q.options[idx].label.clone()
+            } else {
+                choice
+            }
+        } else {
+            choice
+        };
+        answers.push(selected);
+    }
+    Ok(answers)
 }

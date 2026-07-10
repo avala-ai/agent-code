@@ -396,6 +396,8 @@ mod stream_emit_tests {
             subagent_colors: None,
             session_allows: None,
             permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,
@@ -416,6 +418,7 @@ mod stream_emit_tests {
                     assert_eq!(call_id, "call-1");
                     chunks.push(chunk);
                 }
+                ToolEvent::PlanProposed { .. } => {}
             }
         }
         assert!(!chunks.is_empty());

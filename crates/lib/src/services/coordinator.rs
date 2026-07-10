@@ -389,6 +389,17 @@ pub fn effective_permissions(definition: &AgentDefinition) -> Option<Permissions
     }
 
     let mut perms = definition.permissions.clone().unwrap_or_default();
+    // Visibility-only overlays (no explicit frontmatter permissions) must
+    // not leave `Ask` as default: one-shot subagents have no prompter and
+    // would auto-allow every mutating tool. Read-only → Plan; otherwise
+    // Deny + explicit Allow rules for listed tools.
+    if definition.permissions.is_none() {
+        if definition.read_only {
+            perms.default_mode = PermissionMode::Plan;
+        } else {
+            perms.default_mode = PermissionMode::Deny;
+        }
+    }
     if definition.read_only {
         perms.default_mode = PermissionMode::Plan;
     }
@@ -413,7 +424,59 @@ pub fn effective_permissions(definition: &AgentDefinition) -> Option<Permissions
             }
         }
     }
+    // When default is Deny and we only have an allowlist (visibility),
+    // grant Allow rules for each listed tool so the child can run them
+    // without a prompter.
+    if matches!(perms.default_mode, PermissionMode::Deny) && !perms.allowed_tools.is_empty() {
+        for tool in &perms.allowed_tools {
+            let already = perms.rules.iter().any(|r| r.tool == *tool);
+            if !already {
+                perms.rules.push(PermissionRule {
+                    tool: tool.clone(),
+                    pattern: None,
+                    action: PermissionMode::Allow,
+                });
+            }
+        }
+    }
     Some(perms)
+}
+
+/// Compose a child permissions overlay onto a host permissions config.
+///
+/// Overlay wins for `default_mode` and visibility allowlists; host
+/// `rules` are preserved so project-level policy is not wiped when a
+/// typed subagent only restricts tool visibility.
+pub fn compose_permissions_overlay(
+    host: &PermissionsConfig,
+    overlay: &PermissionsConfig,
+) -> PermissionsConfig {
+    let mut rules = overlay.rules.clone();
+    for r in &host.rules {
+        if !rules
+            .iter()
+            .any(|x| x.tool == r.tool && x.pattern == r.pattern && x.action == r.action)
+        {
+            rules.push(r.clone());
+        }
+    }
+    let allowed_tools = if !overlay.allowed_tools.is_empty() {
+        overlay.allowed_tools.clone()
+    } else {
+        host.allowed_tools.clone()
+    };
+    let mut disallowed_tools = host.disallowed_tools.clone();
+    for t in &overlay.disallowed_tools {
+        if !disallowed_tools.iter().any(|x| x == t) {
+            disallowed_tools.push(t.clone());
+        }
+    }
+    PermissionsConfig {
+        default_mode: overlay.default_mode,
+        rules,
+        allowed_tools,
+        disallowed_tools,
+    }
 }
 
 /// Write a permissions overlay TOML to a temp file and return its path.
@@ -526,7 +589,7 @@ pub fn apply_agent_definition(
     model_override: Option<&str>,
 ) {
     if let Some(model) = model_override.or(definition.model.as_deref()) {
-        cmd.arg("--model").arg(model);
+        cmd.arg("--model").arg(resolve_model_alias(model));
     }
     if let Some(max_turns) = definition.max_turns {
         cmd.arg("--max-turns").arg(max_turns.to_string());
@@ -547,6 +610,18 @@ pub fn apply_agent_definition(
                 );
             }
         }
+    }
+}
+
+/// Expand short model aliases used by agents (`sonnet` / `opus` / `haiku`).
+pub fn resolve_model_alias(model: &str) -> String {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "sonnet" | "claude-sonnet" => "claude-sonnet-5".into(),
+        "opus" | "claude-opus" => "claude-opus-4-8".into(),
+        "haiku" | "claude-haiku" => "claude-haiku-4-5".into(),
+        "gpt" | "gpt-latest" => "gpt-5.4".into(),
+        "grok" => "grok-4.3".into(),
+        other => other.to_string(),
     }
 }
 
@@ -1177,6 +1252,44 @@ mod coordinator_tests {
         assert!(perms.allowed_tools.contains(&"FileRead".into()));
         assert!(perms.disallowed_tools.contains(&"Bash".into()));
         assert_eq!(perms.default_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn resolve_model_alias_expands_short_names() {
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-5");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-8");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5");
+        assert_eq!(resolve_model_alias("claude-sonnet-5"), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn compose_permissions_overlay_keeps_host_rules() {
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("rm *".into()),
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![],
+            allowed_tools: vec!["FileRead".into(), "Grep".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        assert_eq!(merged.default_mode, PermissionMode::Plan);
+        assert!(merged.allowed_tools.contains(&"FileRead".into()));
+        assert!(
+            merged
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
+            "host project rules must survive overlay"
+        );
     }
 
     #[test]

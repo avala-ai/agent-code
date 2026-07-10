@@ -85,11 +85,16 @@ impl PermissionPrompter for ModernPrompter {
         tool_name: &str,
         description: &str,
         input_preview: Option<&str>,
+        origin: Option<&str>,
     ) -> PermissionResponse {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let description = match origin {
+            Some(o) if !o.is_empty() => format!("{description} (from {o})"),
+            _ => description.to_string(),
+        };
         let sent = self.tx.send(EngineEvent::PermissionAsk {
             name: tool_name.to_string(),
-            description: description.to_string(),
+            description,
             input_preview: input_preview.map(str::to_string),
             respond: resp_tx,
         });
@@ -237,7 +242,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
         drop(rx);
-        let resp = prompter.ask("Bash", "run", None);
+        let resp = prompter.ask("Bash", "run", None, None);
         assert!(matches!(resp, PermissionResponse::Deny));
     }
 
@@ -245,7 +250,7 @@ mod tests {
     fn prompter_denies_when_responder_dropped() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
-        let worker = std::thread::spawn(move || prompter.ask("Bash", "run", None));
+        let worker = std::thread::spawn(move || prompter.ask("Bash", "run", None, None));
         // Receive the ask, then drop it (and its responder) unanswered.
         let ev = loop {
             match rx.try_recv() {
@@ -261,7 +266,8 @@ mod tests {
     fn prompter_returns_users_answer() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
-        let worker = std::thread::spawn(move || prompter.ask("Bash", "cargo test", Some("{}")));
+        let worker =
+            std::thread::spawn(move || prompter.ask("Bash", "cargo test", Some("{}"), None));
         let ev = loop {
             match rx.try_recv() {
                 Ok(ev) => break ev,

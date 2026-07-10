@@ -331,7 +331,8 @@ pub fn build_subagent_command(
     if let Some(def) = definition {
         apply_agent_definition(&mut cmd, def, model_override);
     } else if let Some(model) = model_override {
-        cmd.arg("--model").arg(model);
+        cmd.arg("--model")
+            .arg(crate::services::coordinator::resolve_model_alias(model));
     }
 
     for var in SUBAGENT_ENV_PASSTHROUGH {
