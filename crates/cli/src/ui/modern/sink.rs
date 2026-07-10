@@ -26,10 +26,15 @@ pub enum EngineEvent {
     Text(String),
     Thinking(String),
     ToolStart {
+        /// Stable engine tool-call id, used to correlate the result card.
+        /// Empty only if the engine emitted the legacy id-less callback.
+        call_id: String,
         name: String,
         detail: String,
     },
     ToolResult {
+        /// Matches the `call_id` of the originating [`EngineEvent::ToolStart`].
+        call_id: String,
         name: String,
         content: String,
         is_error: bool,
@@ -65,6 +70,9 @@ pub enum EngineEvent {
     PermissionAsk {
         name: String,
         description: String,
+        /// Who triggered the ask (e.g. a subagent id), kept typed so the UI
+        /// renders it distinctly instead of splicing it into `description`.
+        origin: Option<String>,
         input_preview: Option<String>,
         respond: std::sync::mpsc::Sender<PermissionResponse>,
     },
@@ -110,13 +118,10 @@ impl PermissionPrompter for ModernPrompter {
         origin: Option<&str>,
     ) -> PermissionResponse {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-        let description = match origin {
-            Some(o) if !o.is_empty() => format!("{description} (from {o})"),
-            _ => description.to_string(),
-        };
         let sent = self.tx.send(EngineEvent::PermissionAsk {
             name: tool_name.to_string(),
-            description,
+            description: description.to_string(),
+            origin: origin.filter(|o| !o.is_empty()).map(str::to_string),
             input_preview: input_preview.map(str::to_string),
             respond: resp_tx,
         });
@@ -190,16 +195,29 @@ impl StreamSink for ChannelSink {
     }
 
     fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value) {
+        // Legacy id-less path: the engine calls `on_tool_call_start` instead,
+        // so this only fires for sinks/tests using the base callback. Empty
+        // `call_id` makes the UI fall back to oldest-pending correlation.
+        self.on_tool_call_start("", tool_name, input);
+    }
+
+    fn on_tool_result(&self, tool_name: &str, result: &ToolResult) {
+        self.on_tool_call_result("", tool_name, result);
+    }
+
+    fn on_tool_call_start(&self, call_id: &str, tool_name: &str, input: &serde_json::Value) {
         let detail = tool_detail(tool_name, input);
         self.send(EngineEvent::ToolStart {
+            call_id: call_id.to_string(),
             name: tool_name.to_string(),
             detail,
         });
     }
 
-    fn on_tool_result(&self, tool_name: &str, result: &ToolResult) {
+    fn on_tool_call_result(&self, call_id: &str, tool_name: &str, result: &ToolResult) {
         let content: String = result.content.chars().take(4_000).collect();
         self.send(EngineEvent::ToolResult {
+            call_id: call_id.to_string(),
             name: tool_name.to_string(),
             content,
             is_error: result.is_error,

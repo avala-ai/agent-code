@@ -16,6 +16,9 @@ use super::sink::UiQuestion;
 pub struct PendingPermission {
     pub name: String,
     pub description: String,
+    /// Who triggered the ask (e.g. a subagent id), rendered as a distinct
+    /// line rather than folded into `description`.
+    pub origin: Option<String>,
     pub input_preview: Option<String>,
     pub respond: std::sync::mpsc::Sender<PermissionResponse>,
 }

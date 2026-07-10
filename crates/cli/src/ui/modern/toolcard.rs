@@ -123,6 +123,7 @@ mod tests {
 
     fn read(detail: &str) -> TranscriptItem {
         TranscriptItem::Tool {
+            call_id: String::new(),
             name: "FileRead".into(),
             detail: detail.into(),
             result: Some("ok".into()),
@@ -131,6 +132,7 @@ mod tests {
     }
     fn bash() -> TranscriptItem {
         TranscriptItem::Tool {
+            call_id: String::new(),
             name: "Bash".into(),
             detail: "ls".into(),
             result: Some("ok".into()),
@@ -139,6 +141,7 @@ mod tests {
     }
     fn running_read() -> TranscriptItem {
         TranscriptItem::Tool {
+            call_id: String::new(),
             name: "FileRead".into(),
             detail: "x".into(),
             result: None,

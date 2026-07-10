@@ -22,6 +22,9 @@ pub enum TranscriptItem {
     Assistant(String),
     Thinking(String),
     Tool {
+        /// Engine tool-call id used to correlate the result to this card.
+        /// Empty when the engine used the legacy id-less callback.
+        call_id: String,
         name: String,
         detail: String,
         result: Option<String>,
@@ -219,9 +222,14 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
-            EngineEvent::ToolStart { name, detail } => {
+            EngineEvent::ToolStart {
+                call_id,
+                name,
+                detail,
+            } => {
                 self.waiting_on = WaitingOn::Tool(name.clone());
                 self.transcript.push(TranscriptItem::Tool {
+                    call_id,
                     name,
                     detail,
                     result: None,
@@ -229,20 +237,36 @@ impl App {
                 });
             }
             EngineEvent::ToolResult {
-                content, is_error, ..
+                call_id,
+                content,
+                is_error,
+                ..
             } => {
-                // Attach to the OLDEST pending tool: the executor runs calls
-                // sequentially in start order, so results arrive in the same
-                // order (rev() paired results with the newest start and
-                // swapped outputs whenever a turn had 2+ tool calls).
+                // Correlate by the engine's stable call_id so parallel tool
+                // calls attach to the right card regardless of completion
+                // order. Fall back to the oldest still-pending card when the
+                // id is absent (legacy id-less callback) or unmatched.
+                let by_id = (!call_id.is_empty())
+                    .then(|| {
+                        self.transcript.iter().position(|i| {
+                            matches!(
+                                i,
+                                TranscriptItem::Tool { call_id: c, result: None, .. }
+                                    if *c == call_id
+                            )
+                        })
+                    })
+                    .flatten();
+                let idx = by_id.or_else(|| {
+                    self.transcript
+                        .iter()
+                        .position(|i| matches!(i, TranscriptItem::Tool { result: None, .. }))
+                });
                 if let Some(TranscriptItem::Tool {
                     result,
                     is_error: err,
                     ..
-                }) = self
-                    .transcript
-                    .iter_mut()
-                    .find(|i| matches!(i, TranscriptItem::Tool { result: None, .. }))
+                }) = idx.and_then(|i| self.transcript.get_mut(i))
                 {
                     *result = Some(content.lines().next().unwrap_or("").to_string());
                     *err = is_error;
@@ -291,6 +315,7 @@ impl App {
             EngineEvent::PermissionAsk {
                 name,
                 description,
+                origin,
                 input_preview,
                 respond,
             } => {
@@ -299,6 +324,7 @@ impl App {
                 self.modals.push_back(Modal::Permission(PendingPermission {
                     name,
                     description,
+                    origin,
                     input_preview,
                     respond,
                 }));
@@ -758,6 +784,7 @@ mod tests {
         // A tool start is a barrier: it must flush the text before it applies,
         // so the assistant text lands *before* the tool card in the transcript.
         app.apply_engine(EngineEvent::ToolStart {
+            call_id: String::new(),
             name: "Bash".into(),
             detail: "ls".into(),
         });
@@ -774,16 +801,21 @@ mod tests {
 
     #[test]
     fn tool_results_attach_in_start_order() {
+        // Legacy id-less fallback: with empty call_ids the result attaches to
+        // the oldest still-pending card.
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::ToolStart {
+            call_id: String::new(),
             name: "Bash".into(),
             detail: "first".into(),
         });
         app.apply_engine(EngineEvent::ToolStart {
+            call_id: String::new(),
             name: "Grep".into(),
             detail: "second".into(),
         });
         app.apply_engine(EngineEvent::ToolResult {
+            call_id: String::new(),
             name: "Bash".into(),
             content: "r1".into(),
             is_error: false,
@@ -800,6 +832,45 @@ mod tests {
             TranscriptItem::Tool { detail, result, .. } => {
                 assert_eq!(detail, "second");
                 assert!(result.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_results_correlate_by_call_id_out_of_order() {
+        // Parallel tool calls can complete in any order; the result must
+        // attach to the card with the matching call_id, not the oldest.
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::ToolStart {
+            call_id: "call_a".into(),
+            name: "Bash".into(),
+            detail: "first".into(),
+        });
+        app.apply_engine(EngineEvent::ToolStart {
+            call_id: "call_b".into(),
+            name: "Grep".into(),
+            detail: "second".into(),
+        });
+        // The SECOND call returns first.
+        app.apply_engine(EngineEvent::ToolResult {
+            call_id: "call_b".into(),
+            name: "Grep".into(),
+            content: "second-out".into(),
+            is_error: false,
+        });
+        let n = app.transcript.len();
+        match &app.transcript[n - 2] {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "first");
+                assert!(result.is_none(), "call_a must stay pending");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &app.transcript[n - 1] {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "second");
+                assert_eq!(result.as_deref(), Some("second-out"));
             }
             other => panic!("{other:?}"),
         }
@@ -963,11 +1034,13 @@ mod tests {
         app.apply_engine(EngineEvent::TurnStart(1));
         assert_eq!(app.waiting_on, WaitingOn::Model);
         app.apply_engine(EngineEvent::ToolStart {
+            call_id: "c1".into(),
             name: "Bash".into(),
             detail: "cargo test".into(),
         });
         assert_eq!(app.waiting_on, WaitingOn::Tool("Bash".into()));
         app.apply_engine(EngineEvent::ToolResult {
+            call_id: "c1".into(),
             name: "Bash".into(),
             content: "ok".into(),
             is_error: false,
@@ -983,6 +1056,7 @@ mod tests {
         app.apply_engine(EngineEvent::PermissionAsk {
             name: "Bash".into(),
             description: "d".into(),
+            origin: None,
             input_preview: None,
             respond,
         });
@@ -1011,11 +1085,16 @@ mod tests {
         app.apply_engine(EngineEvent::PermissionAsk {
             name: "Bash".into(),
             description: "Bash: run `cargo test`".into(),
+            origin: Some("subagent-3".into()),
             input_preview: Some("{\"command\": \"cargo test\"}".into()),
             respond,
         });
         assert_eq!(app.phase, Phase::Permission);
-        assert!(app.front_permission().is_some());
+        assert_eq!(
+            app.front_permission().and_then(|p| p.origin.as_deref()),
+            Some("subagent-3"),
+            "origin is kept typed on the pending permission"
+        );
 
         app.resolve_permission(PermissionResponse::AllowOnce);
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
@@ -1096,12 +1175,14 @@ mod tests {
         app.apply_engine(EngineEvent::PermissionAsk {
             name: "Bash".into(),
             description: "lead".into(),
+            origin: None,
             input_preview: None,
             respond: r1,
         });
         app.apply_engine(EngineEvent::PermissionAsk {
             name: "FileWrite".into(),
             description: "subagent".into(),
+            origin: Some("subagent-1".into()),
             input_preview: None,
             respond: r2,
         });
@@ -1129,6 +1210,7 @@ mod tests {
             app.apply_engine(EngineEvent::PermissionAsk {
                 name: name.into(),
                 description: name.into(),
+                origin: None,
                 input_preview: None,
                 respond,
             });

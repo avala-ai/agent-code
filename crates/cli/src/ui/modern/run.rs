@@ -730,6 +730,7 @@ mod tests {
                 crate::ui::modern::app::PendingPermission {
                     name: "Bash".into(),
                     description: "d".into(),
+                    origin: None,
                     input_preview: None,
                     respond,
                 },

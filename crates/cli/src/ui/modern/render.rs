@@ -273,6 +273,14 @@ fn draw_permission_modal(
         pending.description.clone(),
         Style::default().fg(Color::White),
     )));
+    if let Some(ref origin) = pending.origin {
+        lines.push(Line::from(Span::styled(
+            format!("from {origin}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
     if let Some(ref preview) = pending.input_preview {
         lines.push(Line::from(""));
         const MAX_PREVIEW: usize = 10;
@@ -621,6 +629,7 @@ mod tests {
                 PendingPermission {
                     name: "Bash".into(),
                     description: "Bash: run `cargo publish`".into(),
+                    origin: Some("subagent-2".into()),
                     input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
                     respond,
                 },
@@ -630,6 +639,7 @@ mod tests {
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
         assert!(s.contains("allow once"), "buffer:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
+        assert!(s.contains("from subagent-2"), "origin line missing:\n{s}");
     }
 
     #[test]
@@ -702,6 +712,7 @@ mod tests {
                     PendingPermission {
                         name: name.into(),
                         description: format!("{name} ask"),
+                        origin: None,
                         input_preview: None,
                         respond,
                     },
@@ -728,6 +739,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new("m", "/tmp", "s");
         app.transcript.push(TranscriptItem::Tool {
+            call_id: String::new(),
             name: "Bash".into(),
             detail: "cargo test".into(),
             result: Some("ok".into()),

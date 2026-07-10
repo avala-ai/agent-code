@@ -187,6 +187,7 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
             detail,
             result,
             is_error,
+            ..
         } => lines.extend(render_tool_card(name, detail, result.as_deref(), *is_error)),
         TranscriptItem::System(t) => {
             lines.push(Line::from(Span::styled(
@@ -400,6 +401,7 @@ mod tests {
 
     fn read_ok(detail: &str) -> TranscriptItem {
         TranscriptItem::Tool {
+            call_id: String::new(),
             name: "FileRead".into(),
             detail: detail.into(),
             result: Some("42 lines".into()),
@@ -428,6 +430,7 @@ mod tests {
         let mut c = LayoutCache::default();
         // A single failed bash card: red ✗, expanded result kept.
         let items = vec![TranscriptItem::Tool {
+            call_id: String::new(),
             name: "Bash".into(),
             detail: "cargo test".into(),
             result: Some("exit 1".into()),
