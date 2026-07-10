@@ -6,6 +6,7 @@
 mod app;
 mod layout;
 mod markdown;
+mod modal;
 mod mode;
 mod render;
 mod run;

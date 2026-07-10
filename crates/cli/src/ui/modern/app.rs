@@ -3,8 +3,6 @@
 //! Pure data + reducers. Drawing lives in [`super::render`]; I/O in
 //! [`super::run`]. This split keeps visual tests free of a live terminal.
 
-use agent_code_lib::tools::PermissionResponse;
-
 use super::layout::LayoutCache;
 use super::mode::SessionMode;
 use super::scroll::ScrollState;
@@ -13,46 +11,9 @@ use super::stream_buffer::StreamBuffer;
 use super::tasks::TaskEntry;
 use super::terminal_caps::TerminalCaps;
 
-/// A permission ask the engine is blocked on, awaiting the user's answer.
-#[derive(Debug, Clone)]
-pub struct PendingPermission {
-    pub name: String,
-    pub description: String,
-    pub input_preview: Option<String>,
-    pub respond: std::sync::mpsc::Sender<PermissionResponse>,
-}
-
-/// A plan proposed via ExitPlanMode, shown for review (plan §M6). Fire-and-
-/// forget — the agent has already exited plan mode; approving just closes
-/// the modal (and optionally switches out of Plan mode).
-#[derive(Debug, Clone)]
-pub struct PlanReview {
-    pub plan_md: String,
-    pub path: Option<String>,
-}
-
-/// An in-progress multi-question ask. Answers accumulate one label per
-/// question; when the last is answered, `respond` receives the full vec.
-#[derive(Debug, Clone)]
-pub struct QuestionState {
-    pub questions: Vec<super::sink::UiQuestion>,
-    /// Index of the question currently shown.
-    pub current: usize,
-    /// Highlighted option in the current question.
-    pub cursor: usize,
-    /// Chosen labels so far (one per answered question).
-    pub answers: Vec<String>,
-    pub respond: std::sync::mpsc::Sender<Vec<String>>,
-}
-
-/// A modal awaiting user input. Displayed FIFO — the front is shown; the
-/// rest wait behind a "⚠ N pending" badge (plan §M6).
-#[derive(Debug, Clone)]
-pub enum Modal {
-    Permission(PendingPermission),
-    Plan(PlanReview),
-    Question(QuestionState),
-}
+// Modal types + resolvers live in `modal.rs`; re-export so existing
+// `app::Modal` / `app::PendingPermission` paths keep working.
+pub use super::modal::{Modal, PendingPermission, PlanReview, QuestionState};
 
 /// One row in the scrollable transcript.
 #[derive(Debug, Clone, Hash)]
@@ -368,108 +329,6 @@ impl App {
         }
     }
 
-    /// The modal currently displayed (front of the FIFO queue).
-    pub fn front_modal(&self) -> Option<&Modal> {
-        self.modals.front()
-    }
-
-    /// The permission ask currently displayed, if the front modal is one.
-    pub fn front_permission(&self) -> Option<&PendingPermission> {
-        match self.modals.front() {
-            Some(Modal::Permission(p)) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// After a modal is answered, close it and return to the turn if the
-    /// queue is now empty.
-    fn advance_modal_phase(&mut self) {
-        if self.modals.is_empty() && self.phase == Phase::Permission {
-            self.phase = Phase::Streaming;
-            self.waiting_on = WaitingOn::Model;
-        }
-        self.dirty = true;
-    }
-
-    /// Resolve a plan-review modal (plan §M6): approve leaves plan behind (and
-    /// switches Plan→AcceptEdits so the follow-up can execute); keep-planning
-    /// re-enters Plan; dismiss just closes. Returns true if a plan modal was
-    /// at the front.
-    pub fn resolve_plan(&mut self, approve: bool, keep_planning: bool) -> bool {
-        if !matches!(self.modals.front(), Some(Modal::Plan(_))) {
-            return false;
-        }
-        let Some(Modal::Plan(p)) = self.modals.pop_front() else {
-            return false;
-        };
-        if approve {
-            self.transcript
-                .push(TranscriptItem::System("plan approved".into()));
-            if self.mode == SessionMode::Plan {
-                self.mode = SessionMode::AcceptEdits;
-            }
-        } else if keep_planning {
-            self.transcript
-                .push(TranscriptItem::System("staying in plan mode".into()));
-            self.mode = SessionMode::Plan;
-        } else {
-            self.transcript
-                .push(TranscriptItem::System("plan dismissed".into()));
-        }
-        // Keep the plan in the transcript for reference.
-        let _ = &p.plan_md;
-        self.advance_modal_phase();
-        true
-    }
-
-    /// Move the question cursor within the current question.
-    pub fn question_move(&mut self, delta: i32) {
-        if let Some(Modal::Question(q)) = self.modals.front_mut() {
-            let n = q.questions[q.current].options.len().max(1);
-            let cur = q.cursor as i32;
-            q.cursor = (cur + delta).rem_euclid(n as i32) as usize;
-            self.dirty = true;
-        }
-    }
-
-    /// Select the highlighted (or numbered) option for the current question,
-    /// advancing to the next question or sending all answers when done.
-    pub fn question_select(&mut self, index: Option<usize>) {
-        let done_answers = {
-            let Some(Modal::Question(q)) = self.modals.front_mut() else {
-                return;
-            };
-            let opts = &q.questions[q.current].options;
-            if opts.is_empty() {
-                return;
-            }
-            let pick = index.unwrap_or(q.cursor).min(opts.len() - 1);
-            q.answers.push(opts[pick].clone());
-            q.current += 1;
-            q.cursor = 0;
-            if q.current >= q.questions.len() {
-                Some(q.answers.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(answers) = done_answers
-            && let Some(Modal::Question(q)) = self.modals.pop_front()
-        {
-            let _ = q.respond.send(answers);
-            self.transcript
-                .push(TranscriptItem::System("answered".into()));
-            self.advance_modal_phase();
-        } else {
-            self.dirty = true;
-        }
-    }
-
-    /// Number of modals still waiting behind the front (for the badge).
-    pub fn pending_modal_count(&self) -> usize {
-        self.modals.len().saturating_sub(1)
-    }
-
     /// Drain any buffered streaming text into the transcript. Called before
     /// applying a non-delta event and on the coalescer's flush deadline.
     pub fn flush_stream(&mut self) {
@@ -488,40 +347,6 @@ impl App {
             self.push_or_append_assistant(&out.assistant);
         }
         self.dirty = true;
-    }
-
-    /// Answer the front permission ask and advance the modal queue. No-op if
-    /// the front modal is not a permission ask (so a mixed queue is safe).
-    pub fn resolve_permission(&mut self, resp: PermissionResponse) {
-        if !matches!(self.modals.front(), Some(Modal::Permission(_))) {
-            return;
-        }
-        let Some(Modal::Permission(p)) = self.modals.pop_front() else {
-            return;
-        };
-        let note = match resp {
-            PermissionResponse::AllowOnce => format!("allowed {} once", p.name),
-            PermissionResponse::AllowSession => format!("allowed {} for this session", p.name),
-            PermissionResponse::Deny => format!("denied {}", p.name),
-        };
-        let _ = p.respond.send(resp);
-        self.transcript.push(TranscriptItem::System(note));
-        self.advance_modal_phase();
-    }
-
-    /// Fail-close every queued modal (used on shutdown so turn tasks blocked
-    /// in the prompter/asker never deadlock the join). Permission asks get
-    /// Deny; question asks get their channel dropped (recv fails closed);
-    /// plan modals are fire-and-forget.
-    pub fn deny_all_modals(&mut self) {
-        while let Some(m) = self.modals.pop_front() {
-            match m {
-                Modal::Permission(p) => {
-                    let _ = p.respond.send(PermissionResponse::Deny);
-                }
-                Modal::Question(_) | Modal::Plan(_) => {}
-            }
-        }
     }
 
     fn push_or_append_assistant(&mut self, t: &str) {
@@ -794,6 +619,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_code_lib::tools::PermissionResponse;
 
     // Build a transcript tall enough to scroll, then prime layout metrics as
     // the draw would (one System block = one wrapped line each here).
