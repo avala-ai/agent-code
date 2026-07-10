@@ -131,6 +131,8 @@ impl TaskExecutor for LocalAgentExecutor {
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
         };
 
         let outcome = AgentTool.call(input, &tool_ctx).await;

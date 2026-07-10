@@ -143,6 +143,8 @@ pub async fn execute_tool_calls(
                                     sandbox: None,
                                     active_disk_output_style: None,
                                     agent_limiter: None,
+                                    tool_events: None,
+                                    active_call_id: None,
                                 },
                                 &perm_checker,
                             )
@@ -182,6 +184,9 @@ async fn execute_single_tool(
     ctx: &ToolContext,
     permission_checker: &PermissionChecker,
 ) -> ToolCallResult {
+    // Bind the call id so progressive tool events (stdout chunks) correlate.
+    let ctx = ctx.with_call_id(&call.id);
+
     // Block non-read-only tools in plan mode.
     if ctx.plan_mode && !tool.is_read_only() {
         return ToolCallResult {
@@ -279,7 +284,7 @@ async fn execute_single_tool(
     }
 
     // Execute.
-    match tool.call(call.input.clone(), ctx).await {
+    match tool.call(call.input.clone(), &ctx).await {
         Ok(mut result) => {
             // Persist large outputs to disk, replace with truncated + path reference.
             result.content = crate::services::output_store::persist_if_large(

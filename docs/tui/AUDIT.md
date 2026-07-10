@@ -119,7 +119,7 @@
 4. ✅ Session-allow keys: tool + normalized input  
 5. ✅ Cancel latency test under `start_paused` (`cancel_reaches_terminal_within_150ms_virtual`)  
 6. ✅ Constrain `ExitPlanMode` writes to plan dir (security follow-up from PR review)  
-7. ☐ Wire bash `on_tool_output` chunks (method exists; executor not streaming yet)  
+7. ✅ Wire bash `on_tool_output` chunks via `tools::event_sink` channel + query-loop drain  
 8. ✅ Emit `on_subagent_update` on Agent tool start/result (query loop)  
 9. ✅ `ApplyPatch` tool (#407) — Begin Patch dialect, multi-file add/update/delete
 

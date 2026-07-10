@@ -29,6 +29,7 @@ pub mod cron_create;
 pub mod cron_delete;
 pub mod cron_list;
 pub mod cron_support;
+pub mod event_sink;
 pub mod executor;
 pub mod file_edit;
 pub mod file_read;
@@ -240,6 +241,42 @@ pub struct ToolContext {
     /// (e.g. in tests / non-interactive contexts).
     pub agent_limiter:
         Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
+    /// Live tool-event channel (stdout chunks, etc.). Optional so tests
+    /// and one-shot paths can omit it.
+    pub tool_events: Option<event_sink::ToolEventTx>,
+    /// Id of the tool call currently executing (for correlating events).
+    pub active_call_id: Option<String>,
+}
+
+impl ToolContext {
+    /// Emit progressive tool output when a live event channel is installed.
+    pub fn emit_tool_output(&self, chunk: &str) {
+        if let (Some(tx), Some(id)) = (&self.tool_events, &self.active_call_id) {
+            tx.emit_output(id, chunk);
+        }
+    }
+
+    /// Clone this context with a specific active call id (and shared event tx).
+    pub fn with_call_id(&self, call_id: impl Into<String>) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            cancel: self.cancel.clone(),
+            permission_checker: self.permission_checker.clone(),
+            verbose: self.verbose,
+            plan_mode: self.plan_mode,
+            file_cache: self.file_cache.clone(),
+            denial_tracker: self.denial_tracker.clone(),
+            task_manager: self.task_manager.clone(),
+            subagent_colors: self.subagent_colors.clone(),
+            session_allows: self.session_allows.clone(),
+            permission_prompter: self.permission_prompter.clone(),
+            sandbox: self.sandbox.clone(),
+            active_disk_output_style: self.active_disk_output_style.clone(),
+            agent_limiter: self.agent_limiter.clone(),
+            tool_events: self.tool_events.clone(),
+            active_call_id: Some(call_id.into()),
+        }
+    }
 }
 
 /// Result of a tool execution.

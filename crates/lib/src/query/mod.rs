@@ -1188,6 +1188,8 @@ impl QueryEngine {
                                                         sandbox: None,
                                                         active_disk_output_style: None,
                                                         agent_limiter: None,
+                                                    tool_events: None,
+                                                    active_call_id: None,
                                                     },
                                                 )
                                                 .await
@@ -1406,6 +1408,7 @@ impl QueryEngine {
             // Step 8: Execute tool calls with pre/post hooks.
             info!("Executing {} tool call(s)", tool_calls.len());
             let cwd = PathBuf::from(&self.state.cwd);
+            let (tool_event_tx, mut tool_event_rx) = crate::tools::event_sink::tool_event_channel();
             let tool_ctx = ToolContext {
                 cwd: cwd.clone(),
                 cancel: self.cancel.clone(),
@@ -1427,6 +1430,8 @@ impl QueryEngine {
                     .as_ref()
                     .map(|s| s.name.clone()),
                 agent_limiter: Some(self.state.agent_limiter.clone()),
+                tool_events: Some(tool_event_tx),
+                active_call_id: None,
             };
 
             // Collect streaming tool results first.
@@ -1557,13 +1562,36 @@ impl QueryEngine {
             // them alongside the real tool outputs.
             results.extend(vetoed_results);
             if !remaining_calls.is_empty() {
-                let batch_results = execute_tool_calls(
+                // Run tools while forwarding live tool events (e.g. bash
+                // stdout chunks) to the stream sink for progressive UI.
+                let exec = execute_tool_calls(
                     &remaining_calls,
                     self.tools.all(),
                     &tool_ctx,
                     &self.permissions,
-                )
-                .await;
+                );
+                tokio::pin!(exec);
+                let batch_results = loop {
+                    tokio::select! {
+                        biased;
+                        Some(evt) = tool_event_rx.recv() => {
+                            match evt {
+                                crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
+                                    sink.on_tool_output(&call_id, &chunk);
+                                }
+                            }
+                        }
+                        batch = &mut exec => break batch,
+                    }
+                };
+                // Drain any trailing events after tools finish.
+                while let Ok(evt) = tool_event_rx.try_recv() {
+                    match evt {
+                        crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
+                            sink.on_tool_output(&call_id, &chunk);
+                        }
+                    }
+                }
                 results.extend(batch_results);
             }
 
