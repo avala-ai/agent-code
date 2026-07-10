@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{App, PendingPermission, Phase};
+use super::colors::palette;
 use super::mode::SessionMode;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -92,7 +93,7 @@ fn draw_plan_modal(
     if pending_behind > 0 {
         lines.push(Line::from(Span::styled(
             format!("⚠ {pending_behind} more pending"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette().warning),
         )));
         lines.push(Line::from(""));
     }
@@ -113,12 +114,13 @@ fn draw_plan_modal(
         Some(p) => format!(" plan · {p} "),
         None => " plan · proposed ".to_string(),
     };
+    let accent = palette().accent;
     draw_modal_box(
         frame,
         area,
         lines,
         &title,
-        Color::Cyan,
+        accent,
         Some(key_hint_line(
             "[a] approve & start   [k] keep planning   [Esc] dismiss",
         )),
@@ -150,9 +152,10 @@ fn draw_question_modal(
     for (i, opt) in cur.options.iter().enumerate() {
         let selected = i == q.cursor;
         let marker = if selected { "❯" } else { " " };
+        let accent = palette().accent;
         let style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
@@ -162,13 +165,13 @@ fn draw_question_modal(
             style,
         )));
     }
-    let _ = pending_behind;
+    let accent = palette().accent;
     draw_modal_box(
         frame,
         area,
         lines,
         " question ",
-        Color::Magenta,
+        accent,
         Some(key_hint_line(
             "↑/↓ move · [1]–[9] pick · Enter select · Esc cancel",
         )),
@@ -178,10 +181,11 @@ fn draw_question_modal(
 /// Sticky footer style for modal keybindings — always visible, never clipped
 /// by a long body/preview.
 fn key_hint_line(text: impl Into<String>) -> Line<'static> {
+    let warning = palette().warning;
     Line::from(Span::styled(
         text.into(),
         Style::default()
-            .fg(Color::Yellow)
+            .fg(warning)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -250,10 +254,11 @@ fn draw_modal_box(
 /// Queue chips row: `⧉ queued: ❶ "…" ❷ "…"` above the prompt (plan §M5).
 fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
     const CIRCLED: [&str; 9] = ["❶", "❷", "❸", "❹", "❺", "❻", "❼", "❽", "❾"];
+    let accent = palette().accent;
     let mut spans = vec![Span::styled(
         "⧉ queued: ",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(accent)
             .add_modifier(Modifier::BOLD),
     )];
     for (i, p) in app.queue.iter().enumerate().take(CIRCLED.len()) {
@@ -274,11 +279,12 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let inner_w = area.width.saturating_sub(2) as usize;
     for t in &app.tasks {
+        let p = palette();
         let color = match t.state {
             TaskState::Working => Color::Blue,
-            TaskState::NeedsInput => Color::Yellow,
-            TaskState::Done => Color::Green,
-            TaskState::Failed => Color::Red,
+            TaskState::NeedsInput => p.warning,
+            TaskState::Done => p.success,
+            TaskState::Failed => p.error,
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", t.state.glyph()), Style::default().fg(color)),
@@ -312,7 +318,7 @@ fn draw_permission_modal(
         lines.push(Line::from(Span::styled(
             format!("⚠ {pending_behind} more pending"),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(palette().warning)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
@@ -354,12 +360,13 @@ fn draw_permission_modal(
     // Keys live in a sticky footer (not the scrollable body) so long
     // descriptions / previews cannot clip them — that was leaving some
     // popups with no [y]/[n] guidance at all.
+    let accent = palette().accent;
     draw_modal_box(
         frame,
         area,
         lines,
         &format!(" permission · {} ", pending.name),
-        Color::Magenta,
+        accent,
         // Keep ≤ ~40 cols so min-width modals still show every binding
         // (digits 1/2/3 work the same as y/a/n; listed in /help).
         Some(key_hint_line(
@@ -369,13 +376,14 @@ fn draw_permission_modal(
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let accent = palette().accent;
     let mode_style = mode_style(app.mode);
     let title = Line::from(vec![
         Span::styled(
             " agent-code ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -454,13 +462,14 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
         width: w,
         height: 1,
     };
+    let accent = palette().accent;
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             label,
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(accent)
                 .add_modifier(Modifier::BOLD),
         ))),
         rect,
@@ -494,10 +503,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         && max > 0
     {
         let pct = ((used as f64 / max as f64) * 100.0).round() as u32;
+        let p = palette();
         let color = if pct >= 90 {
-            Color::Red
+            p.error
         } else if pct >= 70 {
-            Color::Yellow
+            p.warning
         } else {
             Color::DarkGray
         };
@@ -510,11 +520,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Waiting-on spinner while a turn runs (plan §M4); otherwise the last
     // status message.
+    let accent = palette().accent;
+    let warning = palette().warning;
     if app.phase == Phase::Streaming {
         let glyph = SPINNER[(app.tick as usize) % SPINNER.len()];
         let (glyph_color, text_color) = match app.waiting_on {
-            super::app::WaitingOn::UserInput => (Color::Yellow, Color::Yellow),
-            _ => (Color::Cyan, Color::Gray),
+            super::app::WaitingOn::UserInput => (warning, warning),
+            _ => (accent, Color::Gray),
         };
         spans.push(Span::styled(
             format!(" {glyph} "),
@@ -534,7 +546,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::raw("│"));
         spans.push(Span::styled(
             format!(" ⧉ {} queued ", app.queue.len()),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(accent),
         ));
     }
     spans.push(Span::raw("│"));
@@ -546,10 +558,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let p = palette();
     let border = if app.phase == Phase::Streaming {
-        Color::Yellow
+        p.warning
     } else {
-        Color::Cyan
+        p.accent
     };
     let prompt = format!("❯ {}", app.input);
     // Minimal skin: borderless single-line prompt.
@@ -576,11 +589,13 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn mode_style(mode: SessionMode) -> Style {
+    let p = palette();
     let (fg, bg) = match mode {
-        SessionMode::Manual => (Color::Black, Color::Yellow),
-        SessionMode::Normal => (Color::Black, Color::Green),
+        SessionMode::Manual => (Color::Black, p.warning),
+        SessionMode::Normal => (Color::Black, p.success),
         SessionMode::AcceptEdits => (Color::Black, Color::Blue),
-        SessionMode::Plan => (Color::Black, Color::Magenta),
+        // Classic plan-mode tag color (purple on midnight).
+        SessionMode::Plan => (Color::Black, p.plan),
     };
     Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
 }
@@ -876,7 +891,7 @@ mod tests {
 
     #[test]
     fn context_meter_red_at_high_usage() {
-        // 95% → the "ctx 95%" cells should be red.
+        // 95% → the "ctx 95%" cells should use the theme error color.
         let backend = TestBackend::new(100, 24);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new("m", "/tmp", "s");
@@ -885,10 +900,8 @@ mod tests {
         let buf = term.backend().buffer();
         let s = buffer_to_string(buf);
         assert!(s.contains("ctx 95%"), "buffer:\n{s}");
-        // Find a cell of the "ctx" text and assert red fg.
-        let row = 3; // status bar row (header=3 lines, transcript min 5… status is row index after)
-        let _ = row;
-        let mut found_red = false;
+        let error = palette().error;
+        let mut found = false;
         for y in 0..buf.area().height {
             for x in 0..buf.area().width {
                 let cell = &buf[(x, y)];
@@ -896,13 +909,13 @@ mod tests {
                     && x + 6 < buf.area().width
                     && buf[(x + 1, y)].symbol() == "t"
                     && buf[(x + 2, y)].symbol() == "x"
-                    && cell.style().fg == Some(Color::Red)
+                    && cell.style().fg == Some(error)
                 {
-                    found_red = true;
+                    found = true;
                 }
             }
         }
-        assert!(found_red, "ctx meter should be red at 95%");
+        assert!(found, "ctx meter should use theme error color at 95%");
     }
 
     #[test]

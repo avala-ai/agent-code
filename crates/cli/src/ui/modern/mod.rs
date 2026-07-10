@@ -5,6 +5,7 @@
 //! `docs/design/tui-modern-overhaul.md`.
 
 mod app;
+mod colors;
 mod layout;
 mod markdown;
 mod modal;

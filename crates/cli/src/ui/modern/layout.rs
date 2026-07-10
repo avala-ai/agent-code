@@ -17,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::TranscriptItem;
+use super::colors::palette;
 
 struct Cached {
     hash: u64,
@@ -152,8 +153,9 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match item {
         TranscriptItem::User(t) => {
+            let accent = palette().accent;
             lines.push(Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(Color::Cyan)),
+                Span::styled("❯ ", Style::default().fg(accent)),
                 Span::styled(t.clone(), Style::default().fg(Color::White)),
             ]));
             lines.push(Line::from(""));
@@ -271,8 +273,9 @@ fn render_group(items: &[TranscriptItem], idxs: &[usize]) -> Vec<Line<'static>> 
         .join(", ");
     let more = if details.len() > 2 { ", …" } else { "" };
     let n = idxs.len();
+    let accent = palette().accent;
     vec![Line::from(vec![
-        Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+        Span::styled("▸ ", Style::default().fg(accent)),
         Span::styled(
             format!("read {n} "),
             Style::default()
