@@ -374,6 +374,13 @@ pub fn permissions_to_toml(perms: &PermissionsConfig) -> Result<String, String> 
 /// `exclude_tools` (mapped onto `allowed_tools` / `disallowed_tools` so
 /// the child process hides those tools from the model). Returns `None`
 /// when the definition carries no permission-related constraints.
+///
+/// When `definition.read_only` is true, the overlay's `default_mode` is
+/// forced to [`PermissionMode::Plan`]. The child CLI applies
+/// `--permission-mode` first and then **replaces** the whole permissions
+/// config with the overlay; without this force, a visibility-only overlay
+/// would default to `Ask` and one-shot subagents (no prompter) would
+/// auto-allow mutating tools such as `Bash`.
 pub fn effective_permissions(definition: &AgentDefinition) -> Option<PermissionsConfig> {
     let has_include = !definition.include_tools.is_empty();
     let has_exclude = !definition.exclude_tools.is_empty();
@@ -382,6 +389,9 @@ pub fn effective_permissions(definition: &AgentDefinition) -> Option<Permissions
     }
 
     let mut perms = definition.permissions.clone().unwrap_or_default();
+    if definition.read_only {
+        perms.default_mode = PermissionMode::Plan;
+    }
     if has_include {
         // Include list is authoritative for visibility: only listed tools
         // reach the child's schema. Append rather than clobber if frontmatter
@@ -1120,6 +1130,30 @@ mod coordinator_tests {
         assert!(perms.allowed_tools.contains(&"Glob".into()));
         assert!(perms.allowed_tools.contains(&"Bash".into()));
         assert!(perms.allowed_tools.contains(&"WebFetch".into()));
+        // read_only explore must keep Plan mode so the overlay does not
+        // clobber --permission-mode plan with default Ask.
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn effective_permissions_read_only_forces_plan_mode() {
+        let def = AgentRegistry::with_defaults()
+            .get("plan")
+            .unwrap()
+            .clone();
+        let perms = effective_permissions(&def).expect("plan has include_tools");
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+
+        // Even if frontmatter/default asked for Ask/Allow, read_only wins.
+        let mut custom = def;
+        custom.permissions = Some(PermissionsConfig {
+            default_mode: PermissionMode::Allow,
+            rules: vec![],
+            allowed_tools: vec!["FileRead".into()],
+            disallowed_tools: vec![],
+        });
+        let perms = effective_permissions(&custom).unwrap();
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
     }
 
     #[test]
@@ -1145,6 +1179,7 @@ mod coordinator_tests {
         assert!(perms.allowed_tools.contains(&"Grep".into()));
         assert!(perms.allowed_tools.contains(&"FileRead".into()));
         assert!(perms.disallowed_tools.contains(&"Bash".into()));
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
     }
 
     #[test]

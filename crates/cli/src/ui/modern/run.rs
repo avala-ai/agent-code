@@ -81,13 +81,14 @@ async fn event_loop(terminal: &mut Term, session: &Session, app: &mut App) -> an
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Sync plan_mode with SessionMode on the engine when it changes.
+    // Only advance `last_mode` after a successful apply — if the turn
+    // task holds the engine mutex, retry on a later loop iteration.
     let mut last_mode = app.mode;
 
     loop {
         // Apply session mode → plan_mode on the engine (best-effort).
-        if app.mode != last_mode {
+        if app.mode != last_mode && apply_mode_to_engine(session, app.mode).await {
             last_mode = app.mode;
-            apply_mode_to_engine(session, app.mode).await;
         }
 
         // Start a pending turn if idle.
@@ -228,12 +229,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-async fn apply_mode_to_engine(session: &Session, mode: super::mode::SessionMode) {
+/// Apply UI session mode to the engine. Returns `true` if the lock was
+/// acquired and the state was updated; `false` if the engine is busy
+/// (caller should retry without updating its "last applied" tracker).
+async fn apply_mode_to_engine(session: &Session, mode: super::mode::SessionMode) -> bool {
     let engine_arc = session.engine();
     let Ok(mut eng) = engine_arc.try_lock() else {
-        return;
+        return false;
     };
     eng.state_mut().plan_mode = matches!(mode, super::mode::SessionMode::Plan);
     // AcceptEdits / AlwaysApprove: full permission overlay wiring lands in a
     // follow-up; plan mode is the load-bearing safety switch for v1.
+    true
 }

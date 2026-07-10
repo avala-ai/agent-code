@@ -47,7 +47,7 @@ Tools are the bridge between the LLM's intentions and your local environment. Ea
 
 | Tool | What it does |
 |------|-------------|
-| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode; Exit returns the plan file for review before implementation. |
+| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode; Exit accepts plan markdown (`plan` arg), writes the plan file, and returns it for review. |
 | **TaskCreate / TaskUpdate / TaskGet / TaskList / TaskStop / TaskOutput** | Full task lifecycle management. |
 | **TodoWrite** | Structured todo list management. |
 

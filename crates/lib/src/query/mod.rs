@@ -1976,9 +1976,9 @@ pub fn build_system_prompt(
            - `explore` for read-only codebase investigation (\"where is X?\")\n\
            - `plan` for read-only implementation design\n\
            - `general-purpose` only when the child must edit files or run mutations\n\
-         - Use EnterPlanMode when the approach is genuinely ambiguous; write the plan \
-           to the plan file, then ExitPlanMode (which returns the plan for review) \
-           before implementing.\n\
+         - Use EnterPlanMode when the approach is genuinely ambiguous; explore with \
+           read-only tools, then ExitPlanMode with a `plan` argument (markdown content) \
+           so the plan is written and returned for review before implementing.\n\
          - Use EnterWorktree/ExitWorktree for isolated changes in git worktrees.\n\
          - After non-trivial implementations, run an independent verification pass \
            (`/verify` skill or re-read diff + run tests) rather than trusting your own \

@@ -32,8 +32,9 @@ impl Tool for EnterPlanModeTool {
     fn prompt(&self) -> String {
         "Use this tool when a task has genuine ambiguity about the right approach \
          and getting user input before coding would prevent significant rework. \
-         In plan mode, only read-only tools are available. Write tools are blocked \
-         until ExitPlanMode is called.\n\n\
+         In plan mode, only read-only tools are available. FileWrite/FileEdit/Bash \
+         are blocked — pass the finished plan markdown to ExitPlanMode via its \
+         `plan` argument instead of trying to write the plan file with other tools.\n\n\
          When to enter plan mode:\n\
          - Complex tasks requiring multiple file changes\n\
          - Unclear requirements that need investigation first\n\
@@ -46,10 +47,10 @@ impl Tool for EnterPlanModeTool {
          - The user wants to start coding immediately\n\n\
          Workflow:\n\
          1. Call EnterPlanMode — you receive a plan file path.\n\
-         2. Explore the codebase (FileRead, Grep, Glob, read-only Bash).\n\
-         3. Write a concrete plan to the plan file (overwrite the template).\n\
-         4. Call ExitPlanMode — the plan content is returned for review.\n\n\
-         The plan file should include: Context (why), Approach (what), Critical \
+         2. Explore the codebase (FileRead, Grep, Glob, and other read-only tools).\n\
+         3. Call ExitPlanMode with `plan` set to the full markdown plan (this \
+            writes the plan file and returns it for review).\n\n\
+         The plan should include: Context (why), Approach (what), Critical \
          files (paths), Reuse (existing functions/utilities), Verification \
          (how to test end-to-end), and Risks/open questions."
             .to_string()
@@ -114,8 +115,10 @@ impl Tool for EnterPlanModeTool {
         Ok(ToolResult::success(format!(
             "Entered plan mode. Only read-only tools are available.\n\
              Plan file: {}\n\
-             Write your full plan to this file (replace the template sections), \
-             then call ExitPlanMode when ready for review.",
+             Explore with read-only tools, then call ExitPlanMode with a `plan` \
+             argument containing the full markdown plan (that writes this file \
+             and returns it for review). Do not use FileWrite/FileEdit while \
+             plan mode is active — they are blocked.",
             plan_path.display()
         )))
     }
@@ -132,17 +135,19 @@ impl Tool for ExitPlanModeTool {
 
     fn description(&self) -> &'static str {
         "Exit plan mode and re-enable all tools for execution. \
-         Reads the active plan file and returns its content for review. \
-         Call this after the plan file is complete."
+         Prefer passing the finished plan markdown via `plan` (written to the \
+         plan file atomically). Returns the plan content for review."
     }
 
     fn prompt(&self) -> String {
-        "Call ExitPlanMode only after you have written a complete plan to the \
-         plan file created by EnterPlanMode. The tool reads that file from disk \
-         and returns its content so the user can approve or request changes.\n\n\
-         Do not exit plan mode with an empty or still-templated plan. If the \
-         user requests revisions, stay in plan mode, update the plan file, and \
-         call ExitPlanMode again."
+        "Call ExitPlanMode when the plan is ready for user review. Pass the \
+         full plan as the `plan` string argument — that is the supported way \
+         to persist the plan while plan mode is active (FileWrite/FileEdit are \
+         blocked). The tool writes `plan` to the plan file (if provided), then \
+         returns the file content for approval.\n\n\
+         Do not exit with an empty or still-templated plan. If the user requests \
+         revisions, re-enter plan mode and call ExitPlanMode again with an \
+         updated `plan`."
             .to_string()
     }
 
@@ -150,6 +155,12 @@ impl Tool for ExitPlanModeTool {
         json!({
             "type": "object",
             "properties": {
+                "plan": {
+                    "type": "string",
+                    "description": "Full markdown plan content. When set, written to \
+                        the plan file before exit so the plan can be persisted without \
+                        FileWrite (which is blocked in plan mode)."
+                },
                 "plan_path": {
                     "type": "string",
                     "description": "Optional path to the plan file. Defaults to the \
@@ -179,16 +190,36 @@ impl Tool for ExitPlanModeTool {
                 Some(p) => p,
                 None => {
                     return Ok(ToolResult::error(
-                        "No active plan file found. Call EnterPlanMode first, write the plan, \
-                         then ExitPlanMode — or pass plan_path explicitly.",
+                        "No active plan file found. Call EnterPlanMode first, then \
+                         ExitPlanMode with a `plan` argument — or pass plan_path explicitly.",
                     ));
                 }
             }
         };
 
+        // Persist plan content from the tool argument when provided. This is
+        // the write path that remains available while plan_mode blocks
+        // FileWrite/FileEdit/Bash (query loop sets plan_mode immediately after
+        // EnterPlanMode succeeds).
+        if let Some(plan_md) = input.get("plan").and_then(|v| v.as_str()) {
+            if let Some(parent) = plan_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&plan_path, plan_md).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to write plan file {}: {e}",
+                    plan_path.display()
+                ))
+            })?;
+            // Keep the active pointer aligned when the model wrote via `plan`
+            // without having an active session pointer (explicit plan_path).
+            let _ = set_active_plan_path(&plan_path);
+        }
+
         if !plan_path.exists() {
             return Ok(ToolResult::error(format!(
-                "Plan file does not exist: {}. Call EnterPlanMode first or pass a valid plan_path.",
+                "Plan file does not exist: {}. Call EnterPlanMode first, pass plan content \
+                 via the `plan` argument, or pass a valid plan_path.",
                 plan_path.display()
             )));
         }
@@ -376,10 +407,17 @@ mod tests {
         let body = "# Plan\n\n## Context\n\nShip subagent types.\n\n## Approach\n\n\
              Wire Agent tool to AgentRegistry.\n\n## Critical files\n\n\
              crates/lib/src/tools/agent.rs\n\n## Verification\n\ncargo test -p agent-code-lib\n";
-        std::fs::write(&path, body).unwrap();
 
+        // Preferred path: pass plan markdown via ExitPlanMode (works while
+        // plan_mode blocks FileWrite).
         let exit = ExitPlanModeTool
-            .call(json!({ "plan_path": path.to_string_lossy() }), &ctx)
+            .call(
+                json!({
+                    "plan_path": path.to_string_lossy(),
+                    "plan": body,
+                }),
+                &ctx,
+            )
             .await
             .expect("exit");
         assert!(!exit.is_error, "exit error: {}", exit.content);
@@ -397,6 +435,33 @@ mod tests {
             "filled plan should not warn: {}",
             exit.content
         );
+        // File on disk should match what was passed in `plan`.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("Ship subagent types."));
+    }
+
+    #[tokio::test]
+    async fn exit_with_plan_arg_writes_file_without_prior_filewrite() {
+        let ctx = test_ctx();
+        let enter = EnterPlanModeTool.call(json!({}), &ctx).await.unwrap();
+        let path = plan_path_from_enter(&enter.content);
+        // Leave template on disk; only ExitPlanMode writes the real plan.
+        let plan = "# Plan\n\n## Context\n\nNeed a writable exit path.\n\n\
+                    ## Approach\n\nPass `plan` to ExitPlanMode.\n\n\
+                    ## Critical files\n\nplan_mode.rs\n\n## Verification\n\nunit test\n";
+        let exit = ExitPlanModeTool
+            .call(
+                json!({
+                    "plan_path": path.to_string_lossy(),
+                    "plan": plan,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!exit.is_error);
+        assert!(exit.content.contains("Need a writable exit path."));
+        assert!(!exit.content.contains("WARNING: Plan still looks like the template"));
     }
 
     #[tokio::test]
