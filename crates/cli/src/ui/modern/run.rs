@@ -678,12 +678,19 @@ mod tests {
         assert!(app.scroll.is_following(), "click at bottom follows");
     }
 
+    // Assert a command's ANSI byte sequence via `Command::write_ansi`, which
+    // is cross-platform — unlike `execute!`, which on Windows takes the
+    // console (winapi) path and fails without a real console under test.
+    fn ansi_of(cmd: impl crossterm::Command) -> String {
+        let mut s = String::new();
+        cmd.write_ansi(&mut s).unwrap();
+        s
+    }
+
     #[test]
     fn restore_sequence_disables_mouse_capture() {
-        let mut buf: Vec<u8> = Vec::new();
-        crossterm::execute!(buf, DisableMouseCapture).unwrap();
-        let s = String::from_utf8_lossy(&buf);
         // Mouse tracking off = CSI ?1000l (and friends); assert the base one.
+        let s = ansi_of(DisableMouseCapture);
         assert!(
             s.contains("\x1b[?1000l"),
             "mouse capture not disabled: {s:?}"
@@ -694,17 +701,12 @@ mod tests {
     fn restore_sequence_disables_focus_and_paste_reporting() {
         // The bytes we emit on restore must turn OFF focus reporting and
         // bracketed paste so no `^[[I`/`^[[O` or paste brackets leak into the
-        // shell after exit (plan §M7). Capture crossterm's command bytes.
-        let mut buf: Vec<u8> = Vec::new();
-        crossterm::execute!(
-            buf,
-            DisableBracketedPaste,
-            DisableFocusChange,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        )
-        .unwrap();
-        let s = String::from_utf8_lossy(&buf);
+        // shell after exit (plan §M7).
+        let s = format!(
+            "{}{}",
+            ansi_of(DisableFocusChange),
+            ansi_of(DisableBracketedPaste)
+        );
         // Focus reporting off = CSI ?1004l; bracketed paste off = CSI ?2004l.
         assert!(
             s.contains("\x1b[?1004l"),
