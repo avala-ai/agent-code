@@ -132,7 +132,7 @@ fn draw_question_modal(
     frame: &mut Frame<'_>,
     area: Rect,
     q: &crate::ui::modern::app::QuestionState,
-    pending_behind: usize,
+    _pending_behind: usize,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if q.questions.len() > 1 {
