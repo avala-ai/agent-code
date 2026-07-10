@@ -75,6 +75,14 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     .await;
     restore_terminal(&mut terminal)?;
 
+    // Don't silently lose prompts queued but never sent (plan §M5).
+    if !app.queue.is_empty() {
+        println!("\nUnsent queued prompts:");
+        for (i, p) in app.queue.iter().enumerate() {
+            println!("  {}. {p}", i + 1);
+        }
+    }
+
     // SessionStop on clean exit (engine is behind the Session mutex).
     {
         let engine_arc = session.engine();
@@ -190,10 +198,12 @@ async fn event_loop(
         // Reap finished turn.
         if let Some(ref h) = turn {
             use agent_code_lib::query::TurnStatus;
+            let status = h.status();
             if matches!(
-                h.status(),
+                status,
                 TurnStatus::Completed | TurnStatus::Aborted | TurnStatus::Errored(_)
             ) {
+                let completed_ok = matches!(status, TurnStatus::Completed);
                 // Drain remaining events
                 while let Ok(ev) = eng_rx.try_recv() {
                     app.apply_engine(ev);
@@ -239,6 +249,16 @@ async fn event_loop(
                     }
                 }
                 app.mark_turn_idle();
+
+                // Queue handling (plan §M5): auto-send the head on a clean
+                // finish; on abort/error keep the queue and tell the user.
+                if completed_ok {
+                    app.dispatch_queue_head();
+                } else if !app.queue.is_empty() {
+                    app.transcript.push(super::app::TranscriptItem::System(
+                        "queued prompts kept — press Enter to send".into(),
+                    ));
+                }
             }
         }
 
@@ -372,6 +392,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::Tab) => {
             app.cycle_mode_forward();
         }
+        // Queue editing (plan §M5): Alt+↑ pops the newest queued prompt back
+        // into the editor; Alt+- deletes it.
+        (KeyModifiers::ALT, KeyCode::Up) => app.pop_newest_queued_to_editor(),
+        (KeyModifiers::ALT, KeyCode::Char('-')) => app.delete_newest_queued(),
         (_, KeyCode::Esc) => {
             // Navigation only: clear the prompt; NEVER cancel a running turn.
             app.clear_prompt();

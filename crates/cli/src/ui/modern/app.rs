@@ -114,6 +114,8 @@ pub struct App {
     pub should_quit: bool,
     /// Prompt waiting to be started as a turn by the runtime.
     pub pending_submit: Option<String>,
+    /// Prompts typed mid-turn, sent FIFO when the turn ends (plan §M5).
+    pub queue: std::collections::VecDeque<String>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -162,6 +164,7 @@ impl App {
             status_message: String::new(),
             should_quit: false,
             pending_submit: None,
+            queue: std::collections::VecDeque::new(),
             cancel_requested: false,
             quit_armed: false,
             tick: 0,
@@ -398,8 +401,12 @@ impl App {
             self.cursor = 0;
             return;
         }
+        // Mid-turn: queue the prompt instead of dropping it (plan §M5).
         if self.phase == Phase::Streaming {
-            self.status_message = "turn in progress — Ctrl+C to cancel".into();
+            self.queue.push_back(text);
+            self.input.clear();
+            self.cursor = 0;
+            self.status_message = format!("{} queued", self.queue.len());
             return;
         }
         self.transcript.push(TranscriptItem::User(text.clone()));
@@ -409,6 +416,41 @@ impl App {
         self.phase = Phase::Streaming;
         // Jump back to the live tail when the user sends.
         self.scroll = ScrollState::Follow;
+    }
+
+    /// Dispatch the head of the queue as the next turn, if idle and non-empty.
+    /// Called by the run loop when a turn finishes successfully (plan §M5:
+    /// `queue.auto_send`, default on).
+    pub fn dispatch_queue_head(&mut self) {
+        if self.phase != Phase::Idle || self.pending_submit.is_some() {
+            return;
+        }
+        if let Some(text) = self.queue.pop_front() {
+            self.transcript.push(TranscriptItem::User(text.clone()));
+            self.pending_submit = Some(text);
+            self.phase = Phase::Streaming;
+            self.scroll = ScrollState::Follow;
+            self.dirty = true;
+        }
+    }
+
+    /// Pop the newest queued prompt back into the editor for editing
+    /// (Alt+↑). No-op if the queue is empty.
+    pub fn pop_newest_queued_to_editor(&mut self) {
+        if let Some(text) = self.queue.pop_back() {
+            self.input = text;
+            self.cursor = self.input.len();
+            self.status_message = format!("{} queued", self.queue.len());
+            self.dirty = true;
+        }
+    }
+
+    /// Delete the newest queued prompt (Alt+-). No-op if empty.
+    pub fn delete_newest_queued(&mut self) {
+        if self.queue.pop_back().is_some() {
+            self.status_message = format!("{} queued", self.queue.len());
+            self.dirty = true;
+        }
     }
 
     /// Scroll the transcript up by `n` display lines (enters Free).
@@ -663,6 +705,58 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn enter_while_streaming_queues_not_drops() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.input = "fix the flaky test".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.front().unwrap(), "fix the flaky test");
+        assert!(app.input.is_empty());
+        assert!(
+            app.pending_submit.is_none(),
+            "must not start a turn mid-turn"
+        );
+    }
+
+    #[test]
+    fn queue_dispatches_head_on_idle() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.queue.push_back("first".into());
+        app.queue.push_back("second".into());
+        // Turn ends.
+        app.mark_turn_idle();
+        app.dispatch_queue_head();
+        assert_eq!(app.pending_submit.as_deref(), Some("first"));
+        assert_eq!(app.phase, Phase::Streaming);
+        assert_eq!(app.queue.len(), 1, "second stays queued");
+    }
+
+    #[test]
+    fn dispatch_is_noop_while_busy() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.queue.push_back("later".into());
+        app.dispatch_queue_head();
+        assert!(app.pending_submit.is_none());
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn alt_up_pops_newest_to_editor() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.queue.push_back("one".into());
+        app.queue.push_back("two".into());
+        app.pop_newest_queued_to_editor();
+        assert_eq!(app.input, "two");
+        assert_eq!(app.queue.len(), 1);
+        app.delete_newest_queued();
+        assert!(app.queue.is_empty());
     }
 
     #[test]

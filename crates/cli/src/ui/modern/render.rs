@@ -15,26 +15,53 @@ use super::mode::SessionMode;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    // A chips row appears above the prompt only when prompts are queued.
+    let chips_h = if app.queue.is_empty() { 0 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(5),    // transcript
-            Constraint::Length(1), // status
-            Constraint::Length(3), // input
+            Constraint::Length(3),       // header
+            Constraint::Min(5),          // transcript
+            Constraint::Length(1),       // status
+            Constraint::Length(chips_h), // queue chips (0 when empty)
+            Constraint::Length(3),       // input
         ])
         .split(area);
 
     draw_header(frame, chunks[0], app);
     draw_transcript(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
-    draw_input(frame, chunks[3], app);
+    if chips_h > 0 {
+        draw_queue_chips(frame, chunks[3], app);
+    }
+    draw_input(frame, chunks[4], app);
 
     if app.phase == Phase::Permission
         && let Some(pending) = app.pending_permission.clone()
     {
         draw_permission_modal(frame, area, &pending);
     }
+}
+
+/// Queue chips row: `⧉ queued: ❶ "…" ❷ "…"` above the prompt (plan §M5).
+fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    const CIRCLED: [&str; 9] = ["❶", "❷", "❸", "❹", "❺", "❻", "❼", "❽", "❾"];
+    let mut spans = vec![Span::styled(
+        "⧉ queued: ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for (i, p) in app.queue.iter().enumerate().take(CIRCLED.len()) {
+        let mark = CIRCLED[i];
+        let text: String = p.chars().take(40).collect();
+        let ellipsis = if p.chars().count() > 40 { "…" } else { "" };
+        spans.push(Span::styled(
+            format!("{mark} \"{text}{ellipsis}\"  "),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_permission_modal(frame: &mut Frame<'_>, area: Rect, pending: &PendingPermission) {
@@ -246,6 +273,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Gray),
         ));
     }
+    if !app.queue.is_empty() {
+        spans.push(Span::raw("│"));
+        spans.push(Span::styled(
+            format!(" ⧉ {} queued ", app.queue.len()),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     spans.push(Span::raw("│"));
     spans.push(Span::styled(
         format!(" sid {} ", truncate_mid(&app.session_id, 12)),
@@ -412,6 +446,21 @@ mod tests {
         assert!(s.contains("bash"), "kind label missing; buffer:\n{s}");
         assert!(s.contains('✓'), "ok glyph missing; buffer:\n{s}");
         assert!(s.contains("cargo test"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn queue_chips_and_count_render() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.queue.push_back("fix the flaky test".into());
+        app.queue.push_back("then update changelog".into());
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("queued:"), "chips row missing:\n{s}");
+        assert!(s.contains("fix the flaky test"), "chip text missing:\n{s}");
+        assert!(s.contains("2 queued"), "status count missing:\n{s}");
     }
 
     #[test]
