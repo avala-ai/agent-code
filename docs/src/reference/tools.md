@@ -29,7 +29,7 @@
 
 | Tool | Description | Read-only | Concurrent |
 |------|-------------|:---------:|:----------:|
-| `Agent` | Spawn subagents. Optional worktree isolation. | No | No |
+| `Agent` | Spawn typed subagents (`explore` / `plan` / `general-purpose` or custom). Optional worktree isolation and free-form model override. | No | No |
 | `SendMessage` | Inter-agent communication. | No | Yes |
 | `Skill` | Invoke skills programmatically. | Yes | No |
 
@@ -37,8 +37,8 @@
 
 | Tool | Description | Read-only | Concurrent |
 |------|-------------|:---------:|:----------:|
-| `EnterPlanMode` | Switch to read-only mode. | Yes | Yes |
-| `ExitPlanMode` | Re-enable all tools. | Yes | Yes |
+| `EnterPlanMode` | Switch to read-only mode and create a structured plan file. | Yes | Yes |
+| `ExitPlanMode` | Read the plan file, return it for review, re-enable all tools. | Yes | Yes |
 | `TaskCreate` | Create a progress tracking task. | Yes | Yes |
 | `TaskUpdate` | Update task status. | Yes | Yes |
 | `TaskGet` | Get task details by ID. | Yes | Yes |

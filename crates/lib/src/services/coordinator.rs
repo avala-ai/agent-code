@@ -368,6 +368,63 @@ pub fn permissions_to_toml(perms: &PermissionsConfig) -> Result<String, String> 
     toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())
 }
 
+/// Build the effective permission overlay for an agent definition.
+///
+/// Merges explicit `permissions` frontmatter with `include_tools` /
+/// `exclude_tools` (mapped onto `allowed_tools` / `disallowed_tools` so
+/// the child process hides those tools from the model). Returns `None`
+/// when the definition carries no permission-related constraints.
+pub fn effective_permissions(definition: &AgentDefinition) -> Option<PermissionsConfig> {
+    let has_include = !definition.include_tools.is_empty();
+    let has_exclude = !definition.exclude_tools.is_empty();
+    if definition.permissions.is_none() && !has_include && !has_exclude {
+        return None;
+    }
+
+    let mut perms = definition.permissions.clone().unwrap_or_default();
+    if has_include {
+        // Include list is authoritative for visibility: only listed tools
+        // reach the child's schema. Append rather than clobber if frontmatter
+        // already set an allowlist, so both sources compose.
+        if perms.allowed_tools.is_empty() {
+            perms.allowed_tools = definition.include_tools.clone();
+        } else {
+            for tool in &definition.include_tools {
+                if !perms.allowed_tools.iter().any(|t| t == tool) {
+                    perms.allowed_tools.push(tool.clone());
+                }
+            }
+        }
+    }
+    if has_exclude {
+        for tool in &definition.exclude_tools {
+            if !perms.disallowed_tools.iter().any(|t| t == tool) {
+                perms.disallowed_tools.push(tool.clone());
+            }
+        }
+    }
+    Some(perms)
+}
+
+/// Write a permissions overlay TOML to a temp file and return its path.
+///
+/// The file is intentionally leaked: it is tiny, the OS reclaims `/tmp`
+/// on reboot, and early deletion races the child process's read.
+pub fn write_permissions_overlay(perms: &PermissionsConfig) -> Result<PathBuf, String> {
+    let toml_body = permissions_to_toml(perms)?;
+    let filename = format!(
+        "agent-code-perms-{}.toml",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("overlay")
+    );
+    let path = std::env::temp_dir().join(filename);
+    std::fs::write(&path, toml_body).map_err(|e| format!("write permissions overlay: {e}"))?;
+    Ok(path)
+}
+
 // ---- Coordinator Runtime ----
 
 /// A running agent instance.
@@ -448,6 +505,50 @@ pub struct Coordinator {
     cwd: PathBuf,
 }
 
+/// Apply agent-definition flags (model, turns, read-only, permissions)
+/// onto an already-built `agent --prompt` command.
+///
+/// Used by both the coordinator and the Agent tool so typed subagents
+/// share one code path for overlays and include/exclude tool lists.
+pub fn apply_agent_definition(
+    cmd: &mut tokio::process::Command,
+    definition: &AgentDefinition,
+    model_override: Option<&str>,
+) {
+    if let Some(model) = model_override.or(definition.model.as_deref()) {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(max_turns) = definition.max_turns {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
+    if definition.read_only {
+        cmd.arg("--permission-mode").arg("plan");
+    }
+
+    // Per-agent permissions + include/exclude tool visibility.
+    if let Some(perms) = effective_permissions(definition) {
+        match write_permissions_overlay(&perms) {
+            Ok(path) => {
+                cmd.arg("--permissions-overlay").arg(&path);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to write permissions overlay ({e}); subagent will inherit parent permissions"
+                );
+            }
+        }
+    }
+}
+
+/// Prefix the user prompt with the agent type's system-prompt addition.
+pub fn compose_agent_prompt(definition: &AgentDefinition, prompt: &str) -> String {
+    if let Some(ref sys) = definition.system_prompt {
+        format!("{sys}\n\n{prompt}")
+    } else {
+        prompt.to_string()
+    }
+}
+
 /// Build a subprocess command for running an agent.
 ///
 /// Shared by `run_agent()` and `run_team()` to avoid duplication.
@@ -456,11 +557,7 @@ fn build_agent_command(
     prompt: &str,
     cwd: &std::path::Path,
 ) -> tokio::process::Command {
-    let full_prompt = if let Some(ref sys) = definition.system_prompt {
-        format!("{sys}\n\n{prompt}")
-    } else {
-        prompt.to_string()
-    };
+    let full_prompt = compose_agent_prompt(definition, prompt);
 
     let agent_binary = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -473,41 +570,7 @@ fn build_agent_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if let Some(ref model) = definition.model {
-        cmd.arg("--model").arg(model);
-    }
-    if let Some(max_turns) = definition.max_turns {
-        cmd.arg("--max-turns").arg(max_turns.to_string());
-    }
-    if definition.read_only {
-        cmd.arg("--permission-mode").arg("plan");
-    }
-
-    // Per-agent permissions overlay. When the agent definition carries
-    // its own PermissionsConfig, serialise it to a temp TOML file and
-    // pass the path to the child. The child loads the file via
-    // `--permissions-overlay` and replaces its own permissions with it.
-    // We intentionally leak the temp file: the file is tiny, the OS
-    // cleans `/tmp` on reboot, and cleaning it up early would race the
-    // child process's read.
-    if let Some(ref perms) = definition.permissions
-        && let Ok(toml_body) = permissions_to_toml(perms)
-    {
-        let filename = format!(
-            "agent-code-perms-{}.toml",
-            uuid::Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("overlay")
-        );
-        let path = std::env::temp_dir().join(filename);
-        if std::fs::write(&path, toml_body).is_ok() {
-            cmd.arg("--permissions-overlay").arg(&path);
-        } else {
-            warn!("Failed to write permissions overlay; subagent will inherit parent permissions");
-        }
-    }
+    apply_agent_definition(&mut cmd, definition, None);
 
     // Pass through API keys so subagents use the same provider.
     for var in &[
@@ -515,6 +578,12 @@ fn build_agent_command(
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "TOGETHER_API_KEY",
         "AGENT_CODE_API_BASE_URL",
         "AGENT_CODE_MODEL",
     ] {
@@ -1028,5 +1097,71 @@ mod coordinator_tests {
             .unwrap();
         assert_eq!(parsed.default_mode, PermissionMode::Deny);
         assert_eq!(parsed.rules.len(), 2);
+    }
+
+    #[test]
+    fn effective_permissions_none_when_unconstrained() {
+        let def = AgentRegistry::with_defaults()
+            .get("general-purpose")
+            .unwrap()
+            .clone();
+        assert!(effective_permissions(&def).is_none());
+    }
+
+    #[test]
+    fn effective_permissions_maps_include_tools() {
+        let def = AgentRegistry::with_defaults()
+            .get("explore")
+            .unwrap()
+            .clone();
+        let perms = effective_permissions(&def).expect("explore has include_tools");
+        assert!(perms.allowed_tools.contains(&"FileRead".into()));
+        assert!(perms.allowed_tools.contains(&"Grep".into()));
+        assert!(perms.allowed_tools.contains(&"Glob".into()));
+        assert!(perms.allowed_tools.contains(&"Bash".into()));
+        assert!(perms.allowed_tools.contains(&"WebFetch".into()));
+    }
+
+    #[test]
+    fn effective_permissions_merges_exclude_and_frontmatter() {
+        let def = AgentDefinition {
+            name: "custom".into(),
+            description: "t".into(),
+            system_prompt: None,
+            model: None,
+            include_tools: vec!["FileRead".into()],
+            exclude_tools: vec!["Bash".into()],
+            read_only: true,
+            max_turns: None,
+            permissions: Some(PermissionsConfig {
+                default_mode: PermissionMode::Ask,
+                rules: vec![],
+                allowed_tools: vec!["Grep".into()],
+                disallowed_tools: vec![],
+            }),
+        };
+        let perms = effective_permissions(&def).unwrap();
+        // Existing allowlist is preserved and include_tools appended.
+        assert!(perms.allowed_tools.contains(&"Grep".into()));
+        assert!(perms.allowed_tools.contains(&"FileRead".into()));
+        assert!(perms.disallowed_tools.contains(&"Bash".into()));
+    }
+
+    #[test]
+    fn compose_agent_prompt_prefixes_system() {
+        let def = AgentDefinition {
+            name: "x".into(),
+            description: "d".into(),
+            system_prompt: Some("You are specialized.".into()),
+            model: None,
+            include_tools: vec![],
+            exclude_tools: vec![],
+            read_only: false,
+            max_turns: None,
+            permissions: None,
+        };
+        let full = compose_agent_prompt(&def, "do work");
+        assert!(full.starts_with("You are specialized."));
+        assert!(full.contains("do work"));
     }
 }

@@ -1845,7 +1845,7 @@ pub fn build_system_prompt(
          4. Do not commit files that likely contain secrets (.env, credentials.json).\n\
          5. Stage specific files, create the commit.\n\
          6. If pre-commit hook fails, fix the issue and create a NEW commit.\n\
-         7. When creating commits, include a co-author attribution line at the end of the message.\n\n\
+         7. Do not add AI co-author trailers or \"Generated with …\" footers unless the user or project rules explicitly request them.\n\n\
          # Creating pull requests\n\n\
          When the user asks to create a PR:\n\
          1. Run git status, git diff, and git log to understand all changes on the branch.\n\
@@ -1971,9 +1971,18 @@ pub fn build_system_prompt(
         "# Task management\n\n\
          - Use TaskCreate to break complex work into trackable steps.\n\
          - Mark tasks as in_progress when starting, completed when done.\n\
-         - Use the Agent tool to spawn subagents for parallel independent work.\n\
-         - Use EnterPlanMode/ExitPlanMode for read-only exploration before making changes.\n\
-         - Use EnterWorktree/ExitWorktree for isolated changes in git worktrees.\n\n\
+         - Use the Agent tool to spawn subagents for parallel independent work. \
+           Prefer the tightest `subagent_type`:\n\
+           - `explore` for read-only codebase investigation (\"where is X?\")\n\
+           - `plan` for read-only implementation design\n\
+           - `general-purpose` only when the child must edit files or run mutations\n\
+         - Use EnterPlanMode when the approach is genuinely ambiguous; write the plan \
+           to the plan file, then ExitPlanMode (which returns the plan for review) \
+           before implementing.\n\
+         - Use EnterWorktree/ExitWorktree for isolated changes in git worktrees.\n\
+         - After non-trivial implementations, run an independent verification pass \
+           (`/verify` skill or re-read diff + run tests) rather than trusting your own \
+           narrative.\n\n\
          # Output formatting\n\n\
          - All text output is displayed to the user. Use GitHub-flavored markdown.\n\
          - Use fenced code blocks with language hints for code: ```rust, ```python, etc.\n\

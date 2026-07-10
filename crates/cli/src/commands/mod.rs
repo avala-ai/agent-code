@@ -7853,11 +7853,17 @@ mod tests {
         assert!(out.contains("audit security"));
         assert!(out.contains("echo plain"));
         // LocalAgent rows are colorised: the SGR foreground escape
-        // `\x1b[38` opens before the description.
-        assert!(
-            out.contains("\x1b[38"),
-            "expected SGR foreground escape in colourised output: {out:?}"
-        );
+        // `\x1b[38` opens before the description. crossterm honors
+        // `NO_COLOR=1` / `CARGO_TERM_COLOR=never` by stripping colour
+        // codes, so only assert the SGR payload when colour is allowed.
+        let color_disabled = std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("CARGO_TERM_COLOR").as_deref() == Ok("never");
+        if !color_disabled {
+            assert!(
+                out.contains("\x1b[38"),
+                "expected SGR foreground escape in colourised output: {out:?}"
+            );
+        }
         // Verify both kinds appear so the test reflects the real
         // mixed-row case.
         assert!(out.contains(TaskKind::LocalAgent.as_str()));
@@ -8196,8 +8202,9 @@ mod tests {
         let mut svc = agent_code_lib::services::tips::TipsService::with_state_dir(dir.path());
         let mut out = String::new();
         super::run_tips_command(&mut svc, None, &mut out);
-        assert!(out.contains("Loaded 15 tip(s):"), "output: {out}");
+        assert!(out.contains("Loaded 16 tip(s):"), "output: {out}");
         assert!(out.contains("plan-mode"));
+        assert!(out.contains("subagent-types"));
         assert!(out.contains("tips-off"));
     }
 

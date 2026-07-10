@@ -5,6 +5,16 @@
 //! the same tool set and LLM client but with its own conversation
 //! history and permission scope.
 //!
+//! # Subagent types
+//!
+//! Built-in types (from [`crate::services::coordinator::AgentRegistry`]):
+//! - `general-purpose` — full tool access (default)
+//! - `explore` — read-only codebase investigation
+//! - `plan` — read-only implementation planning
+//!
+//! Custom types load from `.agent/agents/*.md` and
+//! `~/.config/agent-code/agents/*.md`.
+//!
 //! # Isolation modes
 //!
 //! - Default: shares the parent's working directory
@@ -16,6 +26,9 @@ use std::path::PathBuf;
 
 use super::{Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
+use crate::services::coordinator::{
+    AgentDefinition, AgentRegistry, apply_agent_definition, compose_agent_prompt,
+};
 use crate::services::subagent_colors::SubagentColor;
 
 /// Pull a stable id out of the input, falling back to a fresh uuid.
@@ -44,16 +57,28 @@ impl Tool for AgentTool {
     fn description(&self) -> &'static str {
         "Launch a subagent to handle a complex task autonomously. The agent \
          runs with its own conversation context and can execute tools in parallel \
-         with the main session."
+         with the main session. Choose a subagent_type (explore, plan, \
+         general-purpose) to scope tools and permissions."
     }
 
     fn prompt(&self) -> String {
         "Launch a subagent for complex, multi-step tasks. Each agent gets its own \
-         conversation context and tool access. Use for:\n\
+         conversation context and tool access.\n\n\
+         **When to use:**\n\
          - Parallel research or code exploration\n\
          - Tasks that would clutter the main conversation\n\
          - Independent subtasks that don't depend on each other\n\n\
-         Provide a clear, complete prompt so the agent can work autonomously."
+         **subagent_type (pick the tightest fit):**\n\
+         - `explore` — read-only search/read. Use for \"where is X?\", codebase \
+           maps, gathering facts. Prefer this over general-purpose for investigation.\n\
+         - `plan` — read-only architecture/planning. Use to design an approach \
+           without writing code.\n\
+         - `general-purpose` — full tools (default). Use only when the child must \
+           edit, run mutating commands, or finish an implementation.\n\
+         Custom types from `.agent/agents/*.md` are also accepted.\n\n\
+         Provide a clear, complete prompt so the agent can work autonomously. \
+         Do not assume the child inherits your recent conversation — put every \
+         needed fact in `prompt`."
             .to_string()
     }
 
@@ -70,10 +95,16 @@ impl Tool for AgentTool {
                     "type": "string",
                     "description": "The complete task for the agent to perform"
                 },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Agent type: general-purpose (default), explore \
+                        (read-only research), plan (read-only architecture), or a \
+                        custom name from .agent/agents/"
+                },
                 "model": {
                     "type": "string",
-                    "enum": ["sonnet", "opus", "haiku"],
-                    "description": "Optional model override for this agent"
+                    "description": "Optional model override for this agent \
+                        (any provider model id, e.g. grok-4, gpt-5.4, claude-sonnet-4)"
                 },
                 "isolation": {
                     "type": "string",
@@ -116,6 +147,24 @@ impl Tool for AgentTool {
             .ok_or_else(|| ToolError::InvalidInput("'prompt' is required".into()))?;
 
         let isolation = input.get("isolation").and_then(|v| v.as_str());
+        let model_override = input.get("model").and_then(|v| v.as_str());
+        let subagent_type = input
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general-purpose");
+
+        // Resolve the agent type from the registry (built-ins + disk).
+        // Unknown types are a hard error so the model cannot silently
+        // fall back to full write access when it meant explore/plan.
+        let mut registry = AgentRegistry::with_defaults();
+        registry.load_from_disk(Some(&ctx.cwd));
+        let definition = registry.get(subagent_type).cloned().ok_or_else(|| {
+            let known: Vec<&str> = registry.list().iter().map(|d| d.name.as_str()).collect();
+            ToolError::InvalidInput(format!(
+                "Unknown subagent_type '{subagent_type}'. Known types: {}",
+                known.join(", ")
+            ))
+        })?;
 
         // Resolve a stable id and assign a color through the shared
         // manager. The id is also used to name a temporary worktree
@@ -161,10 +210,12 @@ impl Tool for AgentTool {
                 assigned_color,
                 ctx.active_disk_output_style.as_deref(),
                 ctx.agent_limiter.clone(),
+                Some(&definition),
+                model_override,
             )
             .await;
             return Ok(ToolResult::success(format!(
-                "Agent ({description}) started in the background as task {id}. \
+                "Agent ({description}, type={subagent_type}) started in the background as task {id}. \
                  Its result surfaces automatically when it completes — do not wait on it."
             )));
         }
@@ -176,6 +227,8 @@ impl Tool for AgentTool {
             &subagent_id,
             assigned_color,
             ctx.active_disk_output_style.as_deref(),
+            Some(&definition),
+            model_override,
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -189,7 +242,9 @@ impl Tool for AgentTool {
                         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                        let mut content = format!("Agent ({description}) completed.\n\n");
+                        let mut content = format!(
+                            "Agent ({description}, type={subagent_type}) completed.\n\n"
+                        );
                         if !stdout.is_empty() {
                             content.push_str(&stdout);
                         }
@@ -230,6 +285,7 @@ const SUBAGENT_ENV_PASSTHROUGH: &[&str] = &[
     "AGENT_CODE_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
     "XAI_API_KEY",
     "GOOGLE_API_KEY",
     "DEEPSEEK_API_KEY",
@@ -244,6 +300,9 @@ const SUBAGENT_ENV_PASSTHROUGH: &[&str] = &[
 ///
 /// Sets the program, prompt, working directory, provider env
 /// passthrough, and the subagent role/id/color/output-style markers.
+/// When `definition` is `Some`, also applies type-specific model,
+/// max-turns, read-only plan mode, system-prompt prefix, and
+/// permissions/tool-visibility overlays.
 /// The caller configures stdio: the foreground path uses `output()`;
 /// the background path hands the command to
 /// [`crate::services::background::TaskManager::spawn_command`], which
@@ -254,13 +313,26 @@ pub fn build_subagent_command(
     subagent_id: &str,
     color: Option<SubagentColor>,
     disk_output_style: Option<&str>,
+    definition: Option<&AgentDefinition>,
+    model_override: Option<&str>,
 ) -> tokio::process::Command {
+    let full_prompt = match definition {
+        Some(def) => compose_agent_prompt(def, prompt),
+        None => prompt.to_string(),
+    };
+
     let agent_binary = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "agent".to_string());
 
     let mut cmd = tokio::process::Command::new(&agent_binary);
-    cmd.arg("--prompt").arg(prompt).current_dir(cwd);
+    cmd.arg("--prompt").arg(full_prompt).current_dir(cwd);
+
+    if let Some(def) = definition {
+        apply_agent_definition(&mut cmd, def, model_override);
+    } else if let Some(model) = model_override {
+        cmd.arg("--model").arg(model);
+    }
 
     for var in SUBAGENT_ENV_PASSTHROUGH {
         if let Ok(val) = std::env::var(var) {
@@ -277,6 +349,9 @@ pub fn build_subagent_command(
     }
     if let Some(name) = disk_output_style {
         cmd.env("AGENT_CODE_DISK_OUTPUT_STYLE", name);
+    }
+    if let Some(def) = definition {
+        cmd.env("AGENT_CODE_SUBAGENT_TYPE", &def.name);
     }
 
     cmd
@@ -299,12 +374,26 @@ pub async fn spawn_background_agent(
     color: Option<SubagentColor>,
     disk_output_style: Option<&str>,
     limiter: Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
+    definition: Option<&AgentDefinition>,
+    model_override: Option<&str>,
 ) -> crate::services::background::TaskId {
     use crate::services::background::{TaskKind, TaskPayload};
 
-    let cmd = build_subagent_command(prompt, cwd, subagent_id, color, disk_output_style);
+    let cmd = build_subagent_command(
+        prompt,
+        cwd,
+        subagent_id,
+        color,
+        disk_output_style,
+        definition,
+        model_override,
+    );
     let payload = TaskPayload::LocalAgent {
-        subagent_kind: Some(description.to_string()),
+        subagent_kind: Some(
+            definition
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| description.to_string()),
+        ),
         prompt: prompt.to_string(),
         parent_session: None,
     };
@@ -344,7 +433,15 @@ pub async fn spawn_background_workflow(
 ) -> crate::services::background::TaskId {
     use crate::services::background::{TaskKind, TaskPayload};
 
-    let cmd = build_subagent_command(prompt, cwd, subagent_id, color, disk_output_style);
+    let cmd = build_subagent_command(
+        prompt,
+        cwd,
+        subagent_id,
+        color,
+        disk_output_style,
+        None,
+        None,
+    );
     let payload = TaskPayload::LocalWorkflow {
         workflow: workflow.to_string(),
         args,
@@ -427,6 +524,8 @@ mod tests {
             "sid-1",
             None,
             None,
+            None,
+            None,
         );
         let std_cmd = cmd.as_std();
 
@@ -457,6 +556,7 @@ mod tests {
         // No color / output style passed → those env vars are absent.
         assert!(!envs.contains_key("AGENT_CODE_SUBAGENT_COLOR"));
         assert!(!envs.contains_key("AGENT_CODE_DISK_OUTPUT_STYLE"));
+        assert!(!envs.contains_key("AGENT_CODE_SUBAGENT_TYPE"));
     }
 
     #[test]
@@ -467,6 +567,8 @@ mod tests {
             "sid",
             None,
             Some("concise"),
+            None,
+            None,
         );
         let envs: HashMap<String, String> = cmd
             .as_std()
@@ -481,6 +583,96 @@ mod tests {
         assert_eq!(
             envs.get("AGENT_CODE_DISK_OUTPUT_STYLE").map(String::as_str),
             Some("concise")
+        );
+    }
+
+    #[test]
+    fn build_subagent_command_applies_explore_type() {
+        let registry = AgentRegistry::with_defaults();
+        let def = registry.get("explore").expect("built-in explore");
+        let cmd = build_subagent_command(
+            "find auth code",
+            std::path::Path::new("/tmp"),
+            "sid-explore",
+            None,
+            None,
+            Some(def),
+            Some("grok-4"),
+        );
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // System prompt from the explore definition is prefixed.
+        let prompt_idx = args.iter().position(|a| a == "--prompt").expect("prompt");
+        let prompt = &args[prompt_idx + 1];
+        assert!(
+            prompt.contains("exploration agent") || prompt.contains("find auth code"),
+            "prompt should include definition system prompt + user task: {prompt}"
+        );
+        assert!(prompt.contains("find auth code"), "prompt: {prompt}");
+
+        // Read-only types force plan permission mode.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "plan"),
+            "explore must run under plan mode: {args:?}"
+        );
+        // max_turns from definition.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--max-turns" && w[1] == "20"),
+            "explore max_turns=20: {args:?}"
+        );
+        // model override wins.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "grok-4"),
+            "model override: {args:?}"
+        );
+        // Tool visibility overlay written for include_tools.
+        assert!(
+            args.iter().any(|a| a == "--permissions-overlay"),
+            "include_tools should produce a permissions overlay: {args:?}"
+        );
+
+        let envs: HashMap<String, String> = std_cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            envs.get("AGENT_CODE_SUBAGENT_TYPE").map(String::as_str),
+            Some("explore")
+        );
+    }
+
+    #[test]
+    fn build_subagent_command_model_override_without_definition() {
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            None,
+            None,
+            Some("gpt-5.4"),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "gpt-5.4"),
+            "args: {args:?}"
         );
     }
 

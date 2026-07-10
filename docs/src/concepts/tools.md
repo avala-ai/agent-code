@@ -39,7 +39,7 @@ Tools are the bridge between the LLM's intentions and your local environment. Ea
 
 | Tool | What it does |
 |------|-------------|
-| **Agent** | Spawn subagents for parallel tasks with optional git worktree isolation. |
+| **Agent** | Spawn typed subagents (`explore` / `plan` / `general-purpose`) with optional git worktree isolation. |
 | **SendMessage** | Send messages between running agents. |
 | **Skill** | Invoke user-defined skills programmatically. |
 
@@ -47,7 +47,7 @@ Tools are the bridge between the LLM's intentions and your local environment. Ea
 
 | Tool | What it does |
 |------|-------------|
-| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode for safe exploration. |
+| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode; Exit returns the plan file for review before implementation. |
 | **TaskCreate / TaskUpdate / TaskGet / TaskList / TaskStop / TaskOutput** | Full task lifecycle management. |
 | **TodoWrite** | Structured todo list management. |
 

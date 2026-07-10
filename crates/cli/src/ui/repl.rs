@@ -1478,6 +1478,8 @@ pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
                                 None,
                                 None,
                                 Some(agent_limiter),
+                                None,
+                                None,
                             )
                             .await;
                             eprintln!(

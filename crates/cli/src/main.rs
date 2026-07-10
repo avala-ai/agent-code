@@ -145,6 +145,11 @@ struct Cli {
     #[arg(long)]
     acp: bool,
 
+    /// Interactive TUI surface: `classic` (rustyline REPL) or `modern`
+    /// (full-screen ratatui app). Overrides `[ui] tui` and `AGENT_CODE_TUI`.
+    #[arg(long, value_name = "KIND")]
+    tui: Option<String>,
+
     /// Subcommand (schedule, daemon).
     #[command(subcommand)]
     command: Option<SubCommand>,
@@ -980,12 +985,25 @@ async fn async_main() -> anyhow::Result<()> {
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 
-            ui::repl::run_repl(&mut engine).await?;
+            let tui_kind =
+                ui::modern::resolve_tui_kind(cli.tui.as_deref(), &engine.state().config.ui.tui);
+            match tui_kind {
+                ui::modern::TuiKind::Modern => {
+                    // Modern TUI takes ownership of the engine via Session.
+                    ui::modern::run_modern_tui(engine).await?;
+                    // SessionStop: modern path wraps the engine; hooks that
+                    // need a live engine on clean exit are fired inside when
+                    // we re-acquire — for v1 we skip if already moved.
+                }
+                ui::modern::TuiKind::Classic => {
+                    ui::repl::run_repl(&mut engine).await?;
 
-            // Fire SessionStop once the REPL returns. This is the only
-            // normal exit path from interactive mode; abrupt Ctrl+C
-            // won't reach here, but any clean `/exit` or EOF will.
-            let _ = engine.fire_session_stop_hooks().await;
+                    // Fire SessionStop once the REPL returns. This is the only
+                    // normal exit path from classic interactive mode; abrupt
+                    // Ctrl+C won't reach here, but any clean `/exit` or EOF will.
+                    let _ = engine.fire_session_stop_hooks().await;
+                }
+            }
 
             // Show update notification after session ends.
             if let Ok(Some(check)) = update_handle.await {

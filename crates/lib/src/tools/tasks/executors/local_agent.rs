@@ -54,7 +54,17 @@ impl TaskExecutor for LocalAgentExecutor {
         // subagent id up front so the color assignment ties together
         // the queue entry, the AgentTool call, and any future
         // resume / fork follow-up.
-        let description = subagent_kind.unwrap_or_else(|| "subagent".to_string());
+        //
+        // When `subagent_kind` matches a registered agent type
+        // (explore / plan / general-purpose / custom disk agents),
+        // pass it as `subagent_type` so the Agent tool applies the
+        // right tool set and permissions. Otherwise treat it as a
+        // free-form description only.
+        let kind = subagent_kind.unwrap_or_else(|| "subagent".to_string());
+        let mut registry = crate::services::coordinator::AgentRegistry::with_defaults();
+        registry.load_from_disk(Some(&ctx.cwd));
+        let known_type = registry.get(&kind).is_some();
+        let description = kind.clone();
         let subagent_id = uuid::Uuid::new_v4().to_string();
 
         // Pre-assign a color so the queue entry we register can show
@@ -87,13 +97,19 @@ impl TaskExecutor for LocalAgentExecutor {
             None
         };
 
-        let input = json!({
+        let mut input = json!({
             "description": description,
             "prompt": prompt,
             // Anchor AgentTool's assignment to the same id so the
             // colour doesn't bounce between two slots.
             "subagent_id": subagent_id,
         });
+        if known_type {
+            input
+                .as_object_mut()
+                .expect("object")
+                .insert("subagent_type".into(), json!(kind));
+        }
 
         // Build a minimal tool context. The Agent tool spawns a child
         // `agent` subprocess so it does not reach into permissions or

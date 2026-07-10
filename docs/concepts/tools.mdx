@@ -51,7 +51,8 @@ Tools are the bridge between the LLM's intentions and your local environment. Ea
 
 | Tool | What it does |
 |------|-------------|
-| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode for safe exploration. |
+| **EnterPlanMode / ExitPlanMode** | Toggle read-only mode; Exit returns the plan file for review before implementation. |
+| **Agent (`subagent_type`)** | Spawn typed subagents: `explore` (read-only search), `plan` (architecture), `general-purpose` (full tools). |
 | **TaskCreate / TaskUpdate / TaskGet / TaskList / TaskStop / TaskOutput** | Full task lifecycle management. |
 | **TodoWrite** | Structured todo list management. |
 

@@ -458,8 +458,17 @@ pub struct UiConfig {
     pub inherit_fg: bool,
     /// Editing mode: "emacs" or "vi".
     pub edit_mode: String,
+    /// Interactive surface: `"classic"` (rustyline REPL, default) or
+    /// `"modern"` (full-screen alt-screen TUI). Overridden by
+    /// `--tui` / `AGENT_CODE_TUI`.
+    #[serde(default = "default_tui_kind")]
+    pub tui: String,
     /// Between-turn status line customization.
     pub statusline: StatusLineConfig,
+}
+
+fn default_tui_kind() -> String {
+    "classic".to_string()
 }
 
 impl Default for UiConfig {
@@ -470,6 +479,7 @@ impl Default for UiConfig {
             theme: "dark".to_string(),
             inherit_fg: false,
             edit_mode: "emacs".to_string(),
+            tui: default_tui_kind(),
             statusline: StatusLineConfig::default(),
         }
     }
