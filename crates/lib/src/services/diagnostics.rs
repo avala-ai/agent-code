@@ -109,15 +109,36 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 3. API configuration.
-    if config.api.auth_mode == crate::config::ApiAuthMode::CodexChatgpt {
-        checks.push(Check::pass("config:auth", "Codex ChatGPT auth configured"));
-    } else if config.api.api_key.is_some() {
-        checks.push(Check::pass("config:api_key", "API key configured"));
-    } else {
-        checks.push(Check::fail(
-            "config:api_key",
-            "No API key set (AGENT_CODE_API_KEY or --api-key)",
-        ));
+    match config.api.auth_mode {
+        crate::config::ApiAuthMode::CodexChatgpt => {
+            checks.push(Check::pass(
+                "config:auth",
+                "Codex ChatGPT subscription auth configured",
+            ));
+        }
+        crate::config::ApiAuthMode::XaiOauth => {
+            let path = crate::config::agent_config_dir().map(|d| d.join("xai_auth.json"));
+            match path {
+                Some(p) if p.exists() => checks.push(Check::pass(
+                    "config:auth",
+                    &format!("xAI SuperGrok OAuth session present ({})", p.display()),
+                )),
+                _ => checks.push(Check::fail(
+                    "config:auth",
+                    "auth_mode is xai_oauth but no session file — run `agent login xai`",
+                )),
+            }
+        }
+        crate::config::ApiAuthMode::ApiKey => {
+            if config.api.api_key.is_some() {
+                checks.push(Check::pass("config:api_key", "API key configured"));
+            } else {
+                checks.push(Check::fail(
+                    "config:api_key",
+                    "No API key set (AGENT_CODE_API_KEY or --api-key)",
+                ));
+            }
+        }
     }
 
     checks.push(Check::pass(
@@ -339,10 +360,13 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
     }
 
     // 8. API connectivity test (provider-aware auth).
-    if config.api.auth_mode == crate::config::ApiAuthMode::CodexChatgpt {
+    if matches!(
+        config.api.auth_mode,
+        crate::config::ApiAuthMode::CodexChatgpt | crate::config::ApiAuthMode::XaiOauth
+    ) {
         checks.push(Check::warn(
             "api:connectivity",
-            "Skipping /models connectivity check for Codex ChatGPT auth",
+            "Skipping /models connectivity check for subscription OAuth auth",
         ));
     } else if config.api.api_key.is_some() {
         let api_key = config.api.api_key.as_deref().unwrap_or("");

@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long, env = "AGENT_CODE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
-    /// API auth mode: api_key or codex_chatgpt.
+    /// API auth mode: api_key, codex_chatgpt, or xai_oauth.
     #[arg(long, env = "AGENT_CODE_AUTH_MODE", value_name = "MODE")]
     auth_mode: Option<String>,
 

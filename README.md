@@ -60,10 +60,20 @@ Works with any LLM. Set one env var and go:
 
 Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080/v1`
 
-**Use your ChatGPT/Codex subscription instead of an API key.** Run `agent login`
-to sign in with ChatGPT in your browser (no `codex` CLI required), then start
-agent-code with `agent --auth-mode codex_chatgpt --model gpt-5.5`. Already signed
-in via the `codex` CLI? agent-code reuses that `~/.codex` session automatically.
+**Use a subscription instead of an API key:**
+
+```bash
+# ChatGPT / Codex (Plus/Pro)
+agent login codex
+agent --auth-mode codex_chatgpt --model gpt-5.5
+
+# SuperGrok / X Premium (same path as OpenCode — https://x.ai/news/grok-opencode)
+agent login xai
+agent --auth-mode xai_oauth --model grok-build-0.1
+```
+
+First-run setup also offers both subscription options. Already signed in via the
+`codex` CLI? agent-code reuses that `~/.codex` session automatically.
 
 ## Input Modes
 

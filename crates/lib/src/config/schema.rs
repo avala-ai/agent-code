@@ -843,6 +843,18 @@ codex_home = "/tmp/codex-home"
     }
 
     #[test]
+    fn api_config_parses_xai_oauth_auth_mode_from_toml() {
+        let toml = r#"
+base_url = "https://api.x.ai/v1"
+model = "grok-build-0.1"
+auth_mode = "xai_oauth"
+"#;
+        let cfg: ApiConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.auth_mode, ApiAuthMode::XaiOauth);
+        assert_eq!(cfg.model, "grok-build-0.1");
+    }
+
+    #[test]
     fn api_config_parses_api_key_helper_from_toml() {
         let toml = r#"
 base_url = "https://api.example.com/v1"

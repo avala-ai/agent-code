@@ -755,6 +755,24 @@ mod tests {
         assert!(doc["api"].get("api_key").is_none());
     }
 
+    #[test]
+    fn xai_subscription_writes_auth_mode_and_grok_build_model() {
+        let result = SetupResult {
+            api_key: String::new(),
+            auth_mode: "xai_oauth".into(),
+            provider: "xai".into(),
+            base_url: Some("https://api.x.ai/v1".into()),
+            model: Some("grok-build-0.1".into()),
+            theme: "midnight".into(),
+            permission_mode: "ask".into(),
+        };
+        let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
+        assert_eq!(doc["api"]["auth_mode"].as_str(), Some("xai_oauth"));
+        assert_eq!(doc["api"]["model"].as_str(), Some("grok-build-0.1"));
+        assert_eq!(doc["api"]["base_url"].as_str(), Some("https://api.x.ai/v1"));
+        assert!(doc["api"].get("api_key").is_none());
+    }
+
     /// Read the `api.api_key` field back out of a rendered config the
     /// same way `Config::load` would: parse the TOML, then index in.
     fn loaded_api_key(result: &SetupResult) -> Option<String> {
