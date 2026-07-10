@@ -8,8 +8,9 @@ use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -109,14 +110,16 @@ fn probe_caps() -> TerminalCaps {
 fn setup_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
-    // Enter alt screen and enable focus + bracketed paste reporting. These
-    // are consumed by the loop and disabled on exit so no `^[[I`/`^[[O`
-    // (focus) or paste brackets leak into the shell (plan §M7).
+    // Enter alt screen and enable focus + bracketed paste + mouse capture.
+    // All are consumed by the loop and disabled on exit so no `^[[I`/`^[[O`
+    // (focus), paste brackets, or mouse tracking leak into the shell
+    // (plan §M7/§M9).
     if let Err(e) = execute!(
         out,
         EnterAlternateScreen,
         EnableFocusChange,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture,
     ) {
         let _ = disable_raw_mode();
         return Err(e.into());
@@ -136,6 +139,7 @@ fn setup_terminal() -> anyhow::Result<Term> {
 fn restore_stdout_modes() {
     let _ = execute!(
         stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange,
         LeaveAlternateScreen,
@@ -147,6 +151,7 @@ fn restore_stdout_modes() {
 fn restore_terminal(terminal: &mut Term) -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange,
         LeaveAlternateScreen,
@@ -359,6 +364,7 @@ async fn event_loop(
                             quit_armed_at = None;
                         }
                     }
+                    Some(Ok(Event::Mouse(m))) => handle_mouse(app, m),
                     Some(Ok(Event::Resize(_, _))) => { app.dirty = true; }
                     Some(Ok(_)) => {}
                     // Stream closed or errored: stop the UI cleanly.
@@ -485,6 +491,25 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Route a mouse event (plan §M9). Wheel scrolls the transcript; a left
+/// click on the bottom row (where the jump pill sits) returns to Follow.
+/// Shift/Alt-modified drags are left to the terminal's native selection.
+fn handle_mouse(app: &mut App, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(3),
+        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Clicking near the bottom of the transcript jumps to the live
+            // tail (the jump pill target). Cheap heuristic without full
+            // hit-testing: bottom row of the transcript region.
+            if !app.scroll.is_following() && m.row as usize >= app.viewport_h {
+                app.scroll_to_bottom();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Apply UI session mode to the engine. Returns `true` if the lock was
 /// acquired and the state was updated; `false` if the engine is busy
 /// (caller should retry without updating its "last applied" tracker).
@@ -574,6 +599,67 @@ mod tests {
         assert!(app.input.is_empty(), "Esc clears the prompt");
         assert!(!app.cancel_requested, "Esc must NEVER cancel a turn");
         assert!(!app.should_quit);
+    }
+
+    fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_up_enters_free_wheel_down_follows() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..100 {
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::System(format!(
+                    "l {i}"
+                )));
+        }
+        app.layout.sync(&app.transcript, 80);
+        app.viewport_h = 20;
+        handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 5));
+        assert!(!app.scroll.is_following(), "wheel up enters Free");
+        // Wheel down enough to reach the bottom re-enters Follow.
+        for _ in 0..10 {
+            handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 5));
+        }
+        assert!(app.scroll.is_following(), "wheel down returns to Follow");
+    }
+
+    #[test]
+    fn click_bottom_row_jumps_to_follow() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..100 {
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::System(format!(
+                    "l {i}"
+                )));
+        }
+        app.layout.sync(&app.transcript, 80);
+        app.viewport_h = 20;
+        app.scroll_up(30);
+        assert!(!app.scroll.is_following());
+        // Click on the bottom row (row >= viewport_h) → follow.
+        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 22));
+        assert!(app.scroll.is_following(), "click at bottom follows");
+    }
+
+    #[test]
+    fn restore_sequence_disables_mouse_capture() {
+        let mut buf: Vec<u8> = Vec::new();
+        crossterm::execute!(buf, DisableMouseCapture).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        // Mouse tracking off = CSI ?1000l (and friends); assert the base one.
+        assert!(
+            s.contains("\x1b[?1000l"),
+            "mouse capture not disabled: {s:?}"
+        );
     }
 
     #[test]
