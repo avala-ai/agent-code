@@ -43,7 +43,6 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let cwd = engine.state().cwd.clone();
     let session_id = engine.state().session_id.clone();
     let base_permission_mode = engine.state().config.permissions.default_mode;
-    let bypass_disabled = engine.state().config.security.disable_bypass_permissions;
 
     // Apply theme so any shared color helpers still resolve.
     let configured = engine.state().config.ui.theme.clone();
@@ -81,7 +80,6 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
         eng_tx,
         eng_rx,
         base_permission_mode,
-        bypass_disabled,
         caps,
     )
     .await;
@@ -202,7 +200,6 @@ async fn event_loop(
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     base_permission_mode: PermissionMode,
-    bypass_disabled: bool,
     caps: TerminalCaps,
 ) -> anyhow::Result<()> {
     app.caps = caps;
@@ -227,13 +224,10 @@ async fn event_loop(
         // takes effect at the executor's next decision point *even mid-turn*
         // while the turn task holds the engine mutex (the exact bug the API
         // was built to close). The AppState sync is best-effort for observers.
+        // The mode→permission policy lives entirely in `SessionMode`
+        // (`permission_hint`); the loop just applies it — no per-mode
+        // special-cases here.
         if app.mode != last_mode {
-            if app.mode == super::mode::SessionMode::AlwaysApprove && bypass_disabled {
-                app.transcript.push(super::app::TranscriptItem::Warning(
-                    "always-approve is disabled by security.disable_bypass_permissions".into(),
-                ));
-                app.mode = super::mode::SessionMode::Normal;
-            }
             apply_mode_to_engine(session, app.mode, base_permission_mode);
             last_mode = app.mode;
             app.dirty = true;

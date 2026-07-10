@@ -538,10 +538,10 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn mode_style(mode: SessionMode) -> Style {
     let (fg, bg) = match mode {
+        SessionMode::Manual => (Color::Black, Color::Yellow),
         SessionMode::Normal => (Color::Black, Color::Green),
-        SessionMode::Plan => (Color::Black, Color::Magenta),
         SessionMode::AcceptEdits => (Color::Black, Color::Blue),
-        SessionMode::AlwaysApprove => (Color::Black, Color::Red),
+        SessionMode::Plan => (Color::Black, Color::Magenta),
     };
     Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
 }

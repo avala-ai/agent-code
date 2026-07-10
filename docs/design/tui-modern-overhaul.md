@@ -39,12 +39,17 @@ The interactive path is a **line-oriented rustyline REPL** with ad-hoc raw mode 
 
 ### Session modes (Shift+Tab)
 
+Canonical cycle: **Manual → Normal → AcceptEdits → Plan → Manual** (§3.3 / #404).
+No always-approve/YOLO mode in the cycle — auto-allow is a config choice
+(`[permissions] default_mode`), and sandbox bypass stays engine-enforced via
+`security.disable_bypass_permissions`.
+
 | Mode | Engine effect |
 |------|----------------|
-| Normal | Current permissions / default_mode |
+| Manual | Force `PermissionMode::Ask` — prompt on every tool call |
+| Normal | Current permissions / config `default_mode` |
+| Accept edits | Auto-allow write tools; other mutations follow config |
 | Plan | `state.plan_mode = true` (read-only tools) |
-| Accept edits | Overlay default for write tools (future) |
-| Always approve | Only if `!disable_bypass_permissions` |
 
 ### Module layout
 
