@@ -392,6 +392,21 @@ mod tests {
     }
 
     #[test]
+    fn assistant_markdown_renders_in_transcript() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::Assistant(
+            "# Heading\n\nSome **bold** and `code` and a list:\n\n- item one\n- item two".into(),
+        ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("Heading"), "buffer:\n{s}");
+        assert!(s.contains("• item one"), "buffer:\n{s}");
+        assert!(s.contains("bold"), "buffer:\n{s}");
+    }
+
+    #[test]
     fn jump_pill_shows_when_scrolled_up() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();

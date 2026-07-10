@@ -137,19 +137,28 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         }
         TranscriptItem::Assistant(t) => {
-            for row in t.lines() {
-                lines.push(Line::from(Span::raw(row.to_string())));
-            }
+            // Full markdown rendering (headings, code, lists, links…).
+            lines.extend(super::markdown::render_markdown(t).lines);
             lines.push(Line::from(""));
         }
         TranscriptItem::Thinking(t) => {
-            let preview: String = t.chars().take(400).collect();
+            // Thinking is dimmed; render its markdown then overlay a dim
+            // italic style so it reads as secondary reasoning.
             lines.push(Line::from(Span::styled(
-                format!("  thinking… {preview}"),
+                "  thinking…",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             )));
+            for mut line in super::markdown::render_markdown(t).lines {
+                for span in &mut line.spans {
+                    span.style = span
+                        .style
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                }
+                lines.push(line);
+            }
         }
         TranscriptItem::Tool {
             name,
