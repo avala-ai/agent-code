@@ -1,0 +1,2637 @@
+//! Interactive REPL (Read-Eval-Print Loop).
+//!
+//! The main user interaction loop. Reads input via rustyline,
+//! passes it to the query engine, and streams output to the terminal.
+//! Integrates markdown rendering, activity indicators, and permission
+//! prompts.
+
+use std::borrow::Cow;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+use crossterm::style::Stylize;
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Context, Helper};
+
+use crate::ui::activity::ActivityIndicator;
+use agent_code_lib::llm::message::Usage;
+use agent_code_lib::query::{QueryEngine, StreamSink};
+use agent_code_lib::tools::ToolResult;
+
+/// Write to stdout with LF → CRLF translation. Needed because the escape-key
+/// watcher (`spawn_escape_watcher`) holds the terminal in raw mode for the
+/// entire duration of a streaming turn, and in raw mode a bare `\n` moves the
+/// cursor down one row without returning to column 0 — causing subsequent
+/// lines to drift right by the column of the previous line. Any code path
+/// that prints during a turn must go through this helper (or the tui
+/// renderer, which already uses `\r\n` internally).
+fn raw_print(text: &str) {
+    let translated = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(translated.as_bytes());
+    let _ = out.flush();
+}
+
+/// Like `raw_print`, but for stderr.
+fn raw_eprint(text: &str) {
+    let translated = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(translated.as_bytes());
+    let _ = err.flush();
+}
+
+/// Tab-completion helper for slash commands.
+///
+/// Holds a shared snapshot of the active `(model, base_url)` so
+/// `/model` completion can resolve the current provider and offer only
+/// that provider's models. The REPL loop refreshes the snapshot before
+/// each prompt (the model can change mid-session via `/model`).
+struct CommandCompleter {
+    model_ctx: std::sync::Arc<std::sync::Mutex<(String, String)>>,
+}
+
+/// Match score for a command candidate against a user-typed partial.
+///
+/// Higher is better. `None` means no match — candidate is excluded.
+/// Priority tiers (decreasing):
+///   * 1000 — exact prefix of the name
+///   * 500  — substring (contained, not at start) of the name
+///   * 100..250 — fuzzy subsequence match against the name (score = partial len scaled)
+///   * 50..150 — matches against an alias
+fn score_command(name: &str, aliases: &[&str], partial: &str) -> Option<i32> {
+    if partial.is_empty() {
+        return Some(1000); // surface everything when nothing typed yet
+    }
+    let p = partial.to_lowercase();
+    let n = name.to_lowercase();
+
+    if n.starts_with(&p) {
+        return Some(1000);
+    }
+    if n.contains(&p) {
+        return Some(500);
+    }
+    // Aliases: prefix > contains.
+    for a in aliases {
+        let al = a.to_lowercase();
+        if al.starts_with(&p) {
+            return Some(150);
+        }
+        if al.contains(&p) {
+            return Some(100);
+        }
+    }
+    if fuzzy_subsequence(&n, &p) {
+        // Reward shorter names (closer match) when scoring subsequences.
+        let bonus = 100i32.saturating_sub(n.len() as i32);
+        return Some(100 + bonus.max(0));
+    }
+    None
+}
+
+/// Return true if every char of `needle` appears in `haystack` in order
+/// (not necessarily contiguous). Used as the lowest-tier fuzzy match.
+fn fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    let mut it = haystack.chars();
+    for c in needle.chars() {
+        let found = it.by_ref().any(|h| h == c);
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse a `&`-prefixed background input (already `&`-stripped and
+/// trimmed) into a `(skill_slug, args)` pair when it names a skill —
+/// i.e. it starts with `/`. `& /review src` → `("review", "src")`,
+/// `& just do the thing` → `None` (a free-form subagent prompt).
+///
+/// A bare `&/` (no slug) yields `None` so it falls through to the
+/// free-form path rather than trying to resolve an empty skill.
+fn parse_background_skill(bg_input: &str) -> Option<(String, String)> {
+    let rest = bg_input.strip_prefix('/')?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once(char::is_whitespace) {
+        Some((slug, args)) => Some((slug.to_string(), args.trim().to_string())),
+        None => Some((rest.to_string(), String::new())),
+    }
+}
+
+/// Find the first-argument completion context for `/<cmd> <partial>`
+/// ending at byte position `pos`. Returns `(token_byte_idx, partial)`
+/// where `token_byte_idx` is the byte position of the argument token (so
+/// the replacement overwrites it) and `partial` is what's typed so far.
+///
+/// Fires only when the line is `/<cmd>` followed by whitespace and the
+/// cursor is still inside the first argument token — so `/color mid`
+/// completes but `/color midnight extra` no longer does.
+fn find_command_arg_context<'a>(line: &'a str, pos: usize, cmd: &str) -> Option<(usize, &'a str)> {
+    if pos > line.len() {
+        return None;
+    }
+    let after_slash = line.strip_prefix('/')?;
+    let rest = after_slash.strip_prefix(cmd)?;
+    // Must be whitespace right after the command (rejects e.g. `/colorx`).
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let trimmed = rest.trim_start();
+    let token_idx = line.len() - rest.len() + (rest.len() - trimmed.len());
+    if pos < token_idx {
+        return None;
+    }
+    let partial = &line[token_idx..pos];
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((token_idx, partial))
+}
+
+/// `/tasks <subcommand>` context — a thin wrapper over
+/// [`find_command_arg_context`] for the tasks management verbs.
+fn find_tasks_subcommand_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    find_command_arg_context(line, pos, "tasks")
+}
+
+/// Build `/resume <partial>` completion candidates from session
+/// summaries. Pure (takes the list) so it can be tested with fixtures.
+/// Preserves the input order (recency) for equal-scored matches, since
+/// most recent sessions are the likeliest resume targets. The display
+/// shows a short id plus the label (or last-updated time) so a UUID is
+/// pickable without typing it.
+fn session_completion_pairs(
+    sessions: &[agent_code_lib::services::session::SessionSummary],
+    partial: &str,
+) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = sessions
+        .iter()
+        .filter_map(|s| {
+            let score = score_command(&s.id, &[], partial)?;
+            let short: String = s.id.chars().take(8).collect();
+            let hint = match s.label.as_deref() {
+                Some(label) if !label.is_empty() => label.to_string(),
+                _ => s.updated_at.clone(),
+            };
+            Some((
+                score,
+                Pair {
+                    display: format!("{short}… · {hint}"),
+                    replacement: s.id.clone(),
+                },
+            ))
+        })
+        .collect();
+    // Stable sort by score desc keeps recency order within equal scores.
+    scored.sort_by(|(a, _), (b, _)| b.cmp(a));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Session-id completion for `/resume <partial>`: lists recent sessions
+/// (most recent first) so a session can be picked without recalling its
+/// UUID. Uses the summary-only listing (no transcript parsing) since it
+/// runs synchronously on a tab-completion keypress.
+fn complete_session_id(partial: &str) -> Vec<Pair> {
+    let sessions = agent_code_lib::services::session::list_session_summaries(50);
+    session_completion_pairs(&sessions, partial)
+}
+
+/// Output-style name completion for `/output-style <partial>`. Loads the
+/// registry (built-in + project + user styles) fresh so custom styles
+/// show up, then scores their names against `partial`.
+fn complete_output_style_name(cwd: &str, partial: &str) -> Vec<Pair> {
+    let registry = agent_code_lib::output_styles::OutputStyleRegistry::load_all(Some(
+        std::path::Path::new(cwd),
+    ));
+    let names: Vec<&str> = registry.all().iter().map(|s| s.name.as_str()).collect();
+    complete_from_names(&names, partial)
+}
+
+/// Score `names` against `partial` with the slash-command matcher and
+/// return bare-name completion candidates (no leading `/`), best-first.
+/// Used to complete a command's argument from a fixed value set (e.g.
+/// `/color <theme>`).
+fn complete_from_names(names: &[&str], partial: &str) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = names
+        .iter()
+        .filter_map(|name| {
+            let score = score_command(name, &[], partial)?;
+            Some((
+                score,
+                Pair {
+                    display: name.to_string(),
+                    replacement: name.to_string(),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Completion candidates for `/tasks <partial>`: the management
+/// subcommands, scored against `partial` with the slash-command matcher.
+fn complete_tasks_subcommand(partial: &str) -> Vec<Pair> {
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        ("list", "show background tasks"),
+        ("output", "read a task's output (output <id>)"),
+        ("kill", "cancel a running task (kill <id>)"),
+        ("clear", "prune finished tasks"),
+    ];
+    let mut scored: Vec<(i32, Pair)> = SUBCOMMANDS
+        .iter()
+        .filter_map(|(name, desc)| {
+            let score = score_command(name, &[], partial)?;
+            Some((
+                score,
+                Pair {
+                    display: format!("{name} — {desc}"),
+                    replacement: name.to_string(),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Find a `&/<skill-partial>` completion context ending at byte position
+/// `pos`. Returns `(slash_byte_idx, partial)` where `slash_byte_idx` is
+/// the byte position of the `/` (so the replacement overwrites the whole
+/// `/slug`) and `partial` is the slug text typed so far.
+///
+/// Only fires when the line is a background skill invocation: it starts
+/// with `&`, the next non-whitespace char is `/`, and the cursor is
+/// still inside the (whitespace-free) slug token — so `&/rev` completes
+/// but `&/review some args` no longer does.
+fn find_background_skill_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    if pos > line.len() {
+        return None;
+    }
+    let rest = line.strip_prefix('&')?;
+    // Byte offset of `rest` within `line` is 1 (the `&`).
+    let trimmed = rest.trim_start();
+    let ws = rest.len() - trimmed.len();
+    let slash_idx = 1 + ws;
+    if !line[slash_idx..].starts_with('/') {
+        return None;
+    }
+    if pos <= slash_idx {
+        return None;
+    }
+    let partial = &line[slash_idx + 1..pos];
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((slash_idx, partial))
+}
+
+/// Score the user-invocable skills in `skills` against `partial`,
+/// returning `/name` completion candidates sorted best-first.
+///
+/// Only skills with `userInvocable: true` are offered — matching `/help`
+/// and the documented meaning of the flag — so internal/agent-only
+/// skills don't leak into the completion menu. Pure (no I/O) so it can
+/// be unit-tested with a hand-built fixture.
+fn skill_completion_pairs(skills: &[agent_code_lib::skills::Skill], partial: &str) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = skills
+        .iter()
+        .filter(|skill| skill.metadata.user_invocable)
+        .filter_map(|skill| {
+            let score = score_command(&skill.name, &[], partial)?;
+            let desc = skill.metadata.description.as_deref().unwrap_or("");
+            Some((
+                score,
+                Pair {
+                    display: if desc.is_empty() {
+                        format!("/{}", skill.name)
+                    } else {
+                        format!("/{} — {desc}", skill.name)
+                    },
+                    replacement: format!("/{}", skill.name),
+                },
+            ))
+        })
+        .collect();
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Skill-name completion candidates for a `&/<partial>` context. Loads
+/// the skill registry (project + user + bundled) fresh so newly added
+/// skills show up without a restart, then defers to
+/// [`skill_completion_pairs`].
+fn complete_skill_name(cwd: &str, partial: &str) -> Vec<Pair> {
+    let registry = agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(cwd)));
+    skill_completion_pairs(registry.all(), partial)
+}
+
+/// True when `name` is a built-in command name or alias (including
+/// hidden commands). Such a name is resolved as the command by
+/// `commands::execute` before skills are consulted, so a skill with that
+/// name is unreachable via `/name` — completion must not offer it.
+fn is_command_name_or_alias(name: &str) -> bool {
+    crate::commands::COMMANDS
+        .iter()
+        .any(|c| c.name == name || c.aliases.contains(&name))
+}
+
+/// Build `/`-completion candidates for `partial` (the text after the
+/// leading `/`, up to the cursor): built-in commands first, scored and
+/// sorted, then matching skill names (which are also invocable as
+/// `/name`). Skills are only offered while the partial is a single token
+/// (no args typed yet), and any skill colliding with a command name is
+/// dropped so the command wins.
+fn complete_slash(partial: &str, cwd: &str) -> Vec<Pair> {
+    let mut scored: Vec<(i32, Pair)> = crate::commands::COMMANDS
+        .iter()
+        .filter(|c| !c.hidden)
+        .filter_map(|c| {
+            let score = score_command(c.name, c.aliases, partial)?;
+            let alias_hint = if c.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (alias: /{})", c.aliases.join(", /"))
+            };
+            Some((
+                score,
+                Pair {
+                    display: format!("/{} — {}{alias_hint}", c.name, c.description),
+                    replacement: format!("/{}", c.name),
+                },
+            ))
+        })
+        .collect();
+
+    // Stable sort by score desc, then alphabetical by replacement for
+    // deterministic ordering across equal-scored matches.
+    scored
+        .sort_by(|(sa, pa), (sb, pb)| sb.cmp(sa).then_with(|| pa.replacement.cmp(&pb.replacement)));
+    let mut matches: Vec<Pair> = scored.into_iter().map(|(_, p)| p).collect();
+
+    // Skills are invocable as `/name` too, so offer them after the
+    // built-in commands. Only when the partial is still a single token
+    // (no args typed yet). Skip any skill whose name is a built-in
+    // command or alias (including hidden) — `commands::execute` resolves
+    // those as the command, so the skill is unreachable via `/name` and
+    // offering it would be misleading.
+    if !partial.chars().any(|c| c.is_whitespace()) {
+        for pair in complete_skill_name(cwd, partial) {
+            let name = pair
+                .replacement
+                .strip_prefix('/')
+                .unwrap_or(&pair.replacement);
+            if is_command_name_or_alias(name) {
+                continue;
+            }
+            if matches.iter().all(|m| m.replacement != pair.replacement) {
+                matches.push(pair);
+            }
+        }
+    }
+
+    matches
+}
+
+/// Find an `@path-partial` context ending at byte position `pos` in
+/// `line`, if any. Returns `(at_byte_idx, partial)` where `at_byte_idx`
+/// is the byte position of the `@` and `partial` is the text after it
+/// up to `pos`. Returns `None` when the cursor isn't in an `@`-context.
+///
+/// Rules: the `@` must be at the start of the line or preceded by
+/// whitespace (so `email@example.com` doesn't accidentally trigger
+/// path completion mid-word).
+fn find_at_context(line: &str, pos: usize) -> Option<(usize, &str)> {
+    if pos > line.len() {
+        return None;
+    }
+    let prefix = &line[..pos];
+    let at_idx = prefix.rfind('@')?;
+    // Must be at start, or preceded by whitespace.
+    if at_idx > 0 {
+        let prev = prefix[..at_idx].chars().next_back()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let partial = &prefix[at_idx + 1..];
+    // Reject if whitespace is in the partial — that means the cursor
+    // has already moved past the path token.
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((at_idx, partial))
+}
+
+/// Enumerate file/directory candidates matching an `@` partial path
+/// under `cwd`. Returns up to 50 results, directories first (with a
+/// trailing `/` in the replacement so Tab-tab descends), then files.
+fn complete_at_path(cwd: &str, partial: &str) -> Vec<Pair> {
+    // Split partial into (search_dir, prefix_filter).
+    let (rel_dir, prefix) = match partial.rfind('/') {
+        Some(idx) => (&partial[..idx], &partial[idx + 1..]),
+        None => ("", partial),
+    };
+
+    // Resolve rel_dir relative to cwd; reject absolute paths or any
+    // `..` component to avoid accidentally scanning the filesystem.
+    if rel_dir.starts_with('/') || rel_dir.split('/').any(|c| c == "..") {
+        return Vec::new();
+    }
+
+    let search_dir = if rel_dir.is_empty() {
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::path::PathBuf::from(cwd).join(rel_dir)
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let prefix_lower = prefix.to_lowercase();
+    let mut dirs: Vec<(String, bool)> = Vec::new();
+    let mut files: Vec<(String, bool)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Skip dotfiles unless the user typed a `.` prefix.
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        if !prefix.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push((name, true));
+        } else {
+            files.push((name, false));
+        }
+    }
+
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut pairs: Vec<Pair> = Vec::new();
+    for (name, is_dir) in dirs.into_iter().chain(files).take(50) {
+        let rel = if rel_dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_dir}/{name}")
+        };
+        let replacement = if is_dir {
+            format!("@{rel}/")
+        } else {
+            format!("@{rel}")
+        };
+        let display = if is_dir {
+            format!("{rel}/  (dir)")
+        } else {
+            rel.clone()
+        };
+        pairs.push(Pair {
+            display,
+            replacement,
+        });
+    }
+    pairs
+}
+
+impl Completer for CommandCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // `&/skill` background-skill completion: complete skill names
+        // after a `&/` prefix so the background-workflow feature is
+        // discoverable from the keyboard.
+        if let Some((slash_idx, partial)) = find_background_skill_context(line, pos) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let pairs = complete_skill_name(&cwd, partial);
+            if !pairs.is_empty() {
+                return Ok((slash_idx, pairs));
+            }
+        }
+
+        // `/tasks <subcommand>` completion: offer the management
+        // subcommands so the surface is discoverable from the keyboard.
+        if let Some((token_idx, partial)) = find_tasks_subcommand_context(line, pos) {
+            let pairs = complete_tasks_subcommand(partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/color <theme>` completion: offer the theme names the command
+        // accepts (same list, so a completion always validates).
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "color") {
+            let pairs = complete_from_names(crate::commands::COLOR_THEME_NAMES, partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/output-style <name>` (alias `/style`) completion: offer the
+        // installed style names (built-in + project + user).
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "output-style")
+            .or_else(|| find_command_arg_context(line, pos, "style"))
+        {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let pairs = complete_output_style_name(&cwd, partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/model <name>` completion: offer the current provider's
+        // models. The provider is derived from the live (model, base_url)
+        // snapshot, so switching providers mid-session updates the list.
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "model") {
+            let pairs = self
+                .model_ctx
+                .lock()
+                .ok()
+                .map(|ctx| {
+                    let provider = agent_code_lib::llm::provider::detect_provider(&ctx.0, &ctx.1);
+                    let names: Vec<&str> =
+                        agent_code_lib::llm::provider::models_for_provider(provider)
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .collect();
+                    complete_from_names(&names, partial)
+                })
+                .unwrap_or_default();
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // `/resume <id>` completion: offer recent session ids (with their
+        // labels) so a session can be picked without recalling its UUID.
+        if let Some((token_idx, partial)) = find_command_arg_context(line, pos, "resume") {
+            let pairs = complete_session_id(partial);
+            if !pairs.is_empty() {
+                return Ok((token_idx, pairs));
+            }
+        }
+
+        // @path completion fires whenever the cursor is inside an @-token,
+        // regardless of where that token is in the line.
+        if let Some((at_idx, partial)) = find_at_context(line, pos) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            let pairs = complete_at_path(&cwd, partial);
+            if !pairs.is_empty() {
+                return Ok((at_idx, pairs));
+            }
+        }
+
+        // Otherwise fall back to slash-command completion.
+        if !line.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+
+        let partial = &line[1..pos];
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+
+        // Start replacement from position 0 (replacing the whole /partial).
+        Ok((0, complete_slash(partial, &cwd)))
+    }
+}
+
+impl Hinter for CommandCompleter {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        if !line.starts_with('/') || pos < 2 {
+            return None;
+        }
+
+        let partial = &line[1..pos];
+        crate::commands::COMMANDS
+            .iter()
+            .filter(|c| !c.hidden)
+            .find(|c| c.name.starts_with(partial) && c.name != partial)
+            .map(|c| c.name[partial.len()..].to_string())
+    }
+}
+
+impl Highlighter for CommandCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        // Show hints in grey.
+        Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
+    }
+}
+
+impl Validator for CommandCompleter {}
+impl Helper for CommandCompleter {}
+
+/// Stream sink that writes to the terminal with full rendering.
+struct TerminalSink {
+    /// Tracks whether we're mid-line (for proper newline handling).
+    mid_line: Arc<Mutex<bool>>,
+    /// Accumulates the full response text for post-render.
+    response_buffer: Arc<Mutex<String>>,
+    /// Activity indicator (shown while waiting for LLM).
+    indicator: Arc<Mutex<Option<ActivityIndicator>>>,
+    /// Whether verbose mode is on (shows usage stats inline).
+    verbose: bool,
+    /// Accumulated turn state for the summary panel.
+    turn_state: super::tui::SharedTurnState,
+}
+
+impl TerminalSink {
+    fn new(verbose: bool) -> Self {
+        Self {
+            mid_line: Arc::new(Mutex::new(false)),
+            response_buffer: Arc::new(Mutex::new(String::new())),
+            indicator: Arc::new(Mutex::new(None)),
+            verbose,
+            turn_state: super::tui::new_turn_state(),
+        }
+    }
+
+    /// Start the activity indicator (call when API request begins).
+    fn start_indicator(&self) {
+        if let Ok(mut guard) = self.indicator.lock()
+            && guard.is_none()
+        {
+            *guard = Some(ActivityIndicator::thinking());
+        }
+    }
+
+    fn ensure_newline(&self) {
+        let mut mid = self.mid_line.lock().unwrap();
+        if *mid {
+            raw_print("\n");
+            *mid = false;
+        }
+    }
+
+    /// Stop the activity indicator (called when first token arrives).
+    fn stop_indicator(&self) {
+        if let Ok(mut guard) = self.indicator.lock()
+            && let Some(ind) = guard.take()
+        {
+            ind.stop();
+        }
+    }
+
+    /// Restart the activity indicator (called between tool execution and next LLM call).
+    fn restart_indicator(&self) {
+        if let Ok(mut guard) = self.indicator.lock() {
+            *guard = Some(ActivityIndicator::thinking());
+        }
+    }
+}
+
+impl StreamSink for TerminalSink {
+    fn on_text(&self, text: &str) {
+        // First text token: stop the activity indicator.
+        self.stop_indicator();
+
+        raw_print(text);
+        *self.mid_line.lock().unwrap() = !text.ends_with('\n');
+
+        // Buffer for potential post-processing (markdown render of full blocks).
+        self.response_buffer.lock().unwrap().push_str(text);
+    }
+
+    fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value) {
+        self.stop_indicator();
+        self.ensure_newline();
+        let detail = summarize_tool_input(tool_name, input);
+
+        // Track in turn state.
+        self.turn_state
+            .lock()
+            .unwrap()
+            .add_tool_start(tool_name, &detail);
+
+        // Render inline tool header.
+        super::tui::render_tool_block(tool_name, &detail, None, false);
+    }
+
+    fn on_tool_result(&self, _tool_name: &str, result: &ToolResult) {
+        // Track in turn state.
+        self.turn_state
+            .lock()
+            .unwrap()
+            .complete_last_tool(&result.content, result.is_error);
+
+        // Render inline result line.
+        let t = super::theme::current();
+        if result.is_error {
+            let first_line = result.content.lines().next().unwrap_or("");
+            raw_eprint(&format!(
+                "  {} {}\n",
+                "✗".with(t.error),
+                first_line.with(t.error)
+            ));
+        } else {
+            let preview: String = result
+                .content
+                .lines()
+                .next()
+                .unwrap_or("(ok)")
+                .chars()
+                .take(80)
+                .collect();
+            let line_count = result.content.lines().count();
+            let suffix = if line_count > 1 {
+                format!(" (+{} lines)", line_count - 1)
+                    .with(t.muted)
+                    .to_string()
+            } else {
+                String::new()
+            };
+            raw_eprint(&format!(
+                "  {} {}{}\n",
+                "✓".with(t.success),
+                preview.with(t.muted),
+                suffix
+            ));
+        }
+        self.restart_indicator();
+    }
+
+    fn on_thinking(&self, text: &str) {
+        self.stop_indicator();
+        self.turn_state.lock().unwrap().thinking_chars = text.len();
+        super::tui::render_thinking_block(text);
+    }
+
+    fn on_turn_complete(&self, turn: usize) {
+        self.stop_indicator();
+        self.ensure_newline();
+
+        // Render the turn summary panel if there were multiple tool calls
+        // or at least one success. Skip for single-error turns (noisy).
+        let state = self.turn_state.lock().unwrap();
+        let has_success = state.tools.iter().any(|t| !t.is_error);
+        if state.tools.len() > 1 || has_success {
+            super::tui::render_turn_summary(&state, turn);
+        }
+        drop(state);
+
+        // Clear turn state for next turn.
+        self.turn_state.lock().unwrap().clear();
+    }
+
+    fn on_error(&self, error: &str) {
+        self.stop_indicator();
+        self.ensure_newline();
+        let t = super::theme::current();
+        raw_eprint(&format!(
+            "{} {error}\n",
+            super::theme::label(" ERROR ", t.error, crossterm::style::Color::White)
+        ));
+    }
+
+    fn on_usage(&self, usage: &Usage) {
+        // Track in turn state for the summary panel.
+        {
+            let mut state = self.turn_state.lock().unwrap();
+            state.tokens_in = usage.input_tokens;
+            state.tokens_out = usage.output_tokens;
+            state.cache_read = usage.cache_read_input_tokens;
+            state.cache_write = usage.cache_creation_input_tokens;
+        }
+    }
+
+    fn on_compact(&self, freed_tokens: u64) {
+        let t = super::theme::current();
+        raw_eprint(&format!(
+            "  {} {}\n",
+            "↻".with(t.accent),
+            format!("compacted ~{freed_tokens} tokens").with(t.muted),
+        ));
+    }
+
+    fn on_warning(&self, msg: &str) {
+        let t = super::theme::current();
+        raw_eprint(&format!(
+            "{} {msg}\n",
+            super::theme::label(" WARN ", t.warning, crossterm::style::Color::Black)
+        ));
+    }
+}
+
+/// Spawn a background task that watches for the Escape key during streaming.
+/// Returns a guard that stops the watcher on drop (restoring terminal state).
+/// Uses crossterm raw mode only while actively polling, and yields quickly
+/// to avoid competing with rustyline for stdin.
+fn spawn_escape_watcher(
+    engine: &QueryEngine,
+    input_gate: Arc<std::sync::atomic::AtomicBool>,
+) -> EscapeWatcherGuard {
+    let cancel_token = engine.cancel_token();
+    let steer = engine.steer_sender();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+
+    let handle = std::thread::spawn(move || -> String {
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // Enable raw mode so we can capture individual keypresses.
+        if crossterm::terminal::enable_raw_mode().is_err() {
+            return String::new();
+        }
+
+        // Accumulates text typed during the turn. On Enter it is injected
+        // into the running turn as steered input (a user message applied
+        // at the next agent-loop boundary). Typed characters are not
+        // echoed (raw mode, mid-stream); the queued text is confirmed on
+        // Enter instead.
+        let mut steer_buf = String::new();
+
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            // While a permission prompt owns the terminal, release stdin so the
+            // prompt's selector receives the keypresses instead of us stealing
+            // them (both read crossterm events in raw mode).
+            if input_gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            // Poll with a short timeout to check the stop flag frequently.
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
+                && let Ok(Event::Key(KeyEvent {
+                    code, modifiers, ..
+                })) = event::read()
+            {
+                match code {
+                    KeyCode::Esc => {
+                        cancel_token.cancel();
+                        break;
+                    }
+                    // Also handle Ctrl+C here since raw mode intercepts it.
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        cancel_token.cancel();
+                        break;
+                    }
+                    KeyCode::Enter => {
+                        let text = steer_buf.trim().to_string();
+                        steer_buf.clear();
+                        if !text.is_empty() && steer.send(text.clone()).is_ok() {
+                            let preview: String = text.chars().take(60).collect();
+                            // CRLF: the terminal is in raw mode during the turn.
+                            let _ = std::io::Write::write_all(
+                                &mut std::io::stderr(),
+                                format!("\r\n  ↳ steering queued: {preview}\r\n").as_bytes(),
+                            );
+                            let _ = std::io::Write::flush(&mut std::io::stderr());
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        steer_buf.pop();
+                    }
+                    // Buffer ordinary typed characters (ignore control combos).
+                    KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        steer_buf.push(ch);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let _ = crossterm::terminal::disable_raw_mode();
+
+        // Return any text typed during the turn but not submitted with Enter,
+        // so the caller can seed it into the next prompt instead of losing it.
+        steer_buf
+    });
+
+    EscapeWatcherGuard {
+        stop,
+        handle: Some(handle),
+    }
+}
+
+/// RAII guard that stops the escape watcher thread and restores terminal state.
+struct EscapeWatcherGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<String>>,
+}
+
+impl EscapeWatcherGuard {
+    /// Stop the watcher and return the still-unsubmitted typed text, so the
+    /// REPL can pre-fill it into the next prompt. Consumes the guard; `Drop`
+    /// remains as the panic/early-return fallback that only restores raw mode.
+    fn finish(mut self) -> String {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let leftover = self
+            .handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let _ = crossterm::terminal::disable_raw_mode();
+        leftover
+    }
+}
+
+impl Drop for EscapeWatcherGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        // Ensure raw mode is off even if thread panicked.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// The actionable hint shown in a finished-task toast: the command that
+/// reads that task's captured output. Embeds the task id so the user can
+/// copy it straight to the prompt.
+fn completion_output_hint(id: &str) -> String {
+    format!("/tasks output {id}")
+}
+
+/// Surface background tasks that finished since the last prompt.
+///
+/// Drains the task manager once (de-duplicated by the `notified` flag),
+/// and for each newly-finished task: prints a one-line toast, fires a
+/// desktop notification, and injects a synthetic `is_meta` result
+/// message so the agent can reference the output on its next turn.
+/// Killed tasks are not surfaced (the user initiated them).
+async fn surface_background_completions(
+    engine: &mut QueryEngine,
+    notifier: &agent_code_lib::services::notifier::NotifierService,
+) {
+    use agent_code_lib::services::background::TaskStatus;
+
+    let task_manager = engine.state().task_manager.clone();
+    let completed = task_manager.drain_completions().await;
+    if completed.is_empty() {
+        return;
+    }
+
+    let t = super::theme::current();
+    for info in completed {
+        let (label, ok) = match &info.status {
+            TaskStatus::Completed => ("done", true),
+            TaskStatus::Failed(_) => ("failed", false),
+            _ => continue,
+        };
+        let elapsed = info
+            .finished_at
+            .map(|f| f.saturating_duration_since(info.started_at).as_secs())
+            .unwrap_or(0);
+        let output = task_manager.read_output(&info.id).await.unwrap_or_default();
+
+        let dot = if ok {
+            "✓".with(t.success)
+        } else {
+            "✗".with(t.error)
+        };
+        eprintln!(
+            "  {} {} {} ({elapsed}s) {} {}",
+            dot,
+            format!("background {label}:").with(t.muted),
+            info.description.clone().with(t.text),
+            "·".with(t.muted),
+            completion_output_hint(&info.id).with(t.accent),
+        );
+
+        notifier.notify_task_complete(
+            &format!("Task {label}: {}", info.description),
+            output.trim(),
+            elapsed,
+        );
+
+        // Fire TaskCompleted hooks so automation can react to background
+        // work finishing (open/hookable — the closed agents aren't).
+        let _ = engine.fire_task_completed_hooks(&info).await;
+
+        let msg = agent_code_lib::services::task_surface::build_completion_message(&info, &output);
+        engine.state_mut().push_message(msg);
+    }
+}
+
+/// Run the interactive REPL loop.
+pub async fn run_repl(engine: &mut QueryEngine) -> anyhow::Result<()> {
+    // Configure editing mode and load custom keybindings.
+    let input_mode = super::keymap::InputMode::default();
+    let _keybindings = super::keybindings::KeybindingRegistry::load();
+    let rl_config = rustyline::Config::builder()
+        .edit_mode(input_mode.to_edit_mode())
+        .completion_type(rustyline::config::CompletionType::List)
+        .bracketed_paste(true)
+        .build();
+    let mut rl =
+        rustyline::Editor::<CommandCompleter, rustyline::history::DefaultHistory>::with_config(
+            rl_config,
+        )?;
+    // Shared (model, base_url) snapshot so `/model` completion can resolve
+    // the active provider. Refreshed before each prompt (see the loop).
+    let model_ctx = std::sync::Arc::new(std::sync::Mutex::new((
+        engine.state().config.api.model.clone(),
+        engine.state().config.api.base_url.clone(),
+    )));
+    rl.set_helper(Some(CommandCompleter {
+        model_ctx: model_ctx.clone(),
+    }));
+
+    // Interactive permission prompting. Installing a prompter makes `ask` mode
+    // actually prompt before mutating tools run — without it the engine's
+    // no-prompter fallback silently auto-allows. `input_gate` coordinates stdin
+    // between that prompt (run from inside the turn) and the per-turn escape
+    // watcher so the two don't both consume keypresses.
+    let input_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine.set_permission_prompter(std::sync::Arc::new(super::prompt::TuiPrompter {
+        input_gate: input_gate.clone(),
+    }));
+
+    // Repaint the prompt on terminal resize. rustyline consumes SIGWINCH
+    // internally but skips its line refresh at an idle prompt, so after a
+    // resize the "❯" prompt row is wiped by the terminal's reflow and typed
+    // characters render bare at column 0 until Ctrl+L. An empty external
+    // print rides rustyline's clear+repaint path (the same one Ctrl+L uses),
+    // restoring the prompt; outside readline it writes nothing.
+    //
+    // Unix-only: `tokio::signal::unix` exists solely on Unix targets, and
+    // SIGWINCH is a Unix concept. On Windows, conhost/Windows Terminal reflow
+    // the prompt on resize without leaving it stranded, so no watcher is
+    // needed there.
+    #[cfg(unix)]
+    {
+        use rustyline::ExternalPrinter as _;
+        if let Ok(mut winch_printer) = rl.create_external_printer() {
+            tokio::spawn(async move {
+                let Ok(mut winch) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                else {
+                    return;
+                };
+                while winch.recv().await.is_some() {
+                    let _ = winch_printer.print(String::new());
+                }
+            });
+        }
+    }
+
+    // Generate a session ID for persistence. Clone for later use since
+    // Stylize methods consume the String.
+    let session_id = agent_code_lib::services::session::new_session_id();
+    let session_id_display = session_id.clone();
+
+    // Initialize session notes and clean up old ones.
+    agent_code_lib::memory::session_notes::init_session_notes(&session_id);
+    agent_code_lib::memory::session_notes::cleanup_old_notes();
+
+    // Prune old session files when operator has opted in via
+    // `[session] cleanup_period_days = N`. Best-effort — a failing
+    // sweep must never block REPL startup.
+    if let Some(days) = engine.state().config.session.cleanup_period_days
+        && days > 0
+    {
+        match agent_code_lib::services::session::prune_older_than(days) {
+            Ok(stats) if stats.removed > 0 => {
+                tracing::info!(
+                    "Session cleanup: removed {} old session(s), kept {}",
+                    stats.removed,
+                    stats.kept
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Session cleanup skipped: {e}"),
+        }
+    }
+
+    // Load project-scoped history (hashed from cwd).
+    let history_path = dirs::data_dir().map(|d| {
+        let cwd = &engine.state().cwd;
+        // Hash the cwd to create a project-specific history file.
+        let hash: u64 = cwd
+            .bytes()
+            .fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64));
+        d.join("agent-code")
+            .join("history")
+            .join(format!("{hash:x}.txt"))
+    });
+    if let Some(ref path) = history_path {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = rl.load_history(path);
+    }
+
+    let verbose = engine.state().config.ui.syntax_highlight; // Use as verbose proxy for now.
+
+    // Welcome message.
+    // Render the welcome banner.
+    let term_width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let divider = "─".repeat(term_width.min(100));
+    let model = engine.state().config.api.model.clone();
+    let cwd = engine.state().cwd.clone();
+
+    // Initialize theme. Pass both the configured value (for the
+    // inherit-fg override, which is Auto-only) and the resolved name
+    // so explicit themes still win when the user picked one
+    // explicitly.
+    let configured_theme = engine.state().config.ui.theme.clone();
+    let inherit_fg = engine.state().config.ui.inherit_fg;
+    let theme_name = super::theme::resolve_theme(&configured_theme);
+    super::theme::init_with_options(&theme_name, &configured_theme, inherit_fg);
+    let t = super::theme::current();
+
+    println!();
+
+    // Simple 3-line robot mascot rendered in the current theme accent color.
+    // Replaces the earlier pixel-art crab — see commit history for the
+    // rationale (we preferred the minimal look).
+    println!(
+        "  {}   {} v{}",
+        "▐▛██▜▌".with(t.accent).bold(),
+        "Agent Code".with(t.text).bold(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    println!(
+        "  {}   {} · session {}",
+        "▝▜██▛▘".with(t.accent),
+        model.with(t.text).bold(),
+        session_id_display.as_str().with(t.muted),
+    );
+    println!("  {}   {}", "  ▘▘  ".with(t.accent), cwd.with(t.muted),);
+
+    println!();
+    println!("{}", divider.with(t.muted));
+
+    // Show hint for shortcuts.
+    println!("  {}", "? for shortcuts".with(t.muted),);
+    println!();
+
+    // Render any pending startup warnings (dangerous flags, missing
+    // dependencies, deprecations). No-op when the registry is empty.
+    super::tui::render_warnings_banner();
+
+    // Initialise the rotating-tips service. The bump_session call
+    // increments the persistent session counter used by the cadence
+    // and `show_after_session` rules. We don't render anything yet —
+    // the first tip surfaces after the user's first turn.
+    let mut tips_service = agent_code_lib::services::tips::TipsService::new();
+    let tips_session_count = tips_service.bump_session();
+    let mut tip_shown_this_session = false;
+
+    // Enable durable background tasks: swap in a persistent task manager
+    // and adopt any tasks left over from a previous session. Reclassified
+    // / unfinished completions surface on the first prompt via
+    // surface_background_completions.
+    {
+        let tm = std::sync::Arc::new(
+            agent_code_lib::services::background::TaskManager::with_persistence(
+                agent_code_lib::services::background::tasks_dir(),
+            ),
+        );
+        // Pass the shared subagent limiter so adopted, still-running
+        // subagents reserve a slot and new spawns can't exceed the cap.
+        let adopted = tm.adopt(Some(engine.state().agent_limiter.clone())).await;
+        if adopted > 0 {
+            let t = super::theme::current();
+            eprintln!(
+                "  {} {}",
+                "⟡".with(t.accent),
+                format!("adopted {adopted} background task(s) from a previous session")
+                    .with(t.muted),
+            );
+        }
+        engine.state_mut().task_manager = tm;
+    }
+
+    // Notifier for surfacing finished background tasks (respects config).
+    let notifier = agent_code_lib::services::notifier::NotifierService::new(
+        engine.state().config.notifier.clone(),
+    );
+
+    let mut ctrl_c_pending = false;
+    // Text typed during the previous turn but not submitted with Enter,
+    // carried over to pre-fill the next prompt (see esc_guard.finish()).
+    let mut pending_input = String::new();
+    // Turn number of the last status divider printed, so empty submissions
+    // and other no-output re-prompts don't restack a duplicate divider.
+    let mut last_statusline_turn: u64 = 0;
+
+    loop {
+        let sink = TerminalSink::new(verbose);
+        let t = super::theme::current();
+
+        // Surface any background tasks that finished since the last
+        // prompt (toast + desktop notification + result injection).
+        surface_background_completions(engine, &notifier).await;
+
+        // Inline status divider before prompt (after first turn).
+        {
+            let state = engine.state();
+            let statusline_cfg = &state.config.ui.statusline;
+            // Only redraw the divider when the turn counter has advanced since
+            // the last one; an empty submit or `?` toggle re-enters the loop
+            // without a new turn and must not stack another divider.
+            if state.turn_count > 0
+                && statusline_cfg.enabled
+                && state.turn_count as u64 != last_statusline_turn
+            {
+                last_statusline_turn = state.turn_count as u64;
+                let term_w = crossterm::terminal::size()
+                    .map(|(w, _)| w as usize)
+                    .unwrap_or(80)
+                    .min(100);
+                let status = if let Some(template) = statusline_cfg.template.as_deref() {
+                    let vars = agent_code_lib::config::StatusLineVars {
+                        model: &state.config.api.model,
+                        turn: state.turn_count as u64,
+                        tokens: state.total_usage.total(),
+                        cost_usd: state.total_cost_usd,
+                        cwd: &state.cwd,
+                        session_id: &state.session_id,
+                    };
+                    // Wrap in a single space on each side so the
+                    // template sits cleanly between the divider
+                    // dashes, matching the built-in layout.
+                    format!(
+                        " {} ",
+                        agent_code_lib::config::render_statusline_template(template, &vars)
+                    )
+                } else {
+                    format!(
+                        " {} · turn {} · {} tokens · ${:.4} ",
+                        state.config.api.model,
+                        state.turn_count,
+                        state.total_usage.total(),
+                        state.total_cost_usd,
+                    )
+                };
+                let pad = term_w.saturating_sub(status.len());
+                let left = pad / 2;
+                let right = pad - left;
+                eprintln!(
+                    "{}{}{}",
+                    "─".repeat(left).with(t.muted),
+                    status.with(t.muted),
+                    "─".repeat(right).with(t.muted),
+                );
+            }
+        }
+
+        // Surface a rotating tip once per session, post-first-turn.
+        // The service handles its own cadence/dismiss/snooze rules
+        // and returns None when nothing should be shown — the loop
+        // never blocks on this.
+        if !tip_shown_this_session && engine.state().turn_count > 0 {
+            if let Some(body) = tips_service
+                .next_tip(tips_session_count)
+                .map(|t| t.body.clone())
+            {
+                eprintln!();
+                eprintln!("  {} {}", "tip".with(t.accent).bold(), body.with(t.muted));
+                eprintln!("  {}", "(/tips off to silence)".with(t.muted),);
+                eprintln!();
+            }
+            tip_shown_this_session = true;
+        }
+
+        let prompt = format!("{} ", "❯".with(t.accent).bold());
+
+        // Refresh the completer's model snapshot so `/model` completion
+        // tracks a provider changed earlier this session.
+        if let Ok(mut ctx) = model_ctx.lock() {
+            ctx.0 = engine.state().config.api.model.clone();
+            ctx.1 = engine.state().config.api.base_url.clone();
+        }
+
+        // Pre-fill the prompt with any text carried over from typing during
+        // the previous turn; taken once so later prompts start empty.
+        let seed = std::mem::take(&mut pending_input);
+        let readline_result = if seed.is_empty() {
+            rl.readline(&prompt)
+        } else {
+            rl.readline_with_initial(&prompt, (&seed, ""))
+        };
+        match readline_result {
+            Ok(line) => {
+                ctrl_c_pending = false;
+                let mut input_buf = line.clone();
+
+                // Multi-line input: if line ends with \, keep reading.
+                while input_buf.trim_end().ends_with('\\') {
+                    input_buf.truncate(input_buf.trim_end().len() - 1);
+                    input_buf.push('\n');
+                    let cont_prompt = format!("{} ", ".".with(t.muted));
+                    match rl.readline(&cont_prompt) {
+                        Ok(next) => input_buf.push_str(&next),
+                        Err(_) => break,
+                    }
+                }
+
+                let input = input_buf.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                // Toggle shortcuts help panel on "?".
+                if input == "?" {
+                    render_help_panel(engine.state());
+                    continue;
+                }
+
+                rl.add_history_entry(input)?;
+
+                // Re-echo user input with styled background, overwriting rustyline's echo.
+                if !input.starts_with('/') && input != "?" && !input.starts_with('!') {
+                    let t = super::theme::current();
+                    let bg = if t.is_dark {
+                        "\x1b[48;2;55;55;55m" // dark: subtle grey bg
+                    } else {
+                        "\x1b[48;2;235;235;240m" // light: subtle grey bg
+                    };
+                    // Move cursor up to overwrite rustyline's echo line.
+                    let line_count = input.lines().count().max(1);
+                    eprint!("\x1b[{line_count}A\x1b[2K");
+                    let _ = std::io::stderr().flush();
+                    // Print styled version.
+                    for line in input.lines() {
+                        let pad = crossterm::terminal::size()
+                            .map(|(w, _)| w as usize)
+                            .unwrap_or(80)
+                            .saturating_sub(line.len() + 4);
+                        println!(
+                            "{bg}  {} {}{}\x1b[0m",
+                            "❯".with(t.accent),
+                            line,
+                            " ".repeat(pad),
+                        );
+                    }
+                    println!();
+                }
+
+                // @ file path expansion: inline file contents into the prompt.
+                let input = if input.contains('@') {
+                    expand_file_references(input, &engine.state().cwd)
+                } else {
+                    input.to_string()
+                };
+                let input = input.trim();
+
+                // & prefix: run the prompt as a background subagent task.
+                // Non-blocking — spawns a tracked LocalAgent task and
+                // returns to the prompt immediately. Its result surfaces
+                // automatically when it finishes (see
+                // surface_background_completions).
+                if input.starts_with('&') {
+                    let bg_input = input.strip_prefix('&').unwrap_or("").trim().to_string();
+                    if !bg_input.is_empty() {
+                        let t = super::theme::current();
+                        let task_manager = engine.state().task_manager.clone();
+                        let agent_limiter = engine.state().agent_limiter.clone();
+                        let cwd = engine.state().cwd.clone();
+                        let subagent_id = uuid::Uuid::new_v4().to_string();
+
+                        // `&/skill args` runs a named skill/workflow as a
+                        // background task; `& <prompt>` runs a free-form
+                        // subagent. Both go through the same subprocess
+                        // runner and surface on completion.
+                        if let Some((slug, args_str)) = parse_background_skill(&bg_input) {
+                            let disable_shell =
+                                engine.state().config.security.disable_skill_shell_execution;
+                            let registry = agent_code_lib::skills::SkillRegistry::load_all(Some(
+                                std::path::Path::new(&cwd),
+                            ));
+                            let args_val = if args_str.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String(args_str.clone())
+                            };
+                            match agent_code_lib::tools::tasks::resolve_workflow_prompt(
+                                &slug,
+                                &args_val,
+                                &registry,
+                                disable_shell,
+                            ) {
+                                Ok(prompt) => {
+                                    let description: String = if args_str.is_empty() {
+                                        format!("/{slug}")
+                                    } else {
+                                        format!("/{slug} {args_str}").chars().take(60).collect()
+                                    };
+                                    let id =
+                                        agent_code_lib::tools::agent::spawn_background_workflow(
+                                            &slug,
+                                            args_val,
+                                            &prompt,
+                                            &description,
+                                            std::path::Path::new(&cwd),
+                                            &task_manager,
+                                            &subagent_id,
+                                            None,
+                                            None,
+                                            Some(agent_limiter),
+                                        )
+                                        .await;
+                                    eprintln!(
+                                        "  {} {}",
+                                        "⟡".with(t.accent),
+                                        format!("background workflow {id}: {description}")
+                                            .with(t.muted),
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  {} {}",
+                                        "✗".with(t.error),
+                                        format!("background workflow: {e}").with(t.muted),
+                                    );
+                                }
+                            }
+                        } else {
+                            let description: String = bg_input.chars().take(60).collect();
+                            let id = agent_code_lib::tools::agent::spawn_background_agent(
+                                &bg_input,
+                                &description,
+                                std::path::Path::new(&cwd),
+                                &task_manager,
+                                &subagent_id,
+                                None,
+                                None,
+                                Some(agent_limiter),
+                                None,
+                                None,
+                            )
+                            .await;
+                            eprintln!(
+                                "  {} {}",
+                                "⟡".with(t.accent),
+                                format!("background task {id}: {description}").with(t.muted),
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // ! prefix: run shell command directly with context injection.
+                // Output streams in real-time AND gets injected into conversation
+                // history so the agent can reference it in subsequent turns.
+                if input.starts_with('!') {
+                    let cmd = input.strip_prefix('!').unwrap_or("").trim();
+                    if !cmd.is_empty() {
+                        use agent_code_lib::services::shell_passthrough;
+
+                        let cwd = std::path::Path::new(&engine.state().cwd);
+                        match shell_passthrough::run_and_capture(
+                            cmd,
+                            cwd,
+                            |line| println!("{line}"),
+                            |line| eprintln!("{line}"),
+                        ) {
+                            Ok(output) => {
+                                if let Some(msg) =
+                                    shell_passthrough::build_context_message(cmd, &output)
+                                {
+                                    engine.state_mut().push_message(msg);
+                                }
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle slash commands.
+                if input.starts_with('/') {
+                    match crate::commands::execute(input, engine) {
+                        crate::commands::CommandResult::Handled => continue,
+                        crate::commands::CommandResult::Exit => break,
+                        crate::commands::CommandResult::Passthrough(text) => {
+                            sink.start_indicator();
+                            if let Err(e) = engine.run_turn_with_sink(&text, &sink).await {
+                                {
+                                    let t = super::theme::current();
+                                    eprintln!(
+                                        "{} {e}",
+                                        super::theme::label(
+                                            " ERROR ",
+                                            t.error,
+                                            crossterm::style::Color::White
+                                        )
+                                    );
+                                }
+                            }
+                            sink.ensure_newline();
+                            println!();
+                        }
+                        crate::commands::CommandResult::Prompt(prompt) => {
+                            sink.start_indicator();
+                            if let Err(e) = engine.run_turn_with_sink(&prompt, &sink).await {
+                                {
+                                    let t = super::theme::current();
+                                    eprintln!(
+                                        "{} {e}",
+                                        super::theme::label(
+                                            " ERROR ",
+                                            t.error,
+                                            crossterm::style::Color::White
+                                        )
+                                    );
+                                }
+                            }
+                            sink.ensure_newline();
+                            println!();
+                        }
+                    }
+                    continue;
+                }
+
+                // Run the agent turn with Escape key watcher for cancellation.
+                let esc_guard = spawn_escape_watcher(engine, input_gate.clone());
+                sink.start_indicator();
+                if let Err(e) = engine.run_turn_with_sink(input, &sink).await {
+                    {
+                        let t = super::theme::current();
+                        raw_eprint(&format!(
+                            "{} {e}\n",
+                            super::theme::label(" ERROR ", t.error, crossterm::style::Color::White)
+                        ));
+                    }
+                }
+                // Carry any typed-but-unsubmitted text into the next prompt.
+                pending_input = esc_guard.finish();
+                sink.ensure_newline();
+                println!();
+
+                // Auto-save session after each turn.
+                {
+                    let state = engine.state();
+                    let _ = agent_code_lib::services::session::save_session_full(
+                        &session_id,
+                        &state.messages,
+                        &state.cwd,
+                        &state.config.api.model,
+                        state.turn_count,
+                        state.total_cost_usd,
+                        state.total_usage.input_tokens,
+                        state.total_usage.output_tokens,
+                        state.plan_mode,
+                    );
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if engine.state().is_query_active {
+                    engine.cancel();
+                    eprintln!("{}", "(cancelled)".with(super::theme::current().muted));
+                    ctrl_c_pending = false;
+                } else if ctrl_c_pending {
+                    // Second Ctrl+C at prompt — exit.
+                    break;
+                } else {
+                    // First Ctrl+C at prompt — show hint, continue.
+                    eprintln!(
+                        "{}",
+                        "(Ctrl+C again to exit, or type /exit)".with(super::theme::current().muted)
+                    );
+                    ctrl_c_pending = true;
+                }
+            }
+            Err(ReadlineError::Eof) => {
+                break;
+            }
+            Err(e) => {
+                eprintln!("Input error: {e}");
+                break;
+            }
+        }
+    }
+
+    // Save history.
+    if let Some(ref path) = history_path {
+        let _ = rl.save_history(path);
+    }
+
+    // Persist session.
+    let state = engine.state();
+    if !state.messages.is_empty() {
+        match agent_code_lib::services::session::save_session(
+            &session_id,
+            &state.messages,
+            &state.cwd,
+            &state.config.api.model,
+            state.turn_count,
+        ) {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "{}",
+                format!("Failed to save session: {e}").with(super::theme::current().muted)
+            ),
+        }
+    }
+
+    // Print session summary.
+    let divider = "─".repeat(term_width.min(100));
+    let t = super::theme::current();
+    println!("{}", divider.with(t.muted));
+    if state.total_usage.total() > 0 {
+        println!(
+            "  {} {} turns | {} tokens | ${:.4} | session {}",
+            "session".with(t.accent),
+            state.turn_count,
+            state.total_usage.total(),
+            state.total_cost_usd,
+            session_id_display.as_str().with(t.muted),
+        );
+    } else {
+        println!(
+            "  {} session {}",
+            "goodbye".with(t.accent),
+            session_id_display.as_str().with(t.muted)
+        );
+    }
+
+    Ok(())
+}
+
+/// Create a short summary of tool input for display.
+fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
+    let raw = match tool_name {
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "FileRead" | "FileWrite" | "FileEdit" | "NotebookEdit" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "Grep" | "Glob" | "WebSearch" => input
+            .get("pattern")
+            .or_else(|| input.get("query"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "Agent" => input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => {
+            // Compact JSON preview.
+            serde_json::to_string(input)
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect()
+        }
+    };
+
+    // Truncate long summaries.
+    if raw.len() > 120 {
+        format!("{}...", &raw[..117])
+    } else {
+        raw
+    }
+}
+
+/// Render the interactive help panel shown when the user types `?`.
+///
+/// Pulled out of the REPL loop so it can evolve without cluttering the
+/// main read-dispatch body. Three sections:
+///
+///   * **Current state** — live session info (model, mode, tokens, cost)
+///   * **Keyboard shortcuts** — key bindings and input prefixes
+///   * **Commands** — all non-hidden slash commands, auto-generated from
+///     `COMMANDS`, so new commands show up without touching this panel
+fn render_help_panel(state: &agent_code_lib::state::AppState) {
+    let t = super::theme::current();
+    let divider = "─".repeat(60);
+
+    println!();
+
+    // ---- Current state ----
+    println!("  {}", "Current session".with(t.accent).bold());
+    println!("  {}", divider.as_str().with(t.muted));
+
+    let tokens = state.total_usage.total();
+    let window =
+        agent_code_lib::services::tokens::context_window_for_model(&state.config.api.model);
+    let ctx_pct = if window > 0 {
+        (tokens as f64 / window as f64 * 100.0).round() as u64
+    } else {
+        0
+    };
+    let perm_mode = format!("{:?}", state.config.permissions.default_mode).to_lowercase();
+    let mode_badges: String = {
+        let mut badges: Vec<String> = Vec::new();
+        if state.plan_mode {
+            badges.push("plan".to_string());
+        }
+        if state.brief_mode {
+            badges.push("brief".to_string());
+        }
+        if !state.additional_dirs.is_empty() {
+            badges.push(format!("+{} dirs", state.additional_dirs.len()));
+        }
+        if badges.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", badges.join(", "))
+        }
+    };
+
+    println!(
+        "  {:<14} {}{}",
+        "model".with(t.muted),
+        state.config.api.model.as_str().with(t.text),
+        mode_badges.with(t.accent),
+    );
+    println!(
+        "  {:<14} {}",
+        "permissions".with(t.muted),
+        perm_mode.with(t.text),
+    );
+    println!(
+        "  {:<14} {} (turn {})",
+        "usage".with(t.muted),
+        format!(
+            "{tokens} tokens · {ctx_pct}% of {window} · ${:.4}",
+            state.total_cost_usd
+        )
+        .with(t.text),
+        state.turn_count,
+    );
+
+    // ---- Keyboard shortcuts ----
+    println!();
+    println!("  {}", "Keyboard & input".with(t.accent).bold());
+    println!("  {}", divider.as_str().with(t.muted));
+    let rows = [
+        ("! command", "run shell command directly"),
+        ("@ path/file", "inline file contents in the prompt"),
+        ("& prompt", "run prompt in background"),
+        ("/name", "slash command — Tab to complete"),
+        ("\\ + Enter", "continue on next line"),
+        ("Tab", "auto-complete slash commands"),
+        ("Ctrl+R", "search prompt history"),
+        ("Esc / Ctrl+C", "cancel (Ctrl+C twice to exit)"),
+        ("Ctrl+D", "exit REPL"),
+    ];
+    for (key, desc) in rows {
+        println!("  {:<18} {}", key.with(t.text), desc.with(t.muted));
+    }
+
+    // ---- Commands ----
+    println!();
+    println!(
+        "  {} {}",
+        "Commands".with(t.accent).bold(),
+        format!(
+            "({})",
+            crate::commands::COMMANDS
+                .iter()
+                .filter(|c| !c.hidden)
+                .count()
+        )
+        .with(t.muted),
+    );
+    println!("  {}", divider.as_str().with(t.muted));
+
+    // Auto-generated, sorted alphabetically.
+    let mut cmds: Vec<_> = crate::commands::COMMANDS
+        .iter()
+        .filter(|c| !c.hidden)
+        .collect();
+    cmds.sort_by_key(|c| c.name);
+
+    // Column-align the names.
+    let max_name_len = cmds.iter().map(|c| c.name.len()).max().unwrap_or(10);
+    let name_width = (max_name_len + 2).min(24);
+
+    for cmd in cmds {
+        let alias_suffix = if cmd.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" (alias: /{})", cmd.aliases.join(", /"))
+        };
+        println!(
+            "  /{:<width$} {}{}",
+            cmd.name.with(t.text),
+            cmd.description.with(t.muted),
+            alias_suffix.with(t.muted),
+            width = name_width,
+        );
+    }
+
+    println!();
+}
+
+/// Expand @path references in user input to include file contents.
+/// e.g., "explain @src/main.rs" → "explain\n\nContents of src/main.rs:\n```\n...```"
+fn expand_file_references(input: &str, cwd: &str) -> String {
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    // Find @path patterns (@ followed by non-whitespace chars containing / or .).
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@'
+            && (i == 0 || chars[i - 1].is_whitespace())
+            && i + 1 < chars.len()
+            && !chars[i + 1].is_whitespace()
+        {
+            // Collect the path.
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && !chars[end].is_whitespace() {
+                end += 1;
+            }
+            let path_str: String = chars[start..end].iter().collect();
+
+            // Only expand if it looks like a file path (contains / or .).
+            if path_str.contains('/') || path_str.contains('.') {
+                let full_path = std::path::Path::new(cwd).join(&path_str);
+                if full_path.exists() && full_path.is_file() {
+                    // Add text before the @reference.
+                    let before: String = chars[last_end..i].iter().collect();
+                    result.push_str(&before);
+
+                    // Read and inline the file.
+                    match std::fs::read_to_string(&full_path) {
+                        Ok(content) => {
+                            let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            // Truncate large files.
+                            let display = if content.len() > 50_000 {
+                                format!(
+                                    "{}...\n(truncated, {} bytes total)",
+                                    &content[..50_000],
+                                    content.len()
+                                )
+                            } else {
+                                content
+                            };
+                            result.push_str(&format!(
+                                "\n\nContents of {path_str}:\n```{ext}\n{display}\n```\n"
+                            ));
+                        }
+                        Err(_) => {
+                            result.push('@');
+                            result.push_str(&path_str);
+                        }
+                    }
+                    last_end = end;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Append remaining text.
+    let remaining: String = chars[last_end..].iter().collect();
+    result.push_str(&remaining);
+    result
+}
+
+#[cfg(test)]
+mod raw_print_tests {
+    //! The translation used by `raw_print` / `raw_eprint` is extracted here as
+    //! a pure function so we can test it without touching stdout. The bug
+    //! these guard against: during a streaming turn the escape watcher holds
+    //! the terminal in raw mode, where a bare `\n` moves the cursor down one
+    //! row without returning to column 0. Every newline emitted by the
+    //! streaming sink must therefore be `\r\n`.
+
+    fn translate(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    #[test]
+    fn bare_lf_becomes_crlf() {
+        assert_eq!(translate("a\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn existing_crlf_is_preserved_not_doubled() {
+        // Must not produce `\r\r\n`.
+        assert_eq!(translate("a\r\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn multiple_newlines_all_translated() {
+        assert_eq!(translate("a\nb\nc\n"), "a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn text_without_newlines_is_unchanged() {
+        assert_eq!(translate("hello world"), "hello world");
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(translate(""), "");
+    }
+
+    #[test]
+    fn mixed_lf_and_crlf() {
+        assert_eq!(translate("a\nb\r\nc\n"), "a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn lone_cr_is_not_touched() {
+        // Activity indicator and other helpers use bare `\r` to rewrite the
+        // current line; that must survive translation intact.
+        assert_eq!(translate("\rstatus"), "\rstatus");
+    }
+
+    #[test]
+    fn cr_followed_by_text_then_lf() {
+        assert_eq!(translate("\rstatus\n"), "\rstatus\r\n");
+    }
+}
+
+#[cfg(test)]
+mod completer_tests {
+    //! Scoring for the fuzzy command completer. The completer is tab-
+    //! triggered, so bad scoring means the wrong command floats to the top
+    //! of the suggestion list (or worse, a correct match gets filtered out).
+
+    use super::{fuzzy_subsequence, score_command};
+
+    #[test]
+    fn empty_partial_matches_everything_at_top_score() {
+        assert_eq!(score_command("commit", &[], ""), Some(1000));
+        assert_eq!(score_command("output-style", &["style"], ""), Some(1000));
+    }
+
+    #[test]
+    fn prefix_beats_substring() {
+        let prefix = score_command("review", &[], "rev").unwrap();
+        let substring = score_command("thinkback-play", &[], "kbk").unwrap();
+        assert!(
+            prefix > substring,
+            "prefix {prefix} should beat substring {substring}"
+        );
+    }
+
+    #[test]
+    fn substring_match_works() {
+        // `/install-github-app` when user types `github`
+        assert_eq!(
+            score_command("install-github-app", &["gh-setup"], "github"),
+            Some(500),
+        );
+    }
+
+    #[test]
+    fn alias_match_is_recognised() {
+        // User types `/gh-` — the real name is `install-github-app`, the
+        // alias is `gh-setup`.
+        let score = score_command("install-github-app", &["gh-setup"], "gh-").unwrap();
+        assert!(score >= 100, "alias match should score >= 100, got {score}");
+    }
+
+    #[test]
+    fn fuzzy_subsequence_basic() {
+        assert!(fuzzy_subsequence("review", "rvw"));
+        assert!(fuzzy_subsequence("output-style", "os"));
+        assert!(!fuzzy_subsequence("commit", "xyz"));
+        assert!(!fuzzy_subsequence("abc", "abcd"));
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        assert!(score_command("Review", &[], "rev").is_some());
+        assert!(score_command("review", &[], "REV").is_some());
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        assert_eq!(score_command("commit", &[], "xyz"), None);
+        assert_eq!(score_command("exit", &["quit"], "totally-different"), None);
+    }
+
+    #[test]
+    fn prefix_scores_higher_than_alias_prefix() {
+        // Name prefix (1000) beats alias prefix (150).
+        let name_prefix = score_command("style", &[], "sty").unwrap();
+        let alias_prefix = score_command("output-style", &["style"], "sty").unwrap();
+        assert!(
+            name_prefix > alias_prefix,
+            "name prefix {name_prefix} should beat alias prefix {alias_prefix}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod background_skill_tests {
+    use super::parse_background_skill;
+
+    #[test]
+    fn slug_only() {
+        assert_eq!(
+            parse_background_skill("/review"),
+            Some(("review".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn slug_with_args() {
+        assert_eq!(
+            parse_background_skill("/review src/main.rs and tests"),
+            Some(("review".to_string(), "src/main.rs and tests".to_string()))
+        );
+    }
+
+    #[test]
+    fn extra_whitespace_between_slug_and_args_is_trimmed() {
+        assert_eq!(
+            parse_background_skill("/deploy    prod"),
+            Some(("deploy".to_string(), "prod".to_string()))
+        );
+    }
+
+    #[test]
+    fn free_form_prompt_is_not_a_skill() {
+        assert_eq!(parse_background_skill("just fix the bug"), None);
+        assert_eq!(parse_background_skill("run the build"), None);
+    }
+
+    #[test]
+    fn bare_slash_is_not_a_skill() {
+        // No slug after `/` → fall through to the free-form path
+        // rather than resolving an empty skill.
+        assert_eq!(parse_background_skill("/"), None);
+        assert_eq!(parse_background_skill("/   "), None);
+    }
+}
+
+#[cfg(test)]
+mod background_skill_completion_tests {
+    use super::{complete_skill_name, find_background_skill_context};
+
+    #[test]
+    fn context_at_slug_start() {
+        // `&/` with cursor right after the slash → empty partial.
+        assert_eq!(find_background_skill_context("&/", 2), Some((1, "")));
+    }
+
+    #[test]
+    fn context_with_partial() {
+        assert_eq!(find_background_skill_context("&/rev", 5), Some((1, "rev")));
+    }
+
+    #[test]
+    fn context_tolerates_space_after_amp() {
+        // `& /rev` — a space between `&` and `/` still completes; the
+        // slash index points past the space.
+        assert_eq!(find_background_skill_context("& /rev", 6), Some((2, "rev")));
+    }
+
+    #[test]
+    fn no_context_without_amp() {
+        assert_eq!(find_background_skill_context("/rev", 4), None);
+    }
+
+    #[test]
+    fn no_context_once_past_the_slug() {
+        // After whitespace, the cursor is in the args, not the slug.
+        assert_eq!(find_background_skill_context("&/review src", 12), None);
+    }
+
+    #[test]
+    fn no_context_for_plain_background_prompt() {
+        // `& fix the bug` is a free-form prompt, not a skill.
+        assert_eq!(find_background_skill_context("& fix the bug", 13), None);
+    }
+
+    #[test]
+    fn completer_matches_a_bundled_skill_prefix() {
+        // Pick a real *user-invocable* bundled skill, then confirm a
+        // prefix of its name surfaces it as a `/name` replacement.
+        let reg = agent_code_lib::skills::SkillRegistry::load_bundled_only();
+        let Some(skill) = reg.user_invocable().into_iter().next() else {
+            return; // no invocable bundled skills in this build
+        };
+        let name = skill.name.clone();
+        let prefix: String = name.chars().take(2).collect();
+        let pairs = complete_skill_name(".", &prefix);
+        assert!(
+            pairs.iter().any(|p| p.replacement == format!("/{name}")),
+            "expected /{name} among completions for prefix {prefix:?}: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    fn mk_skill(name: &str, user_invocable: bool) -> agent_code_lib::skills::Skill {
+        use agent_code_lib::skills::{Skill, SkillMetadata};
+        Skill {
+            name: name.to_string(),
+            metadata: SkillMetadata {
+                user_invocable,
+                ..Default::default()
+            },
+            body: "do the thing".to_string(),
+            source: std::path::PathBuf::from("test"),
+        }
+    }
+
+    #[test]
+    fn skill_completion_excludes_non_invocable() {
+        use super::skill_completion_pairs;
+        let skills = vec![mk_skill("review", true), mk_skill("internal-helper", false)];
+        let pairs = skill_completion_pairs(&skills, "");
+        let names: Vec<&String> = pairs.iter().map(|p| &p.replacement).collect();
+        assert!(names.iter().any(|r| *r == "/review"), "{names:?}");
+        assert!(
+            !names.iter().any(|r| *r == "/internal-helper"),
+            "non-invocable skill must not be offered: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod slash_completion_tests {
+    use super::complete_slash;
+
+    #[test]
+    fn includes_builtin_commands() {
+        let pairs = complete_slash("hel", ".");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "/help"),
+            "expected /help: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn includes_matching_skills() {
+        // A user-invocable bundled skill should be offered via `/`
+        // completion too — unless its name is shadowed by a command.
+        let reg = agent_code_lib::skills::SkillRegistry::load_bundled_only();
+        let Some(skill) = reg
+            .user_invocable()
+            .into_iter()
+            .find(|s| !super::is_command_name_or_alias(&s.name))
+        else {
+            return;
+        };
+        let name = skill.name.clone();
+        let prefix: String = name.chars().take(2).collect();
+        let pairs = complete_slash(&prefix, ".");
+        assert!(
+            pairs.iter().any(|p| p.replacement == format!("/{name}")),
+            "expected /{name} via /-completion for {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn command_names_and_aliases_are_recognized() {
+        use super::is_command_name_or_alias;
+        // `find` is an alias of `/search`; `h` of `/help`.
+        assert!(is_command_name_or_alias("search"));
+        assert!(is_command_name_or_alias("find"));
+        assert!(is_command_name_or_alias("help"));
+        assert!(is_command_name_or_alias("h"));
+        assert!(!is_command_name_or_alias("definitely-not-a-command"));
+    }
+
+    #[test]
+    fn no_duplicate_replacements() {
+        // Even if a skill shared a command's name, each `/name` appears
+        // once. Assert the invariant holds across an empty partial
+        // (which surfaces everything).
+        let pairs = complete_slash("", ".");
+        let mut seen = std::collections::HashSet::new();
+        for p in &pairs {
+            assert!(
+                seen.insert(p.replacement.clone()),
+                "duplicate replacement {:?}",
+                p.replacement
+            );
+        }
+    }
+
+    #[test]
+    fn skips_skills_once_args_are_typed() {
+        // With a space in the partial, no skill load happens and the
+        // command scorer also yields nothing — so the result is empty.
+        let pairs = complete_slash("review some args", ".");
+        assert!(
+            pairs.is_empty(),
+            "expected no matches, got {} replacements: {:?}",
+            pairs.len(),
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod completion_toast_tests {
+    use super::completion_output_hint;
+
+    #[test]
+    fn hint_points_at_tasks_output_with_id() {
+        assert_eq!(completion_output_hint("bg_3"), "/tasks output bg_3");
+        assert_eq!(completion_output_hint("w12"), "/tasks output w12");
+    }
+}
+
+#[cfg(test)]
+mod resume_completion_tests {
+    use super::session_completion_pairs;
+    use agent_code_lib::services::session::SessionSummary;
+
+    fn mk(id: &str, label: Option<&str>, updated: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            cwd: "/tmp".to_string(),
+            model: "m".to_string(),
+            turn_count: 0,
+            message_count: 0,
+            updated_at: updated.to_string(),
+            label: label.map(str::to_string),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_partial_lists_all_in_recency_order() {
+        let sessions = vec![
+            mk("aaaa1111-2222", Some("refactor auth"), "2026-06-30T10:00"),
+            mk("bbbb3333-4444", None, "2026-06-29T09:00"),
+        ];
+        let pairs = session_completion_pairs(&sessions, "");
+        // Order preserved (input is recency-sorted); replacement is the id.
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].replacement, "aaaa1111-2222");
+        assert_eq!(pairs[1].replacement, "bbbb3333-4444");
+        // Labelled session shows its label; unlabelled shows the time.
+        assert!(pairs[0].display.contains("refactor auth"));
+        assert!(pairs[1].display.contains("2026-06-29T09:00"));
+    }
+
+    #[test]
+    fn partial_filters_by_id_prefix() {
+        let sessions = vec![
+            mk("aaaa1111", Some("one"), "t1"),
+            mk("bbbb2222", Some("two"), "t2"),
+        ];
+        let pairs = session_completion_pairs(&sessions, "bbbb");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "bbbb2222");
+    }
+}
+
+#[cfg(test)]
+mod model_completion_tests {
+    use super::CommandCompleter;
+    use rustyline::Context;
+    use rustyline::completion::Completer;
+    use rustyline::history::DefaultHistory;
+    use std::sync::{Arc, Mutex};
+
+    fn completer(model: &str, base_url: &str) -> CommandCompleter {
+        CommandCompleter {
+            model_ctx: Arc::new(Mutex::new((model.to_string(), base_url.to_string()))),
+        }
+    }
+
+    #[test]
+    fn model_completion_is_provider_aware() {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        // Anthropic snapshot → Claude models, and no OpenAI models.
+        let c = completer("claude-sonnet-4-20250514", "https://api.anthropic.com");
+        let (idx, pairs) = c.complete("/model claude-o", 15, &ctx).unwrap();
+        assert_eq!(idx, 7, "replacement should overwrite the model token");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "claude-opus-4-8"),
+            "expected a claude model: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs.iter().any(|p| p.replacement.starts_with("gpt")),
+            "must not offer OpenAI models on an Anthropic provider"
+        );
+    }
+
+    #[test]
+    fn model_completion_tracks_provider_switch() {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        // OpenAI snapshot → gpt models surface instead.
+        let c = completer("gpt-4.1", "https://api.openai.com/v1");
+        let (_idx, pairs) = c.complete("/model gpt-5", 12, &ctx).unwrap();
+        assert!(
+            pairs.iter().any(|p| p.replacement.starts_with("gpt-5.4")),
+            "expected gpt-5.4 models: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_style_completion_tests {
+    use super::complete_output_style_name;
+
+    #[test]
+    fn completes_a_builtin_style() {
+        // The built-in "default" style is always present; a prefix of it
+        // should surface it. (Loads the real registry over cwd.)
+        let pairs = complete_output_style_name(".", "def");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "default"),
+            "expected 'default' among completions: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_completion_is_a_real_style() {
+        let registry = agent_code_lib::output_styles::OutputStyleRegistry::load_all(Some(
+            std::path::Path::new("."),
+        ));
+        let known: std::collections::HashSet<&str> =
+            registry.all().iter().map(|s| s.name.as_str()).collect();
+        for p in complete_output_style_name(".", "") {
+            assert!(
+                known.contains(p.replacement.as_str()),
+                "offered unknown style {:?}",
+                p.replacement
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod color_completion_tests {
+    use super::{complete_from_names, find_command_arg_context};
+
+    #[test]
+    fn arg_context_detects_partial() {
+        assert_eq!(
+            find_command_arg_context("/color mid", 10, "color"),
+            Some((7, "mid"))
+        );
+        // Cursor at the arg start (just past the space) → empty partial.
+        assert_eq!(
+            find_command_arg_context("/color ", 7, "color"),
+            Some((7, ""))
+        );
+    }
+
+    #[test]
+    fn arg_context_rejects_non_matching() {
+        // No trailing space → still command completion.
+        assert_eq!(find_command_arg_context("/color", 6, "color"), None);
+        // Different command.
+        assert_eq!(find_command_arg_context("/model gpt", 10, "color"), None);
+        // Past the first arg token.
+        assert_eq!(
+            find_command_arg_context("/color midnight x", 17, "color"),
+            None
+        );
+        // Prefix collision: `/colorful` is not `/color <arg>`.
+        assert_eq!(find_command_arg_context("/colorful", 9, "color"), None);
+    }
+
+    #[test]
+    fn completes_only_accepted_theme_names() {
+        // Every completion offered must be a name `/color` accepts, and
+        // a prefix should surface the matching theme.
+        let pairs = complete_from_names(crate::commands::COLOR_THEME_NAMES, "mid");
+        let names: Vec<&String> = pairs.iter().map(|p| &p.replacement).collect();
+        assert!(names.iter().any(|n| *n == "midnight"));
+        assert!(names.iter().any(|n| *n == "midnight-muted"));
+        for p in &pairs {
+            assert!(
+                crate::commands::COLOR_THEME_NAMES.contains(&p.replacement.as_str()),
+                "offered non-accepted theme {:?}",
+                p.replacement
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tasks_subcommand_completion_tests {
+    use super::{complete_tasks_subcommand, find_tasks_subcommand_context};
+
+    #[test]
+    fn context_at_subcommand_start() {
+        // `/tasks ` with cursor after the space → empty partial at the
+        // token position (just past the space).
+        assert_eq!(find_tasks_subcommand_context("/tasks ", 7), Some((7, "")));
+    }
+
+    #[test]
+    fn context_with_partial() {
+        assert_eq!(
+            find_tasks_subcommand_context("/tasks ki", 9),
+            Some((7, "ki"))
+        );
+    }
+
+    #[test]
+    fn context_tolerates_extra_spaces() {
+        assert_eq!(
+            find_tasks_subcommand_context("/tasks   out", 12),
+            Some((9, "out"))
+        );
+    }
+
+    #[test]
+    fn no_context_without_trailing_space() {
+        // `/tasks` alone is normal command completion, not subcommand.
+        assert_eq!(find_tasks_subcommand_context("/tasks", 6), None);
+        // `/tasksfoo` is not the tasks command.
+        assert_eq!(find_tasks_subcommand_context("/tasksfoo", 9), None);
+    }
+
+    #[test]
+    fn no_context_once_in_the_id() {
+        // After the subcommand token + space, the cursor is in the id.
+        assert_eq!(find_tasks_subcommand_context("/tasks kill bg_3", 16), None);
+    }
+
+    #[test]
+    fn completes_known_subcommands() {
+        let all = complete_tasks_subcommand("");
+        let names: Vec<&String> = all.iter().map(|p| &p.replacement).collect();
+        for want in ["list", "output", "kill", "clear"] {
+            assert!(
+                names.iter().any(|n| *n == want),
+                "missing {want}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filters_by_partial() {
+        let pairs = complete_tasks_subcommand("k");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "kill");
+    }
+}
+
+#[cfg(test)]
+mod at_completion_tests {
+    //! Tests for the `@`-path tab completer. These are file-system tests
+    //! over a tempdir so we don't depend on the repo layout.
+
+    use super::{complete_at_path, find_at_context};
+
+    #[test]
+    fn at_context_at_start_of_line() {
+        let line = "@src";
+        let pos = 4;
+        assert_eq!(find_at_context(line, pos), Some((0, "src")));
+    }
+
+    #[test]
+    fn at_context_after_whitespace() {
+        let line = "explain @src/main";
+        let pos = line.len();
+        assert_eq!(find_at_context(line, pos), Some((8, "src/main")));
+    }
+
+    #[test]
+    fn at_context_rejected_when_preceded_by_non_whitespace() {
+        // email@example.com → not a path context
+        assert_eq!(find_at_context("email@example.com", 10), None);
+    }
+
+    #[test]
+    fn at_context_rejected_when_partial_contains_whitespace() {
+        // Once the user types past the token, we should stop completing.
+        assert_eq!(find_at_context("@src/main.rs here", 17), None);
+    }
+
+    #[test]
+    fn at_context_empty_partial_after_at() {
+        let line = "@";
+        assert_eq!(find_at_context(line, 1), Some((0, "")));
+    }
+
+    #[test]
+    fn at_context_no_at_sign_returns_none() {
+        assert_eq!(find_at_context("just text here", 10), None);
+    }
+
+    #[test]
+    fn at_context_multiple_at_signs_uses_most_recent() {
+        let line = "@src foo @tests";
+        let pos = line.len();
+        assert_eq!(find_at_context(line, pos), Some((9, "tests")));
+    }
+
+    #[test]
+    fn complete_paths_lists_tempdir_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.md"), "").unwrap();
+        std::fs::write(tmp.path().join("beta.rs"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let results = complete_at_path(cwd, "");
+        let replacements: Vec<String> = results.iter().map(|p| p.replacement.clone()).collect();
+        // Directories first, trailing slash.
+        assert!(replacements.contains(&"@src/".to_string()));
+        assert!(replacements.contains(&"@alpha.md".to_string()));
+        assert!(replacements.contains(&"@beta.rs".to_string()));
+        // dirs sort before files.
+        let src_pos = replacements.iter().position(|r| r == "@src/").unwrap();
+        let alpha_pos = replacements.iter().position(|r| r == "@alpha.md").unwrap();
+        assert!(src_pos < alpha_pos, "dirs should list before files");
+    }
+
+    #[test]
+    fn complete_paths_filters_by_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.md"), "").unwrap();
+        std::fs::write(tmp.path().join("beta.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("alphabet.txt"), "").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let results = complete_at_path(cwd, "alp");
+        let replacements: Vec<String> = results.iter().map(|p| p.replacement.clone()).collect();
+        assert!(replacements.contains(&"@alpha.md".to_string()));
+        assert!(replacements.contains(&"@alphabet.txt".to_string()));
+        assert!(!replacements.contains(&"@beta.rs".to_string()));
+    }
+
+    #[test]
+    fn complete_paths_descends_into_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let results = complete_at_path(cwd, "src/m");
+        let replacements: Vec<String> = results.iter().map(|p| p.replacement.clone()).collect();
+        assert_eq!(replacements, vec!["@src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn complete_paths_skips_dotfiles_unless_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".hidden"), "").unwrap();
+        std::fs::write(tmp.path().join("visible"), "").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let default = complete_at_path(cwd, "");
+        let replacements: Vec<String> = default.iter().map(|p| p.replacement.clone()).collect();
+        assert!(replacements.contains(&"@visible".to_string()));
+        assert!(!replacements.contains(&"@.hidden".to_string()));
+
+        let with_dot = complete_at_path(cwd, ".");
+        let replacements: Vec<String> = with_dot.iter().map(|p| p.replacement.clone()).collect();
+        assert!(replacements.contains(&"@.hidden".to_string()));
+    }
+
+    #[test]
+    fn complete_paths_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        assert!(complete_at_path(cwd, "../foo").is_empty());
+        assert!(complete_at_path(cwd, "/etc/passwd").is_empty());
+    }
+
+    #[test]
+    fn complete_paths_empty_for_nonexistent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        assert!(complete_at_path(cwd, "does-not-exist/foo").is_empty());
+    }
+}

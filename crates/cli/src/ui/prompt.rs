@@ -93,7 +93,7 @@ pub fn ask_permission_detailed(
 
 /// Adapter that lets the lib engine drive this interactive permission prompt.
 ///
-/// Classic stdin prompter (kept for non-TUI / one-shot paths). One-shot/`-p` runs
+/// Installed on the classic interactive path (see `run_repl`); one-shot/`-p` runs
 /// leave the engine's prompter unset (auto-allow, unchanged). `ask()` is called
 /// from inside the running turn (the tool executor) while the REPL's
 /// escape-watcher thread holds the terminal in raw mode reading keypresses for

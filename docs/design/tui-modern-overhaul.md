@@ -13,7 +13,7 @@ The interactive path is a **line-oriented rustyline REPL** with ad-hoc raw mode 
 1. Full-screen **alt-screen** TUI (ratatui + crossterm) as the primary interactive surface.
 2. **Modern chrome**: mode cycle, plan review, task visibility, clear status.
 3. **Engine reuse** via `query::Session` + `StreamSink` (no second agent loop).
-4. **Classic REPL removed** — modern fullscreen TUI is the only interactive surface.
+4. **Classic REPL retained** (`--tui classic` / `ui.tui = "classic"`) for CI and constrained terminals; modern is the default.
 5. **Visual regression tests** using ratatui `TestBackend` (no live TTY required).
 
 ## Non-goals (this branch v1)
@@ -91,7 +91,7 @@ No network in default `cargo test`.
 agent --tui modern
 ```
 
-Config: `[ui] tui = "modern"` (default). Legacy `classic` values remap to modern.
+Config: `[ui] tui = "classic" | "modern"` (default **modern**).
 
 ## Related docs
 
