@@ -1,12 +1,16 @@
 //! Terminal UI layer.
 //!
-//! Provides the interactive REPL, markdown rendering, and streaming
-//! output display. Built on crossterm and rustyline.
+//! Two interactive surfaces:
+//! - **modern** (default) — full-screen alt-screen ratatui pager (`modern`)
+//! - **classic** — line-oriented rustyline REPL (`repl`)
+//!
+//! Select with `--tui classic|modern`, `AGENT_CODE_TUI`, or `[ui] tui`.
 
 pub mod activity;
 pub mod color_emit;
 pub mod keybindings;
 pub mod keymap;
+pub mod modern;
 pub mod onboarding;
 pub mod prompt;
 pub mod render;

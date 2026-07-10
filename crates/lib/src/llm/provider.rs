@@ -115,7 +115,9 @@ pub fn models_for_provider(kind: ProviderKind) -> &'static [(&'static str, &'sta
             ("o3", "o3 · Reasoning"),
         ],
         ProviderKind::Xai => &[
-            ("grok-4.3", "Grok 4.3 · Most capable"),
+            ("grok-build-0.1", "Grok Build · Agentic coding (SuperGrok)"),
+            ("grok-4.5", "Grok 4.5 · Flagship"),
+            ("grok-4.3", "Grok 4.3 · Previous flagship"),
             ("grok-4", "Grok 4 · Balanced"),
         ],
         ProviderKind::Google => &[

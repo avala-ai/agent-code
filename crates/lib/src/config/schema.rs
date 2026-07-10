@@ -226,6 +226,8 @@ pub enum ApiAuthMode {
     ApiKey,
     /// Reuse an existing OpenAI Codex ChatGPT login from CODEX_HOME.
     CodexChatgpt,
+    /// SuperGrok / X Premium OAuth via `agent login xai` (no XAI_API_KEY).
+    XaiOauth,
 }
 
 /// API connection settings.
@@ -240,9 +242,10 @@ pub struct ApiConfig {
     pub base_url: String,
     /// Model identifier.
     pub model: String,
-    /// Authentication mode. `api_key` uses the normal provider API key
-    /// path; `codex_chatgpt` reuses an existing Codex ChatGPT login from
-    /// `$CODEX_HOME/auth.json` (or `~/.codex/auth.json`).
+    /// Authentication mode:
+    /// - `api_key` — env/config/CLI API key
+    /// - `codex_chatgpt` — ChatGPT/Codex subscription (`~/.codex/auth.json`)
+    /// - `xai_oauth` — SuperGrok / X Premium OAuth (`~/.config/agent-code/xai_auth.json`)
     pub auth_mode: ApiAuthMode,
     /// Optional cheaper / faster model used by `/fast`. When set, the
     /// `/fast` command toggles `model` and `fast_model` for the
@@ -458,9 +461,8 @@ pub struct UiConfig {
     pub inherit_fg: bool,
     /// Editing mode: "emacs" or "vi".
     pub edit_mode: String,
-    /// Interactive surface: `"classic"` (rustyline REPL, default) or
-    /// `"modern"` (full-screen alt-screen TUI). Overridden by
-    /// `--tui` / `AGENT_CODE_TUI`.
+    /// Interactive surface: `"modern"` (full-screen TUI, default) or
+    /// `"classic"` (rustyline REPL). Overridden by `--tui` / `AGENT_CODE_TUI`.
     #[serde(default = "default_tui_kind")]
     pub tui: String,
     /// Between-turn status line customization.
@@ -468,7 +470,7 @@ pub struct UiConfig {
 }
 
 fn default_tui_kind() -> String {
-    "classic".to_string()
+    "modern".to_string()
 }
 
 impl Default for UiConfig {
@@ -838,6 +840,18 @@ codex_home = "/tmp/codex-home"
         let cfg: ApiConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.auth_mode, ApiAuthMode::CodexChatgpt);
         assert_eq!(cfg.codex_home.as_deref(), Some("/tmp/codex-home"));
+    }
+
+    #[test]
+    fn api_config_parses_xai_oauth_auth_mode_from_toml() {
+        let toml = r#"
+base_url = "https://api.x.ai/v1"
+model = "grok-build-0.1"
+auth_mode = "xai_oauth"
+"#;
+        let cfg: ApiConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.auth_mode, ApiAuthMode::XaiOauth);
+        assert_eq!(cfg.model, "grok-build-0.1");
     }
 
     #[test]

@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long, env = "AGENT_CODE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
-    /// API auth mode: api_key or codex_chatgpt.
+    /// API auth mode: api_key, codex_chatgpt, or xai_oauth.
     #[arg(long, env = "AGENT_CODE_AUTH_MODE", value_name = "MODE")]
     auth_mode: Option<String>,
 
@@ -145,6 +145,11 @@ struct Cli {
     #[arg(long)]
     acp: bool,
 
+    /// Interactive TUI surface: `modern` (fullscreen ratatui, default) or
+    /// `classic` (rustyline REPL). Overrides `[ui] tui` and `AGENT_CODE_TUI`.
+    #[arg(long, value_name = "KIND")]
+    tui: Option<String>,
+
     /// Subcommand (schedule, daemon).
     #[command(subcommand)]
     command: Option<SubCommand>,
@@ -198,7 +203,7 @@ enum SubCommand {
     },
     /// Sign in with a provider subscription via the browser (OAuth).
     Login {
-        /// Provider to sign in to. Currently: `codex` (ChatGPT/Codex subscription).
+        /// Provider: `codex` (ChatGPT/Codex) or `xai` / `grok` (SuperGrok / X Premium).
         #[arg(default_value = "codex")]
         provider: String,
         /// Codex home to write `auth.json` to (default: `$CODEX_HOME` or `~/.codex`).
@@ -259,11 +264,12 @@ enum ScheduleAction {
 }
 
 fn run_setup_wizard() {
-    if let Some(result) = ui::setup::run_setup()
-        && !result.api_key.is_empty()
-    {
-        // SAFETY: single-threaded, before async runtime work.
-        unsafe { std::env::set_var("AGENT_CODE_API_KEY", &result.api_key) };
+    if let Some(result) = ui::setup::run_setup() {
+        // Subscription auth has no API key; only seed the env for key mode.
+        if result.auth_mode == "api_key" && !result.api_key.is_empty() {
+            // SAFETY: single-threaded, before async runtime work.
+            unsafe { std::env::set_var("AGENT_CODE_API_KEY", &result.api_key) };
+        }
     }
 }
 
@@ -271,8 +277,11 @@ fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
     match value.trim().replace('-', "_").as_str() {
         "api_key" => Ok(ApiAuthMode::ApiKey),
         "codex_chatgpt" | "chatgpt" => Ok(ApiAuthMode::CodexChatgpt),
+        "xai_oauth" | "grok_oauth" | "xai" | "grok" => Ok(ApiAuthMode::XaiOauth),
         other => {
-            anyhow::bail!("invalid auth mode `{other}`; expected `api_key` or `codex_chatgpt`")
+            anyhow::bail!(
+                "invalid auth mode `{other}`; expected `api_key`, `codex_chatgpt`, or `xai_oauth`"
+            )
         }
     }
 }
@@ -337,7 +346,11 @@ async fn async_main() -> anyhow::Result<()> {
     {
         match provider.as_str() {
             "codex" | "chatgpt" | "openai" => {
-                eprintln!("Opening your browser to sign in with ChatGPT...");
+                eprintln!("Starting ChatGPT / Codex sign-in…");
+                eprintln!(
+                    "(On headless/SSH hosts the browser may not open — a URL and \
+                     port-forward hint will be printed.)"
+                );
                 let path = agent_code_lib::llm::codex_auth::browser_login(codex_home.as_deref())
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -347,7 +360,24 @@ async fn async_main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            other => anyhow::bail!("unknown login provider `{other}` (supported: codex)"),
+            "xai" | "grok" | "supergrok" => {
+                eprintln!("Starting SuperGrok / X Premium device sign-in…");
+                eprintln!("(Works well on headless/SSH: open the printed URL on any browser.)");
+                let path = agent_code_lib::llm::xai_auth::device_code_login(true)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Signed in. xAI OAuth session written to {}", path.display());
+                println!(
+                    "Run agent-code on your subscription with:\n  agent --auth-mode xai_oauth --model grok-build-0.1"
+                );
+                println!(
+                    "(Also works if you already ran `grok login` — agent-code reuses ~/.grok/auth.json.)"
+                );
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("unknown login provider `{other}` (supported: codex, xai)")
+            }
         }
     }
 
@@ -402,6 +432,7 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && cli.command.is_none()
         && cli_auth_mode != Some(ApiAuthMode::CodexChatgpt)
+        && cli_auth_mode != Some(ApiAuthMode::XaiOauth)
         && ui::setup::needs_setup()
     {
         run_setup_wizard();
@@ -539,11 +570,21 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // Determine the effective API key: CLI flag > env var (in config) > config file.
-    // If nothing found and interactive, run the setup wizard.
+    // Determine whether auth is ready: API key (CLI/env/config) or a
+    // subscription mode (ChatGPT/Codex OAuth session). If nothing found and
+    // interactive, run the setup wizard (which now offers both).
     let has_key = cli.api_key.is_some()
         || config.api.api_key.is_some()
-        || config.api.auth_mode == ApiAuthMode::CodexChatgpt;
+        || config.api.auth_mode == ApiAuthMode::CodexChatgpt
+        || config.api.auth_mode == ApiAuthMode::XaiOauth
+        || std::env::var("AGENT_CODE_AUTH_MODE")
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "codex_chatgpt" | "chatgpt" | "xai_oauth" | "grok_oauth" | "xai" | "grok"
+                )
+            })
+            .unwrap_or(false);
 
     // The setup wizard reads from stdin via arrow-key prompts. Run it
     // only when we're actually in an interactive REPL context — i.e.
@@ -597,10 +638,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize LLM provider. If --model or --provider implies a different
     // provider than what's in the config, override the base URL to match.
-    let provider_kind = if config.api.auth_mode == ApiAuthMode::CodexChatgpt {
-        ProviderKind::OpenAi
-    } else {
-        match cli.provider.as_str() {
+    let provider_kind = match config.api.auth_mode {
+        ApiAuthMode::CodexChatgpt => ProviderKind::OpenAi,
+        ApiAuthMode::XaiOauth => ProviderKind::Xai,
+        ApiAuthMode::ApiKey => match cli.provider.as_str() {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
             "bedrock" | "aws" => ProviderKind::Bedrock,
@@ -614,11 +655,11 @@ async fn async_main() -> anyhow::Result<()> {
             "zhipu" | "glm" | "z.ai" => ProviderKind::Zhipu,
             "azure" | "azure-openai" => ProviderKind::AzureOpenAi,
             _ => detect_provider(&config.api.model, &config.api.base_url),
-        }
+        },
     };
 
     // Override base URL if the detected provider has a known default.
-    if config.api.auth_mode != ApiAuthMode::CodexChatgpt
+    if matches!(config.api.auth_mode, ApiAuthMode::ApiKey)
         && cli.api_base_url.is_none()
         && let Some(default_url) = provider_kind.default_base_url()
     {
@@ -627,40 +668,57 @@ async fn async_main() -> anyhow::Result<()> {
     if config.api.auth_mode == ApiAuthMode::CodexChatgpt && cli.api_base_url.is_none() {
         config.api.base_url = "https://chatgpt.com/backend-api/codex".to_string();
     }
+    if config.api.auth_mode == ApiAuthMode::XaiOauth && cli.api_base_url.is_none() {
+        config.api.base_url = "https://api.x.ai/v1".to_string();
+    }
 
-    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = if config.api.auth_mode
-        == ApiAuthMode::CodexChatgpt
-    {
-        let auth = agent_code_lib::llm::codex_auth::CodexChatGptAuth::load(
-            config.api.codex_home.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        Arc::new(
-            agent_code_lib::llm::openai::OpenAiProvider::new_responses_with_codex_auth(
-                &config.api.base_url,
-                auth,
-            ),
-        )
-    } else {
-        let api_key = api_key.expect("api_key is set for ApiAuthMode::ApiKey");
-        match provider_kind {
-            ProviderKind::AzureOpenAi => {
-                Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
+    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match config.api.auth_mode {
+        ApiAuthMode::CodexChatgpt => {
+            let auth = agent_code_lib::llm::codex_auth::CodexChatGptAuth::load(
+                config.api.codex_home.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Arc::new(
+                agent_code_lib::llm::openai::OpenAiProvider::new_responses_with_codex_auth(
                     &config.api.base_url,
-                    api_key,
-                ))
-            }
-            _ => match provider_kind.wire_format() {
-                WireFormat::Anthropic => {
-                    Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                    auth,
+                ),
+            )
+        }
+        ApiAuthMode::XaiOauth => {
+            let auth = agent_code_lib::llm::xai_auth::XaiOauthAuth::load(None)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Arc::new(
+                agent_code_lib::llm::openai::OpenAiProvider::new_with_xai_oauth(
+                    &config.api.base_url,
+                    auth,
+                ),
+            )
+        }
+        ApiAuthMode::ApiKey => {
+            let api_key = api_key.expect("api_key is set for ApiAuthMode::ApiKey");
+            match provider_kind {
+                ProviderKind::AzureOpenAi => {
+                    Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
                         &config.api.base_url,
                         api_key,
                     ))
                 }
-                WireFormat::OpenAiCompatible => Arc::new(
-                    agent_code_lib::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
-                ),
-            },
+                _ => match provider_kind.wire_format() {
+                    WireFormat::Anthropic => {
+                        Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                            &config.api.base_url,
+                            api_key,
+                        ))
+                    }
+                    WireFormat::OpenAiCompatible => {
+                        Arc::new(agent_code_lib::llm::openai::OpenAiProvider::new(
+                            &config.api.base_url,
+                            api_key,
+                        ))
+                    }
+                },
+            }
         }
     };
     tracing::info!(
@@ -987,12 +1045,29 @@ async fn async_main() -> anyhow::Result<()> {
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 
-            ui::repl::run_repl(&mut engine).await?;
+            // Reject bad values instead of silently launching the other surface.
+            if let Some(ref s) = cli.tui
+                && ui::modern::TuiKind::parse(s).is_none()
+            {
+                anyhow::bail!("invalid --tui value '{s}' (expected 'classic' or 'modern')");
+            }
+            let tui_kind =
+                ui::modern::resolve_tui_kind(cli.tui.as_deref(), &engine.state().config.ui.tui);
+            match tui_kind {
+                ui::modern::TuiKind::Modern => {
+                    // Modern TUI takes ownership of the engine via Session
+                    // and fires SessionStop itself on clean exit.
+                    ui::modern::run_modern_tui(engine).await?;
+                }
+                ui::modern::TuiKind::Classic => {
+                    ui::repl::run_repl(&mut engine).await?;
 
-            // Fire SessionStop once the REPL returns. This is the only
-            // normal exit path from interactive mode; abrupt Ctrl+C
-            // won't reach here, but any clean `/exit` or EOF will.
-            let _ = engine.fire_session_stop_hooks().await;
+                    // Fire SessionStop once the REPL returns. This is the only
+                    // normal exit path from classic interactive mode; abrupt
+                    // Ctrl+C won't reach here, but any clean `/exit` or EOF will.
+                    let _ = engine.fire_session_stop_hooks().await;
+                }
+            }
 
             // Show update notification after session ends.
             if let Ok(Some(check)) = update_handle.await {

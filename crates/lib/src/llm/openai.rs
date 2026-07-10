@@ -15,6 +15,7 @@ use super::codex_auth::CodexChatGptAuth;
 use super::message::{ContentBlock, Message, StopReason, Usage};
 use super::provider::{Provider, ProviderError, ProviderRequest, ToolChoice};
 use super::stream::StreamEvent;
+use super::xai_auth::XaiOauthAuth;
 
 /// OpenAI Chat Completions provider (GPT, Groq, Together, DeepSeek, etc.).
 pub struct OpenAiProvider {
@@ -27,6 +28,7 @@ pub struct OpenAiProvider {
 enum OpenAiAuth {
     ApiKey(String),
     CodexChatGpt(CodexChatGptAuth),
+    XaiOauth(XaiOauthAuth),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,21 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth: OpenAiAuth::CodexChatGpt(auth),
             api: OpenAiApi::Responses,
+        }
+    }
+
+    /// xAI SuperGrok / X Premium OAuth — Chat Completions against `api.x.ai`.
+    pub fn new_with_xai_oauth(base_url: &str, auth: XaiOauthAuth) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("failed to build HTTP client");
+
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            auth: OpenAiAuth::XaiOauth(auth),
+            api: OpenAiApi::ChatCompletions,
         }
     }
 
@@ -250,6 +267,16 @@ impl OpenAiProvider {
                 Ok(headers)
             }
             OpenAiAuth::CodexChatGpt(auth) => auth.auth_headers().await,
+            OpenAiAuth::XaiOauth(auth) => {
+                let token = auth.access_token().await?;
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {token}"))
+                        .map_err(|e| ProviderError::Auth(e.to_string()))?,
+                );
+                Ok(headers)
+            }
         }
     }
 
