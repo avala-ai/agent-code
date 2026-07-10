@@ -505,7 +505,14 @@ async fn async_main() -> anyhow::Result<()> {
                                 .try_into::<agent_code_lib::config::PermissionsConfig>()
                             {
                                 Ok(perms) => {
-                                    config.permissions = perms;
+                                    // Compose with host permissions so project
+                                    // rules survive typed-subagent visibility
+                                    // overlays (do not wholesale replace).
+                                    config.permissions =
+                                        agent_code_lib::services::coordinator::compose_permissions_overlay(
+                                            &config.permissions,
+                                            &perms,
+                                        );
                                     tracing::debug!(
                                         "Applied permissions overlay from {overlay_path}"
                                     );

@@ -54,7 +54,34 @@ impl TaskExecutor for LocalAgentExecutor {
         // subagent id up front so the color assignment ties together
         // the queue entry, the AgentTool call, and any future
         // resume / fork follow-up.
-        let description = subagent_kind.unwrap_or_else(|| "subagent".to_string());
+        //
+        // When `subagent_kind` matches a registered agent type
+        // (explore / plan / general-purpose / custom disk agents),
+        // pass it as `subagent_type` so the Agent tool applies the
+        // right tool set and permissions. Otherwise treat it as a
+        // free-form description only.
+        let had_explicit_kind = subagent_kind.is_some();
+        let kind = subagent_kind.unwrap_or_else(|| "subagent".to_string());
+        let mut registry = crate::services::coordinator::AgentRegistry::with_defaults();
+        registry.load_from_disk(Some(&ctx.cwd));
+        let known_type = registry.get(&kind).is_some();
+        // Typo safety: a single-token kind that isn't registered looks like
+        // a mistyped type (e.g. "exploree") and must not silently upgrade
+        // to full-access general-purpose. Free-form descriptions with
+        // spaces remain allowed as description-only runs.
+        let looks_like_type_name = !kind.contains(char::is_whitespace)
+            && kind
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !known_type && looks_like_type_name && had_explicit_kind {
+            let known: Vec<&str> = registry.list().iter().map(|d| d.name.as_str()).collect();
+            return Err(TaskError::InvalidPayload(format!(
+                "Unknown subagent_kind '{kind}'. Known types: {}. \
+                 Use a registered type, or a free-form description with spaces.",
+                known.join(", ")
+            )));
+        }
+        let description = kind.clone();
         let subagent_id = uuid::Uuid::new_v4().to_string();
 
         // Pre-assign a color so the queue entry we register can show
@@ -87,13 +114,19 @@ impl TaskExecutor for LocalAgentExecutor {
             None
         };
 
-        let input = json!({
+        let mut input = json!({
             "description": description,
             "prompt": prompt,
             // Anchor AgentTool's assignment to the same id so the
             // colour doesn't bounce between two slots.
             "subagent_id": subagent_id,
         });
+        if known_type {
+            input
+                .as_object_mut()
+                .expect("object")
+                .insert("subagent_type".into(), json!(kind));
+        }
 
         // Build a minimal tool context. The Agent tool spawns a child
         // `agent` subprocess so it does not reach into permissions or
@@ -112,9 +145,13 @@ impl TaskExecutor for LocalAgentExecutor {
             subagent_colors: ctx.subagent_colors.clone(),
             session_allows: None,
             permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
         };
 
         let outcome = AgentTool.call(input, &tool_ctx).await;

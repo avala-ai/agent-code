@@ -94,7 +94,10 @@ impl Tool for ToolSearchTool {
             ("FileEdit", "Search-and-replace editing in files"),
             ("Grep", "Regex content search powered by ripgrep"),
             ("Glob", "Find files matching glob patterns"),
-            ("Agent", "Spawn subagents for parallel tasks"),
+            (
+                "Agent",
+                "Spawn typed subagents (explore/plan/general-purpose)",
+            ),
             ("WebFetch", "Fetch content from URLs"),
             ("AskUserQuestion", "Ask the user interactive questions"),
             ("NotebookEdit", "Edit Jupyter notebook cells"),

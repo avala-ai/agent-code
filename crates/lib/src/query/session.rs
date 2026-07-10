@@ -13,31 +13,89 @@
 //! `Session` only owns the turn's *lifecycle*.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{QueryEngine, StreamSink, TurnStatus};
+use crate::config::PermissionMode;
 use crate::error::{Error, Result};
+use crate::permissions::PermissionChecker;
 
 /// Owns a [`QueryEngine`] behind a shared async mutex so turns can run
 /// on detached tasks.
 #[derive(Clone)]
 pub struct Session {
     engine: Arc<Mutex<QueryEngine>>,
+    /// Lock-free plan-mode flag (same Arc the engine uses).
+    live_plan_mode: Arc<AtomicBool>,
+    /// Live permission checker (same Arc the tool executor uses).
+    permissions: Arc<PermissionChecker>,
 }
 
 impl Session {
     /// Wrap an engine for spawnable-turn execution.
     pub fn new(engine: QueryEngine) -> Self {
+        let live_plan_mode = engine.live_plan_mode_handle();
+        let permissions = engine.permissions_handle();
         Self {
             engine: Arc::new(Mutex::new(engine)),
+            live_plan_mode,
+            permissions,
         }
     }
 
     /// Access the shared engine (e.g. to read state between turns).
     pub fn engine(&self) -> Arc<Mutex<QueryEngine>> {
         self.engine.clone()
+    }
+
+    /// Apply session interaction mode without waiting on the turn mutex.
+    ///
+    /// Mid-turn Shift+Tab must take effect at the **next** permission
+    /// decision; the turn task holds `engine` exclusively, so this path
+    /// mutates the shared live handles only.
+    ///
+    /// # UI migration (modern TUI)
+    ///
+    /// Replace `apply_mode_to_engine` that only updates state under
+    /// `try_lock` (and silently no-ops while a turn holds the lock) with:
+    ///
+    /// ```ignore
+    /// // Always apply live handles (works mid-turn):
+    /// let plan = matches!(mode, SessionMode::Plan);
+    /// let perm = mode.permission_hint().unwrap_or(base_permission_mode);
+    /// session.apply_live_mode(plan, perm);
+    ///
+    /// // Best-effort sync AppState for badge / EnterPlanMode observers
+    /// // when the lock is free (do not block the UI loop):
+    /// if let Ok(mut eng) = session.engine().try_lock() {
+    ///     eng.state_mut().plan_mode = plan;
+    ///     eng.state_mut().config.permissions.default_mode = perm;
+    ///     true // mode fully applied
+    /// } else {
+    ///     false // live handles updated; state sync pending
+    /// }
+    /// ```
+    ///
+    /// `PermissionChecker` used by the tool executor is the same `Arc`
+    /// returned by [`Self::permissions`]; `set_default_mode` is what the
+    /// next `Ask` / default-mode check reads. Plan mode is read via
+    /// `QueryEngine::effective_plan_mode()` when building `ToolContext`.
+    pub fn apply_live_mode(&self, plan_mode: bool, permission_mode: PermissionMode) {
+        self.live_plan_mode.store(plan_mode, Ordering::SeqCst);
+        self.permissions.set_default_mode(permission_mode);
+    }
+
+    /// Shared permission checker (for tests / advanced UI wiring).
+    pub fn permissions(&self) -> Arc<PermissionChecker> {
+        self.permissions.clone()
+    }
+
+    /// Whether live plan mode is currently enabled.
+    pub fn live_plan_mode(&self) -> bool {
+        self.live_plan_mode.load(Ordering::SeqCst)
     }
 
     /// Subscribe to the engine's turn-status stream.

@@ -11,6 +11,7 @@ description: "Complete list of all 32 built-in tools"
 | `FileWrite` | Create or overwrite files. Auto-creates parent dirs. | No | No |
 | `FileEdit` | Search-and-replace. Requires unique match or `replace_all`. | No | No |
 | `MultiEdit` | Batch multiple edits in a single atomic operation. | No | No |
+| `ApplyPatch` | Multi-hunk / multi-file patch (Begin Patch dialect). Prefer over many FileEdits. | No | No |
 | `NotebookEdit` | Edit Jupyter cells (replace, insert, delete). | No | No |
 
 ## Search
@@ -33,7 +34,7 @@ description: "Complete list of all 32 built-in tools"
 
 | Tool | Description | Read-only | Concurrent |
 |------|-------------|:---------:|:----------:|
-| `Agent` | Spawn subagents. Optional worktree isolation. | No | No |
+| `Agent` | Spawn typed subagents (`explore` / `plan` / `general-purpose` or custom `.agent/agents/*.md`). Optional worktree isolation and free-form model override. | No | No |
 | `SendMessage` | Inter-agent communication. | No | Yes |
 | `Skill` | Invoke skills programmatically. | Yes | No |
 
@@ -41,8 +42,8 @@ description: "Complete list of all 32 built-in tools"
 
 | Tool | Description | Read-only | Concurrent |
 |------|-------------|:---------:|:----------:|
-| `EnterPlanMode` | Switch to read-only mode. | Yes | Yes |
-| `ExitPlanMode` | Re-enable all tools. | Yes | Yes |
+| `EnterPlanMode` | Switch to read-only mode and create a structured plan file. | Yes | Yes |
+| `ExitPlanMode` | Accept plan markdown via `plan`, write the plan file, return it for review, re-enable all tools. | Yes | Yes |
 | `TaskCreate` | Create a progress tracking task. | Yes | Yes |
 | `TaskUpdate` | Update task status. | Yes | Yes |
 | `TaskGet` | Get task details by ID. | Yes | Yes |

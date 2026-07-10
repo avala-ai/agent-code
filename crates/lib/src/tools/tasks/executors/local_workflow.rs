@@ -92,9 +92,13 @@ impl TaskExecutor for LocalWorkflowExecutor {
             subagent_colors: ctx.subagent_colors.clone(),
             session_allows: None,
             permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
         };
 
         let outcome = AgentTool.call(input, &tool_ctx).await;

@@ -484,9 +484,13 @@ mod tests {
             subagent_colors: None,
             session_allows: None,
             permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
             sandbox: None,
             active_disk_output_style: None,
             agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
         }
     }
 
@@ -783,6 +787,7 @@ mod tests {
             tool_name: &str,
             _description: &str,
             input_preview: Option<&str>,
+            _origin: Option<&str>,
         ) -> super::super::PermissionResponse {
             self.calls
                 .lock()

@@ -75,6 +75,7 @@ pub struct QueryEngine {
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
+    question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
     cached_system_prompt: Option<(u64, String)>, // (hash, prompt)
     /// Publishes the current turn's [`TurnStatus`] to observers.
@@ -87,9 +88,16 @@ pub struct QueryEngine {
     /// steered input is injected as a user message before the next LLM
     /// call (see [`Self::run_turn_inner`]).
     steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Live plan-mode flag readable at every tool decision without the
+    /// engine mutex (mid-turn Shift+Tab / EnterPlanMode).
+    live_plan_mode: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Callback for streaming events to the UI.
+///
+/// New methods are optional with defaults so classic REPL / JSON / serve /
+/// modern adapters keep compiling. Prefer implementing the call-id variants
+/// when correlating tool cards in a fullscreen pager (M0 surface).
 pub trait StreamSink: Send + Sync {
     fn on_text(&self, text: &str);
     fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value);
@@ -102,6 +110,38 @@ pub trait StreamSink: Send + Sync {
     fn on_usage(&self, _usage: &Usage) {}
     fn on_compact(&self, _freed_tokens: u64) {}
     fn on_warning(&self, _msg: &str) {}
+
+    /// Tool started with stable `call_id` for UI card correlation.
+    /// Default forwards to [`Self::on_tool_start`].
+    fn on_tool_call_start(&self, _call_id: &str, tool_name: &str, input: &serde_json::Value) {
+        self.on_tool_start(tool_name, input);
+    }
+
+    /// Tool finished with `call_id`. Default forwards to [`Self::on_tool_result`].
+    fn on_tool_call_result(
+        &self,
+        _call_id: &str,
+        tool_name: &str,
+        result: &crate::tools::ToolResult,
+    ) {
+        self.on_tool_result(tool_name, result);
+    }
+
+    /// Streaming tool stdout/stderr chunk (bash-like tools). Default no-op.
+    fn on_tool_output(&self, _call_id: &str, _chunk: &str) {}
+
+    /// Cheap running context meter (used, max). UI must not re-scan history.
+    fn on_context_usage(&self, _used: u64, _max: u64) {}
+
+    /// Background / typed subagent lifecycle update.
+    fn on_subagent_update(&self, _agent_id: &str, _state: &str, _headline: &str) {}
+
+    /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
+    fn on_turn_outcome(&self, _turn: usize, _outcome: &str) {}
+
+    /// Plan ready for user approval (ExitPlanMode completed with content).
+    /// `path` is the jailed plan file path when known.
+    fn on_plan_proposed(&self, _plan_md: &str, _path: Option<&str>) {}
 }
 
 /// A no-op stream sink for non-interactive mode.
@@ -151,6 +191,7 @@ impl QueryEngine {
         let cancel = CancellationToken::new();
         let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let live_plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(state.plan_mode));
         Self {
             llm,
             tools,
@@ -173,11 +214,46 @@ impl QueryEngine {
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             permission_prompter: None,
+            question_asker: None,
             cached_system_prompt: None,
             turn_status: tokio::sync::watch::channel(TurnStatus::Idle).0,
             steer_tx,
             steer_rx,
+            live_plan_mode,
         }
+    }
+
+    /// Shared permission checker (same Arc the tool executor uses).
+    pub fn permissions_handle(&self) -> Arc<PermissionChecker> {
+        self.permissions.clone()
+    }
+
+    /// Live plan-mode flag (lock-free mid-turn updates).
+    pub fn live_plan_mode_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.live_plan_mode.clone()
+    }
+
+    /// Set plan mode for the next permission / executor check without
+    /// needing exclusive access to conversation state.
+    pub fn set_live_plan_mode(&self, enabled: bool) {
+        self.live_plan_mode
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Effective plan mode: live flag wins, then AppState.
+    pub fn effective_plan_mode(&self) -> bool {
+        self.live_plan_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.state.plan_mode
+    }
+
+    /// Emit a cheap context-usage estimate to the sink (used/max).
+    fn emit_context_usage(&self, sink: &dyn StreamSink) {
+        let used = crate::services::tokens::estimate_context_tokens(&self.state.messages);
+        // Model context windows vary; a fixed ceiling is enough for a
+        // status-bar ratio until a per-model table is wired.
+        const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+        sink.on_context_usage(used, DEFAULT_CONTEXT_WINDOW);
     }
 
     /// Install the interactive permission prompter.
@@ -188,6 +264,14 @@ impl QueryEngine {
     /// interactive path only; one-shot/non-interactive runs leave it unset.
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
+    }
+
+    /// Install the multi-choice question asker (modern TUI modal).
+    ///
+    /// Without this, [`AskUserQuestion`](crate::tools::ask_user::AskUserQuestionTool)
+    /// falls back to stdin — which hangs under alt-screen raw mode.
+    pub fn set_question_asker(&mut self, asker: Arc<dyn crate::tools::QuestionAsker>) {
+        self.question_asker = Some(asker);
     }
 
     /// Load hooks from configuration into the registry.
@@ -1071,7 +1155,10 @@ impl QueryEngine {
                                     ref input,
                                 } = block
                                 {
-                                    sink.on_tool_start(name, input);
+                                    sink.on_tool_call_start(id, name, input);
+                                    if name == "Agent" {
+                                        emit_agent_subagent_update(sink, input, "working");
+                                    }
 
                                     // Start read-only tools immediately during streaming.
                                     if let Some(tool) = self.tools.get(name)
@@ -1112,9 +1199,13 @@ impl QueryEngine {
                                                         subagent_colors: None,
                                                         session_allows: None,
                                                         permission_prompter: None,
+                                                        question_asker: None,
+                                                        agent_origin: None,
                                                         sandbox: None,
                                                         active_disk_output_style: None,
                                                         agent_limiter: None,
+                                                    tool_events: None,
+                                                    active_call_id: None,
                                                     },
                                                 )
                                                 .await
@@ -1163,6 +1254,7 @@ impl QueryEngine {
 
             if cancelled {
                 sink.on_warning("Cancelled");
+                sink.on_turn_outcome(turn + 1, "cancelled");
                 self.state.is_query_active = false;
                 return Ok(());
             }
@@ -1179,6 +1271,7 @@ impl QueryEngine {
             });
             self.state.push_message(assistant_msg);
             self.state.record_usage(&usage, &model);
+            self.emit_context_usage(sink);
 
             // Token budget tracking per turn.
             if self.state.config.features.token_budget && usage.total() > 0 {
@@ -1275,6 +1368,7 @@ impl QueryEngine {
                 // No tools requested — turn is complete.
                 info!("Turn complete (no tool calls)");
                 sink.on_turn_complete(turn + 1);
+                sink.on_turn_outcome(turn + 1, "done");
                 self.state.is_query_active = false;
 
                 // PostTurn hooks fire on successful completion. Not fired
@@ -1330,18 +1424,21 @@ impl QueryEngine {
             // Step 8: Execute tool calls with pre/post hooks.
             info!("Executing {} tool call(s)", tool_calls.len());
             let cwd = PathBuf::from(&self.state.cwd);
+            let (tool_event_tx, mut tool_event_rx) = crate::tools::event_sink::tool_event_channel();
             let tool_ctx = ToolContext {
                 cwd: cwd.clone(),
                 cancel: self.cancel.clone(),
                 permission_checker: self.permissions.clone(),
                 verbose: self.config.verbose,
-                plan_mode: self.state.plan_mode,
+                plan_mode: self.effective_plan_mode(),
                 file_cache: Some(self.file_cache.clone()),
                 denial_tracker: Some(self.denial_tracker.clone()),
                 task_manager: Some(self.state.task_manager.clone()),
                 subagent_colors: Some(self.state.subagent_colors.clone()),
                 session_allows: Some(self.session_allows.clone()),
                 permission_prompter: self.permission_prompter.clone(),
+                question_asker: self.question_asker.clone(),
+                agent_origin: None,
                 sandbox: Some(std::sync::Arc::new(
                     crate::sandbox::SandboxExecutor::from_session_config(&self.state.config, &cwd),
                 )),
@@ -1351,6 +1448,8 @@ impl QueryEngine {
                     .as_ref()
                     .map(|s| s.name.clone()),
                 agent_limiter: Some(self.state.agent_limiter.clone()),
+                tool_events: Some(tool_event_tx),
+                active_call_id: None,
             };
 
             // Collect streaming tool results first.
@@ -1481,13 +1580,28 @@ impl QueryEngine {
             // them alongside the real tool outputs.
             results.extend(vetoed_results);
             if !remaining_calls.is_empty() {
-                let batch_results = execute_tool_calls(
+                // Run tools while forwarding live tool events (e.g. bash
+                // stdout chunks) to the stream sink for progressive UI.
+                let exec = execute_tool_calls(
                     &remaining_calls,
                     self.tools.all(),
                     &tool_ctx,
                     &self.permissions,
-                )
-                .await;
+                );
+                tokio::pin!(exec);
+                let batch_results = loop {
+                    tokio::select! {
+                        biased;
+                        Some(evt) = tool_event_rx.recv() => {
+                            forward_tool_event(sink, evt);
+                        }
+                        batch = &mut exec => break batch,
+                    }
+                };
+                // Drain any trailing events after tools finish.
+                while let Ok(evt) = tool_event_rx.try_recv() {
+                    forward_tool_event(sink, evt);
+                }
                 results.extend(batch_results);
             }
 
@@ -1498,17 +1612,22 @@ impl QueryEngine {
                     match result.tool_name.as_str() {
                         "EnterPlanMode" => {
                             self.state.plan_mode = true;
+                            self.set_live_plan_mode(true);
                             info!("Plan mode enabled");
                         }
                         "ExitPlanMode" => {
                             self.state.plan_mode = false;
+                            self.set_live_plan_mode(false);
                             info!("Plan mode disabled");
                         }
                         _ => {}
                     }
                 }
 
-                sink.on_tool_result(&result.tool_name, &result.result);
+                sink.on_tool_call_result(&result.tool_use_id, &result.tool_name, &result.result);
+                if result.tool_name == "Agent" {
+                    emit_agent_result_update(sink, &result.result);
+                }
 
                 // Fire post-tool-use hooks.
                 self.hooks
@@ -1525,15 +1644,19 @@ impl QueryEngine {
                 // FileChanged fires for file-mutating tools as a
                 // consolidated signal so audit / backup / pre-commit
                 // hooks don't have to enumerate every file-editing
-                // tool via PostToolUse filters. Path comes from the
-                // original tool call input's `file_path` field —
-                // every file-mutating tool's schema uses that key.
-                if is_file_mutating_tool(&result.tool_name)
-                    && let Some(path) = extract_file_path(&tool_calls, &result.tool_use_id)
-                {
-                    let _ = self
-                        .fire_file_changed_hooks(&result.tool_name, &path, result.result.is_error)
-                        .await;
+                // tool via PostToolUse filters. Most tools expose
+                // `file_path`; ApplyPatch supplies a multi-file
+                // `patch` string — emit once per affected path.
+                if is_file_mutating_tool(&result.tool_name) {
+                    for path in extract_file_paths(&tool_calls, &result.tool_use_id) {
+                        let _ = self
+                            .fire_file_changed_hooks(
+                                &result.tool_name,
+                                &path,
+                                result.result.is_error,
+                            )
+                            .await;
+                    }
                 }
 
                 let msg = tool_result_message(
@@ -1549,6 +1672,7 @@ impl QueryEngine {
 
         warn!("Max turns ({max_turns}) reached");
         sink.on_warning(&format!("Agent stopped after {max_turns} turns"));
+        sink.on_turn_outcome(max_turns, "max_turns");
         self.state.is_query_active = false;
         Ok(())
     }
@@ -1620,7 +1744,13 @@ fn last_assistant_text(messages: &[crate::llm::message::Message]) -> Option<Stri
 /// Tool names whose `PostToolUse` should also fire a `FileChanged`
 /// event. Keep this list in sync with the `file_path`-input-shape
 /// tools in `crates/lib/src/tools/`.
-const FILE_MUTATING_TOOLS: &[&str] = &["FileWrite", "FileEdit", "MultiEdit", "NotebookEdit"];
+const FILE_MUTATING_TOOLS: &[&str] = &[
+    "FileWrite",
+    "FileEdit",
+    "MultiEdit",
+    "NotebookEdit",
+    "ApplyPatch",
+];
 
 /// Whether a tool name indicates a file mutation that should fire
 /// `FileChanged`. Pure so tests can probe without an engine.
@@ -1628,22 +1758,110 @@ fn is_file_mutating_tool(name: &str) -> bool {
     FILE_MUTATING_TOOLS.contains(&name)
 }
 
-/// Look up a tool call by its use-id and return the `file_path` input
-/// value if present. Returns None when the id doesn't match or the
-/// input isn't a JSON object with a string `file_path` (shouldn't
-/// happen for file-mutating tools since their input schemas require
-/// it, but be defensive — agents produce garbage sometimes).
+fn forward_tool_event(sink: &dyn StreamSink, evt: crate::tools::event_sink::ToolEvent) {
+    match evt {
+        crate::tools::event_sink::ToolEvent::Output { call_id, chunk } => {
+            sink.on_tool_output(&call_id, &chunk);
+        }
+        crate::tools::event_sink::ToolEvent::PlanProposed { plan_md, path } => {
+            sink.on_plan_proposed(&plan_md, path.as_deref());
+        }
+    }
+}
+
+/// Emit a subagent lifecycle event from an Agent tool input payload.
+fn emit_agent_subagent_update(sink: &dyn StreamSink, input: &serde_json::Value, state: &str) {
+    let agent_id = input
+        .get("subagent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent")
+                .chars()
+                .take(32)
+                .collect()
+        });
+    let headline = input
+        .get("description")
+        .and_then(|v| v.as_str())
+        .or_else(|| input.get("prompt").and_then(|v| v.as_str()))
+        .unwrap_or(state);
+    let headline: String = headline.chars().take(120).collect();
+    let type_hint = input
+        .get("subagent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("general-purpose");
+    let full_headline = format!("[{type_hint}] {headline}");
+    sink.on_subagent_update(&agent_id, state, &full_headline);
+}
+
+fn emit_agent_result_update(sink: &dyn StreamSink, result: &crate::tools::ToolResult) {
+    let state = if result.is_error {
+        "failed"
+    } else if result.content.contains("started in the background") {
+        "working"
+    } else {
+        "done"
+    };
+    let headline = result.content.lines().next().unwrap_or(state);
+    let headline: String = headline.chars().take(120).collect();
+    let agent_id = result
+        .content
+        .split_whitespace()
+        .find(|w| {
+            w.starts_with("task-")
+                || w.starts_with("agent-")
+                || (w.len() > 8 && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        })
+        .unwrap_or("agent")
+        .trim_end_matches(['.', ',', ';', ':'])
+        .to_string();
+    sink.on_subagent_update(&agent_id, state, &headline);
+}
+
+/// Look up a tool call by its use-id and return every path it mutated.
+///
+/// - Standard file tools: single `file_path` input.
+/// - `ApplyPatch`: parse the `patch` body (Begin Patch dialect) and
+///   return every referenced path so multi-file edits still fire
+///   per-path `FileChanged` hooks.
+///
+/// Empty when the id doesn't match or no path can be recovered
+/// (defensive — agents produce garbage sometimes).
+fn extract_file_paths(
+    tool_calls: &[crate::tools::executor::PendingToolCall],
+    use_id: &str,
+) -> Vec<String> {
+    let Some(call) = tool_calls.iter().find(|c| c.id == use_id) else {
+        return Vec::new();
+    };
+    if call.name == "ApplyPatch" {
+        if let Some(patch) = call.input.get("patch").and_then(|v| v.as_str()) {
+            return crate::tools::apply_patch::paths_from_patch(patch)
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+        }
+        return Vec::new();
+    }
+    call.input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
+}
+
+/// Convenience for tests / single-path callers.
+#[cfg(test)]
 fn extract_file_path(
     tool_calls: &[crate::tools::executor::PendingToolCall],
     use_id: &str,
 ) -> Option<String> {
-    tool_calls
-        .iter()
-        .find(|c| c.id == use_id)?
-        .input
-        .get("file_path")?
-        .as_str()
-        .map(str::to_string)
+    extract_file_paths(tool_calls, use_id).into_iter().next()
 }
 
 fn get_fallback_model(current: &str) -> String {
@@ -1845,7 +2063,7 @@ pub fn build_system_prompt(
          4. Do not commit files that likely contain secrets (.env, credentials.json).\n\
          5. Stage specific files, create the commit.\n\
          6. If pre-commit hook fails, fix the issue and create a NEW commit.\n\
-         7. When creating commits, include a co-author attribution line at the end of the message.\n\n\
+         7. Do not add AI co-author trailers or \"Generated with …\" footers unless the user or project rules explicitly request them.\n\n\
          # Creating pull requests\n\n\
          When the user asks to create a PR:\n\
          1. Run git status, git diff, and git log to understand all changes on the branch.\n\
@@ -1971,9 +2189,18 @@ pub fn build_system_prompt(
         "# Task management\n\n\
          - Use TaskCreate to break complex work into trackable steps.\n\
          - Mark tasks as in_progress when starting, completed when done.\n\
-         - Use the Agent tool to spawn subagents for parallel independent work.\n\
-         - Use EnterPlanMode/ExitPlanMode for read-only exploration before making changes.\n\
-         - Use EnterWorktree/ExitWorktree for isolated changes in git worktrees.\n\n\
+         - Use the Agent tool to spawn subagents for parallel independent work. \
+           Prefer the tightest `subagent_type`:\n\
+           - `explore` for read-only codebase investigation (\"where is X?\")\n\
+           - `plan` for read-only implementation design\n\
+           - `general-purpose` only when the child must edit files or run mutations\n\
+         - Use EnterPlanMode when the approach is genuinely ambiguous; explore with \
+           read-only tools, then ExitPlanMode with a `plan` argument (markdown content) \
+           so the plan is written and returned for review before implementing.\n\
+         - Use EnterWorktree/ExitWorktree for isolated changes in git worktrees.\n\
+         - After non-trivial implementations, run an independent verification pass \
+           (`/verify` skill or re-read diff + run tests) rather than trusting your own \
+           narrative.\n\n\
          # Output formatting\n\n\
          - All text output is displayed to the user. Use GitHub-flavored markdown.\n\
          - Use fenced code blocks with language hints for code: ```rust, ```python, etc.\n\
@@ -1999,6 +2226,7 @@ mod tests {
         assert!(is_file_mutating_tool("FileEdit"));
         assert!(is_file_mutating_tool("MultiEdit"));
         assert!(is_file_mutating_tool("NotebookEdit"));
+        assert!(is_file_mutating_tool("ApplyPatch"));
     }
 
     #[test]
@@ -2051,6 +2279,46 @@ mod tests {
             input: serde_json::json!({"file_path": 42}),
         }];
         assert!(extract_file_path(&calls, "t1").is_none());
+    }
+
+    #[test]
+    fn extract_file_paths_from_apply_patch_lists_all_targets() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src/a.rs
+@@
+-old
++new
+*** Add File: src/b.rs
++hi
+*** Delete File: gone.txt
+*** End Patch
+";
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "ApplyPatch".into(),
+            input: serde_json::json!({ "patch": patch }),
+        }];
+        let paths = extract_file_paths(&calls, "t1");
+        assert_eq!(
+            paths,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "gone.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_file_paths_apply_patch_empty_on_bad_input() {
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "ApplyPatch".into(),
+            input: serde_json::json!({ "patch": "not a patch" }),
+        }];
+        // parse fails → empty (hooks skip rather than crash)
+        assert!(extract_file_paths(&calls, "t1").is_empty());
     }
 
     // ---- last_assistant_text helper (for Stop hook context) ----
@@ -2888,6 +3156,80 @@ mod tests {
                 .await
                 .expect("cancelled turn should reach terminal status");
         assert_eq!(final_status, TurnStatus::Aborted);
+    }
+
+    /// M0 / #400: cancel must be observed inside the model-stream select
+    /// loop and complete within the 150 ms product budget (virtual time).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_reaches_terminal_within_150ms_virtual() {
+        use std::time::{Duration, Instant};
+
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new(build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        })));
+        let handle = session
+            .spawn_turn("hang".to_string(), Arc::new(NullSink))
+            .await;
+
+        // Advance just enough for the turn task to acquire the engine lock
+        // and enter the stream loop.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(handle.status(), TurnStatus::Running);
+
+        let t0 = Instant::now();
+        handle.cancel();
+
+        // Poll with virtual advances until terminal or budget exceeded.
+        let budget = Duration::from_millis(150);
+        let final_status = loop {
+            if handle.status().is_final() {
+                break handle.status();
+            }
+            if t0.elapsed() > budget {
+                panic!(
+                    "cancel did not reach terminal within {budget:?}; last={:?}",
+                    handle.status()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(5)).await;
+            // Yield so the turn task can observe cancel under paused time.
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(final_status, TurnStatus::Aborted);
+        assert!(
+            t0.elapsed() <= budget,
+            "cancel latency {:?} exceeded {:?}",
+            t0.elapsed(),
+            budget
+        );
+    }
+
+    #[test]
+    fn apply_live_mode_updates_permission_checker_without_engine_lock() {
+        use crate::config::PermissionMode;
+
+        let session = Session::new(build_engine(Arc::new(CompletingProvider)));
+        assert!(!session.live_plan_mode());
+
+        session.apply_live_mode(true, PermissionMode::Plan);
+        assert!(session.live_plan_mode());
+        assert!(matches!(
+            session
+                .permissions()
+                .check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Deny(_)
+        ));
+
+        session.apply_live_mode(false, PermissionMode::Allow);
+        assert!(!session.live_plan_mode());
+        assert!(matches!(
+            session
+                .permissions()
+                .check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Allow
+        ));
     }
 
     #[tokio::test]

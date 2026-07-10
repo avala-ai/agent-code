@@ -85,6 +85,7 @@ impl ToolRegistry {
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(super::agent::AgentTool));
+        registry.register(Arc::new(super::apply_patch::ApplyPatchTool));
         registry.register(Arc::new(super::bash::BashTool));
         registry.register(Arc::new(super::file_read::FileReadTool));
         registry.register(Arc::new(super::file_write::FileWriteTool));

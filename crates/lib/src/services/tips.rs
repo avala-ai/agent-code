@@ -86,6 +86,10 @@ pub const BUNDLED_TIP_FILES: &[(&str, &str)] = &[
         include_str!("tips/bundled/agent-worktrees.md"),
     ),
     ("plan-mode", include_str!("tips/bundled/plan-mode.md")),
+    (
+        "subagent-types",
+        include_str!("tips/bundled/subagent-types.md"),
+    ),
     ("multi-edit", include_str!("tips/bundled/multi-edit.md")),
     ("syntax-theme", include_str!("tips/bundled/syntax-theme.md")),
     ("reload", include_str!("tips/bundled/reload.md")),
@@ -447,7 +451,7 @@ mod tests {
     #[test]
     fn bundled_tips_parse_cleanly() {
         let tips = load_bundled_tips();
-        assert_eq!(tips.len(), 15, "expected 15 bundled tips");
+        assert_eq!(tips.len(), 16, "expected 16 bundled tips");
         for tip in &tips {
             assert!(!tip.id.is_empty(), "tip has empty id: {tip:?}");
             assert!(!tip.body.is_empty(), "tip {} has empty body", tip.id);

@@ -137,12 +137,16 @@ pub async fn execute_tool_calls(
                                     subagent_colors: None,
                                     session_allows: None,
                                     permission_prompter: None,
+                                    question_asker: None,
+                                    agent_origin: None,
                                     // Parallel branch only runs read-only, concurrency-safe
                                     // tools — none of them spawn subprocesses, so the
                                     // sandbox would be inert here anyway.
                                     sandbox: None,
                                     active_disk_output_style: None,
                                     agent_limiter: None,
+                                    tool_events: None,
+                                    active_call_id: None,
                                 },
                                 &perm_checker,
                             )
@@ -182,6 +186,9 @@ async fn execute_single_tool(
     ctx: &ToolContext,
     permission_checker: &PermissionChecker,
 ) -> ToolCallResult {
+    // Bind the call id so progressive tool events (stdout chunks) correlate.
+    let ctx = ctx.with_call_id(&call.id);
+
     // Block non-read-only tools in plan mode.
     if ctx.plan_mode && !tool.is_read_only() {
         return ToolCallResult {
@@ -215,9 +222,12 @@ async fn execute_single_tool(
             };
         }
         PermissionDecision::Ask(prompt) => {
-            // Check session-level allows first (user previously chose "Allow for session").
+            // Session allows key on (tool, normalized input shape) so
+            // "allow for session" does not blanket every future call of
+            // the same tool name (M0 AllowSession store).
+            let allow_key = session_allow_key(&call.name, &call.input);
             if let Some(ref allows) = ctx.session_allows
-                && allows.lock().await.contains(call.name.as_str())
+                && allows.lock().await.contains(&allow_key)
             {
                 // Already allowed for this session — skip prompt.
             } else {
@@ -226,7 +236,12 @@ async fn execute_single_tool(
                 let input_preview = serde_json::to_string_pretty(&call.input).ok();
 
                 let response = if let Some(ref prompter) = ctx.permission_prompter {
-                    prompter.ask(&call.name, &description, input_preview.as_deref())
+                    prompter.ask(
+                        &call.name,
+                        &description,
+                        input_preview.as_deref(),
+                        ctx.agent_origin.as_deref(),
+                    )
                 } else {
                     // No prompter = auto-allow (non-interactive mode).
                     super::PermissionResponse::AllowOnce
@@ -237,9 +252,8 @@ async fn execute_single_tool(
                         // Continue to execution.
                     }
                     super::PermissionResponse::AllowSession => {
-                        // Record session-level allow so future calls skip the prompt.
                         if let Some(ref allows) = ctx.session_allows {
-                            allows.lock().await.insert(call.name.clone());
+                            allows.lock().await.insert(allow_key);
                         }
                     }
                     super::PermissionResponse::Deny => {
@@ -277,7 +291,7 @@ async fn execute_single_tool(
     }
 
     // Execute.
-    match tool.call(call.input.clone(), ctx).await {
+    match tool.call(call.input.clone(), &ctx).await {
         Ok(mut result) => {
             // Persist large outputs to disk, replace with truncated + path reference.
             result.content = crate::services::output_store::persist_if_large(
@@ -303,5 +317,55 @@ async fn execute_single_tool(
             tool_name: call.name.clone(),
             result: ToolResult::error(e.to_string()),
         },
+    }
+}
+
+/// Stable session-allow key: tool name + normalized input shape.
+///
+/// Used so "allow for session" on one bash command does not auto-allow
+/// every future Bash call.
+pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
+    let shape = match tool {
+        "Bash" | "PowerShell" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "FileWrite" | "FileEdit" | "FileRead" | "MultiEdit" | "NotebookEdit" => input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => {
+            let s = serde_json::to_string(input).unwrap_or_default();
+            if s.len() > 256 {
+                s.chars().take(256).collect()
+            } else {
+                s
+            }
+        }
+    };
+    format!("{tool}\0{shape}")
+}
+
+#[cfg(test)]
+mod session_allow_tests {
+    use super::*;
+
+    #[test]
+    fn session_allow_key_distinguishes_bash_commands() {
+        let a = session_allow_key("Bash", &serde_json::json!({"command": "ls"}));
+        let b = session_allow_key("Bash", &serde_json::json!({"command": "rm -rf /"}));
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            session_allow_key("Bash", &serde_json::json!({"command": "ls"}))
+        );
     }
 }

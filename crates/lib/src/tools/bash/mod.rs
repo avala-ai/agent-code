@@ -291,8 +291,12 @@ impl Tool for BashTool {
         let result = tokio::select! {
             r = async {
                 let (so, se) = tokio::join!(
-                    async { stdout_handle.read_to_end(&mut stdout_buf).await },
-                    async { stderr_handle.read_to_end(&mut stderr_buf).await },
+                    async {
+                        read_stream_emitting(&mut stdout_handle, &mut stdout_buf, ctx).await
+                    },
+                    async {
+                        read_stream_emitting(&mut stderr_handle, &mut stderr_buf, ctx).await
+                    },
                 );
                 so?;
                 se?;
@@ -325,6 +329,30 @@ impl Tool for BashTool {
     }
 }
 
+/// Read a pipe in chunks, accumulating into `buf` and forwarding live
+/// UTF-8 pieces to the tool-event channel (modern TUI live tool cards).
+async fn read_stream_emitting(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    ctx: &ToolContext,
+) -> std::io::Result<()> {
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        // Best-effort UTF-8 decode of this chunk for the UI; full output
+        // is re-decoded from `buf` at the end for the tool result.
+        let chunk = String::from_utf8_lossy(&tmp[..n]);
+        if !chunk.is_empty() {
+            ctx.emit_tool_output(&chunk);
+        }
+    }
+    Ok(())
+}
+
 /// Run a command in the background, returning a task ID immediately.
 async fn run_background(
     command: &str,
@@ -342,6 +370,60 @@ async fn run_background(
         "Command running in background (task {task_id}). \
          Use TaskOutput to check results when complete."
     )))
+}
+
+#[cfg(test)]
+mod stream_emit_tests {
+    use super::*;
+    use crate::permissions::PermissionChecker;
+    use crate::tools::event_sink::{ToolEvent, tool_event_channel};
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn read_stream_emits_chunks_to_tool_events() {
+        let (tx, mut rx) = tool_event_channel();
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            cancel: CancellationToken::new(),
+            permission_checker: Arc::new(PermissionChecker::allow_all()),
+            verbose: false,
+            plan_mode: false,
+            file_cache: None,
+            denial_tracker: None,
+            task_manager: None,
+            subagent_colors: None,
+            session_allows: None,
+            permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
+            sandbox: None,
+            active_disk_output_style: None,
+            agent_limiter: None,
+            tool_events: Some(tx),
+            active_call_id: Some("call-1".into()),
+        };
+        let data = b"hello world from bash\n";
+        let mut cursor = Cursor::new(&data[..]);
+        let mut buf = Vec::new();
+        read_stream_emitting(&mut cursor, &mut buf, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(buf, data);
+        let mut chunks = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                ToolEvent::Output { call_id, chunk } => {
+                    assert_eq!(call_id, "call-1");
+                    chunks.push(chunk);
+                }
+                ToolEvent::PlanProposed { .. } => {}
+            }
+        }
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks.concat(), "hello world from bash\n");
+    }
 }
 
 /// Format stdout/stderr into a single output string with truncation.

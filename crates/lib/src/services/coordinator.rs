@@ -368,6 +368,154 @@ pub fn permissions_to_toml(perms: &PermissionsConfig) -> Result<String, String> 
     toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())
 }
 
+/// Build the effective permission overlay for an agent definition.
+///
+/// Merges explicit `permissions` frontmatter with `include_tools` /
+/// `exclude_tools` (mapped onto `allowed_tools` / `disallowed_tools` so
+/// the child process hides those tools from the model). Returns `None`
+/// when the definition carries no permission-related constraints.
+///
+/// When `definition.read_only` is true, the overlay's `default_mode` is
+/// forced to [`PermissionMode::Plan`]. The child CLI applies
+/// `--permission-mode` first and then **replaces** the whole permissions
+/// config with the overlay; without this force, a visibility-only overlay
+/// would default to `Ask` and one-shot subagents (no prompter) would
+/// auto-allow mutating tools such as `Bash`.
+pub fn effective_permissions(definition: &AgentDefinition) -> Option<PermissionsConfig> {
+    let has_include = !definition.include_tools.is_empty();
+    let has_exclude = !definition.exclude_tools.is_empty();
+    if definition.permissions.is_none() && !has_include && !has_exclude {
+        return None;
+    }
+
+    let mut perms = definition.permissions.clone().unwrap_or_default();
+    // Visibility-only overlays (no explicit frontmatter permissions) must
+    // not leave `Ask` as default: one-shot subagents have no prompter and
+    // would auto-allow every mutating tool. Read-only → Plan; otherwise
+    // Deny + explicit Allow rules for listed tools.
+    if definition.permissions.is_none() {
+        if definition.read_only {
+            perms.default_mode = PermissionMode::Plan;
+        } else {
+            perms.default_mode = PermissionMode::Deny;
+        }
+    }
+    if definition.read_only {
+        perms.default_mode = PermissionMode::Plan;
+    }
+    if has_include {
+        // Include list is authoritative for visibility: only listed tools
+        // reach the child's schema. Append rather than clobber if frontmatter
+        // already set an allowlist, so both sources compose.
+        if perms.allowed_tools.is_empty() {
+            perms.allowed_tools = definition.include_tools.clone();
+        } else {
+            for tool in &definition.include_tools {
+                if !perms.allowed_tools.iter().any(|t| t == tool) {
+                    perms.allowed_tools.push(tool.clone());
+                }
+            }
+        }
+    }
+    if has_exclude {
+        for tool in &definition.exclude_tools {
+            if !perms.disallowed_tools.iter().any(|t| t == tool) {
+                perms.disallowed_tools.push(tool.clone());
+            }
+        }
+    }
+    // When default is Deny and we only have an allowlist (visibility),
+    // grant Allow rules for each listed tool so the child can run them
+    // without a prompter.
+    if matches!(perms.default_mode, PermissionMode::Deny) && !perms.allowed_tools.is_empty() {
+        for tool in &perms.allowed_tools {
+            let already = perms.rules.iter().any(|r| r.tool == *tool);
+            if !already {
+                perms.rules.push(PermissionRule {
+                    tool: tool.clone(),
+                    pattern: None,
+                    action: PermissionMode::Allow,
+                });
+            }
+        }
+    }
+    Some(perms)
+}
+
+/// Compose a child permissions overlay onto a host permissions config.
+///
+/// Host **restrictions** always win:
+/// - Rules are ordered host-first so first-match evaluation never lets an
+///   overlay `Allow` shadow a project `Deny` (or other host rule).
+/// - `allowed_tools` is the intersection when both sides set a list; an
+///   overlay cannot re-expose a tool the host omitted from its allowlist.
+/// - `disallowed_tools` is the union (either side can forbid).
+///
+/// Overlay still wins for `default_mode` (typed subagents set Plan/Deny).
+pub fn compose_permissions_overlay(
+    host: &PermissionsConfig,
+    overlay: &PermissionsConfig,
+) -> PermissionsConfig {
+    // Host rules first: PermissionChecker first-match must not let an
+    // overlay Allow(Bash) shadow host Deny(Bash(rm *)).
+    let mut rules = host.rules.clone();
+    for r in &overlay.rules {
+        if !rules
+            .iter()
+            .any(|x| x.tool == r.tool && x.pattern == r.pattern && x.action == r.action)
+        {
+            rules.push(r.clone());
+        }
+    }
+    // Visibility: intersect when both sides restrict; never replace a host
+    // allowlist with a looser overlay list.
+    let allowed_tools = match (
+        host.allowed_tools.is_empty(),
+        overlay.allowed_tools.is_empty(),
+    ) {
+        (false, false) => overlay
+            .allowed_tools
+            .iter()
+            .filter(|t| host.allowed_tools.iter().any(|h| h == *t))
+            .cloned()
+            .collect(),
+        (false, true) => host.allowed_tools.clone(),
+        (true, false) => overlay.allowed_tools.clone(),
+        (true, true) => Vec::new(),
+    };
+    let mut disallowed_tools = host.disallowed_tools.clone();
+    for t in &overlay.disallowed_tools {
+        if !disallowed_tools.iter().any(|x| x == t) {
+            disallowed_tools.push(t.clone());
+        }
+    }
+    PermissionsConfig {
+        default_mode: overlay.default_mode,
+        rules,
+        allowed_tools,
+        disallowed_tools,
+    }
+}
+
+/// Write a permissions overlay TOML to a temp file and return its path.
+///
+/// The file is intentionally leaked: it is tiny, the OS reclaims `/tmp`
+/// on reboot, and early deletion races the child process's read.
+pub fn write_permissions_overlay(perms: &PermissionsConfig) -> Result<PathBuf, String> {
+    let toml_body = permissions_to_toml(perms)?;
+    let filename = format!(
+        "agent-code-perms-{}.toml",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("overlay")
+    );
+    let path = std::env::temp_dir().join(filename);
+    std::fs::write(&path, toml_body).map_err(|e| format!("write permissions overlay: {e}"))?;
+    Ok(path)
+}
+
 // ---- Coordinator Runtime ----
 
 /// A running agent instance.
@@ -448,6 +596,62 @@ pub struct Coordinator {
     cwd: PathBuf,
 }
 
+/// Apply agent-definition flags (model, turns, read-only, permissions)
+/// onto an already-built `agent --prompt` command.
+///
+/// Used by both the coordinator and the Agent tool so typed subagents
+/// share one code path for overlays and include/exclude tool lists.
+pub fn apply_agent_definition(
+    cmd: &mut tokio::process::Command,
+    definition: &AgentDefinition,
+    model_override: Option<&str>,
+) {
+    if let Some(model) = model_override.or(definition.model.as_deref()) {
+        cmd.arg("--model").arg(resolve_model_alias(model));
+    }
+    if let Some(max_turns) = definition.max_turns {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
+    if definition.read_only {
+        cmd.arg("--permission-mode").arg("plan");
+    }
+
+    // Per-agent permissions + include/exclude tool visibility.
+    if let Some(perms) = effective_permissions(definition) {
+        match write_permissions_overlay(&perms) {
+            Ok(path) => {
+                cmd.arg("--permissions-overlay").arg(&path);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to write permissions overlay ({e}); subagent will inherit parent permissions"
+                );
+            }
+        }
+    }
+}
+
+/// Expand short model aliases used by agents (`sonnet` / `opus` / `haiku`).
+pub fn resolve_model_alias(model: &str) -> String {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "sonnet" | "claude-sonnet" => "claude-sonnet-5".into(),
+        "opus" | "claude-opus" => "claude-opus-4-8".into(),
+        "haiku" | "claude-haiku" => "claude-haiku-4-5".into(),
+        "gpt" | "gpt-latest" => "gpt-5.4".into(),
+        "grok" => "grok-4.3".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Prefix the user prompt with the agent type's system-prompt addition.
+pub fn compose_agent_prompt(definition: &AgentDefinition, prompt: &str) -> String {
+    if let Some(ref sys) = definition.system_prompt {
+        format!("{sys}\n\n{prompt}")
+    } else {
+        prompt.to_string()
+    }
+}
+
 /// Build a subprocess command for running an agent.
 ///
 /// Shared by `run_agent()` and `run_team()` to avoid duplication.
@@ -456,11 +660,7 @@ fn build_agent_command(
     prompt: &str,
     cwd: &std::path::Path,
 ) -> tokio::process::Command {
-    let full_prompt = if let Some(ref sys) = definition.system_prompt {
-        format!("{sys}\n\n{prompt}")
-    } else {
-        prompt.to_string()
-    };
+    let full_prompt = compose_agent_prompt(definition, prompt);
 
     let agent_binary = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -473,41 +673,7 @@ fn build_agent_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if let Some(ref model) = definition.model {
-        cmd.arg("--model").arg(model);
-    }
-    if let Some(max_turns) = definition.max_turns {
-        cmd.arg("--max-turns").arg(max_turns.to_string());
-    }
-    if definition.read_only {
-        cmd.arg("--permission-mode").arg("plan");
-    }
-
-    // Per-agent permissions overlay. When the agent definition carries
-    // its own PermissionsConfig, serialise it to a temp TOML file and
-    // pass the path to the child. The child loads the file via
-    // `--permissions-overlay` and replaces its own permissions with it.
-    // We intentionally leak the temp file: the file is tiny, the OS
-    // cleans `/tmp` on reboot, and cleaning it up early would race the
-    // child process's read.
-    if let Some(ref perms) = definition.permissions
-        && let Ok(toml_body) = permissions_to_toml(perms)
-    {
-        let filename = format!(
-            "agent-code-perms-{}.toml",
-            uuid::Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("overlay")
-        );
-        let path = std::env::temp_dir().join(filename);
-        if std::fs::write(&path, toml_body).is_ok() {
-            cmd.arg("--permissions-overlay").arg(&path);
-        } else {
-            warn!("Failed to write permissions overlay; subagent will inherit parent permissions");
-        }
-    }
+    apply_agent_definition(&mut cmd, definition, None);
 
     // Pass through API keys so subagents use the same provider.
     for var in &[
@@ -515,6 +681,12 @@ fn build_agent_command(
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "TOGETHER_API_KEY",
         "AGENT_CODE_API_BASE_URL",
         "AGENT_CODE_MODEL",
     ] {
@@ -1028,5 +1200,214 @@ mod coordinator_tests {
             .unwrap();
         assert_eq!(parsed.default_mode, PermissionMode::Deny);
         assert_eq!(parsed.rules.len(), 2);
+    }
+
+    #[test]
+    fn effective_permissions_none_when_unconstrained() {
+        let def = AgentRegistry::with_defaults()
+            .get("general-purpose")
+            .unwrap()
+            .clone();
+        assert!(effective_permissions(&def).is_none());
+    }
+
+    #[test]
+    fn effective_permissions_maps_include_tools() {
+        let def = AgentRegistry::with_defaults()
+            .get("explore")
+            .unwrap()
+            .clone();
+        let perms = effective_permissions(&def).expect("explore has include_tools");
+        assert!(perms.allowed_tools.contains(&"FileRead".into()));
+        assert!(perms.allowed_tools.contains(&"Grep".into()));
+        assert!(perms.allowed_tools.contains(&"Glob".into()));
+        assert!(perms.allowed_tools.contains(&"Bash".into()));
+        assert!(perms.allowed_tools.contains(&"WebFetch".into()));
+        // read_only explore must keep Plan mode so the overlay does not
+        // clobber --permission-mode plan with default Ask.
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn effective_permissions_read_only_forces_plan_mode() {
+        let def = AgentRegistry::with_defaults().get("plan").unwrap().clone();
+        let perms = effective_permissions(&def).expect("plan has include_tools");
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+
+        // Even if frontmatter/default asked for Ask/Allow, read_only wins.
+        let mut custom = def;
+        custom.permissions = Some(PermissionsConfig {
+            default_mode: PermissionMode::Allow,
+            rules: vec![],
+            allowed_tools: vec!["FileRead".into()],
+            disallowed_tools: vec![],
+        });
+        let perms = effective_permissions(&custom).unwrap();
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn effective_permissions_merges_exclude_and_frontmatter() {
+        let def = AgentDefinition {
+            name: "custom".into(),
+            description: "t".into(),
+            system_prompt: None,
+            model: None,
+            include_tools: vec!["FileRead".into()],
+            exclude_tools: vec!["Bash".into()],
+            read_only: true,
+            max_turns: None,
+            permissions: Some(PermissionsConfig {
+                default_mode: PermissionMode::Ask,
+                rules: vec![],
+                allowed_tools: vec!["Grep".into()],
+                disallowed_tools: vec![],
+            }),
+        };
+        let perms = effective_permissions(&def).unwrap();
+        // Existing allowlist is preserved and include_tools appended.
+        assert!(perms.allowed_tools.contains(&"Grep".into()));
+        assert!(perms.allowed_tools.contains(&"FileRead".into()));
+        assert!(perms.disallowed_tools.contains(&"Bash".into()));
+        assert_eq!(perms.default_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn resolve_model_alias_expands_short_names() {
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-5");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-8");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5");
+        assert_eq!(resolve_model_alias("claude-sonnet-5"), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn compose_permissions_overlay_keeps_host_rules() {
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("rm *".into()),
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![],
+            allowed_tools: vec!["FileRead".into(), "Grep".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        assert_eq!(merged.default_mode, PermissionMode::Plan);
+        assert!(merged.allowed_tools.contains(&"FileRead".into()));
+        assert!(
+            merged
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
+            "host project rules must survive overlay"
+        );
+    }
+
+    #[test]
+    fn compose_permissions_overlay_host_deny_beats_overlay_allow() {
+        // First-match: host Deny must appear before overlay Allow so a
+        // project Bash(rm *) rule is never shadowed by include_tools Allow.
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("rm *".into()),
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: None,
+                action: PermissionMode::Allow,
+            }],
+            allowed_tools: vec!["Bash".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        let deny_pos = merged
+            .rules
+            .iter()
+            .position(|r| {
+                r.tool == "Bash"
+                    && r.pattern.as_deref() == Some("rm *")
+                    && r.action == PermissionMode::Deny
+            })
+            .expect("host deny present");
+        let allow_pos = merged
+            .rules
+            .iter()
+            .position(|r| {
+                r.tool == "Bash" && r.pattern.is_none() && r.action == PermissionMode::Allow
+            })
+            .expect("overlay allow present");
+        assert!(
+            deny_pos < allow_pos,
+            "host Deny must precede overlay Allow (first-match)"
+        );
+
+        // End-to-end with PermissionChecker: rm is denied, other bash allowed.
+        let checker = crate::permissions::PermissionChecker::from_config(&merged);
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "rm -rf /tmp/x"})),
+            crate::permissions::PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn compose_permissions_overlay_intersects_allowlists() {
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![],
+            allowed_tools: vec!["Bash".into(), "FileRead".into()],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![],
+            // Tries to drop FileRead and re-add Grep (not on host list).
+            allowed_tools: vec!["FileRead".into(), "Grep".into(), "Bash".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        assert!(merged.allowed_tools.contains(&"Bash".into()));
+        assert!(merged.allowed_tools.contains(&"FileRead".into()));
+        assert!(
+            !merged.allowed_tools.contains(&"Grep".into()),
+            "overlay must not re-expose tools outside the host allowlist"
+        );
+        assert_eq!(merged.allowed_tools.len(), 2);
+    }
+
+    #[test]
+    fn compose_agent_prompt_prefixes_system() {
+        let def = AgentDefinition {
+            name: "x".into(),
+            description: "d".into(),
+            system_prompt: Some("You are specialized.".into()),
+            model: None,
+            include_tools: vec![],
+            exclude_tools: vec![],
+            read_only: false,
+            max_turns: None,
+            permissions: None,
+        };
+        let full = compose_agent_prompt(&def, "do work");
+        assert!(full.starts_with("You are specialized."));
+        assert!(full.contains("do work"));
     }
 }

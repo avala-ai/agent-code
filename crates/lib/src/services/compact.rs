@@ -344,10 +344,7 @@ pub fn microcompact(messages: &mut [Message], keep_recent: usize) -> u64 {
     for &(msg_idx, block_idx) in to_clear {
         if let Message::User(ref mut u) = messages[msg_idx]
             && let ContentBlock::ToolResult {
-                ref mut content,
-                tool_use_id: _,
-                is_error: _,
-                ..
+                ref mut content, ..
             } = u.content[block_idx]
         {
             let old_tokens = tokens::estimate_tokens(content);

@@ -19,6 +19,7 @@
 //! 4. Result mapping (to API format)
 
 pub mod agent;
+pub mod apply_patch;
 pub mod ask_user;
 pub mod bash;
 pub mod bash_parse;
@@ -28,6 +29,7 @@ pub mod cron_create;
 pub mod cron_delete;
 pub mod cron_list;
 pub mod cron_support;
+pub mod event_sink;
 pub mod executor;
 pub mod file_edit;
 pub mod file_read;
@@ -169,21 +171,48 @@ pub enum PermissionResponse {
 
 /// Trait for prompting the user for permission decisions.
 /// Implemented by the CLI's UI layer; the lib engine uses this abstraction.
+///
+/// **Signature note (PR #415):** `origin` is the requesting agent id when the
+/// ask comes from a background/subagent context (`None` for the lead session).
+/// UI impls should surface it (e.g. "from research-1") when `Some`.
 pub trait PermissionPrompter: Send + Sync {
     fn ask(
         &self,
         tool_name: &str,
         description: &str,
         input_preview: Option<&str>,
+        origin: Option<&str>,
     ) -> PermissionResponse;
 }
 
 /// Default prompter that always allows (for non-interactive/testing).
 pub struct AutoAllowPrompter;
 impl PermissionPrompter for AutoAllowPrompter {
-    fn ask(&self, _: &str, _: &str, _: Option<&str>) -> PermissionResponse {
+    fn ask(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>) -> PermissionResponse {
         PermissionResponse::AllowOnce
     }
+}
+
+/// One choice in an [`AskUserQuestion`](ask_user::AskUserQuestionTool) prompt.
+#[derive(Debug, Clone)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One question with labeled options.
+#[derive(Debug, Clone)]
+pub struct UserQuestion {
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+}
+
+/// Trait for multi-choice questions (modern TUI modal / classic stdin).
+///
+/// Returns one selected **label** per question, in order. Fail closed when
+/// the UI is gone — do not hang on stdin under alt-screen raw mode.
+pub trait QuestionAsker: Send + Sync {
+    fn ask(&self, questions: &[UserQuestion]) -> Result<Vec<String>, String>;
 }
 
 /// Context passed to every tool during execution.
@@ -220,6 +249,11 @@ pub struct ToolContext {
     pub session_allows: Option<Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Permission prompter for interactive approval.
     pub permission_prompter: Option<Arc<dyn PermissionPrompter>>,
+    /// Multi-choice question asker (modern modal / tests). When `None`,
+    /// [`ask_user::AskUserQuestionTool`] falls back to stdin (classic REPL).
+    pub question_asker: Option<Arc<dyn QuestionAsker>>,
+    /// Origin agent id for permission attribution (subagent / bg task).
+    pub agent_origin: Option<String>,
     /// Process-level sandbox executor.
     ///
     /// `None` means sandboxing is unavailable for this context
@@ -239,6 +273,79 @@ pub struct ToolContext {
     /// (e.g. in tests / non-interactive contexts).
     pub agent_limiter:
         Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
+    /// Live tool-event channel (stdout chunks, etc.). Optional so tests
+    /// and one-shot paths can omit it.
+    pub tool_events: Option<event_sink::ToolEventTx>,
+    /// Id of the tool call currently executing (for correlating events).
+    pub active_call_id: Option<String>,
+}
+
+impl ToolContext {
+    /// Minimal context for unit tests (`cwd = "."`, allow-all permissions).
+    ///
+    /// Prefer this (or [`Self::minimal`]) over hand-rolling every optional
+    /// field — the struct grows with engine features and field-list
+    /// construction is a common source of merge noise in tool tests.
+    pub fn for_tests() -> Self {
+        Self::minimal(PathBuf::from("."), CancellationToken::new())
+    }
+
+    /// Build a minimal context with the given cwd and cancel token.
+    ///
+    /// All optional fields are `None` / false; permissions allow everything.
+    pub fn minimal(cwd: PathBuf, cancel: CancellationToken) -> Self {
+        Self {
+            cwd,
+            cancel,
+            permission_checker: Arc::new(PermissionChecker::allow_all()),
+            verbose: false,
+            plan_mode: false,
+            file_cache: None,
+            denial_tracker: None,
+            task_manager: None,
+            subagent_colors: None,
+            session_allows: None,
+            permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
+            sandbox: None,
+            active_disk_output_style: None,
+            agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
+        }
+    }
+
+    /// Emit progressive tool output when a live event channel is installed.
+    pub fn emit_tool_output(&self, chunk: &str) {
+        if let (Some(tx), Some(id)) = (&self.tool_events, &self.active_call_id) {
+            tx.emit_output(id, chunk);
+        }
+    }
+
+    /// Clone this context with a specific active call id (and shared event tx).
+    pub fn with_call_id(&self, call_id: impl Into<String>) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            cancel: self.cancel.clone(),
+            permission_checker: self.permission_checker.clone(),
+            verbose: self.verbose,
+            plan_mode: self.plan_mode,
+            file_cache: self.file_cache.clone(),
+            denial_tracker: self.denial_tracker.clone(),
+            task_manager: self.task_manager.clone(),
+            subagent_colors: self.subagent_colors.clone(),
+            session_allows: self.session_allows.clone(),
+            permission_prompter: self.permission_prompter.clone(),
+            question_asker: self.question_asker.clone(),
+            agent_origin: self.agent_origin.clone(),
+            sandbox: self.sandbox.clone(),
+            active_disk_output_style: self.active_disk_output_style.clone(),
+            agent_limiter: self.agent_limiter.clone(),
+            tool_events: self.tool_events.clone(),
+            active_call_id: Some(call_id.into()),
+        }
+    }
 }
 
 /// Result of a tool execution.
