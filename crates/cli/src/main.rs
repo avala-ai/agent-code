@@ -346,7 +346,11 @@ async fn async_main() -> anyhow::Result<()> {
     {
         match provider.as_str() {
             "codex" | "chatgpt" | "openai" => {
-                eprintln!("Opening your browser to sign in with ChatGPT...");
+                eprintln!("Starting ChatGPT / Codex sign-in…");
+                eprintln!(
+                    "(On headless/SSH hosts the browser may not open — a URL and \
+                     port-forward hint will be printed.)"
+                );
                 let path = agent_code_lib::llm::codex_auth::browser_login(codex_home.as_deref())
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -357,7 +361,8 @@ async fn async_main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "xai" | "grok" | "supergrok" => {
-                eprintln!("Starting SuperGrok / X Premium device sign-in...");
+                eprintln!("Starting SuperGrok / X Premium device sign-in…");
+                eprintln!("(Works well on headless/SSH: open the printed URL on any browser.)");
                 let path = agent_code_lib::llm::xai_auth::device_code_login(true)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;

@@ -520,7 +520,40 @@ impl OAuthService {
         let auth_url =
             build_authorization_url(&self.config, &redirect_uri, &pkce.code_challenge, &state);
 
-        (self.browser)(&auth_url)?;
+        // Headless / SSH / no-DISPLAY hosts cannot open a browser. Never
+        // abort the flow for that — print the URL (and a tunnel hint when
+        // the redirect is a fixed loopback port) so the user can finish
+        // on another machine.
+        match (self.browser)(&auth_url) {
+            Ok(()) => {}
+            Err(OAuthError::BrowserLaunchFailed(reason)) => {
+                tracing::warn!("browser open failed ({reason}); continuing with printed URL");
+                eprintln!();
+                eprintln!("Could not open a browser automatically ({reason}).");
+                eprintln!("Open this URL on any machine with a browser:");
+                eprintln!();
+                eprintln!("  {auth_url}");
+                eprintln!();
+                if let Some(port) = self.config.loopback_port {
+                    eprintln!(
+                        "If you are SSH'd into a remote host, forward the callback port first:"
+                    );
+                    eprintln!("  ssh -L {port}:127.0.0.1:{port} <this-host>");
+                    eprintln!(
+                        "Then open the URL above in your local browser (callback: {redirect_uri})."
+                    );
+                    eprintln!();
+                } else {
+                    eprintln!(
+                        "If you are on SSH, forward the callback port from the URL \
+                         (127.0.0.1:<port>) with: ssh -L <port>:127.0.0.1:<port> <this-host>"
+                    );
+                    eprintln!();
+                }
+                eprintln!("Waiting for you to complete sign-in…");
+            }
+            Err(e) => return Err(e),
+        }
 
         let captured = capture_redirect(listener, &state).await?;
 
