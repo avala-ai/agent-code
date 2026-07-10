@@ -118,6 +118,12 @@ pub fn run_setup() -> Option<SetupResult> {
             preview: None,
         },
         SelectOption {
+            label: "SuperGrok / X Premium subscription".into(),
+            description: "xAI Grok OAuth device sign-in (no XAI_API_KEY)".into(),
+            value: "xai_subscription".into(),
+            preview: None,
+        },
+        SelectOption {
             label: "OpenAI API key".into(),
             description: "GPT-5.4, GPT-4.1 — paste OPENAI_API_KEY".into(),
             value: "openai".into(),
@@ -131,7 +137,7 @@ pub fn run_setup() -> Option<SetupResult> {
         },
         SelectOption {
             label: "xAI (Grok) API key".into(),
-            description: "Grok models — paste XAI_API_KEY (no subscription OAuth yet)".into(),
+            description: "Grok models — paste XAI_API_KEY".into(),
             value: "xai".into(),
             preview: None,
         },
@@ -185,51 +191,86 @@ pub fn run_setup() -> Option<SetupResult> {
         },
     ]);
 
-    // ---- ChatGPT / Codex subscription (browser OAuth) ----
-    if provider_choice == "codex_subscription" {
+    // ---- Subscription OAuth paths (ChatGPT / SuperGrok) ----
+    if provider_choice == "codex_subscription" || provider_choice == "xai_subscription" {
         println!();
         println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
         let permission_mode = select_permission_mode();
         println!();
         print_safety_notes(4);
 
-        println!(
-            "  {} Opening browser for ChatGPT / Codex sign-in…\n",
-            "→".dark_cyan().bold()
-        );
-        println!(
-            "    Complete the flow in your browser. This reuses the same session as the Codex CLI.\n"
-        );
-
-        match run_codex_browser_login() {
-            Ok(path) => {
-                println!(
-                    "    {} Signed in. Session saved to {}",
-                    "✓".green(),
-                    path.display()
-                );
+        let result = if provider_choice == "codex_subscription" {
+            println!(
+                "  {} Opening browser for ChatGPT / Codex sign-in…\n",
+                "→".dark_cyan().bold()
+            );
+            println!(
+                "    Complete the flow in your browser. This reuses the same session as the Codex CLI.\n"
+            );
+            match run_codex_browser_login() {
+                Ok(path) => {
+                    println!(
+                        "    {} Signed in. Session saved to {}",
+                        "✓".green(),
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    println!("    {} Browser sign-in failed: {e}", "✗".red());
+                    println!("    {}", "Retry later with: agent login codex".yellow());
+                    println!();
+                    return None;
+                }
             }
-            Err(e) => {
-                println!("    {} Browser sign-in failed: {e}", "✗".red());
-                println!("    {}", "You can retry later with: agent login".yellow());
-                println!();
-                return None;
+            SetupResult {
+                api_key: String::new(),
+                auth_mode: "codex_chatgpt".into(),
+                provider: "openai".into(),
+                base_url: Some("https://chatgpt.com/backend-api/codex".into()),
+                model: Some("gpt-5.5".into()),
+                theme: theme.clone(),
+                permission_mode,
             }
-        }
-        println!();
-
-        let result = SetupResult {
-            api_key: String::new(),
-            auth_mode: "codex_chatgpt".into(),
-            provider: "openai".into(),
-            base_url: Some("https://chatgpt.com/backend-api/codex".into()),
-            model: Some("gpt-5.5".into()),
-            theme: theme.clone(),
-            permission_mode,
+        } else {
+            println!(
+                "  {} SuperGrok / X Premium device sign-in…\n",
+                "→".dark_cyan().bold()
+            );
+            println!("    A verification URL and code will be printed; approve in your browser.\n");
+            match run_xai_device_login() {
+                Ok(path) => {
+                    println!(
+                        "    {} Signed in. Session saved to {}",
+                        "✓".green(),
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    println!("    {} Sign-in failed: {e}", "✗".red());
+                    println!("    {}", "Retry later with: agent login xai".yellow());
+                    println!();
+                    return None;
+                }
+            }
+            SetupResult {
+                api_key: String::new(),
+                auth_mode: "xai_oauth".into(),
+                provider: "xai".into(),
+                base_url: Some("https://api.x.ai/v1".into()),
+                model: Some("grok-build-0.1".into()),
+                theme: theme.clone(),
+                permission_mode,
+            }
         };
+        println!();
         write_config(&result);
+        let label = if result.auth_mode == "xai_oauth" {
+            "SuperGrok / X Premium"
+        } else {
+            "ChatGPT subscription"
+        };
         println!(
-            "  {} Configured for ChatGPT subscription. Type {} to start.",
+            "  {} Configured for {label}. Type {} to start.",
             "Ready!".green().bold(),
             "agent".bold(),
         );
@@ -650,16 +691,32 @@ fn print_safety_notes(step: u8) {
 /// Setup is sync and may already be running under the main Tokio runtime
 /// (`block_on` from a worker would panic), so we always use a fresh thread.
 fn run_codex_browser_login() -> Result<std::path::PathBuf, String> {
-    std::thread::spawn(|| {
+    run_async_login(|| async {
+        agent_code_lib::llm::codex_auth::browser_login(None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn run_xai_device_login() -> Result<std::path::PathBuf, String> {
+    run_async_login(|| async {
+        agent_code_lib::llm::xai_auth::device_code_login(true)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn run_async_login<F, Fut>(f: F) -> Result<std::path::PathBuf, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<std::path::PathBuf, String>> + Send,
+{
+    std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
-        rt.block_on(async {
-            agent_code_lib::llm::codex_auth::browser_login(None)
-                .await
-                .map_err(|e| e.to_string())
-        })
+        rt.block_on(f())
     })
     .join()
     .unwrap_or_else(|_| Err("login thread panicked".into()))

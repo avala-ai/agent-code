@@ -203,7 +203,7 @@ enum SubCommand {
     },
     /// Sign in with a provider subscription via the browser (OAuth).
     Login {
-        /// Provider to sign in to. Currently: `codex` (ChatGPT/Codex subscription).
+        /// Provider: `codex` (ChatGPT/Codex) or `xai` / `grok` (SuperGrok / X Premium).
         #[arg(default_value = "codex")]
         provider: String,
         /// Codex home to write `auth.json` to (default: `$CODEX_HOME` or `~/.codex`).
@@ -277,8 +277,11 @@ fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
     match value.trim().replace('-', "_").as_str() {
         "api_key" => Ok(ApiAuthMode::ApiKey),
         "codex_chatgpt" | "chatgpt" => Ok(ApiAuthMode::CodexChatgpt),
+        "xai_oauth" | "grok_oauth" | "xai" | "grok" => Ok(ApiAuthMode::XaiOauth),
         other => {
-            anyhow::bail!("invalid auth mode `{other}`; expected `api_key` or `codex_chatgpt`")
+            anyhow::bail!(
+                "invalid auth mode `{other}`; expected `api_key`, `codex_chatgpt`, or `xai_oauth`"
+            )
         }
     }
 }
@@ -353,7 +356,20 @@ async fn async_main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            other => anyhow::bail!("unknown login provider `{other}` (supported: codex)"),
+            "xai" | "grok" | "supergrok" => {
+                eprintln!("Starting SuperGrok / X Premium device sign-in...");
+                let path = agent_code_lib::llm::xai_auth::device_code_login(true)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                println!("Signed in. xAI OAuth session written to {}", path.display());
+                println!(
+                    "Run agent-code on your subscription with:\n  agent --auth-mode xai_oauth --model grok-build-0.1"
+                );
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("unknown login provider `{other}` (supported: codex, xai)")
+            }
         }
     }
 
@@ -408,6 +424,7 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && cli.command.is_none()
         && cli_auth_mode != Some(ApiAuthMode::CodexChatgpt)
+        && cli_auth_mode != Some(ApiAuthMode::XaiOauth)
         && ui::setup::needs_setup()
     {
         run_setup_wizard();
@@ -551,8 +568,14 @@ async fn async_main() -> anyhow::Result<()> {
     let has_key = cli.api_key.is_some()
         || config.api.api_key.is_some()
         || config.api.auth_mode == ApiAuthMode::CodexChatgpt
+        || config.api.auth_mode == ApiAuthMode::XaiOauth
         || std::env::var("AGENT_CODE_AUTH_MODE")
-            .map(|v| matches!(v.as_str(), "codex_chatgpt" | "chatgpt"))
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "codex_chatgpt" | "chatgpt" | "xai_oauth" | "grok_oauth" | "xai" | "grok"
+                )
+            })
             .unwrap_or(false);
 
     // The setup wizard reads from stdin via arrow-key prompts. Run it
@@ -607,10 +630,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize LLM provider. If --model or --provider implies a different
     // provider than what's in the config, override the base URL to match.
-    let provider_kind = if config.api.auth_mode == ApiAuthMode::CodexChatgpt {
-        ProviderKind::OpenAi
-    } else {
-        match cli.provider.as_str() {
+    let provider_kind = match config.api.auth_mode {
+        ApiAuthMode::CodexChatgpt => ProviderKind::OpenAi,
+        ApiAuthMode::XaiOauth => ProviderKind::Xai,
+        ApiAuthMode::ApiKey => match cli.provider.as_str() {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::OpenAi,
             "bedrock" | "aws" => ProviderKind::Bedrock,
@@ -624,11 +647,11 @@ async fn async_main() -> anyhow::Result<()> {
             "zhipu" | "glm" | "z.ai" => ProviderKind::Zhipu,
             "azure" | "azure-openai" => ProviderKind::AzureOpenAi,
             _ => detect_provider(&config.api.model, &config.api.base_url),
-        }
+        },
     };
 
     // Override base URL if the detected provider has a known default.
-    if config.api.auth_mode != ApiAuthMode::CodexChatgpt
+    if matches!(config.api.auth_mode, ApiAuthMode::ApiKey)
         && cli.api_base_url.is_none()
         && let Some(default_url) = provider_kind.default_base_url()
     {
@@ -637,40 +660,57 @@ async fn async_main() -> anyhow::Result<()> {
     if config.api.auth_mode == ApiAuthMode::CodexChatgpt && cli.api_base_url.is_none() {
         config.api.base_url = "https://chatgpt.com/backend-api/codex".to_string();
     }
+    if config.api.auth_mode == ApiAuthMode::XaiOauth && cli.api_base_url.is_none() {
+        config.api.base_url = "https://api.x.ai/v1".to_string();
+    }
 
-    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = if config.api.auth_mode
-        == ApiAuthMode::CodexChatgpt
-    {
-        let auth = agent_code_lib::llm::codex_auth::CodexChatGptAuth::load(
-            config.api.codex_home.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        Arc::new(
-            agent_code_lib::llm::openai::OpenAiProvider::new_responses_with_codex_auth(
-                &config.api.base_url,
-                auth,
-            ),
-        )
-    } else {
-        let api_key = api_key.expect("api_key is set for ApiAuthMode::ApiKey");
-        match provider_kind {
-            ProviderKind::AzureOpenAi => {
-                Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
+    let llm: Arc<dyn agent_code_lib::llm::provider::Provider> = match config.api.auth_mode {
+        ApiAuthMode::CodexChatgpt => {
+            let auth = agent_code_lib::llm::codex_auth::CodexChatGptAuth::load(
+                config.api.codex_home.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Arc::new(
+                agent_code_lib::llm::openai::OpenAiProvider::new_responses_with_codex_auth(
                     &config.api.base_url,
-                    api_key,
-                ))
-            }
-            _ => match provider_kind.wire_format() {
-                WireFormat::Anthropic => {
-                    Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                    auth,
+                ),
+            )
+        }
+        ApiAuthMode::XaiOauth => {
+            let auth = agent_code_lib::llm::xai_auth::XaiOauthAuth::load(None)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            Arc::new(
+                agent_code_lib::llm::openai::OpenAiProvider::new_with_xai_oauth(
+                    &config.api.base_url,
+                    auth,
+                ),
+            )
+        }
+        ApiAuthMode::ApiKey => {
+            let api_key = api_key.expect("api_key is set for ApiAuthMode::ApiKey");
+            match provider_kind {
+                ProviderKind::AzureOpenAi => {
+                    Arc::new(agent_code_lib::llm::azure_openai::AzureOpenAiProvider::new(
                         &config.api.base_url,
                         api_key,
                     ))
                 }
-                WireFormat::OpenAiCompatible => Arc::new(
-                    agent_code_lib::llm::openai::OpenAiProvider::new(&config.api.base_url, api_key),
-                ),
-            },
+                _ => match provider_kind.wire_format() {
+                    WireFormat::Anthropic => {
+                        Arc::new(agent_code_lib::llm::anthropic::AnthropicProvider::new(
+                            &config.api.base_url,
+                            api_key,
+                        ))
+                    }
+                    WireFormat::OpenAiCompatible => {
+                        Arc::new(agent_code_lib::llm::openai::OpenAiProvider::new(
+                            &config.api.base_url,
+                            api_key,
+                        ))
+                    }
+                },
+            }
         }
     };
     tracing::info!(

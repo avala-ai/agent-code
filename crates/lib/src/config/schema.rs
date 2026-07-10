@@ -226,6 +226,8 @@ pub enum ApiAuthMode {
     ApiKey,
     /// Reuse an existing OpenAI Codex ChatGPT login from CODEX_HOME.
     CodexChatgpt,
+    /// SuperGrok / X Premium OAuth via `agent login xai` (no XAI_API_KEY).
+    XaiOauth,
 }
 
 /// API connection settings.
@@ -240,9 +242,10 @@ pub struct ApiConfig {
     pub base_url: String,
     /// Model identifier.
     pub model: String,
-    /// Authentication mode. `api_key` uses the normal provider API key
-    /// path; `codex_chatgpt` reuses an existing Codex ChatGPT login from
-    /// `$CODEX_HOME/auth.json` (or `~/.codex/auth.json`).
+    /// Authentication mode:
+    /// - `api_key` — env/config/CLI API key
+    /// - `codex_chatgpt` — ChatGPT/Codex subscription (`~/.codex/auth.json`)
+    /// - `xai_oauth` — SuperGrok / X Premium OAuth (`~/.config/agent-code/xai_auth.json`)
     pub auth_mode: ApiAuthMode,
     /// Optional cheaper / faster model used by `/fast`. When set, the
     /// `/fast` command toggles `model` and `fast_model` for the
