@@ -446,6 +446,37 @@ mod tests {
             .expect("enter result should include 'Plan file: …'")
     }
 
+    #[tokio::test]
+    async fn exit_plan_emits_plan_proposed_on_event_channel() {
+        // The plan-approval modal is driven by this event. The query loop's
+        // streaming fast-path must hand ExitPlanMode a live event channel
+        // (it is read-only + concurrency-safe, so it never reaches the
+        // Step-8 executor context) — this covers the tool half of that.
+        let (tx, mut rx) = crate::tools::event_sink::tool_event_channel();
+        let mut ctx = test_ctx();
+        ctx.tool_events = Some(tx);
+        let tool = ExitPlanModeTool;
+        let result = tool
+            .call(
+                serde_json::json!({
+                    "plan_path": "test-plan-proposed-event.md",
+                    "plan": "# Plan\n\nConcrete steps with real file paths, long enough \
+                             to clear the short-plan warning threshold for this test."
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        match rx.try_recv() {
+            Ok(crate::tools::event_sink::ToolEvent::PlanProposed { plan_md, path }) => {
+                assert!(plan_md.contains("Concrete steps"), "{plan_md}");
+                assert!(path.is_some(), "jailed plan path should be reported");
+            }
+            other => panic!("expected PlanProposed event, got {other:?}"),
+        }
+    }
+
     #[test]
     fn looks_like_template_detects_placeholders() {
         let template = "# Plan\n\n## Context\n\n(why this change is needed)\n\n\
