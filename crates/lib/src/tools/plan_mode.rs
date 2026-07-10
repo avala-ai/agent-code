@@ -461,7 +461,11 @@ mod tests {
             .unwrap();
         assert!(!exit.is_error);
         assert!(exit.content.contains("Need a writable exit path."));
-        assert!(!exit.content.contains("WARNING: Plan still looks like the template"));
+        assert!(
+            !exit
+                .content
+                .contains("WARNING: Plan still looks like the template")
+        );
     }
 
     #[tokio::test]

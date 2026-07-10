@@ -1137,10 +1137,7 @@ mod coordinator_tests {
 
     #[test]
     fn effective_permissions_read_only_forces_plan_mode() {
-        let def = AgentRegistry::with_defaults()
-            .get("plan")
-            .unwrap()
-            .clone();
+        let def = AgentRegistry::with_defaults().get("plan").unwrap().clone();
         let perms = effective_permissions(&def).expect("plan has include_tools");
         assert_eq!(perms.default_mode, PermissionMode::Plan);
 
