@@ -233,6 +233,25 @@ async fn event_loop(
             app.dirty = true;
         }
 
+        // Apply deferred `/model` (list or set). try_lock so a mid-turn
+        // switch does not block the UI; if the turn holds the mutex we
+        // retry on the next loop iteration.
+        if let Some(action) = app.pending_model.take() {
+            let engine_arc = session.engine();
+            match engine_arc.try_lock() {
+                Ok(mut eng) => {
+                    let current = eng.state().config.api.model.clone();
+                    let base_url = eng.state().config.api.base_url.clone();
+                    app.apply_model_action(action, &current, &base_url, |name| {
+                        eng.state_mut().config.api.model = name;
+                    });
+                }
+                Err(_) => {
+                    app.pending_model = Some(action);
+                }
+            }
+        }
+
         // Start a pending turn if idle.
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()

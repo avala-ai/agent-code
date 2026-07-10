@@ -15,6 +15,56 @@ use super::terminal_caps::TerminalCaps;
 // `app::Modal` / `app::PendingPermission` paths keep working.
 pub use super::modal::{Modal, PendingPermission, PlanReview, QuestionState};
 
+/// Local `/model` action deferred to the run loop (needs the engine lock).
+/// Classic uses an interactive stdin selector; under the alt-screen TUI we
+/// list models in the transcript and accept `/model <id>` to switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingModelAction {
+    /// Show current model + provider catalog in the transcript.
+    Show,
+    /// Set `config.api.model` (and the status-bar badge) to this id.
+    Set(String),
+}
+
+/// Parse `/model` / `/model <id>` from a slash line. Returns `None` if the
+/// input is not a model command.
+pub(crate) fn parse_model_slash(input: &str) -> Option<PendingModelAction> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let rest = trimmed.trim_start_matches('/');
+    let (cmd, args) = match rest.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, Some(a.trim())),
+        None => (rest, None),
+    };
+    if !cmd.eq_ignore_ascii_case("model") {
+        return None;
+    }
+    match args {
+        None | Some("") => Some(PendingModelAction::Show),
+        Some(name) => Some(PendingModelAction::Set(name.to_string())),
+    }
+}
+
+/// Format `/model` catalog lines for the transcript (no stdin selector).
+pub(crate) fn format_model_catalog(current: &str, base_url: &str) -> Vec<String> {
+    let provider =
+        agent_code_lib::llm::provider::detect_provider(current, base_url);
+    let models = agent_code_lib::llm::provider::models_for_provider(provider);
+    let mut lines = vec![format!("Model: {current}")];
+    if models.is_empty() {
+        lines.push("Use /model <name> to change.".into());
+    } else {
+        lines.push("Available models (use /model <id>):".into());
+        for (name, desc) in models {
+            let mark = if *name == current { " ✔" } else { "" };
+            lines.push(format!("  {name}{mark}  — {desc}"));
+        }
+    }
+    lines
+}
+
 /// Expand a user-invocable skill slash (`/commit`, `/review foo`) to its
 /// prompt body. Returns `None` for non-slash input, modern-local commands,
 /// or unknown skill names (those pass through as normal prompts).
@@ -45,6 +95,7 @@ pub(crate) fn try_expand_skill_slash(input: &str, cwd: &str) -> Option<String> {
             | "minimal"
             | "fullscreen"
             | "stats"
+            | "model"
     ) {
         return None;
     }
@@ -166,6 +217,8 @@ pub struct App {
     pub should_quit: bool,
     /// Prompt waiting to be started as a turn by the runtime.
     pub pending_submit: Option<String>,
+    /// `/model` action waiting for the run loop (needs the engine lock).
+    pub pending_model: Option<PendingModelAction>,
     /// Prompts typed mid-turn, sent FIFO when the turn ends (plan §M5).
     pub queue: std::collections::VecDeque<String>,
     /// When true, runtime should cancel the active turn.
@@ -228,6 +281,7 @@ impl App {
             status_message: String::new(),
             should_quit: false,
             pending_submit: None,
+            pending_model: None,
             queue: std::collections::VecDeque::new(),
             cancel_requested: false,
             quit_armed: false,
@@ -493,7 +547,7 @@ impl App {
                 "Keys: Enter send · Shift+Tab mode · Ctrl+C cancel turn (then quit) · \
                  Esc clear prompt · Ctrl+T tasks · permission prompt: y once / a session / n deny · \
                  Skills: /commit /review /test /… (same as classic) · \
-                 /clear /terminal-setup /stats /exit"
+                 /model [id] · /clear /terminal-setup /stats /exit"
                     .into(),
             ));
             self.input.clear();
@@ -532,6 +586,15 @@ impl App {
             self.cursor = 0;
             return;
         }
+        // /model needs the engine lock (run loop applies). Handled even
+        // mid-turn so a switch is not sent to the LLM as a prompt.
+        if let Some(action) = parse_model_slash(&text) {
+            self.pending_model = Some(action);
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
         // Mid-turn: queue the prompt instead of dropping it (plan §M5).
         // Skill expansion happens when the queue head is dispatched so the
         // expanded body is what the engine sees.
@@ -543,6 +606,32 @@ impl App {
             return;
         }
         self.enqueue_turn(text);
+    }
+
+    /// Apply a deferred `/model` action against live engine state.
+    /// Returns `true` if applied (caller should clear `pending_model`).
+    pub fn apply_model_action(
+        &mut self,
+        action: PendingModelAction,
+        current_model: &str,
+        base_url: &str,
+        set_model: impl FnOnce(String),
+    ) {
+        match action {
+            PendingModelAction::Show => {
+                for line in format_model_catalog(current_model, base_url) {
+                    self.transcript.push(TranscriptItem::System(line));
+                }
+            }
+            PendingModelAction::Set(name) => {
+                set_model(name.clone());
+                self.model = name.clone();
+                self.status_message = format!("model → {name}");
+                self.transcript
+                    .push(TranscriptItem::System(format!("Model changed to: {name}")));
+            }
+        }
+        self.dirty = true;
     }
 
     /// Resolve user text into a turn: expand `/skill` invocations the same
@@ -787,7 +876,111 @@ mod tests {
         assert!(try_expand_skill_slash("hello", "/tmp").is_none());
         assert!(try_expand_skill_slash("/help", "/tmp").is_none());
         assert!(try_expand_skill_slash("/clear", "/tmp").is_none());
+        assert!(try_expand_skill_slash("/model", "/tmp").is_none());
+        assert!(try_expand_skill_slash("/model grok-4", "/tmp").is_none());
         assert!(try_expand_skill_slash("/not-a-real-skill-xyz", "/tmp").is_none());
+    }
+
+    #[test]
+    fn parse_model_slash_show_and_set() {
+        assert_eq!(
+            parse_model_slash("/model"),
+            Some(PendingModelAction::Show)
+        );
+        assert_eq!(
+            parse_model_slash("/model  "),
+            Some(PendingModelAction::Show)
+        );
+        assert_eq!(
+            parse_model_slash("/model grok-4.5"),
+            Some(PendingModelAction::Set("grok-4.5".into()))
+        );
+        assert_eq!(
+            parse_model_slash("/MODEL gpt-5.4"),
+            Some(PendingModelAction::Set("gpt-5.4".into()))
+        );
+        assert!(parse_model_slash("/help").is_none());
+        assert!(parse_model_slash("model").is_none());
+        assert!(parse_model_slash("hello").is_none());
+    }
+
+    #[test]
+    fn submit_model_show_sets_pending_not_turn() {
+        let mut app = App::new("grok-4", "/tmp", "s");
+        app.input = "/model".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.pending_model, Some(PendingModelAction::Show));
+        assert!(app.pending_submit.is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn submit_model_set_sets_pending_even_while_streaming() {
+        let mut app = App::new("grok-4", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.input = "/model grok-4.5".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(
+            app.pending_model,
+            Some(PendingModelAction::Set("grok-4.5".into()))
+        );
+        assert!(
+            app.queue.is_empty(),
+            "/model must not be queued as a prompt"
+        );
+        assert!(app.pending_submit.is_none());
+    }
+
+    #[test]
+    fn apply_model_action_set_updates_badge_and_transcript() {
+        let mut app = App::new("old-model", "/tmp", "s");
+        let mut engine_model = "old-model".to_string();
+        app.apply_model_action(
+            PendingModelAction::Set("new-model".into()),
+            "old-model",
+            "",
+            |name| engine_model = name,
+        );
+        assert_eq!(engine_model, "new-model");
+        assert_eq!(app.model, "new-model");
+        assert!(app.pending_model.is_none());
+        match app.transcript.last() {
+            Some(TranscriptItem::System(s)) => assert!(s.contains("new-model")),
+            other => panic!("expected System line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_model_action_show_lists_catalog() {
+        let mut app = App::new("grok-4", "/tmp", "s");
+        let before = app.transcript.len();
+        app.apply_model_action(PendingModelAction::Show, "grok-4", "https://api.x.ai/v1", |_| {});
+        assert!(app.transcript.len() > before);
+        let joined: String = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Model: grok-4"));
+        assert!(
+            joined.contains("/model"),
+            "catalog should mention how to switch"
+        );
+    }
+
+    #[test]
+    fn format_model_catalog_marks_current() {
+        let lines = format_model_catalog("grok-4", "https://api.x.ai/v1");
+        let joined = lines.join("\n");
+        assert!(joined.contains("grok-4 ✔") || joined.contains("Model: grok-4"));
+        assert!(joined.contains("Use /model") || joined.contains("Available models"));
     }
 
     #[test]
