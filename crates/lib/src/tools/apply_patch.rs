@@ -147,6 +147,15 @@ impl Tool for ApplyPatchTool {
                     report.push(format!("updated {}", op.path.display()));
                 }
                 OpKind::Add { content } => {
+                    // Refuse silent overwrite: Update requires a unique old
+                    // block; Add must fail when the target already exists so
+                    // a path typo or stale patch cannot wipe a source file.
+                    if abs.exists() {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "Add File refused: {} already exists (use Update File or Delete first)",
+                            abs.display()
+                        )));
+                    }
                     if let Some(parent) = abs.parent() {
                         tokio::fs::create_dir_all(parent).await.map_err(|e| {
                             ToolError::ExecutionFailed(format!(
@@ -208,6 +217,17 @@ fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+/// Paths referenced by a Begin Patch body (best-effort; empty on parse error).
+///
+/// Used by the query loop to fire per-file `FileChanged` hooks after a
+/// successful `ApplyPatch` (the tool input is a single `patch` string, not
+/// `file_path`).
+pub fn paths_from_patch(patch: &str) -> Vec<PathBuf> {
+    parse_patch(patch)
+        .map(|ops| ops.into_iter().map(|o| o.path).collect())
+        .unwrap_or_default()
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<FileOp>, String> {
@@ -471,31 +491,10 @@ fn join_lines(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::PermissionChecker;
-    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     fn ctx(cwd: PathBuf) -> ToolContext {
-        ToolContext {
-            cwd,
-            cancel: CancellationToken::new(),
-            permission_checker: Arc::new(PermissionChecker::allow_all()),
-            verbose: false,
-            plan_mode: false,
-            file_cache: None,
-            denial_tracker: None,
-            task_manager: None,
-            subagent_colors: None,
-            session_allows: None,
-            permission_prompter: None,
-            question_asker: None,
-            agent_origin: None,
-            sandbox: None,
-            active_disk_output_style: None,
-            agent_limiter: None,
-            tool_events: None,
-            active_call_id: None,
-        }
+        ToolContext::minimal(cwd, CancellationToken::new())
     }
 
     #[test]
@@ -583,5 +582,51 @@ mod tests {
             "alpha\nbeta\n"
         );
         assert!(!del_path.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_patch_refuses_add_over_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+wiped\n*** End Patch\n",
+            path.display()
+        );
+        let tool = ApplyPatchTool;
+        let err = tool
+            .call(json!({ "patch": patch }), &ctx(dir.path().to_path_buf()))
+            .await
+            .expect_err("Add over existing path must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") || msg.contains("Add File refused"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original\n",
+            "existing file must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn paths_from_patch_lists_all_files() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src/a.rs
+@@
+-old
++new
+*** Add File: src/b.rs
++hi
+*** Delete File: src/c.rs
+*** End Patch
+";
+        let paths = paths_from_patch(patch);
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0], PathBuf::from("src/a.rs"));
+        assert_eq!(paths[1], PathBuf::from("src/b.rs"));
+        assert_eq!(paths[2], PathBuf::from("src/c.rs"));
     }
 }

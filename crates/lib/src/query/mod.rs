@@ -1644,15 +1644,19 @@ impl QueryEngine {
                 // FileChanged fires for file-mutating tools as a
                 // consolidated signal so audit / backup / pre-commit
                 // hooks don't have to enumerate every file-editing
-                // tool via PostToolUse filters. Path comes from the
-                // original tool call input's `file_path` field —
-                // every file-mutating tool's schema uses that key.
-                if is_file_mutating_tool(&result.tool_name)
-                    && let Some(path) = extract_file_path(&tool_calls, &result.tool_use_id)
-                {
-                    let _ = self
-                        .fire_file_changed_hooks(&result.tool_name, &path, result.result.is_error)
-                        .await;
+                // tool via PostToolUse filters. Most tools expose
+                // `file_path`; ApplyPatch supplies a multi-file
+                // `patch` string — emit once per affected path.
+                if is_file_mutating_tool(&result.tool_name) {
+                    for path in extract_file_paths(&tool_calls, &result.tool_use_id) {
+                        let _ = self
+                            .fire_file_changed_hooks(
+                                &result.tool_name,
+                                &path,
+                                result.result.is_error,
+                            )
+                            .await;
+                    }
                 }
 
                 let msg = tool_result_message(
@@ -1819,22 +1823,45 @@ fn emit_agent_result_update(sink: &dyn StreamSink, result: &crate::tools::ToolRe
     sink.on_subagent_update(&agent_id, state, &headline);
 }
 
-/// Look up a tool call by its use-id and return the `file_path` input
-/// value if present. Returns None when the id doesn't match or the
-/// input isn't a JSON object with a string `file_path` (shouldn't
-/// happen for file-mutating tools since their input schemas require
-/// it, but be defensive — agents produce garbage sometimes).
+/// Look up a tool call by its use-id and return every path it mutated.
+///
+/// - Standard file tools: single `file_path` input.
+/// - `ApplyPatch`: parse the `patch` body (Begin Patch dialect) and
+///   return every referenced path so multi-file edits still fire
+///   per-path `FileChanged` hooks.
+///
+/// Empty when the id doesn't match or no path can be recovered
+/// (defensive — agents produce garbage sometimes).
+fn extract_file_paths(
+    tool_calls: &[crate::tools::executor::PendingToolCall],
+    use_id: &str,
+) -> Vec<String> {
+    let Some(call) = tool_calls.iter().find(|c| c.id == use_id) else {
+        return Vec::new();
+    };
+    if call.name == "ApplyPatch" {
+        if let Some(patch) = call.input.get("patch").and_then(|v| v.as_str()) {
+            return crate::tools::apply_patch::paths_from_patch(patch)
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+        }
+        return Vec::new();
+    }
+    call.input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
+}
+
+/// Convenience for tests / single-path callers.
+#[cfg(test)]
 fn extract_file_path(
     tool_calls: &[crate::tools::executor::PendingToolCall],
     use_id: &str,
 ) -> Option<String> {
-    tool_calls
-        .iter()
-        .find(|c| c.id == use_id)?
-        .input
-        .get("file_path")?
-        .as_str()
-        .map(str::to_string)
+    extract_file_paths(tool_calls, use_id).into_iter().next()
 }
 
 fn get_fallback_model(current: &str) -> String {
@@ -2252,6 +2279,46 @@ mod tests {
             input: serde_json::json!({"file_path": 42}),
         }];
         assert!(extract_file_path(&calls, "t1").is_none());
+    }
+
+    #[test]
+    fn extract_file_paths_from_apply_patch_lists_all_targets() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src/a.rs
+@@
+-old
++new
+*** Add File: src/b.rs
++hi
+*** Delete File: gone.txt
+*** End Patch
+";
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "ApplyPatch".into(),
+            input: serde_json::json!({ "patch": patch }),
+        }];
+        let paths = extract_file_paths(&calls, "t1");
+        assert_eq!(
+            paths,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "gone.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_file_paths_apply_patch_empty_on_bad_input() {
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "ApplyPatch".into(),
+            input: serde_json::json!({ "patch": "not a patch" }),
+        }];
+        // parse fails → empty (hooks skip rather than crash)
+        assert!(extract_file_paths(&calls, "t1").is_empty());
     }
 
     // ---- last_assistant_text helper (for Stop hook context) ----

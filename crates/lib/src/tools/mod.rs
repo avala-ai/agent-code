@@ -281,6 +281,41 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Minimal context for unit tests (`cwd = "."`, allow-all permissions).
+    ///
+    /// Prefer this (or [`Self::minimal`]) over hand-rolling every optional
+    /// field — the struct grows with engine features and field-list
+    /// construction is a common source of merge noise in tool tests.
+    pub fn for_tests() -> Self {
+        Self::minimal(PathBuf::from("."), CancellationToken::new())
+    }
+
+    /// Build a minimal context with the given cwd and cancel token.
+    ///
+    /// All optional fields are `None` / false; permissions allow everything.
+    pub fn minimal(cwd: PathBuf, cancel: CancellationToken) -> Self {
+        Self {
+            cwd,
+            cancel,
+            permission_checker: Arc::new(PermissionChecker::allow_all()),
+            verbose: false,
+            plan_mode: false,
+            file_cache: None,
+            denial_tracker: None,
+            task_manager: None,
+            subagent_colors: None,
+            session_allows: None,
+            permission_prompter: None,
+            question_asker: None,
+            agent_origin: None,
+            sandbox: None,
+            active_disk_output_style: None,
+            agent_limiter: None,
+            tool_events: None,
+            active_call_id: None,
+        }
+    }
+
     /// Emit progressive tool output when a live event channel is installed.
     pub fn emit_tool_output(&self, chunk: &str) {
         if let (Some(tx), Some(id)) = (&self.tool_events, &self.active_call_id) {

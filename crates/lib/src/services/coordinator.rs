@@ -444,15 +444,22 @@ pub fn effective_permissions(definition: &AgentDefinition) -> Option<Permissions
 
 /// Compose a child permissions overlay onto a host permissions config.
 ///
-/// Overlay wins for `default_mode` and visibility allowlists; host
-/// `rules` are preserved so project-level policy is not wiped when a
-/// typed subagent only restricts tool visibility.
+/// Host **restrictions** always win:
+/// - Rules are ordered host-first so first-match evaluation never lets an
+///   overlay `Allow` shadow a project `Deny` (or other host rule).
+/// - `allowed_tools` is the intersection when both sides set a list; an
+///   overlay cannot re-expose a tool the host omitted from its allowlist.
+/// - `disallowed_tools` is the union (either side can forbid).
+///
+/// Overlay still wins for `default_mode` (typed subagents set Plan/Deny).
 pub fn compose_permissions_overlay(
     host: &PermissionsConfig,
     overlay: &PermissionsConfig,
 ) -> PermissionsConfig {
-    let mut rules = overlay.rules.clone();
-    for r in &host.rules {
+    // Host rules first: PermissionChecker first-match must not let an
+    // overlay Allow(Bash) shadow host Deny(Bash(rm *)).
+    let mut rules = host.rules.clone();
+    for r in &overlay.rules {
         if !rules
             .iter()
             .any(|x| x.tool == r.tool && x.pattern == r.pattern && x.action == r.action)
@@ -460,10 +467,21 @@ pub fn compose_permissions_overlay(
             rules.push(r.clone());
         }
     }
-    let allowed_tools = if !overlay.allowed_tools.is_empty() {
-        overlay.allowed_tools.clone()
-    } else {
-        host.allowed_tools.clone()
+    // Visibility: intersect when both sides restrict; never replace a host
+    // allowlist with a looser overlay list.
+    let allowed_tools = match (
+        host.allowed_tools.is_empty(),
+        overlay.allowed_tools.is_empty(),
+    ) {
+        (false, false) => overlay
+            .allowed_tools
+            .iter()
+            .filter(|t| host.allowed_tools.iter().any(|h| h == *t))
+            .cloned()
+            .collect(),
+        (false, true) => host.allowed_tools.clone(),
+        (true, false) => overlay.allowed_tools.clone(),
+        (true, true) => Vec::new(),
     };
     let mut disallowed_tools = host.disallowed_tools.clone();
     for t in &overlay.disallowed_tools {
@@ -1290,6 +1308,89 @@ mod coordinator_tests {
                 .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
             "host project rules must survive overlay"
         );
+    }
+
+    #[test]
+    fn compose_permissions_overlay_host_deny_beats_overlay_allow() {
+        // First-match: host Deny must appear before overlay Allow so a
+        // project Bash(rm *) rule is never shadowed by include_tools Allow.
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("rm *".into()),
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: None,
+                action: PermissionMode::Allow,
+            }],
+            allowed_tools: vec!["Bash".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        let deny_pos = merged
+            .rules
+            .iter()
+            .position(|r| {
+                r.tool == "Bash"
+                    && r.pattern.as_deref() == Some("rm *")
+                    && r.action == PermissionMode::Deny
+            })
+            .expect("host deny present");
+        let allow_pos = merged
+            .rules
+            .iter()
+            .position(|r| {
+                r.tool == "Bash" && r.pattern.is_none() && r.action == PermissionMode::Allow
+            })
+            .expect("overlay allow present");
+        assert!(
+            deny_pos < allow_pos,
+            "host Deny must precede overlay Allow (first-match)"
+        );
+
+        // End-to-end with PermissionChecker: rm is denied, other bash allowed.
+        let checker = crate::permissions::PermissionChecker::from_config(&merged);
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "rm -rf /tmp/x"})),
+            crate::permissions::PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn compose_permissions_overlay_intersects_allowlists() {
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![],
+            allowed_tools: vec!["Bash".into(), "FileRead".into()],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![],
+            // Tries to drop FileRead and re-add Grep (not on host list).
+            allowed_tools: vec!["FileRead".into(), "Grep".into(), "Bash".into()],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        assert!(merged.allowed_tools.contains(&"Bash".into()));
+        assert!(merged.allowed_tools.contains(&"FileRead".into()));
+        assert!(
+            !merged.allowed_tools.contains(&"Grep".into()),
+            "overlay must not re-expose tools outside the host allowlist"
+        );
+        assert_eq!(merged.allowed_tools.len(), 2);
     }
 
     #[test]
