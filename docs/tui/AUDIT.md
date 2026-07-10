@@ -3,7 +3,8 @@
 **Date:** 2026-07-10  
 **Branch:** `feat/tui-modern-overhaul`  
 **Owner track:** M0 engine surface (handoff from PR #415)  
-**Boundary:** this track owns `crates/lib/**` + `docs/tui/**` (+ design doc fixes). Does **not** edit `crates/cli/src/ui/modern/**`.
+**Boundary:** this track owns `crates/lib/**` + `docs/tui/**` (+ design doc fixes). Does **not** edit `crates/cli/src/ui/modern/**`.  
+**Engine track status (2026-07-10):** **complete** for §3.1/§3.4 UI surface — plan/HITL/subagent/context/tool-output events emit; UI consumes them (M1–M9). Remaining gate is **manual** multi-terminal dogfood ([ACCEPTANCE.md](./ACCEPTANCE.md) / [SUPPORT.md](./SUPPORT.md)) before #396 default flip.
 
 ---
 

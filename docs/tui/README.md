@@ -21,9 +21,15 @@ Epic **#385**. Milestones M0–M10: **#386–#396**. Agent-ready leaves under M0
 
 ## Parallel ownership (PR #415 handoff)
 
-| Track | Paths |
-|---|---|
-| **M0 engine** | `crates/lib/**`, `docs/tui/**` |
-| **M1+ UI** | `crates/cli/src/ui/modern/**` only |
+| Track | Paths | Status |
+|---|---|---|
+| **Engine (M0 + HITL surface)** | `crates/lib/**`, `docs/tui/**` | **Done** — see AUDIT.md |
+| **UI (M1–M10)** | `crates/cli/src/ui/modern/**` | M1–M9 landed; M10 dogfood + default flip |
 
-Shared interface: additive `StreamSink` in `crates/lib/src/query/`.
+Shared interface: additive `StreamSink` / `QuestionAsker` / `PermissionPrompter` in lib.
+
+## Default flip checklist (#396)
+
+1. Fill [SUPPORT.md](./SUPPORT.md) matrix on real terminals  
+2. Green [ACCEPTANCE.md](./ACCEPTANCE.md) product bar  
+3. Only then change default `ui.tui` / auto from classic → modern
