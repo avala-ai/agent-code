@@ -12,7 +12,7 @@
 
 | Plan path | Status | Actual path / notes |
 |---|---|---|
-| `ui/repl.rs` | exists | classic rustyline REPL — opt-in via `--tui classic` |
+| `ui/repl.rs` | removed | classic rustyline REPL deleted; modern is sole interactive UI |
 | `ui/modern/mod.rs` | exists | `crates/cli/src/ui/modern/mod.rs` |
 | `ui/modern/run.rs` | exists | shell loop + prompter install (UI track) |
 | `ui/modern/app.rs` | exists | App + reducers; still `TranscriptItem` not `Block` |
