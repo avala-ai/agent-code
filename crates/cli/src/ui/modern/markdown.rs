@@ -116,9 +116,7 @@ impl Builder {
             s = s.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.link.is_some() {
-            s = s
-                .fg(palette().accent)
-                .add_modifier(Modifier::UNDERLINED);
+            s = s.fg(palette().accent).add_modifier(Modifier::UNDERLINED);
         }
         s
     }

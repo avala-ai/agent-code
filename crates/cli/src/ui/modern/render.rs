@@ -154,9 +154,7 @@ fn draw_question_modal(
         let marker = if selected { "❯" } else { " " };
         let accent = palette().accent;
         let style = if selected {
-            Style::default()
-                .fg(accent)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -184,9 +182,7 @@ fn key_hint_line(text: impl Into<String>) -> Line<'static> {
     let warning = palette().warning;
     Line::from(Span::styled(
         text.into(),
-        Style::default()
-            .fg(warning)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(warning).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -237,17 +233,11 @@ fn draw_modal_box(
             width: inner.width,
             height: 1,
         };
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            body,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
         // Fixed footer: key hints always land on the last inner row.
         frame.render_widget(Paragraph::new(footer_line), foot);
     } else {
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 }
 
@@ -257,9 +247,7 @@ fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let accent = palette().accent;
     let mut spans = vec![Span::styled(
         "⧉ queued: ",
-        Style::default()
-            .fg(accent)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
     for (i, p) in app.queue.iter().enumerate().take(CIRCLED.len()) {
         let mark = CIRCLED[i];
@@ -369,9 +357,7 @@ fn draw_permission_modal(
         accent,
         // Keep ≤ ~40 cols so min-width modals still show every binding
         // (digits 1/2/3 work the same as y/a/n; listed in /help).
-        Some(key_hint_line(
-            "[y] once   [a] session   [n]/[Esc] deny",
-        )),
+        Some(key_hint_line("[y] once   [a] session   [n]/[Esc] deny")),
     );
 }
 
@@ -717,8 +703,8 @@ mod tests {
             .push_back(crate::ui::modern::app::Modal::Permission(
                 PendingPermission {
                     name: "Bash".into(),
-                    description: "Bash: run a long pipeline that wraps across many columns and rows"
-                        .into(),
+                    description:
+                        "Bash: run a long pipeline that wraps across many columns and rows".into(),
                     origin: None,
                     input_preview: Some(preview),
                     respond,
@@ -726,8 +712,14 @@ mod tests {
             ));
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("[y]"), "sticky footer [y] missing under tall body:\n{s}");
-        assert!(s.contains("[n]"), "sticky footer [n] missing under tall body:\n{s}");
+        assert!(
+            s.contains("[y]"),
+            "sticky footer [y] missing under tall body:\n{s}"
+        );
+        assert!(
+            s.contains("[n]"),
+            "sticky footer [n] missing under tall body:\n{s}"
+        );
         assert!(
             s.contains("[Esc]") || s.contains("deny"),
             "deny/Esc hint missing under tall body:\n{s}"

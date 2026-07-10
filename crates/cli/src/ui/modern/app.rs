@@ -49,8 +49,7 @@ pub(crate) fn parse_model_slash(input: &str) -> Option<PendingModelAction> {
 
 /// Format `/model` catalog lines for the transcript (no stdin selector).
 pub(crate) fn format_model_catalog(current: &str, base_url: &str) -> Vec<String> {
-    let provider =
-        agent_code_lib::llm::provider::detect_provider(current, base_url);
+    let provider = agent_code_lib::llm::provider::detect_provider(current, base_url);
     let models = agent_code_lib::llm::provider::models_for_provider(provider);
     let mut lines = vec![format!("Model: {current}")];
     if models.is_empty() {
@@ -99,8 +98,7 @@ pub(crate) fn try_expand_skill_slash(input: &str, cwd: &str) -> Option<String> {
     ) {
         return None;
     }
-    let registry =
-        agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(cwd)));
+    let registry = agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(cwd)));
     let skill = registry.find(cmd)?;
     // Only user-invocable skills are slash-callable (same as classic /help).
     if !skill.metadata.user_invocable {
@@ -903,10 +901,7 @@ mod tests {
 
     #[test]
     fn parse_model_slash_show_and_set() {
-        assert_eq!(
-            parse_model_slash("/model"),
-            Some(PendingModelAction::Show)
-        );
+        assert_eq!(parse_model_slash("/model"), Some(PendingModelAction::Show));
         assert_eq!(
             parse_model_slash("/model  "),
             Some(PendingModelAction::Show)
@@ -1003,7 +998,12 @@ mod tests {
     fn apply_model_action_show_lists_catalog() {
         let mut app = App::new("grok-4", "/tmp", "s");
         let before = app.transcript.len();
-        app.apply_model_action(PendingModelAction::Show, "grok-4", "https://api.x.ai/v1", |_| {});
+        app.apply_model_action(
+            PendingModelAction::Show,
+            "grok-4",
+            "https://api.x.ai/v1",
+            |_| {},
+        );
         assert!(app.transcript.len() > before);
         let joined: String = app
             .transcript

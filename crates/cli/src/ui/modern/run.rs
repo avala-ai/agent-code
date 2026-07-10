@@ -772,7 +772,10 @@ mod tests {
         app.input = "typed while running".into();
         app.cursor = app.input.len();
         handle_key(&mut app, key(KeyCode::Esc));
-        assert!(app.cancel_requested, "Esc cancels a running turn (classic parity)");
+        assert!(
+            app.cancel_requested,
+            "Esc cancels a running turn (classic parity)"
+        );
         assert!(!app.should_quit);
     }
 
