@@ -266,7 +266,7 @@ impl App {
             waiting_on: WaitingOn::Model,
             modals: std::collections::VecDeque::new(),
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Shift+Tab mode · Ctrl+C cancel turn / quit · Esc clear prompt · Enter send".into(),
+                "Modern TUI · Shift+Tab mode · Esc/Ctrl+C cancel turn / quit · Enter send".into(),
             )],
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
@@ -544,8 +544,8 @@ impl App {
         }
         if text == "/help" {
             self.transcript.push(TranscriptItem::System(
-                "Keys: Enter send · Shift+Tab mode · Ctrl+C cancel turn (then quit) · \
-                 Esc clear prompt · Ctrl+T tasks · permission prompt: y once / a session / n deny · \
+                "Keys: Enter send · Shift+Tab mode · Esc/Ctrl+C cancel turn (again to quit) · \
+                 Ctrl+T tasks · permission prompt: y once / a session / n deny · \
                  Skills: /commit /review /test /… (same as classic) · \
                  /model [id] · /clear /terminal-setup /stats /exit"
                     .into(),
@@ -733,7 +733,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// Clear the prompt editor (Esc / Ctrl+C navigation — never cancels a turn).
+    /// Clear the prompt editor (idle interrupt with non-empty input).
     pub fn clear_prompt(&mut self) {
         self.input.clear();
         self.cursor = 0;

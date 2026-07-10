@@ -418,13 +418,14 @@ async fn event_loop(
     Ok(())
 }
 
-/// True for Ctrl+C / Ctrl+Shift+C / Cmd+C (Super) / raw ETX.
+/// True for Esc, Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
 ///
-/// Real terminals often set extra modifier bits (e.g. SHIFT with Ctrl+C) so
-/// exact `KeyModifiers::CONTROL` equality silently drops the key. Classic
-/// REPL uses `.contains(CONTROL)`; modern must do the same.
+/// Classic REPL: "Esc / Ctrl+C cancel". Real terminals often set extra
+/// modifier bits (e.g. SHIFT with Ctrl+C) so exact `KeyModifiers::CONTROL`
+/// equality silently drops the key — use `.contains(CONTROL)` instead.
 fn is_interrupt_chord(key: &KeyEvent) -> bool {
     match key.code {
+        KeyCode::Esc => true,
         // Raw ETX (0x03) — some paths deliver the byte without CONTROL.
         KeyCode::Char('\u{3}') => true,
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => {
@@ -519,7 +520,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     if is_interrupt_chord(&key) {
         if app.phase == super::app::Phase::Streaming {
-            // Ctrl+C is the ONLY cancel (Esc never cancels a turn).
+            // Esc / Ctrl+C cancel the running turn (classic REPL parity).
             app.request_cancel();
             app.transcript.push(super::app::TranscriptItem::System(
                 "interrupted — cancelling turn…".into(),
@@ -530,10 +531,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.should_quit = true;
         } else {
             app.quit_armed = true;
-            app.status_message = "press Ctrl+C again to quit".into();
+            app.status_message = "press Esc/Ctrl+C again to quit".into();
             // Status bar alone is easy to miss — also pin a transcript line.
             app.transcript.push(super::app::TranscriptItem::System(
-                "Ctrl+C again to quit · or type /exit · or Ctrl+D".into(),
+                "Esc or Ctrl+C again to quit · or type /exit · or Ctrl+D".into(),
             ));
         }
         return;
@@ -555,10 +556,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Toggle the tasks/agents pane (plan §M8).
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
-        }
-        (_, KeyCode::Esc) => {
-            // Navigation only: clear the prompt; NEVER cancel a running turn.
-            app.clear_prompt();
         }
         (_, KeyCode::Enter) => {
             app.submit();
@@ -751,15 +748,45 @@ mod tests {
     }
 
     #[test]
-    fn esc_clears_prompt_never_cancels_turn() {
+    fn esc_while_streaming_cancels_turn() {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
         app.input = "typed while running".into();
         app.cursor = app.input.len();
         handle_key(&mut app, key(KeyCode::Esc));
-        assert!(app.input.is_empty(), "Esc clears the prompt");
-        assert!(!app.cancel_requested, "Esc must NEVER cancel a turn");
+        assert!(app.cancel_requested, "Esc cancels a running turn (classic parity)");
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_with_text_clears_prompt() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello".into();
+        app.cursor = 5;
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+        assert!(!app.cancel_requested);
+    }
+
+    #[test]
+    fn esc_double_press_arms_then_quits() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.quit_armed, "first Esc arms");
+        assert!(!app.should_quit);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.should_quit, "second Esc quits");
+    }
+
+    #[test]
+    fn esc_then_ctrl_c_still_quits() {
+        // Mix of interrupt keys shares the same quit arm.
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.quit_armed);
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.should_quit);
     }
 
     fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
