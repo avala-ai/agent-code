@@ -95,6 +95,17 @@ impl WaitingOn {
     }
 }
 
+/// Visual skin (plan §M10). A render config, not a fork — the same block
+/// model renders in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Skin {
+    /// Bordered header + status + framed prompt.
+    #[default]
+    Fullscreen,
+    /// No header, compact borderless prompt — maximizes transcript space.
+    Minimal,
+}
+
 /// High-level UI phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -165,6 +176,11 @@ pub struct App {
     pub show_tasks: bool,
     /// Detected terminal capabilities, set once at loop start (plan §M7).
     pub caps: TerminalCaps,
+    /// Visual skin (plan §M10); toggled with /minimal · /fullscreen.
+    pub skin: Skin,
+    /// Frames actually drawn — instrumentation for /stats and the idle
+    /// zero-frame invariant.
+    pub frame_count: u64,
 
     /// Spinner frame index while streaming.
     pub tick: u64,
@@ -215,6 +231,8 @@ impl App {
             tasks: Vec::new(),
             show_tasks: true,
             caps: TerminalCaps::default(),
+            skin: Skin::Fullscreen,
+            frame_count: 0,
             tick: 0,
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
@@ -593,6 +611,32 @@ impl App {
         }
         if text == "/terminal-setup" {
             self.emit_terminal_setup();
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/minimal" || text == "/fullscreen" {
+            self.skin = if text == "/minimal" {
+                Skin::Minimal
+            } else {
+                Skin::Fullscreen
+            };
+            self.status_message = format!("skin → {text}");
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
+        if text == "/stats" {
+            let (blocks, cached) = self.layout.stats();
+            self.transcript.push(TranscriptItem::System(format!(
+                "stats: {} transcript items · {blocks} layout blocks · {cached} cached lines · \
+                 {} frames drawn · queue {} · tasks {}",
+                self.transcript.len(),
+                self.frame_count,
+                self.queue.len(),
+                self.tasks.len(),
+            )));
             self.input.clear();
             self.cursor = 0;
             return;
@@ -990,6 +1034,38 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         app.delete_newest_queued();
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn skin_slash_commands_toggle() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert_eq!(app.skin, Skin::Fullscreen);
+        app.input = "/minimal".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.skin, Skin::Minimal);
+        assert!(app.pending_submit.is_none(), "skin toggle is not a turn");
+        app.input = "/fullscreen".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.skin, Skin::Fullscreen);
+    }
+
+    #[test]
+    fn stats_command_reports_counts() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.frame_count = 7;
+        app.layout.sync(&app.transcript, 80);
+        app.input = "/stats".into();
+        app.cursor = app.input.len();
+        app.submit();
+        match app.transcript.last() {
+            Some(TranscriptItem::System(t)) => {
+                assert!(t.contains("frames drawn"), "{t}");
+                assert!(t.contains("7 frames"), "{t}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

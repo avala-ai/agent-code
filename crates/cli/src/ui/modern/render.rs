@@ -14,21 +14,29 @@ use super::app::{App, PendingPermission, Phase};
 use super::mode::SessionMode;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.frame_count = app.frame_count.wrapping_add(1);
     let area = frame.area();
+    // Minimal skin (plan §M10) drops the header and the framed prompt for a
+    // compact look — same block model, render config only.
+    let minimal = app.skin == crate::ui::modern::app::Skin::Minimal;
+    let header_h = if minimal { 0 } else { 3 };
+    let prompt_h = if minimal { 1 } else { 3 };
     // A chips row appears above the prompt only when prompts are queued.
     let chips_h = if app.queue.is_empty() { 0 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),       // header
-            Constraint::Min(5),          // transcript
-            Constraint::Length(1),       // status
-            Constraint::Length(chips_h), // queue chips (0 when empty)
-            Constraint::Length(3),       // input
+            Constraint::Length(header_h), // header (0 in minimal)
+            Constraint::Min(5),           // transcript
+            Constraint::Length(1),        // status
+            Constraint::Length(chips_h),  // queue chips (0 when empty)
+            Constraint::Length(prompt_h), // input
         ])
         .split(area);
 
-    draw_header(frame, chunks[0], app);
+    if header_h > 0 {
+        draw_header(frame, chunks[0], app);
+    }
     // Tasks pane (plan §M8): a right split ≥110 wide, else a below-transcript
     // strip; hidden when there are no tasks.
     if app.tasks_visible() {
@@ -508,6 +516,18 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         Color::Cyan
     };
+    let prompt = format!("❯ {}", app.input);
+    // Minimal skin: borderless single-line prompt.
+    if app.skin == crate::ui::modern::app::Skin::Minimal {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                prompt,
+                Style::default().fg(border),
+            ))),
+            area,
+        );
+        return;
+    }
     let title = if app.phase == Phase::Streaming {
         " input (buffered until turn ends) "
     } else {
@@ -517,7 +537,6 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .title(title);
-    let prompt = format!("❯ {}", app.input);
     frame.render_widget(Paragraph::new(prompt).block(block), area);
 }
 
@@ -623,6 +642,20 @@ mod tests {
         assert!(s.contains("permission · Bash"), "buffer:\n{s}");
         assert!(s.contains("allow once"), "buffer:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
+    }
+
+    #[test]
+    fn minimal_skin_drops_header_and_border() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("gpt-5.4", "/home/user/project", "abc12345");
+        app.skin = crate::ui::modern::app::Skin::Minimal;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        // No branding header in minimal.
+        assert!(!s.contains("agent-code"), "header should be hidden:\n{s}");
+        // Prompt still present.
+        assert!(s.contains('❯'), "prompt missing:\n{s}");
     }
 
     #[test]

@@ -108,6 +108,11 @@ impl LayoutCache {
         self.total
     }
 
+    /// (`display block count`, `cached line count`) for the /stats command.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.blocks.len(), self.total)
+    }
+
     /// How many blocks were (re)rendered this width — test hook.
     #[cfg(test)]
     pub fn block_count(&self) -> usize {

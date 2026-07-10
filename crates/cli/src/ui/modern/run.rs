@@ -526,13 +526,13 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     match m.kind {
         MouseEventKind::ScrollUp => app.scroll_up(3),
         MouseEventKind::ScrollDown => app.scroll_down(3),
-        MouseEventKind::Down(MouseButton::Left) => {
-            // Clicking near the bottom of the transcript jumps to the live
-            // tail (the jump pill target). Cheap heuristic without full
-            // hit-testing: bottom row of the transcript region.
-            if !app.scroll.is_following() && m.row as usize >= app.viewport_h {
-                app.scroll_to_bottom();
-            }
+        // Clicking near the bottom of the transcript jumps to the live tail
+        // (the jump pill target). Cheap heuristic without full hit-testing:
+        // bottom row of the transcript region.
+        MouseEventKind::Down(MouseButton::Left)
+            if !app.scroll.is_following() && m.row as usize >= app.viewport_h =>
+        {
+            app.scroll_to_bottom();
         }
         _ => {}
     }
