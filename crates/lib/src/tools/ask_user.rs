@@ -125,7 +125,17 @@ impl Tool for AskUserQuestionTool {
         }
 
         let labels = if let Some(asker) = ctx.question_asker.as_ref() {
-            asker.ask(&questions).map_err(ToolError::ExecutionFailed)?
+            // Blocks until the human answers (same contract as the
+            // permission prompter) — announce it so the runtime hands this
+            // worker's queue and timer driver to a spare thread instead of
+            // starving other tasks. No-op guard on current-thread runtimes
+            // (block_in_place would panic there).
+            let run = || asker.ask(&questions);
+            let answers = match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(run),
+                _ => run(),
+            };
+            answers.map_err(ToolError::ExecutionFailed)?
         } else {
             // Classic REPL / tests: stdin letter choice.
             ask_via_stdin(&questions)?

@@ -236,12 +236,29 @@ async fn execute_single_tool(
                 let input_preview = serde_json::to_string_pretty(&call.input).ok();
 
                 let response = if let Some(ref prompter) = ctx.permission_prompter {
-                    prompter.ask(
-                        &call.name,
-                        &description,
-                        input_preview.as_deref(),
-                        ctx.agent_origin.as_deref(),
-                    )
+                    // `ask` blocks synchronously until the human answers —
+                    // potentially minutes. Announce the block so the runtime
+                    // hands this worker's queue AND the timer driver to a
+                    // spare thread; otherwise a pending ask can starve
+                    // timers/other tasks on small runtimes (few cores), up
+                    // to freezing the UI loop that would answer the modal.
+                    // block_in_place is a no-op choice on current-thread
+                    // runtimes (it would panic), where blocking is the
+                    // caller's contract anyway.
+                    let ask = || {
+                        prompter.ask(
+                            &call.name,
+                            &description,
+                            input_preview.as_deref(),
+                            ctx.agent_origin.as_deref(),
+                        )
+                    };
+                    match tokio::runtime::Handle::current().runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => {
+                            tokio::task::block_in_place(ask)
+                        }
+                        _ => ask(),
+                    }
                 } else {
                     // No prompter = auto-allow (non-interactive mode).
                     super::PermissionResponse::AllowOnce
