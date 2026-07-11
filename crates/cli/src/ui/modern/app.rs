@@ -226,6 +226,17 @@ pub struct App {
     pub pending_submit: Option<String>,
     /// `/model` action waiting for the run loop (needs the engine lock).
     pub pending_model: Option<PendingModelAction>,
+    /// `/clear` also clears the ENGINE conversation; applied by the run
+    /// loop under try_lock (mirrors `pending_model`).
+    pub pending_clear: bool,
+    /// Whether a turn task currently exists (set by the run loop). Lets
+    /// modal resolution decide between returning to Streaming (turn still
+    /// running) and Idle (modal outlived its turn).
+    pub turn_live: bool,
+    /// Absolute screen row of the transcript's bottom line, recorded at the
+    /// last draw (0 = not drawn yet). Mouse hit-testing target for the
+    /// click-to-follow jump pill.
+    pub transcript_bottom_row: u16,
     /// Prompts typed mid-turn, sent FIFO when the turn ends (plan §M5).
     pub queue: std::collections::VecDeque<String>,
     /// When true, runtime should cancel the active turn.
@@ -301,6 +312,9 @@ impl App {
             should_quit: false,
             pending_submit: None,
             pending_model: None,
+            pending_clear: false,
+            turn_live: false,
+            transcript_bottom_row: 0,
             queue: std::collections::VecDeque::new(),
             cancel_requested: false,
             quit_armed: false,
@@ -317,12 +331,13 @@ impl App {
     }
 
     pub fn apply_engine(&mut self, ev: EngineEvent) {
-        // Any state change must repaint.
-        self.dirty = true;
-
         // Text/thinking deltas are coalesced; everything else is a "barrier"
         // event that must flush buffered text first so ordering is preserved
         // (plan §2.2 rule 3: deltas never reorder around tool/turn events).
+        // Deltas do NOT set dirty: buffered text isn't rendered until it is
+        // flushed into the transcript, so repainting per delta drew identical
+        // frames at token rate — paying a full layout resync each time — and
+        // defeated the ≤10 fps coalescer budget. The flush tick sets dirty.
         match ev {
             EngineEvent::Text(t) => {
                 self.stream_buf.push_assistant(&t);
@@ -332,7 +347,11 @@ impl App {
                 self.stream_buf.push_thinking(&t);
                 return;
             }
-            _ => self.flush_stream(),
+            _ => {
+                self.flush_stream();
+                // Any barrier event changes visible state — repaint.
+                self.dirty = true;
+            }
         }
 
         match ev {
@@ -384,7 +403,11 @@ impl App {
                     ..
                 }) = idx.and_then(|i| self.transcript.get_mut(i))
                 {
-                    *result = Some(content.lines().next().unwrap_or("").to_string());
+                    // Keep the FULL result on the card (the renderer clamps
+                    // to a few lines). Keeping only the first line destroyed
+                    // failure output — a failing `cargo test` showed a single
+                    // useless line with no way to see more.
+                    *result = Some(content);
                     *err = is_error;
                 }
                 // Back to waiting on the model once a tool returns.
@@ -397,7 +420,15 @@ impl App {
                 self.status_message = format!("turn {n}");
             }
             EngineEvent::TurnComplete(n) => {
-                self.phase = Phase::Idle;
+                // A pending modal keeps the Permission phase: PlanProposed is
+                // fire-and-forget and typically arrives right before this
+                // event, so flipping to Idle here orphaned the plan-approval
+                // modal (invisible, unanswerable, blocking later modals).
+                self.phase = if self.modals.is_empty() {
+                    Phase::Idle
+                } else {
+                    Phase::Permission
+                };
                 self.turn_count = n;
                 self.status_message = format!("turn {n} done");
             }
@@ -565,6 +596,12 @@ impl App {
     pub fn submit(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
+            // Empty-Enter while idle sends the next queued prompt — after an
+            // aborted turn the UI says "queued prompts kept — press Enter to
+            // send", and this is what makes that true.
+            if self.phase == Phase::Idle {
+                self.dispatch_queue_head();
+            }
             return;
         }
         if text == "/exit" || text == "/quit" {
@@ -575,8 +612,14 @@ impl App {
         }
         if text == "/clear" {
             self.transcript.clear();
+            // Also clear the ENGINE conversation (classic parity): clearing
+            // only the view silently kept paying for the entire prior
+            // context. The run loop applies this under try_lock.
+            self.pending_clear = true;
+            self.ctx_meter = None;
             self.input.clear();
             self.cursor = 0;
+            self.dirty = true;
             return;
         }
         if text == "/help" {
@@ -674,15 +717,32 @@ impl App {
     /// Resolve user text into a turn: expand `/skill` invocations the same
     /// way classic REPL does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
-        let (display, prompt) =
-            match try_expand_skill_slash(&text, &self.cwd, self.disable_skill_shell) {
-                Some(expanded) => {
-                    // Keep the slash visible in the transcript; send the expanded
-                    // skill body to the engine as the real user message.
-                    (text, expanded)
+        let (display, prompt) = match try_expand_skill_slash(
+            &text,
+            &self.cwd,
+            self.disable_skill_shell,
+        ) {
+            Some(expanded) => {
+                // Keep the slash visible in the transcript; send the expanded
+                // skill body to the engine as the real user message.
+                (text, expanded)
+            }
+            None => {
+                // A slash input that is neither a built-in nor a skill is
+                // a typo or a classic-only command — sending it to the
+                // model as a prompt costs a turn and does nothing.
+                if text.starts_with('/') {
+                    self.transcript.push(TranscriptItem::System(format!(
+                            "unknown command {text} — /help lists modern-TUI                              commands (some classic commands are not available                              here yet)"
+                        )));
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.dirty = true;
+                    return;
                 }
-                None => (text.clone(), text),
-            };
+                (text.clone(), text)
+            }
+        };
         self.transcript.push(TranscriptItem::User(display));
         self.input.clear();
         self.cursor = 0;
@@ -817,7 +877,15 @@ impl App {
     pub fn mark_turn_idle(&mut self) {
         // Any text still buffered when the turn ends must land now.
         self.flush_stream();
-        self.phase = Phase::Idle;
+        self.turn_live = false;
+        // Same rule as TurnComplete: a pending modal (plan approval after a
+        // finished plan turn) keeps the Permission phase so it stays visible
+        // and answerable; answering it advances to Idle.
+        self.phase = if self.modals.is_empty() {
+            Phase::Idle
+        } else {
+            Phase::Permission
+        };
         self.cancel_requested = false;
         self.dirty = true;
     }
@@ -1109,16 +1177,110 @@ mod tests {
     }
 
     #[test]
-    fn deltas_dirty_but_do_not_touch_transcript_until_flush() {
+    fn deltas_buffer_without_redraw_until_flush() {
+        // Buffered text isn't rendered until it lands in the transcript, so
+        // a delta must NOT request a repaint — dirty-per-delta drew identical
+        // frames at token rate and defeated the ≤10 fps coalescer budget.
+        // The flush (tick or barrier event) is what repaints.
         let mut app = App::new("m", "/tmp", "s");
         app.dirty = false;
         let before = app.transcript.len();
         app.apply_engine(EngineEvent::Text("x".into()));
-        assert!(app.dirty, "a delta requests a redraw");
+        assert!(!app.dirty, "a buffered delta must not request a redraw");
         assert_eq!(
             app.transcript.len(),
             before,
             "delta is buffered, not applied"
+        );
+        app.flush_stream();
+        assert!(app.dirty, "the flush requests the redraw");
+        assert_eq!(app.transcript.len(), before + 1);
+    }
+
+    #[test]
+    fn plan_modal_survives_turn_complete() {
+        // PlanProposed is fire-and-forget and typically arrives right before
+        // TurnComplete; flipping to Idle used to orphan the modal (invisible,
+        // unanswerable, blocking later modals).
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.apply_engine(EngineEvent::PlanProposed {
+            plan_md: "# plan".into(),
+            path: None,
+        });
+        app.apply_engine(EngineEvent::TurnComplete(1));
+        assert_eq!(app.phase, Phase::Permission, "modal keeps Permission");
+        assert!(app.front_modal().is_some(), "plan modal still answerable");
+        // The turn is gone; approving must land on Idle, not a phantom
+        // Streaming spinner.
+        app.turn_live = false;
+        app.resolve_plan(true, false);
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn empty_enter_dispatches_queue_when_idle() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.queue.push_back("queued one".into());
+        app.input.clear();
+        app.cursor = 0;
+        app.submit();
+        assert_eq!(app.pending_submit.as_deref(), Some("queued one"));
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn unknown_slash_rejected_with_hint_not_sent() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/definitely-not-a-command".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(app.pending_submit.is_none(), "must not become a model turn");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|t| matches!(t, TranscriptItem::System(s) if s.contains("unknown command"))),
+            "hint shown: {:?}",
+            app.transcript
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn clear_requests_engine_conversation_clear() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/clear".into();
+        app.cursor = 6;
+        app.submit();
+        assert!(app.pending_clear, "engine clear deferred to run loop");
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn tool_result_keeps_full_multiline_content() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::ToolStart {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+        });
+        app.apply_engine(EngineEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            content: "error[E0308]: mismatched types\n --> src/main.rs:1\nnote: expected u32"
+                .into(),
+            is_error: true,
+        });
+        let full = app.transcript.iter().find_map(|t| match t {
+            TranscriptItem::Tool {
+                result: Some(r), ..
+            } => Some(r.clone()),
+            _ => None,
+        });
+        let full = full.expect("tool card has a result");
+        assert!(
+            full.contains("note: expected u32"),
+            "full output retained (was first-line-only): {full}"
         );
     }
 
@@ -1468,6 +1630,8 @@ mod tests {
     #[test]
     fn permission_ask_opens_modal_and_resolve_unblocks() {
         let mut app = App::new("m", "/tmp", "s");
+        // These model a MID-TURN modal; the run loop sets this at spawn.
+        app.turn_live = true;
         app.apply_engine(EngineEvent::TurnStart(1));
         let (respond, rx) = std::sync::mpsc::channel();
         app.apply_engine(EngineEvent::PermissionAsk {
@@ -1497,6 +1661,8 @@ mod tests {
     #[test]
     fn plan_proposed_opens_modal_and_approve_switches_mode() {
         let mut app = App::new("m", "/tmp", "s");
+        // These model a MID-TURN modal; the run loop sets this at spawn.
+        app.turn_live = true;
         app.mode = SessionMode::Plan;
         app.apply_engine(EngineEvent::TurnStart(1));
         app.apply_engine(EngineEvent::PlanProposed {
@@ -1515,6 +1681,8 @@ mod tests {
     fn question_flow_collects_one_label_per_question() {
         use super::super::sink::UiQuestion;
         let mut app = App::new("m", "/tmp", "s");
+        // These model a MID-TURN modal; the run loop sets this at spawn.
+        app.turn_live = true;
         app.apply_engine(EngineEvent::TurnStart(1));
         let (respond, rx) = std::sync::mpsc::channel();
         app.apply_engine(EngineEvent::QuestionAsk {
@@ -1556,6 +1724,8 @@ mod tests {
     #[test]
     fn concurrent_permission_asks_queue_fifo() {
         let mut app = App::new("m", "/tmp", "s");
+        // These model a MID-TURN modal; the run loop sets this at spawn.
+        app.turn_live = true;
         app.apply_engine(EngineEvent::TurnStart(1));
         let (r1, rx1) = std::sync::mpsc::channel();
         let (r2, rx2) = std::sync::mpsc::channel();
