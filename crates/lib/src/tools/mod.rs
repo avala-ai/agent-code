@@ -129,10 +129,16 @@ pub trait Tool: Send + Sync {
         checker: &PermissionChecker,
     ) -> PermissionDecision {
         if self.is_read_only() {
-            // Reads are allowed, but honor a read scope when one is set
-            // (confined workers such as the AMR scan map phase). With no
-            // scope this returns Allow, so the interactive agent is
-            // unaffected.
+            // Reads default to Allow, but an explicit Deny rule must still
+            // block them — `check_read` consults exactly those rules (a
+            // configured `{tool: "FileRead", pattern: "*.secret", Deny}`
+            // was previously ignored because only the scope check ran).
+            if let PermissionDecision::Deny(reason) = checker.check_read(self.name(), input) {
+                return PermissionDecision::Deny(reason);
+            }
+            // Then honor a read scope when one is set (confined workers
+            // such as the AMR scan map phase). With no scope this returns
+            // Allow, so the interactive agent is unaffected.
             checker.check_read_scope(self.name(), input)
         } else {
             checker.check(self.name(), input)
@@ -393,5 +399,65 @@ impl<T: Tool + ?Sized> From<&T> for ToolSchema {
             description: tool.description(),
             input_schema: tool.input_schema(),
         }
+    }
+}
+
+#[cfg(test)]
+mod default_check_tests {
+    use super::*;
+    use crate::config::{PermissionMode, PermissionRule, PermissionsConfig};
+
+    struct ReadOnlyProbe;
+
+    #[async_trait]
+    impl Tool for ReadOnlyProbe {
+        fn name(&self) -> &'static str {
+            "FileRead"
+        }
+        fn description(&self) -> &'static str {
+            "test read-only tool"
+        }
+        fn prompt(&self) -> String {
+            String::new()
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            Ok(ToolResult::success(String::new()))
+        }
+    }
+
+    /// The DEFAULT read-only permission path must honor explicit Deny
+    /// rules — it used to run only the read-scope check, making
+    /// `{tool: "FileRead", pattern: "*.secret", Deny}` dead config.
+    #[tokio::test]
+    async fn default_read_only_check_honors_explicit_deny_rule() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Allow,
+            rules: vec![PermissionRule {
+                tool: "FileRead".into(),
+                pattern: Some("*.secret".into()),
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+        let denied = ReadOnlyProbe
+            .check_permissions(&serde_json::json!({"file_path": "keys.secret"}), &checker)
+            .await;
+        assert!(matches!(denied, PermissionDecision::Deny(_)));
+
+        let allowed = ReadOnlyProbe
+            .check_permissions(&serde_json::json!({"file_path": "src/lib.rs"}), &checker)
+            .await;
+        assert!(matches!(allowed, PermissionDecision::Allow));
     }
 }

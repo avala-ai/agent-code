@@ -111,6 +111,19 @@ impl Tool for ApplyPatchTool {
                     }
                 }
             }
+            // Deny-parity with the single-file edit tools: rules match tool
+            // names exactly, so a user rule like `{tool: "FileEdit",
+            // pattern: "*.env", Deny}` would otherwise not block the same
+            // edit routed through a patch. Only the Deny outcome is
+            // borrowed — FileEdit's Ask/Allow may come from mode defaults
+            // and must not override an explicit ApplyPatch Allow rule.
+            for edit_tool in ["FileEdit", "FileWrite"] {
+                if let PermissionDecision::Deny(reason) = checker.check(edit_tool, &synthetic) {
+                    return PermissionDecision::Deny(format!(
+                        "{reason} (via {edit_tool} rule parity)"
+                    ));
+                }
+            }
         }
         if let Some(prompt) = any_ask {
             PermissionDecision::Ask(prompt)
@@ -465,7 +478,16 @@ fn apply_hunks(before: &str, hunks: &[Hunk]) -> Result<String, String> {
             content.push_str(&new_block);
             continue;
         }
-        let matches: Vec<_> = content.match_indices(&old_block).collect();
+        // Only accept matches anchored at a line start. A raw substring
+        // match can land mid-line (e.g. hunk `let x = 1;` inside
+        // `    let x = 1;`), splicing the replacement after the leading
+        // indentation and silently corrupting the line — and mid-line hits
+        // also inflated the ambiguity count below.
+        let matches: Vec<usize> = content
+            .match_indices(&old_block)
+            .map(|(idx, _)| idx)
+            .filter(|&idx| idx == 0 || content.as_bytes()[idx - 1] == b'\n')
+            .collect();
         if matches.is_empty() {
             return Err(format!(
                 "hunk {} old block not found ({} lines). Re-read the file and retry.",
@@ -480,7 +502,7 @@ fn apply_hunks(before: &str, hunks: &[Hunk]) -> Result<String, String> {
                 matches.len()
             ));
         }
-        let (idx, _) = matches[0];
+        let idx = matches[0];
         content.replace_range(idx..idx + old_block.len(), &new_block);
     }
 
@@ -549,6 +571,34 @@ mod tests {
         let after = apply_hunks(before, &hunks).unwrap();
         assert!(after.contains("println!(\"new\")"));
         assert!(!after.contains("println!(\"old\")"));
+    }
+
+    #[test]
+    fn apply_hunk_rejects_mid_line_substring_match() {
+        // The old block appears only as a SUFFIX of an indented line. A raw
+        // substring match would splice the replacement after the leading
+        // spaces, silently corrupting the line — it must report not-found.
+        let before = "    let x = 1;\n";
+        let hunks = vec![Hunk {
+            old_lines: vec!["let x = 1;".into()],
+            new_lines: vec!["let x = 2;".into()],
+        }];
+        let err = apply_hunks(before, &hunks).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_hunk_ambiguity_ignores_mid_line_hits() {
+        // One line-anchored occurrence + one mid-line occurrence: only the
+        // anchored one counts, so the hunk applies instead of erroring
+        // "matched 2 times".
+        let before = "b = a();\na();\n";
+        let hunks = vec![Hunk {
+            old_lines: vec!["a();".into()],
+            new_lines: vec!["c();".into()],
+        }];
+        let after = apply_hunks(before, &hunks).unwrap();
+        assert_eq!(after, "b = a();\nc();\n");
     }
 
     #[tokio::test]

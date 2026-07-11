@@ -340,6 +340,18 @@ fn ensure_path_under_plan_dir(path: &Path) -> Result<PathBuf, ToolError> {
 }
 
 fn active_plan_pointer() -> PathBuf {
+    // Keyed per-process so concurrent sessions (each its own `agent`
+    // process, incl. subagents) don't clobber each other's active plan —
+    // with the shared `.active-plan` name, session B's EnterPlanMode
+    // redirected session A's ExitPlanMode. Full session-id plumbing
+    // through ToolContext is the eventual fix; pid covers every
+    // process-per-session path today.
+    plan_dir().join(format!(".active-plan-{}", std::process::id()))
+}
+
+/// Legacy shared pointer name (pre-per-process); still read as a fallback
+/// so a session resumed in a new process can find its plan.
+fn legacy_plan_pointer() -> PathBuf {
     plan_dir().join(".active-plan")
 }
 
@@ -349,7 +361,9 @@ fn set_active_plan_path(path: &Path) -> std::io::Result<()> {
 }
 
 fn active_plan_path() -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(active_plan_pointer()).ok()?;
+    let raw = std::fs::read_to_string(active_plan_pointer())
+        .or_else(|_| std::fs::read_to_string(legacy_plan_pointer()))
+        .ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         None
@@ -359,6 +373,12 @@ fn active_plan_path() -> Option<PathBuf> {
 }
 
 fn clear_active_plan_path() -> std::io::Result<()> {
+    // Remove the legacy pointer too so a stale shared file can't shadow
+    // future fallback reads.
+    let legacy = legacy_plan_pointer();
+    if legacy.exists() {
+        let _ = std::fs::remove_file(legacy);
+    }
     let ptr = active_plan_pointer();
     if ptr.exists() {
         std::fs::remove_file(ptr)?;

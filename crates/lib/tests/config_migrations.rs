@@ -417,6 +417,15 @@ fn backup_rotation_does_not_run_when_atomic_write_fails() {
     readonly.set_mode(0o555);
     fs::set_permissions(tmp.path(), readonly).unwrap();
 
+    // Root (and some sandboxes) bypass directory write bits, so the
+    // failure this test depends on never happens — probe and skip
+    // instead of failing on such runners.
+    if fs::write(tmp.path().join(".probe"), b"x").is_ok() {
+        fs::set_permissions(tmp.path(), dir_perms_before).unwrap();
+        eprintln!("skipping: read-only dir not enforced (running as root?)");
+        return;
+    }
+
     let res = load_and_migrate_toml(&path);
 
     // Restore directory perms so the TempDir cleanup (and subsequent
