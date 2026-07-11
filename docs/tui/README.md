@@ -34,3 +34,31 @@ Shared interface: additive `StreamSink` / `QuestionAsker` / `PermissionPrompter`
 1. Fill [SUPPORT.md](./SUPPORT.md) matrix on real terminals  
 2. Green [ACCEPTANCE.md](./ACCEPTANCE.md) product bar  
 3. Default is modern; classic remains opt-in via `--tui classic`
+
+## fake_engine test harness (#406)
+
+`crates/cli/src/ui/modern/fake_engine.rs` drives the **real**
+`run::event_loop` in integration tests — do not test the loop by poking
+`App` reducers alone when the behavior spans the loop (turn reaping,
+modal FIFO, queue auto-send, mid-turn mode).
+
+How it works (all under `#[tokio::test(start_paused = true)]`, hermetic):
+
+- **Fake the provider, not the loop.** `ScriptedProvider` plays a
+  per-turn script of raw `StreamEvent`s with virtual-time delays; every
+  real layer above it runs: `QueryEngine`, tool execution, permission
+  prompter → modal → response, `ChannelSink`, coalescer, `event_loop`.
+- **Scripted terminal.** `ScriptedTerm::play(vec![(at, Event)…])` feeds
+  crossterm events at virtual offsets; closing the script quits the loop
+  (same as production EOF).
+- **TestBackend frames.** `run_script(harness, script)` renders to a
+  ratatui `TestBackend` and returns the final `App` + frame count.
+- **Mid-turn assertions.** `Harness` exposes the engine's lock-free
+  handles (`live_plan`, `permissions`) so tests can assert engine state
+  *while the turn still holds the engine mutex* (see
+  `shift_tab_mid_turn_applies_live_mode`).
+
+Start from an existing test: `end_to_end_prompt_streams_and_completes`
+is the minimal template; `permission_modal_allow_once_runs_tool` shows
+the HITL round-trip; `ctrl_c_cancels_streaming_turn_quickly` shows the
+virtual-time latency-bound pattern.

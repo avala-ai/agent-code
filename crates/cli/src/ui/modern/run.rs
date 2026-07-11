@@ -72,16 +72,19 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
     let caps = probe_caps();
+    app.caps = caps;
 
     let mut terminal = setup_terminal()?;
+    let mut term_events = EventStream::new();
+    let mut draw = |app: &mut App| draw_frame(&mut terminal, app, caps);
     let result = event_loop(
-        &mut terminal,
         &session,
         &mut app,
         eng_tx,
         eng_rx,
         base_permission_mode,
-        caps,
+        &mut term_events,
+        &mut draw,
     )
     .await;
     restore_terminal(&mut terminal)?;
@@ -193,19 +196,23 @@ fn draw_frame(terminal: &mut Term, app: &mut App, caps: TerminalCaps) -> anyhow:
     Ok(())
 }
 
+/// Core select! loop, decoupled from the real terminal so the fake_engine
+/// harness (#406) can drive it: `term_events` is any stream of crossterm
+/// events (the real `EventStream` in production, a scripted channel in
+/// tests) and `draw` renders a frame (real alt-screen terminal in
+/// production, `TestBackend` in tests). Engine/session wiring is always
+/// real — tests fake the *provider*, not the loop.
 #[allow(clippy::too_many_arguments)]
-async fn event_loop(
-    terminal: &mut Term,
+pub(super) async fn event_loop(
     session: &Session,
     app: &mut App,
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     base_permission_mode: PermissionMode,
-    caps: TerminalCaps,
+    term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
+    draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    app.caps = caps;
     let mut turn: Option<TurnHandle> = None;
-    let mut term_events = EventStream::new();
 
     // Spinner animation (~12 fps) and coalescer flush deadline (~10 fps).
     // Both are only *polled* while a turn is live / text is buffered, so an
@@ -331,6 +338,14 @@ async fn event_loop(
                 // finish; on abort/error keep the queue and tell the user.
                 if completed_ok {
                     app.dispatch_queue_head();
+                    // Start the dispatched head NOW. The spawn check lives at
+                    // the top of the loop; falling through to `select!` here
+                    // parks the loop, and the queued prompt would sit
+                    // unstarted until an unrelated input event arrives
+                    // (caught by the fake_engine queue test).
+                    if app.pending_submit.is_some() {
+                        continue;
+                    }
                 } else if !app.queue.is_empty() {
                     app.transcript.push(super::app::TranscriptItem::System(
                         "queued prompts kept — press Enter to send".into(),
@@ -343,7 +358,7 @@ async fn event_loop(
         // and no pending deltas never repaints (plan §2.2 rule 1). The draw
         // is wrapped in a synchronized update when the terminal supports it.
         if app.dirty {
-            draw_frame(terminal, app, caps)?;
+            draw(app)?;
             app.dirty = false;
         }
 

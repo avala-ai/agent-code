@@ -15,6 +15,7 @@ dependencies = [
  "agent-code-lib",
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "axum",
  "chrono",
  "clap",

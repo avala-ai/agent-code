@@ -6,6 +6,8 @@
 
 mod app;
 mod colors;
+#[cfg(test)]
+mod fake_engine;
 mod layout;
 mod markdown;
 mod modal;
