@@ -90,12 +90,17 @@ pub async fn execute_tool_calls(
                 i += 1;
             }
             Some(tool) => {
-                if tool.is_concurrency_safe() {
-                    // Collect consecutive concurrency-safe calls.
+                // Parallel batching requires read-only IN ADDITION TO
+                // concurrency-safe: the spawned context has no task manager
+                // or sandbox, and a mutating tool must never slip past the
+                // serial path's full accounting. (SendMessage/TaskStop are
+                // concurrency-safe but mutate — they take the serial path.)
+                if tool.is_concurrency_safe() && tool.is_read_only() {
+                    // Collect consecutive concurrency-safe, read-only calls.
                     let batch_start = i;
                     while i < calls.len() {
                         let t = tools.iter().find(|t| t.name() == calls[i].name);
-                        if t.is_some_and(|t| t.is_concurrency_safe()) {
+                        if t.is_some_and(|t| t.is_concurrency_safe() && t.is_read_only()) {
                             i += 1;
                         } else {
                             break;
@@ -120,7 +125,16 @@ pub async fn execute_tool_calls(
 
                         let ctx_plan_mode = ctx.plan_mode;
                         let ctx_file_cache = ctx.file_cache.clone();
-                        // Read-only tools still go through permission checks.
+                        // Read-only tools still go through permission checks —
+                        // with the SAME prompter/allow-store/denial-tracker as
+                        // the serial path, so an `Ask` decision prompts the
+                        // user instead of silently auto-allowing, session
+                        // allows apply, and denials reach the audit hooks.
+                        let ctx_prompter = ctx.permission_prompter.clone();
+                        let ctx_allows = ctx.session_allows.clone();
+                        let ctx_denials = ctx.denial_tracker.clone();
+                        let ctx_events = ctx.tool_events.clone();
+                        let ctx_origin = ctx.agent_origin.clone();
                         handles.push(tokio::spawn(async move {
                             execute_single_tool(
                                 &call,
@@ -132,20 +146,19 @@ pub async fn execute_tool_calls(
                                     verbose: ctx_verbose,
                                     plan_mode: ctx_plan_mode,
                                     file_cache: ctx_file_cache,
-                                    denial_tracker: None,
+                                    denial_tracker: ctx_denials,
                                     task_manager: None,
                                     subagent_colors: None,
-                                    session_allows: None,
-                                    permission_prompter: None,
+                                    session_allows: ctx_allows,
+                                    permission_prompter: ctx_prompter,
                                     question_asker: None,
-                                    agent_origin: None,
-                                    // Parallel branch only runs read-only, concurrency-safe
-                                    // tools — none of them spawn subprocesses, so the
-                                    // sandbox would be inert here anyway.
+                                    agent_origin: ctx_origin,
+                                    // Read-only tools spawn no subprocesses, so
+                                    // the sandbox would be inert here anyway.
                                     sandbox: None,
                                     active_disk_output_style: None,
                                     agent_limiter: None,
-                                    tool_events: None,
+                                    tool_events: ctx_events,
                                     active_call_id: None,
                                 },
                                 &perm_checker,
@@ -360,12 +373,16 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
             .unwrap_or("")
             .to_string(),
         _ => {
+            // Hash the FULL canonical JSON. Truncating to a prefix let two
+            // different inputs sharing a 256-char prefix collide — an
+            // AllowSession grant for one large ApplyPatch/MCP input silently
+            // covered a different one. Length + hash makes collisions
+            // practically impossible within a session (keys never persist).
+            use std::hash::{Hash, Hasher};
             let s = serde_json::to_string(input).unwrap_or_default();
-            if s.len() > 256 {
-                s.chars().take(256).collect()
-            } else {
-                s
-            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut h);
+            format!("len{}:h{:016x}", s.len(), h.finish())
         }
     };
     format!("{tool}\0{shape}")
@@ -384,5 +401,143 @@ mod session_allow_tests {
             a,
             session_allow_key("Bash", &serde_json::json!({"command": "ls"}))
         );
+    }
+
+    #[test]
+    fn session_allow_key_fallback_distinguishes_shared_prefixes() {
+        // The pre-hash fallback truncated canonical JSON at 256 chars, so
+        // two different inputs sharing a long prefix produced the SAME key
+        // — an AllowSession grant for one covered the other.
+        let prefix = "x".repeat(300);
+        let a = session_allow_key(
+            "ApplyPatch",
+            &serde_json::json!({"patch": format!("{prefix}-variant-a")}),
+        );
+        let b = session_allow_key(
+            "ApplyPatch",
+            &serde_json::json!({"patch": format!("{prefix}-variant-b")}),
+        );
+        assert_ne!(a, b, "distinct inputs must have distinct allow keys");
+        // Still deterministic for identical input.
+        assert_eq!(
+            a,
+            session_allow_key(
+                "ApplyPatch",
+                &serde_json::json!({"patch": format!("{prefix}-variant-a")}),
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod parallel_batch_tests {
+    use super::*;
+    use crate::permissions::PermissionDecision;
+    use crate::tools::{PermissionPrompter, PermissionResponse, Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Concurrency-safe but NOT read-only — the SendMessage/TaskStop shape.
+    struct MutSafeTool {
+        ran: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for MutSafeTool {
+        fn name(&self) -> &'static str {
+            "MutSafe"
+        }
+        fn description(&self) -> &'static str {
+            "test tool"
+        }
+        fn prompt(&self) -> String {
+            String::new()
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            true
+        }
+        async fn check_permissions(
+            &self,
+            _input: &serde_json::Value,
+            _checker: &crate::permissions::PermissionChecker,
+        ) -> PermissionDecision {
+            PermissionDecision::Ask("mutating test tool".into())
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("ok".to_string()))
+        }
+    }
+
+    struct DenyPrompter {
+        asked: Arc<AtomicUsize>,
+    }
+    impl PermissionPrompter for DenyPrompter {
+        fn ask(
+            &self,
+            _tool_name: &str,
+            _description: &str,
+            _input_preview: Option<&str>,
+            _origin: Option<&str>,
+        ) -> PermissionResponse {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            PermissionResponse::Deny
+        }
+    }
+
+    /// A mutating concurrency-safe tool must NOT ride the parallel branch
+    /// into a stripped context where `Ask` auto-allows: its Ask decision
+    /// has to reach the prompter, and a Deny has to block the call.
+    #[tokio::test]
+    async fn mutating_concurrency_safe_tool_ask_reaches_prompter() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MutSafeTool { ran: ran.clone() })];
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.permission_prompter = Some(Arc::new(DenyPrompter {
+            asked: asked.clone(),
+        }));
+
+        let calls = vec![
+            PendingToolCall {
+                id: "c1".into(),
+                name: "MutSafe".into(),
+                input: serde_json::json!({}),
+            },
+            PendingToolCall {
+                id: "c2".into(),
+                name: "MutSafe".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+        let checker = crate::permissions::PermissionChecker::allow_all();
+        let results = execute_tool_calls(&calls, &tools, &ctx, &checker).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "every Ask must reach the prompter (parallel branch used to \
+             strip it and auto-allow)"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "denied tool must not run");
+        for r in &results {
+            assert!(r.result.is_error, "denied call returns an error result");
+        }
     }
 }

@@ -1047,7 +1047,20 @@ impl QueryEngine {
                                 // "Retrying" — otherwise a persistent 402/429/500
                                 // is invisible even at RUST_LOG=debug.
                                 warn!("LLM call failed ({e}); retrying in {}ms", after.as_millis());
-                                tokio::time::sleep(after).await;
+                                // Backoff can reach 60s — racing the cancel
+                                // token keeps Ctrl+C responsive during it
+                                // (previously the sleep ran to completion and
+                                // the turn then errored on a dead token).
+                                tokio::select! {
+                                    _ = tokio::time::sleep(after) => {}
+                                    _ = self.cancel.cancelled() => {
+                                        warn!("Turn cancelled during retry backoff");
+                                        sink.on_warning("Cancelled");
+                                        sink.on_turn_outcome(turn + 1, "cancelled");
+                                        self.state.is_query_active = false;
+                                        return Ok(());
+                                    }
+                                }
                                 continue 'acquire;
                             }
                             crate::llm::retry::RetryAction::FallbackModel => {
@@ -1079,7 +1092,16 @@ impl QueryEngine {
                                     // bound, so a persistently-down provider still
                                     // terminates instead of hanging.
                                     warn!("Unattended retry: waiting 30s for capacity");
-                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                                        _ = self.cancel.cancelled() => {
+                                            warn!("Turn cancelled during capacity wait");
+                                            sink.on_warning("Cancelled");
+                                            sink.on_turn_outcome(turn + 1, "cancelled");
+                                            self.state.is_query_active = false;
+                                            return Ok(());
+                                        }
+                                    }
                                     continue 'turn;
                                 }
                                 // Before giving up, try reactive compact for size
@@ -1126,6 +1148,11 @@ impl QueryEngine {
                                 let _ = self
                                     .fire_error_hooks("llm_call_failed", &e.to_string())
                                     .await;
+                                // The documented "error" outcome — without it
+                                // a UI listening on on_turn_outcome never
+                                // learns the turn died (only on_error fires,
+                                // which mid-turn recovery also uses).
+                                sink.on_turn_outcome(turn + 1, "error");
                                 return Err(crate::error::Error::Other(e.to_string()));
                             }
                         }
@@ -1257,9 +1284,17 @@ impl QueryEngine {
                     _ = self.cancel.cancelled() => {
                         warn!("Turn cancelled by user");
                         cancelled = true;
-                        // Abort any in-flight streaming tool handles.
-                        for (_, _, handle) in streaming_tool_handles.drain(..) {
+                        // Abort any in-flight streaming tool handles — and
+                        // resolve their UI cards. `on_tool_call_start` already
+                        // fired for these ids; without a matching result the
+                        // cards spin forever.
+                        for (id, name, handle) in streaming_tool_handles.drain(..) {
                             handle.abort();
+                            sink.on_tool_call_result(
+                                &id,
+                                &name,
+                                &crate::tools::ToolResult::error("(cancelled)".to_string()),
+                            );
                         }
                         break;
                     }
@@ -1267,6 +1302,12 @@ impl QueryEngine {
             }
 
             if cancelled {
+                // Deliver events fast-path tools emitted before the cancel
+                // (plan-proposed, output chunks) — the Step-8 drain below is
+                // unreachable on this exit.
+                while let Ok(evt) = tool_event_rx.try_recv() {
+                    forward_tool_event(sink, evt);
+                }
                 sink.on_warning("Cancelled");
                 sink.on_turn_outcome(turn + 1, "cancelled");
                 self.state.is_query_active = false;
@@ -1547,6 +1588,15 @@ impl QueryEngine {
             // sees disallowed inputs.
             for call in &tool_calls {
                 if vetoed_ids.contains(&call.id) {
+                    continue;
+                }
+                // Streaming fast-path tools have ALREADY executed and hold a
+                // result in `streaming_results`. Running the hook here could
+                // not prevent execution (the veto would be a lie), and
+                // pushing a synthetic veto result would give the model two
+                // tool_results for one tool_use_id — the next API call is
+                // rejected. Skip them.
+                if streaming_ids.contains(&call.id) {
                     continue;
                 }
                 let hook_results = self
