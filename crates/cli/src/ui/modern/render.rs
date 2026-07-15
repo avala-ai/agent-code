@@ -98,6 +98,76 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             }
         }
     }
+
+    if app.command_palette_open() {
+        draw_command_palette(frame, area, app);
+    }
+}
+
+fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let matches = app.palette_matches();
+    let selected = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.selected)
+        .unwrap_or(0);
+    let query = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.query.as_str())
+        .unwrap_or("");
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("/{}", query),
+        Style::default()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    const MAX_ROWS: usize = 12;
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching commands",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let start = selected.saturating_sub(MAX_ROWS.saturating_sub(1).min(selected));
+        let end = (start + MAX_ROWS).min(matches.len());
+        for (i, (name, desc)) in matches.iter().enumerate().take(end).skip(start) {
+            let is_sel = i == selected;
+            let marker = if is_sel { "❯" } else { " " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} /{name}  "), style),
+                Span::styled((*desc).to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if matches.len() > MAX_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} total", matches.len()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    draw_modal_box(
+        frame,
+        area,
+        lines,
+        " commands ",
+        palette().accent,
+        Some(key_hint_line(
+            "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
+        )),
+    );
 }
 
 /// Plan-approval modal: renders the plan markdown with approve/keep/dismiss.

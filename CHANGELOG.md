@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Modern TUI agent-screen parity** — multiline composer, prompt history, fold/expand, queue pane, interject (Ctrl+Enter), full slash-command bridge with Tab complete and stdout capture, `!` shell passthrough, y/Y block copy, shared clipboard (native → tmux → OSC 52), and setup hero polish.
+- **Ctrl+P command palette** — filterable slash-command picker in the modern TUI (Enter fills `/cmd `).
 
 ### Removed
 

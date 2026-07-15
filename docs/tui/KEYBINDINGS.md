@@ -13,6 +13,7 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+C` (also `Ctrl+Shift+C`, `Cmd+C`) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit |
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
+| `Ctrl+P` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
 
@@ -79,11 +80,12 @@ Compact chips still show above the composer when the pane is closed.
 
 ## Slash commands
 
-### Slash commands (full classic bridge)
+### Slash commands
 
-**Every** built-in from classic REPL is available: type `/` + name, **Tab** to complete.
-Output is captured into the transcript (alt-screen safe). `CommandResult::Prompt`
-commands inject a model turn (e.g. `/diff`, `/review`).
+**Every** built-in is available: type `/` + name, **Tab** to complete, or **Ctrl+P**
+for the filterable command palette. Output is captured into the transcript
+(alt-screen safe). `CommandResult::Prompt` commands inject a model turn
+(e.g. `/diff`, `/review`).
 
 Fast-path locals (no engine lock): `/help` `/clear` `/copy` `/cost` `/usage`
 `/version` `/status` `/plan` `/theme` `/permissions` `/queue` `/tasks` `/model`

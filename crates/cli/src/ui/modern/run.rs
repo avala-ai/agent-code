@@ -649,6 +649,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Command palette captures input when open (not during HITL modals).
+    if app.command_palette_open() {
+        handle_palette_key(app, key);
+        return;
+    }
+
     // Permission modal captures all input until answered.
     // Esc = dismiss only. Ctrl+C = dismiss + cancel turn ("get me out").
     if app.phase == super::app::Phase::Permission {
@@ -800,6 +806,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Toggle the tasks/agents pane (plan §M8).
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
+        }
+        // Command palette (Ctrl+P).
+        (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
+            app.open_command_palette();
         }
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
@@ -959,6 +969,33 @@ fn handle_paste(app: &mut App, text: &str) {
 
 /// Route a mouse event (plan §M9). Wheel scrolls the transcript; a left
 /// click on the bottom row (where the jump pill sits) returns to Follow.
+fn handle_palette_key(app: &mut App, key: KeyEvent) {
+    // Ctrl+P toggles closed; Esc / Ctrl+C dismiss.
+    if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.close_command_palette();
+        return;
+    }
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.close_command_palette();
+        return;
+    }
+    match key.code {
+        KeyCode::Up => app.palette_move(-1),
+        KeyCode::Down => app.palette_move(1),
+        KeyCode::Enter | KeyCode::Tab => app.palette_accept(),
+        KeyCode::Backspace => app.palette_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.palette_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
 /// Shift/Alt-modified drags are left to the terminal's native selection.
 fn handle_mouse(app: &mut App, m: MouseEvent) {
     match m.kind {
@@ -1113,6 +1150,19 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.quit_armed);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_p_opens_and_accepts_command_palette() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('p'));
+        assert!(app.command_palette_open());
+        for c in "hel".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.command_palette_open());
+        assert!(app.input.starts_with("/help"));
     }
 
     #[test]
