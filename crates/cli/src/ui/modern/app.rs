@@ -520,12 +520,16 @@ impl App {
                     input_preview,
                     respond,
                 }));
+                // HITL always wins: drop the Ctrl+P palette so keys reach
+                // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
+                self.command_palette = None;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
             EngineEvent::PlanProposed { plan_md, path } => {
                 self.modals
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
+                self.command_palette = None;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -540,6 +544,7 @@ impl App {
                         answers: Vec::new(),
                         respond,
                     }));
+                    self.command_palette = None;
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
                 }

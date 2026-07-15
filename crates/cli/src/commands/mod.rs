@@ -633,18 +633,32 @@ pub fn is_builtin_command(name: &str) -> bool {
     })
 }
 
-/// Tab-completion candidates for a partial slash command (name only).
+/// Tab-completion candidates for a partial slash command (**name/alias
+/// prefix only** — not description substrings).
 pub fn complete_slash(partial: &str) -> Vec<&'static str> {
-    list_slash_for_palette(partial)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
+    let partial = partial.trim().trim_start_matches('/').to_ascii_lowercase();
+    let mut out: Vec<&'static str> = COMMANDS
+        .iter()
+        .filter(|c| !c.hidden)
+        .filter(|c| {
+            partial.is_empty()
+                || c.name.starts_with(&partial)
+                || c.aliases.iter().any(|a| a.starts_with(partial.as_str()))
+        })
+        .map(|c| c.name)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
-/// Slash-command entries for the Ctrl+P palette / Tab complete.
+/// Slash-command entries for the Ctrl+P palette.
 ///
-/// Matches on command name (prefix) or description (substring). Hidden
-/// commands are omitted. Sorted by name.
+/// Matches on command name (prefix), alias (prefix), or description
+/// (substring). Hidden commands are omitted. Sorted by name.
+///
+/// Description matching is **palette-only** — Tab complete uses
+/// [`complete_slash`] so `/hel` still resolves to `/help`.
 pub fn list_slash_for_palette(query: &str) -> Vec<(&'static str, &'static str)> {
     let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
     let mut out: Vec<(&'static str, &'static str)> = COMMANDS
@@ -682,6 +696,10 @@ mod slash_lookup_tests {
     fn complete_slash_prefix() {
         let c = complete_slash("hel");
         assert!(c.contains(&"help"));
+        assert!(
+            c.iter().all(|n| n.starts_with("hel")),
+            "Tab candidates must be name prefixes of 'hel', got {c:?}"
+        );
         let empty = complete_slash("");
         assert!(empty.len() > 10);
     }
@@ -696,6 +714,12 @@ mod slash_lookup_tests {
                 .iter()
                 .any(|(n, _)| *n == "clear" || *n == "compact"),
             "description substring should match: {by_desc:?}"
+        );
+        // Tab path stays name-only even when description would match.
+        let tab = complete_slash("conversation");
+        assert!(
+            tab.is_empty() || tab.iter().all(|n| n.starts_with("conversation")),
+            "Tab must not use description match: {tab:?}"
         );
     }
 }

@@ -99,7 +99,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    if app.command_palette_open() {
+    // Palette never draws over HITL (permission / plan / question).
+    if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
     }
 }

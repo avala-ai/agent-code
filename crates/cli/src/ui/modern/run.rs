@@ -649,7 +649,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Command palette captures input when open (not during HITL modals).
+    // HITL modals always win over the command palette. A permission ask
+    // can arrive while the palette is open (streaming turn); dismiss the
+    // palette so y/a/n, Esc, and Ctrl+C reach the modal.
+    if app.phase == super::app::Phase::Permission {
+        app.close_command_palette();
+    }
+
+    // Command palette captures input when open (and no HITL modal is up).
     if app.command_palette_open() {
         handle_palette_key(app, key);
         return;
@@ -1163,6 +1170,29 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.command_palette_open());
         assert!(app.input.starts_with("/help"));
+    }
+
+    #[test]
+    fn permission_phase_closes_palette_and_takes_keys() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('p'));
+        assert!(app.command_palette_open());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        // y must reach the modal, not the palette filter.
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(!app.command_palette_open());
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
     }
 
     #[test]
