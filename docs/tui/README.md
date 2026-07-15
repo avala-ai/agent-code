@@ -8,6 +8,7 @@ Classic rustyline REPL remains available via `--tui classic` / `ui.tui = "classi
 | [AUDIT.md](./AUDIT.md) | M0 reality map: modules, StreamSink gaps, version stance |
 | [SUPPORT.md](./SUPPORT.md) | Terminal support matrix (filled in M10) |
 | [ACCEPTANCE.md](./ACCEPTANCE.md) | Appendix C product-bar checklist (filled in M10) |
+| [KEYBINDINGS.md](./KEYBINDINGS.md) | Modern TUI keybindings reference |
 
 ## Design sources (repo)
 

@@ -213,6 +213,7 @@ pub(super) async fn event_loop(
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut turn: Option<TurnHandle> = None;
+    let mut loop_err: Option<anyhow::Error> = None;
 
     // Spinner animation (~12 fps) and coalescer flush deadline (~10 fps).
     // Both are only *polled* while a turn is live / text is buffered, so an
@@ -260,6 +261,18 @@ pub(super) async fn event_loop(
             }
         }
 
+        // Apply a deferred `/clear` to the engine conversation (classic
+        // parity). try_lock like `/model`: if a turn holds the mutex we
+        // retry next iteration (the live atomic state is unaffected).
+        if app.pending_clear
+            && let Ok(mut eng) = session.engine().try_lock()
+        {
+            eng.state_mut().messages.clear();
+            app.pending_clear = false;
+            app.status_message = "context cleared".into();
+            app.dirty = true;
+        }
+
         // Start a pending turn if idle.
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
@@ -267,6 +280,7 @@ pub(super) async fn event_loop(
             let sink = ChannelSink::new(eng_tx.clone());
             let handle = session.spawn_turn(prompt, sink).await;
             turn = Some(handle);
+            app.turn_live = true;
             app.phase = super::app::Phase::Streaming;
             app.dirty = true;
         }
@@ -321,8 +335,16 @@ pub(super) async fn event_loop(
                                     super::mode::SessionMode::Normal
                                 };
                                 last_mode = app.mode;
-                                eng.state_mut().config.permissions.default_mode =
+                                // Apply to the LIVE handles (plan atomic +
+                                // checker default), not just the config copy:
+                                // after a model-initiated ExitPlanMode the
+                                // checker default stayed Plan, so every
+                                // subsequent edit was denied while the badge
+                                // said NORMAL.
+                                let hint =
                                     app.mode.permission_hint().unwrap_or(base_permission_mode);
+                                session.apply_live_mode(engine_plan, hint);
+                                eng.state_mut().config.permissions.default_mode = hint;
                                 app.transcript
                                     .push(super::app::TranscriptItem::System(format!(
                                         "mode synced from engine → {}",
@@ -358,7 +380,15 @@ pub(super) async fn event_loop(
         // and no pending deltas never repaints (plan §2.2 rule 1). The draw
         // is wrapped in a synchronized update when the terminal supports it.
         if app.dirty {
-            draw(app)?;
+            if let Err(e) = draw(app) {
+                // Do NOT early-return: the teardown below must still deny
+                // pending modals and join the turn. Returning here left a
+                // turn task blocked in the prompter holding the engine
+                // mutex, and run_modern_tui's SessionStop lock then hung
+                // the process forever after the terminal was restored.
+                loop_err = Some(e);
+                break;
+            }
             app.dirty = false;
         }
 
@@ -440,7 +470,10 @@ pub(super) async fn event_loop(
         let _ = h.join().await;
     }
 
-    Ok(())
+    match loop_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// True for Esc, Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
@@ -529,7 +562,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.request_cancel();
                 }
                 (_, KeyCode::Char(c)) if c.is_ascii_digit() && c != '0' => {
-                    app.question_select(Some((c as usize - '1' as usize).min(8)));
+                    // Out-of-range digits are ignored by question_select.
+                    app.question_select(Some(c as usize - '1' as usize));
                 }
                 _ => {}
             },
@@ -631,8 +665,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         // (the jump pill target). Cheap heuristic without full hit-testing:
         // bottom row of the transcript region.
         MouseEventKind::Down(MouseButton::Left)
-            if !app.scroll.is_following() && m.row as usize >= app.viewport_h =>
+            if !app.scroll.is_following()
+                && app.transcript_bottom_row != 0
+                && m.row == app.transcript_bottom_row =>
         {
+            // Exactly the transcript's bottom screen row (recorded at last
+            // draw) — comparing against viewport_h (a HEIGHT) made any click
+            // on the lower half of the screen, including the input box,
+            // silently snap the transcript to bottom.
             app.scroll_to_bottom();
         }
         _ => {}
@@ -884,9 +924,17 @@ mod tests {
         }
         app.layout.sync(&app.transcript, 80);
         app.viewport_h = 20;
+        app.transcript_bottom_row = 22;
         app.scroll_up(30);
         assert!(!app.scroll.is_following());
-        // Click on the bottom row (row >= viewport_h) → follow.
+        // A click anywhere BELOW the transcript (status bar, input box) must
+        // NOT snap the viewport — that lost the user's reading position.
+        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 25));
+        assert!(
+            !app.scroll.is_following(),
+            "click on input box must not jump"
+        );
+        // Exactly the transcript's bottom row (the jump-pill target) follows.
         handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 22));
         assert!(app.scroll.is_following(), "click at bottom follows");
     }

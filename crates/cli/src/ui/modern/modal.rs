@@ -78,8 +78,18 @@ impl App {
     /// queue is now empty.
     fn advance_modal_phase(&mut self) {
         if self.modals.is_empty() && self.phase == Phase::Permission {
-            self.phase = Phase::Streaming;
-            self.waiting_on = WaitingOn::Model;
+            if self.turn_live {
+                self.phase = Phase::Streaming;
+                self.waiting_on = WaitingOn::Model;
+            } else {
+                // The modal outlived its turn (plan approval arrives right
+                // before TurnComplete). Returning to Streaming here would
+                // show a spinner forever with nothing running.
+                self.phase = Phase::Idle;
+                self.waiting_on = WaitingOn::Model;
+                // A prompt queued behind the modal can start now.
+                self.dispatch_queue_head();
+            }
         }
         self.dirty = true;
     }
@@ -154,7 +164,14 @@ impl App {
             if opts.is_empty() {
                 return;
             }
-            let pick = index.unwrap_or(q.cursor).min(opts.len() - 1);
+            // Ignore an out-of-range digit instead of clamping: pressing
+            // `9` on a 3-option question used to pick option 3 and
+            // auto-advance with no undo.
+            let pick = match index {
+                Some(i) if i >= opts.len() => return,
+                Some(i) => i,
+                None => q.cursor.min(opts.len() - 1),
+            };
             q.answers.push(opts[pick].clone());
             q.current += 1;
             q.cursor = 0;

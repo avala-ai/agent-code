@@ -239,18 +239,35 @@ fn render_tool_card(
         Span::styled("· ", Style::default().fg(Color::DarkGray)),
         Span::styled(detail.to_string(), Style::default().fg(Color::Gray)),
     ])];
-    // Errors keep their output visible; successes show a dim one-line summary.
+    // Errors keep more of their output visible; successes stay compact.
+    // The card holds the FULL result (spill/expand is the M4.2 follow-up);
+    // the renderer clamps to a head so a huge output can't flood the
+    // transcript, with an elision count so truncation is never silent.
     if let Some(r) = result
         && !r.is_empty()
     {
-        lines.push(Line::from(Span::styled(
-            format!("   ↳ {r}"),
-            Style::default().fg(if is_error {
-                Color::Red
-            } else {
-                Color::DarkGray
-            }),
-        )));
+        let color = if is_error {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+        let head = if is_error { 5 } else { 1 };
+        let total = r.lines().count();
+        for (i, line) in r.lines().take(head).enumerate() {
+            let prefix = if i == 0 { "   ↳ " } else { "     " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{line}"),
+                Style::default().fg(color),
+            )));
+        }
+        if total > head {
+            lines.push(Line::from(Span::styled(
+                format!("     … +{} more lines", total - head),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
     }
     lines
 }

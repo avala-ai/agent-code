@@ -407,6 +407,8 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // scroll-key handlers that run before the next draw.
     app.layout.sync(&app.transcript, inner.width);
     app.viewport_h = height;
+    // Record the bottom screen row for mouse hit-testing (jump pill).
+    app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
     let total = app.layout.total_lines();
     let top = app.scroll.top(total, height);
     let view = app.layout.viewport(top, height);
@@ -466,7 +468,19 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let tokens = app.tokens_in + app.tokens_out;
-    let mut spans = vec![
+    let mut spans = Vec::new();
+    // The mode badge must be visible in EVERY state (product bar). The
+    // minimal skin hides the header that normally carries it, so show it
+    // in the status bar there — permission behavior differs radically
+    // between Manual/AcceptEdits/Plan and must never be invisible.
+    if matches!(app.skin, super::app::Skin::Minimal) {
+        spans.push(Span::styled(
+            format!(" {} ", app.mode.short_badge()),
+            mode_style(app.mode),
+        ));
+        spans.push(Span::raw("│"));
+    }
+    spans.extend([
         Span::styled(
             format!(" turn {} ", app.turn_count),
             Style::default().fg(Color::DarkGray),
@@ -482,7 +496,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("│"),
-    ];
+    ]);
 
     // Context meter: yellow ≥70%, red ≥90% (plan §M1/§6).
     if let Some((used, max)) = app.ctx_meter
