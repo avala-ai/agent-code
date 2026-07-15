@@ -1,9 +1,9 @@
 //! First-run setup wizard.
 //!
-//! Guides new users through initial configuration with arrow-key
-//! navigable menus: theme, API provider, permission mode, and
-//! a brief safety overview. Runs automatically on first launch
-//! or when no API key is configured.
+//! First-run setup wizard: hero welcome, numbered steps with progress,
+//! provider/subscription sign-in, permissions, safety notes, modern TUI
+//! defaults, and a post-setup tips screen. Runs when no config exists
+//! (or when the CLI re-invokes setup for a missing API key).
 
 use std::io::Write;
 
@@ -11,6 +11,9 @@ use agent_code_lib::config::atomic::atomic_write_secret;
 use crossterm::style::Stylize;
 
 use super::selector::{SelectOption, select};
+
+/// Total interactive steps shown in the progress rail.
+const TOTAL_STEPS: u8 = 4;
 
 /// Check if the setup wizard should run.
 pub fn needs_setup() -> bool {
@@ -21,15 +24,148 @@ pub fn needs_setup() -> bool {
     }
 }
 
+fn print_hero() {
+    let version = env!("CARGO_PKG_VERSION");
+    println!();
+    println!(
+        "  {}",
+        "╭──────────────────────────────────────────────────────────╮".dark_cyan()
+    );
+    println!(
+        "  {}  {}{}{}  {}",
+        "│".dark_cyan(),
+        "agent-code".white().bold(),
+        "  v".dark_grey(),
+        version.dark_grey(),
+        "                               │".dark_cyan()
+    );
+    println!(
+        "  {}  {}  {}",
+        "│".dark_cyan(),
+        "Open-source AI coding agent · multi-provider · MIT".dark_grey(),
+        " │".dark_cyan()
+    );
+    println!(
+        "  {}",
+        "╰──────────────────────────────────────────────────────────╯".dark_cyan()
+    );
+    println!();
+    println!(
+        "  {} fullscreen TUI · headless · ACP · no default telemetry",
+        "▸".dark_cyan()
+    );
+    println!();
+    println!(
+        "  {}  {}  {}  {}",
+        "1 Appearance".white().bold(),
+        "→".dark_grey(),
+        "2 Sign-in".dark_grey(),
+        "→ 3 Permissions → 4 Safety".dark_grey()
+    );
+    println!();
+    println!(
+        "  {}  ↑/↓ move · Enter select · Esc keeps highlight",
+        "Keys".dark_grey()
+    );
+    println!();
+}
+
+fn print_step(step: u8, title: &str) {
+    let bar: String = (1..=TOTAL_STEPS)
+        .map(|i| if i <= step { "●" } else { "○" })
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!();
+    println!(
+        "  {}  {}  {}",
+        format!("{step}/{TOTAL_STEPS}").dark_cyan().bold(),
+        bar.dark_cyan(),
+        title.white().bold()
+    );
+    println!();
+}
+
+fn print_ready_tips(result: &SetupResult) {
+    println!();
+    println!(
+        "  {}",
+        "╭──────────────────────────────────────────────────────────╮".green()
+    );
+    println!(
+        "  {}  {}{}",
+        "│".green(),
+        "You're ready.".green().bold(),
+        "                                         │".green()
+    );
+    println!(
+        "  {}",
+        "╰──────────────────────────────────────────────────────────╯".green()
+    );
+    println!();
+    println!("  {} Modern TUI (default)", "▸".dark_cyan());
+    println!(
+        "    {}  send          {}  newline",
+        "Enter".white().bold(),
+        "Alt+Enter".white().bold()
+    );
+    println!(
+        "    {}  cycle modes   {}  cancel turn",
+        "Shift+Tab".white().bold(),
+        "Ctrl+C".white().bold()
+    );
+    println!(
+        "    {}  never cancels {}  interject / send-now",
+        "Esc".white().bold(),
+        "Ctrl+Enter".white().bold()
+    );
+    println!(
+        "    {}  queue pane    {}  tasks pane",
+        "Ctrl+;".white().bold(),
+        "Ctrl+T".white().bold()
+    );
+    println!();
+    println!("  {} Sign-in", "▸".dark_cyan());
+    match result.auth_mode.as_str() {
+        "codex_chatgpt" => println!("    ChatGPT / Codex subscription (browser)"),
+        "xai_oauth" => println!("    SuperGrok / X Premium (device code)"),
+        _ => {
+            if !result.api_key.is_empty() && result.api_key != "ollama" {
+                println!("    API key stored in config (owner-only perms)");
+            } else if result.provider == "ollama" {
+                println!("    Ollama local — no API key");
+            } else {
+                println!("    Provider: {}", result.provider);
+            }
+        }
+    }
+    println!(
+        "    model={} · permissions={}",
+        result.model.as_deref().unwrap_or("default"),
+        result.permission_mode
+    );
+    println!();
+    println!(
+        "  {}  {}{}{}",
+        "Tip".dark_grey(),
+        "docs/tui/KEYBINDINGS.md".dark_grey(),
+        " · ".dark_grey(),
+        "/help inside the TUI".dark_grey()
+    );
+    println!();
+    println!(
+        "  {} Launch:  {}",
+        "→".green().bold(),
+        "agent".white().bold()
+    );
+    println!();
+}
+
 /// Run the interactive setup wizard.
 pub fn run_setup() -> Option<SetupResult> {
-    println!();
-    println!("{}", " agent-code setup ".on_dark_cyan().white().bold());
-    println!();
-    println!("Use arrow keys to navigate, Enter to select.\n");
+    print_hero();
 
     // Step 1: Theme.
-    println!("  {} Appearance:\n", "1.".dark_cyan().bold());
+    print_step(1, "Appearance");
     let theme = select(&[
         SelectOption {
             label: "Midnight".into(),
@@ -109,7 +245,7 @@ pub fn run_setup() -> Option<SetupResult> {
     // Step 2: Provider / auth method.
     // Subscription OAuth sits first so new users with a ChatGPT plan
     // don't have to know about API keys (or `agent login`).
-    println!("  {} AI provider / sign-in:\n", "2.".dark_cyan().bold());
+    print_step(2, "Sign-in / provider");
     let provider_choice = select(&[
         SelectOption {
             label: "ChatGPT / Codex subscription".into(),
@@ -193,11 +329,10 @@ pub fn run_setup() -> Option<SetupResult> {
 
     // ---- Subscription OAuth paths (ChatGPT / SuperGrok) ----
     if provider_choice == "codex_subscription" || provider_choice == "xai_subscription" {
-        println!();
-        println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
+        print_step(3, "Permission mode");
         let permission_mode = select_permission_mode();
-        println!();
-        print_safety_notes(4);
+        print_step(4, "Safety");
+        print_safety_notes();
 
         let result = if provider_choice == "codex_subscription" {
             println!(
@@ -264,17 +399,7 @@ pub fn run_setup() -> Option<SetupResult> {
         };
         println!();
         write_config(&result);
-        let label = if result.auth_mode == "xai_oauth" {
-            "SuperGrok / X Premium"
-        } else {
-            "ChatGPT subscription"
-        };
-        println!(
-            "  {} Configured for {label}. Type {} to start.",
-            "Ready!".green().bold(),
-            "agent".bold(),
-        );
-        println!();
+        print_ready_tips(&result);
         return Some(result);
     }
 
@@ -507,12 +632,12 @@ pub fn run_setup() -> Option<SetupResult> {
     };
 
     // Step 3: Permission mode.
-    println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
+    print_step(3, "Permission mode");
     let permission_mode = select_permission_mode();
-    println!();
 
     // Step 4: Safety notes.
-    print_safety_notes(4);
+    print_step(4, "Safety");
+    print_safety_notes();
 
     let result = SetupResult {
         api_key,
@@ -524,13 +649,7 @@ pub fn run_setup() -> Option<SetupResult> {
         permission_mode,
     };
     write_config(&result);
-
-    println!(
-        "  {} Type {} to start.",
-        "Ready!".green().bold(),
-        "agent".bold(),
-    );
-    println!();
+    print_ready_tips(&result);
 
     Some(result)
 }
@@ -611,6 +730,9 @@ pub fn write_config(result: &SetupResult) {
                 "{}",
                 format!("  Config saved to {}", config_path.display()).dark_grey()
             );
+            // Setup already chose a theme — skip the separate first-run
+            // onboarding theme picker on the next launch.
+            super::onboarding::mark_onboarded();
         }
         Err(e) => {
             println!(
@@ -661,29 +783,36 @@ fn select_permission_mode() -> String {
     ])
 }
 
-fn print_safety_notes(step: u8) {
+fn print_safety_notes() {
     println!(
-        "  {} Quick safety notes:\n",
-        format!("{step}.").dark_cyan().bold()
-    );
-    println!(
-        "    {} The agent can read, write, and delete files",
+        "    {} Can read, write, and delete project files",
         "•".dark_grey()
     );
     println!(
-        "    {} It can run shell commands on your machine",
+        "    {} Can run shell commands on this machine",
         "•".dark_grey()
     );
     println!(
-        "    {} Destructive commands trigger warnings",
+        "    {} Destructive patterns warn; .git / node_modules writes blocked",
         "•".dark_grey()
     );
     println!(
-        "    {} Use /plan mode for read-only exploration",
+        "    {} Shift+Tab → Plan for read-only exploration",
         "•".dark_grey()
     );
-    println!("    {} No telemetry is collected", "•".dark_grey());
+    println!(
+        "    {} No product telemetry by default (opt-in only)",
+        "•".dark_grey()
+    );
     println!();
+    println!("  {}  Press Enter to continue…", "→".dark_cyan());
+    // Brief pause so the user reads the notes (Enter or any key via select of one option).
+    let _ = select(&[SelectOption {
+        label: "I understand — finish setup".into(),
+        description: String::new(),
+        value: "ok".into(),
+        preview: None,
+    }]);
 }
 
 /// Run the ChatGPT/Codex browser OAuth flow on a dedicated runtime thread.
@@ -824,6 +953,10 @@ mod tests {
         assert_eq!(doc["api"]["model"].as_str(), Some("gpt-5.4"));
         assert_eq!(doc["permissions"]["default_mode"].as_str(), Some("ask"));
         assert_eq!(doc["ui"]["theme"].as_str(), Some("midnight"));
+        assert!(
+            doc["ui"].get("tui").is_none(),
+            "tui kind is no longer configurable — modern is the only interactive surface"
+        );
     }
 
     #[test]

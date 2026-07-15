@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "agent-code",
+  "name": "Agent Code",
   "colors": {
     "primary": "#0D9373",
     "light": "#07C983",
@@ -43,7 +43,13 @@
     "groups": [
       {
         "group": "Getting Started",
-        "pages": ["overview", "quickstart", "installation"]
+        "pages": [
+          "overview",
+          "installation",
+          "quickstart",
+          "authentication",
+          "keyboard-shortcuts"
+        ]
       },
       {
         "group": "Tutorials",
@@ -60,9 +66,14 @@
           "concepts/agent-loop",
           "concepts/tools",
           "concepts/permissions",
+          "plan-mode",
           "concepts/memory",
           "concepts/sessions"
         ]
+      },
+      {
+        "group": "Using Agent Code",
+        "pages": ["headless", "sandbox", "terminal-support"]
       },
       {
         "group": "Configuration",

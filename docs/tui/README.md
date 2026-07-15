@@ -1,7 +1,6 @@
 # agent-code modern TUI
 
-Docs for the fullscreen pager track (default interactive UI; `ui.tui = "modern"`).
-Classic rustyline REPL remains available via `--tui classic` / `ui.tui = "classic"`.
+Docs for the fullscreen interactive TUI (the only interactive surface).
 
 | Doc | Purpose |
 |---|---|
@@ -9,13 +8,13 @@ Classic rustyline REPL remains available via `--tui classic` / `ui.tui = "classi
 | [SUPPORT.md](./SUPPORT.md) | Terminal support matrix (filled in M10) |
 | [ACCEPTANCE.md](./ACCEPTANCE.md) | Appendix C product-bar checklist (filled in M10) |
 | [KEYBINDINGS.md](./KEYBINDINGS.md) | Modern TUI keybindings reference |
+| [../design/tui-world-class-parity.md](../design/tui-world-class-parity.md) | Parity-or-better bar + execution waves (T0–T5, engine follow-ons) |
 
 ## Design sources (repo)
 
 - `docs/design/tui-modern-plan-of-attack.md` — execution plan  
 - `docs/design/tui-modern-overhaul.md` — design sketch  
-- `docs/design/harness-comparison-2026-07.md` — anonymized peer matrix  
-- `docs/design/reference-pager-binary-forensics.md` — public-binary architecture notes  
+- `docs/design/tui-world-class-parity.md` — product bar + waves  
 
 ## Issue tree
 
@@ -34,7 +33,7 @@ Shared interface: additive `StreamSink` / `QuestionAsker` / `PermissionPrompter`
 
 1. Fill [SUPPORT.md](./SUPPORT.md) matrix on real terminals  
 2. Green [ACCEPTANCE.md](./ACCEPTANCE.md) product bar  
-3. Default is modern; classic remains opt-in via `--tui classic`
+3. Interactive path is modern-only (classic rustyline REPL removed)
 
 ## fake_engine test harness (#406)
 

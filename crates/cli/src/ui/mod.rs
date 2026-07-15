@@ -1,20 +1,13 @@
 //! Terminal UI layer.
 //!
-//! Two interactive surfaces:
-//! - **modern** (default) — full-screen alt-screen ratatui pager (`modern`)
-//! - **classic** — line-oriented rustyline REPL (`repl`)
-//!
-//! Select with `--tui classic|modern`, `AGENT_CODE_TUI`, or `[ui] tui`.
+//! Interactive sessions always use the full-screen modern TUI (`modern`).
+//! Headless (`-p`), HTTP (`--serve`), and ACP remain separate entry points.
 
-pub mod activity;
 pub mod color_emit;
 pub mod keybindings;
-pub mod keymap;
 pub mod modern;
 pub mod onboarding;
-pub mod prompt;
 pub mod render;
-pub mod repl;
 pub mod selector;
 pub mod setup;
 pub mod terminal_query;

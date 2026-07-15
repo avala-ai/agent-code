@@ -12,7 +12,7 @@
 
 | Plan path | Status | Actual path / notes |
 |---|---|---|
-| `ui/repl.rs` | exists | classic rustyline REPL — opt-in via `--tui classic` |
+| `ui/repl.rs` | **removed** | classic rustyline REPL deleted; modern-only interactive |
 | `ui/modern/mod.rs` | exists | `crates/cli/src/ui/modern/mod.rs` |
 | `ui/modern/run.rs` | exists | shell loop + prompter install (UI track) |
 | `ui/modern/app.rs` | exists | App + reducers; still `TranscriptItem` not `Block` |
@@ -29,7 +29,7 @@
 | `spill.rs` / `theme.rs` | to create | UI track (M4 / M1) |
 | `render/{transcript,statusbar,prompt,toolcard,modal,tasks}.rs` | to create | requires `render.rs` → `render/` split (UI) |
 
-**Naming stance:** keep shipped `SessionMode` / `--tui` / `ui.tui` / `AGENT_CODE_TUI` until product decides rename; plan §9’s `--ui` spelling is aspirational (flag in epic #385).
+**Naming stance:** interactive path is modern-only (`--tui` / `ui.tui` / `AGENT_CODE_TUI` removed). Keep shipped `SessionMode` name; plan §9’s `--ui` spelling remains aspirational (flag in epic #385).
 
 ---
 
@@ -156,6 +156,6 @@ No existing `StreamSink` / `Session` method signatures were removed; only additi
 Do not edit:
 
 - `crates/cli/src/ui/modern/**`
-- Classic REPL behavior beyond what shared lib APIs require
+- Historical classic REPL behavior beyond what shared lib APIs require
 
 When `StreamSink` grows methods, keep defaults so modern `ChannelSink` compiles until UI migrates.

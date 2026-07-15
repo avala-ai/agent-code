@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{App, PendingPermission, Phase};
 use super::colors::palette;
@@ -21,17 +21,32 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // compact look — same block model, render config only.
     let minimal = app.skin == crate::ui::modern::app::Skin::Minimal;
     let header_h = if minimal { 0 } else { 3 };
-    let prompt_h = if minimal { 1 } else { 3 };
-    // A chips row appears above the prompt only when prompts are queued.
-    let chips_h = if app.queue.is_empty() { 0 } else { 1 };
+    // Composer grows with content (capped); bordered fullscreen needs +2 for
+    // the box, +1 for the mode/hint info line under the text.
+    let prompt_h = prompt_area_height(app, minimal, area.height);
+    // Queue: compact chips when non-empty, or a full pane when toggled open.
+    let chips_h = if app.queue.is_empty() || app.show_queue_pane {
+        0
+    } else {
+        1
+    };
+    let queue_pane_h = if app.show_queue_pane && !app.queue.is_empty() {
+        (app.queue.len() as u16)
+            .saturating_add(2)
+            .clamp(3, 8)
+            .min(area.height.saturating_sub(10).max(3))
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_h), // header (0 in minimal)
-            Constraint::Min(5),           // transcript
-            Constraint::Length(1),        // status
-            Constraint::Length(chips_h),  // queue chips (0 when empty)
-            Constraint::Length(prompt_h), // input
+            Constraint::Length(header_h),     // header (0 in minimal)
+            Constraint::Min(5),               // transcript
+            Constraint::Length(1),            // status
+            Constraint::Length(chips_h),      // queue chips
+            Constraint::Length(queue_pane_h), // queue pane
+            Constraint::Length(prompt_h),     // input
         ])
         .split(area);
 
@@ -64,7 +79,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if chips_h > 0 {
         draw_queue_chips(frame, chunks[3], app);
     }
-    draw_input(frame, chunks[4], app);
+    if queue_pane_h > 0 {
+        draw_queue_pane(frame, chunks[4], app);
+    }
+    draw_input(frame, chunks[5], app);
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()
@@ -258,7 +276,57 @@ fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Gray),
         ));
     }
+    spans.push(Span::styled(
+        " Ctrl+; pane",
+        Style::default().fg(Color::DarkGray),
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Full queue pane: selectable rows, Enter send-now, Backspace delete.
+fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let accent = palette().accent;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            format!(" queue · {} ", app.queue.len()),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, p) in app.queue.iter().enumerate() {
+        let selected = i == app.queue_selected;
+        let mark = if selected { "▸ " } else { "  " };
+        let preview: String = p
+            .chars()
+            .take(inner.width.saturating_sub(4) as usize)
+            .collect();
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark}{}. {preview}", i + 1),
+            style,
+        )));
+    }
+    if lines.len() < inner.height as usize {
+        lines.push(Line::from(Span::styled(
+            " ↑/↓ select · Enter send-now · Backspace drop · Ctrl+; close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Tasks/agents pane: state-ordered subagent rows (plan §M8).
@@ -405,7 +473,12 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Rebuild only the changed blocks at this width; record metrics for the
     // scroll-key handlers that run before the next draw.
-    app.layout.sync(&app.transcript, inner.width);
+    app.layout.sync(
+        &app.transcript,
+        inner.width,
+        &app.expanded,
+        app.selected_item,
+    );
     app.viewport_h = height;
     // Record the bottom screen row for mouse hit-testing (jump pill).
     app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
@@ -557,6 +630,27 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Height of the prompt region given content and skin.
+fn prompt_area_height(app: &App, minimal: bool, total_h: u16) -> u16 {
+    let lines = app.input_line_count() as u16;
+    // Cap growth so the transcript keeps room; leave at least 8 rows above.
+    let max_body = total_h
+        .saturating_sub(header_and_chrome_reserve(minimal))
+        .min(10);
+    let body = lines.clamp(1, max_body.max(1));
+    if minimal {
+        body
+    } else {
+        // borders (2) + body + info line (1)
+        body.saturating_add(3).min(total_h.saturating_sub(6).max(3))
+    }
+}
+
+fn header_and_chrome_reserve(minimal: bool) -> u16 {
+    // header + status + min transcript
+    if minimal { 1 + 1 + 8 } else { 3 + 1 + 8 }
+}
+
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let p = palette();
     let border = if app.phase == Phase::Streaming {
@@ -564,28 +658,122 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         p.accent
     };
-    let prompt = format!("❯ {}", app.input);
-    // Minimal skin: borderless single-line prompt.
+    let body_style = Style::default().fg(p.text);
+    let prefix_style = Style::default().fg(border).add_modifier(Modifier::BOLD);
+
+    // Build per-line display with ❯ only on the first row.
+    let input_lines: Vec<&str> = if app.input.is_empty() {
+        vec![""]
+    } else {
+        // Keep trailing empty line when the draft ends with \n.
+        let mut v: Vec<&str> = app.input.split('\n').collect();
+        if app.input.ends_with('\n') {
+            // split already yields trailing "" for trailing newline
+        }
+        if v.is_empty() {
+            v.push("");
+        }
+        v
+    };
+
+    let mut display_lines: Vec<Line<'static>> = Vec::with_capacity(input_lines.len());
+    for (i, segment) in input_lines.iter().enumerate() {
+        let mut spans = Vec::new();
+        if i == 0 {
+            spans.push(Span::styled("❯ ".to_string(), prefix_style));
+        } else {
+            spans.push(Span::raw("  ".to_string())); // indent continuation
+        }
+        spans.push(Span::styled((*segment).to_string(), body_style));
+        display_lines.push(Line::from(spans));
+    }
+
     if app.skin == crate::ui::modern::app::Skin::Minimal {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                prompt,
-                Style::default().fg(border),
-            ))),
-            area,
-        );
+        frame.render_widget(Paragraph::new(display_lines), area);
+        set_prompt_cursor(frame, area, app, /*bordered*/ false);
         return;
     }
+
     let title = if app.phase == Phase::Streaming {
-        " input (buffered until turn ends) "
+        " composer · queued until turn ends "
+    } else if app.multiline_mode {
+        " composer · multiline "
     } else {
-        " input "
+        " composer "
     };
+    let hint = if app.multiline_mode {
+        "Enter newline · Alt/Shift+Enter send · Ctrl+Enter interject · Shift+Tab mode · Ctrl+M"
+    } else {
+        "Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode · Ctrl+M"
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
-        .title(title);
-    frame.render_widget(Paragraph::new(prompt).block(block), area);
+        .title(Span::styled(
+            title,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Body + one-row hint footer inside the box.
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let body_h = inner.height.saturating_sub(1).max(1);
+    let body_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: body_h,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + body_h,
+        width: inner.width,
+        height: if inner.height > 1 { 1 } else { 0 },
+    };
+    frame.render_widget(
+        Paragraph::new(display_lines).wrap(Wrap { trim: false }),
+        body_area,
+    );
+    if hint_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_mid(hint, hint_area.width as usize),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            hint_area,
+        );
+    }
+    set_prompt_cursor(frame, body_area, app, /*bordered*/ true);
+}
+
+/// Place the terminal cursor on the composer caret.
+fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordered: bool) {
+    if body_area.width == 0 || body_area.height == 0 {
+        return;
+    }
+    let (line, col) = app.cursor_line_col();
+    // Prefix "❯ " is 2 columns on line 0; continuation lines are indented 2.
+    let prefix_cols: u16 = 2;
+    let x = body_area
+        .x
+        .saturating_add(prefix_cols)
+        .saturating_add(col as u16)
+        .min(
+            body_area
+                .x
+                .saturating_add(body_area.width.saturating_sub(1)),
+        );
+    let y = body_area.y.saturating_add(line as u16).min(
+        body_area
+            .y
+            .saturating_add(body_area.height.saturating_sub(1)),
+    );
+    frame.set_cursor_position((x, y));
 }
 
 fn mode_style(mode: SessionMode) -> Style {

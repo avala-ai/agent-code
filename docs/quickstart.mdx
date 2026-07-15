@@ -1,12 +1,16 @@
 ---
 title: "Quickstart"
-description: "Get up and running with agent-code in 2 minutes"
+description: "Get up and running with Agent Code in minutes"
 ---
 
 ## Install
 
 <CodeGroup>
-```bash cargo (recommended)
+```bash one-liner
+curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
+```
+
+```bash cargo
 cargo install agent-code
 ```
 
@@ -17,14 +21,14 @@ brew install avala-ai/tap/agent-code
 ```bash from source
 git clone https://github.com/avala-ai/agent-code.git
 cd agent-code
-cargo build --release
+cargo build --release -p agent-code
 # Binary: target/release/agent
 ```
 </CodeGroup>
 
-## Set your API key
+## Authenticate
 
-agent-code works with any LLM provider. Set the key for the one you use:
+Agent Code works with any major LLM provider. Set a key, or use a subscription login:
 
 <CodeGroup>
 ```bash Anthropic (Claude)
@@ -39,12 +43,20 @@ export OPENAI_API_KEY="sk-..."
 export AGENT_CODE_API_KEY="your-key"
 export AGENT_CODE_API_BASE_URL="https://api.your-provider.com/v1"
 ```
+
+```bash subscription
+agent login codex   # ChatGPT / Codex
+agent login xai     # SuperGrok / X Premium
+```
 </CodeGroup>
+
+See [Authentication](./authentication.mdx) for full options.
 
 ## Start the agent
 
 ```bash
-agent
+agent                 # fullscreen interactive TUI
+agent -p "say hi"     # headless one-shot
 ```
 
 ### First-run onboarding

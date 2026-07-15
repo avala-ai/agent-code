@@ -93,7 +93,7 @@ pub enum EngineEvent {
 
 /// Permission prompter that surfaces engine asks inside the TUI.
 ///
-/// The classic REPL prompts on stdin; the modern TUI owns the terminal in
+/// Headless and tests may prompt on stdin; the modern TUI owns the terminal in
 /// raw mode, so `ask()` instead pushes a [`EngineEvent::PermissionAsk`]
 /// onto the event channel and blocks the turn task until the event loop
 /// answers. Fails **closed**: if the UI is gone (channel closed or the

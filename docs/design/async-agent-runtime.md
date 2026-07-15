@@ -149,7 +149,7 @@ Shipped:
 Deliberately **not** built (decisions, not omissions):
 - **REPL promote-hotkey** (foreground turn → background mid-flight): dropped. The interactive turn
   borrows the single engine lock for its whole duration; a clean promote would require re-architecting
-  `run_repl` around `Session` ownership for marginal value. The spawn primitive exists if revisited.
+  the interactive loop around `Session` ownership for marginal value. The spawn primitive exists if revisited.
 - **Stubbed executors** (`MonitorMcp` / `RemoteAgent` / `Dream`) and the **multi-agent `Coordinator`**:
   these remain test-only scaffolding. The executor registry has no production dispatch driver (real
   background work goes through `spawn_shell` / `spawn_background_agent`), and `Coordinator` is
