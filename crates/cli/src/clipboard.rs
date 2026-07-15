@@ -182,17 +182,26 @@ fn try_tmux(text: &str) -> Result<(), String> {
     }
 }
 
+/// Truncate `text` to at most `max` bytes on a UTF-8 char boundary, then
+/// append a truncation marker. Used for OSC 52 size caps.
+fn truncate_for_osc52(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut s = text[..end].to_string();
+    s.push_str("\n…[truncated for OSC 52]");
+    s
+}
+
 fn try_osc52(text: &str) -> Result<(), String> {
     // OSC 52 payload size is often capped by terminals (~100KB). Truncate
     // with a marker rather than failing entirely on large copies.
     const MAX: usize = 75_000;
-    let payload = if text.len() > MAX {
-        let mut s = text[..MAX].to_string();
-        s.push_str("\n…[truncated for OSC 52]");
-        s
-    } else {
-        text.to_string()
-    };
+    let payload = truncate_for_osc52(text, MAX);
     let b64 = base64_encode(payload.as_bytes());
     // BEL-terminated OSC 52 set clipboard (c = clipboard selection).
     let seq = if in_tmux() {
@@ -271,6 +280,17 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn truncate_for_osc52_respects_utf8_boundaries() {
+        // "é" is 2 bytes (C3 A9). Cap mid-character must not panic.
+        let s = "é".repeat(10);
+        let out = truncate_for_osc52(&s, 5);
+        assert!(out.contains("truncated"));
+        assert!(out.is_char_boundary(out.find('\n').unwrap_or(out.len())));
+        // Short text is unchanged.
+        assert_eq!(truncate_for_osc52("hi", 100), "hi");
     }
 
     #[test]

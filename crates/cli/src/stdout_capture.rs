@@ -56,11 +56,23 @@ where
         }
         return (f(), String::new());
     }
-    // Close our copy of the write end so the reader sees EOF after `f` and
-    // the dup2'd stdout is closed/restored.
+    // Close our extra write-end handle. fd 1 still holds a write end until
+    // we restore stdout; the reader thread sees EOF after that restore.
     unsafe {
         libc::close(write_fd);
     }
+
+    // Drain the pipe concurrently. If we only read after `f` returns, a
+    // command that prints more than the OS pipe buffer (often ~64 KiB) can
+    // block forever inside `println!` / `write(1, …)`.
+    // SAFETY: exclusive ownership of `read_fd` moves into the reader thread.
+    let reader = std::thread::spawn(move || {
+        let mut file = unsafe { File::from_raw_fd(read_fd) };
+        let mut buf = Vec::new();
+        let _ = file.read_to_end(&mut buf);
+        // File drop closes read_fd.
+        buf
+    });
 
     let result = f();
 
@@ -70,18 +82,13 @@ where
         libc::fflush(std::ptr::null_mut());
     }
 
-    // SAFETY: restore original stdout (closes the only write end of the pipe).
+    // SAFETY: restore original stdout (closes the only remaining write end).
     unsafe {
         let _ = libc::dup2(saved, 1);
         libc::close(saved);
     }
 
-    // SAFETY: take ownership of the read end; File::drop closes it.
-    let mut reader = unsafe { File::from_raw_fd(read_fd) };
-    let mut buf = Vec::new();
-    let _ = reader.read_to_end(&mut buf);
-    drop(reader);
-
+    let buf = reader.join().unwrap_or_default();
     let text = String::from_utf8_lossy(&buf).into_owned();
     (result, text)
 }
@@ -106,6 +113,36 @@ mod tests {
         assert!(
             out.contains("hello-capture"),
             "expected captured fd write, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn captures_more_than_pipe_buffer_without_deadlock() {
+        // Write well past a typical 64 KiB pipe buffer while a concurrent
+        // reader drains — must not hang.
+        let chunk = b"x".repeat(4096);
+        let n_chunks = 64; // 256 KiB
+        let ((), out) = capture_stdout(|| {
+            for _ in 0..n_chunks {
+                unsafe {
+                    let mut off = 0usize;
+                    while off < chunk.len() {
+                        let n = libc::write(1, chunk[off..].as_ptr().cast(), chunk.len() - off);
+                        if n <= 0 {
+                            break;
+                        }
+                        off += n as usize;
+                    }
+                }
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        });
+        assert_eq!(
+            out.len(),
+            chunk.len() * n_chunks,
+            "expected full capture, got {} bytes",
+            out.len()
         );
     }
 }
