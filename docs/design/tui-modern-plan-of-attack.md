@@ -3,7 +3,7 @@
 **Status:** ready to execute  
 **Branch:** `feat/tui-modern-overhaul`  
 **Spec source:** implementation report (M0–M10, shared types, budgets)  
-**Supporting evidence:** `docs/design/harness-comparison-2026-07.md`, `docs/design/reference-pager-binary-forensics.md`, `docs/design/tui-modern-overhaul.md`
+**Related:** `docs/design/tui-modern-overhaul.md`, `docs/design/tui-world-class-parity.md`, `docs/tui/ACCEPTANCE.md`
 
 This document is the **execution plan**. The long implementation report remains the behavior contract. When they disagree on *how*, prefer the report; when they disagree on *what already exists*, prefer this audit.
 
@@ -11,7 +11,7 @@ This document is the **execution plan**. The long implementation report remains 
 
 ## 1. Mission
 
-Ship a fullscreen Rust agent pager competitive with best-in-class terminal coding agents, without rewriting the engine or abandoning MIT / multi-provider / no-telemetry differentiators.
+Ship a fullscreen Rust agent pager at world-class terminal UX, without rewriting the engine or abandoning MIT / multi-provider / no-telemetry differentiators.
 
 **Definition of done (product bar):** Appendix C of the implementation report, recorded in `docs/tui/ACCEPTANCE.md`, then flip `ui.default` / `--ui auto` → modern. Classic stays `--ui classic`.
 
@@ -34,7 +34,7 @@ Ship a fullscreen Rust agent pager competitive with best-in-class terminal codin
 | StreamSink | text/thinking/tool start+result/usage | + ToolOutput stream, PermissionRequest, SubagentUpdate, ContextUsage, full inputs |
 | Terminal | alt-screen + raw only | guard + mouse/focus/paste/kitty + sync-update |
 | Tests | few unit tests, no TestBackend suite | insta + fake engine + property tests |
-| Default | classic (`--tui modern` opt-in) | flip only after M10 / Appendix C |
+| Default | modern-only interactive (classic removed) | |
 
 ### Correct foundations to keep
 
@@ -276,7 +276,7 @@ Assume one focused agent (or human) at a time.
 | **D10–D12** | M4 tool cards + grouping + spill (plain markdown ok) |
 | **D13–D15** | M6 permission/plan/question modals |
 
-Checkpoint: **Wave A dogfood** — daily use with `--tui modern` for real work. Then M5 queue, M7 caps, M3 polish, M8 agents, M9/M10.
+Checkpoint: **Wave A dogfood** — daily use of the modern TUI for real work. Then M5 queue, M7 caps, M3 polish, M8 agents, M9/M10.
 
 ---
 
@@ -307,7 +307,7 @@ Checkpoint: **Wave A dogfood** — daily use with `--tui modern` for real work. 
 
 | Metric | Target |
 |---|---|
-| Harness comparison TUI rank | From 5th → top-tier polish without sacrificing engine wins |
+| Modern TUI product bar | Daily-driver polish without sacrificing engine wins |
 | Product bar | Appendix C all green on support matrix |
 | Perf | §7 budgets in M10 smoke |
 | Classic | golden / scripted session unchanged |
@@ -323,4 +323,4 @@ Checkpoint: **Wave A dogfood** — daily use with `--tui modern` for real work. 
 
 ---
 
-*This plan of attack freezes sequencing and scaffold deltas. Behavior details remain in the implementation report; evidence remains in the harness comparison + reference pager forensics docs.*
+*This plan of attack freezes sequencing and scaffold deltas. Behavior details remain in the implementation report and `docs/tui/ACCEPTANCE.md`.*

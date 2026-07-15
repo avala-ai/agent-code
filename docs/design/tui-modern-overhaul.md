@@ -6,19 +6,19 @@
 
 ## Problem
 
-The interactive path is a **line-oriented rustyline REPL** with ad-hoc raw mode during turns (`ui/repl.rs` ~2.6k LOC). Ratatui is only used for inline styling helpers (`ui/tui.rs`), not a real full-screen app. Result: fragile resize/raw-mode interaction, weak discoverability of plan mode / tasks / permissions, and a UX that peer fullscreen terminal agents have left behind.
+The interactive path was a **line-oriented rustyline REPL** with ad-hoc raw mode during turns (`ui/repl.rs` ~2.6k LOC, now removed). Ratatui was only used for inline styling helpers (`ui/tui.rs`), not a real full-screen app. Result: fragile resize/raw-mode interaction and weak discoverability of plan mode / tasks / permissions.
 
 ## Goals
 
 1. Full-screen **alt-screen** TUI (ratatui + crossterm) as the primary interactive surface.
 2. **Modern chrome**: mode cycle, plan review, task visibility, clear status.
 3. **Engine reuse** via `query::Session` + `StreamSink` (no second agent loop).
-4. **Classic REPL retained** (`--tui classic` / `ui.tui = "classic"`) for CI and constrained terminals; modern is the default.
+4. **Classic REPL removed** — modern is the only interactive surface (headless `-p` / serve / ACP remain).
 5. **Visual regression tests** using ratatui `TestBackend` (no live TTY required).
 
 ## Non-goals (this branch v1)
 
-- Pixel parity with any third-party product
+- Pixel-perfect clones of other products
 - Rewriting slash-command handlers (reuse `commands/` progressively)
 - Cloud/desktop product surfaces
 - Weakening permission/sandbox invariants
@@ -69,7 +69,7 @@ Target layout (M1+) is documented in `docs/design/tui-modern-plan-of-attack.md`.
 
 1. **Unit / snapshot (CI, hermetic)** — `TestBackend`, deterministic `App` state  
 2. **Scripted key paths (CI)** — drive `App::handle_key` without a real terminal  
-3. **Manual / dogfood** — `cargo run -p agent-code -- --tui modern`  
+3. **Manual / dogfood** — `cargo run -p agent-code`  
 4. **Future** — optional VHS/asciinema fixtures for docs  
 
 No network in default `cargo test`.
@@ -83,18 +83,18 @@ No network in default `cargo test`.
 | 2 | Mode cycle + plan badge + plan review overlay |
 | 3 | Permission / AskUserQuestion overlays |
 | 4 | Task dock, tool cards collapse, slash command palette |
-| 5 | Default flip to modern when stable; classic remains |
+| 5 | Modern-only interactive (classic REPL removed) |
 
 ## Entry points
 
 ```bash
-agent --tui modern
+agent
 ```
 
-Config: `[ui] tui = "classic" | "modern"` (default **modern**).
+Interactive sessions always open the modern fullscreen TUI.
 
 ## Related docs
 
 - Execution plan: `docs/design/tui-modern-plan-of-attack.md`
-- Peer harness matrix (anonymized): `docs/design/harness-comparison-2026-07.md`
-- Reference pager forensics: `docs/design/reference-pager-binary-forensics.md`
+- Product bar / waves: `docs/design/tui-world-class-parity.md`
+- Acceptance checklist: `docs/tui/ACCEPTANCE.md`

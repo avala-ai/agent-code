@@ -1,6 +1,6 @@
 # Modern TUI keybindings
 
-The default interactive surface (`ui.tui = "modern"`). Classic REPL: `--tui classic`.
+Interactive sessions use the fullscreen TUI.
 
 ## Global
 

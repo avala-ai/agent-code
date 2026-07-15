@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Removed
+
+- **Classic rustyline REPL** — interactive sessions always use the modern fullscreen TUI. Removed `--tui`, `AGENT_CODE_TUI`, `[ui] tui`, and the `ui/repl.rs` path. Headless (`-p`), `--serve`, and ACP are unchanged.
 
 ## [0.26.0] - 2026-07-10
 
