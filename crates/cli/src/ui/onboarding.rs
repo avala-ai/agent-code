@@ -179,7 +179,19 @@ fn print_welcome() {
     println!();
     println!("  {}", DECOR_LINE.with(t.muted));
     println!();
-    println!("  {}", "Let's get started.".with(t.text));
+    println!(
+        "  {}",
+        "Fullscreen TUI · multi-provider · MIT · no default telemetry".with(t.muted)
+    );
+    println!();
+    println!(
+        "  {}",
+        "Pick a look — live preview updates as you move ↑/↓.".with(t.text)
+    );
+    println!(
+        "  {}",
+        "Enter confirms · Esc skips (uses Auto).".with(t.muted)
+    );
     println!();
 }
 

@@ -174,8 +174,32 @@ choco install ripgrep
 - Old sessions may have been cleaned up
 - Session format may be incompatible after an upgrade — start fresh
 
+## Modern TUI
+
+### Colors look washed out / no truecolor
+
+```bash
+export COLORTERM=truecolor
+```
+
+In tmux, also set `default-terminal` and RGB terminal-features. Full guide: [Terminal support](./terminal-support.mdx).
+
+### Clipboard / copy does nothing under tmux
+
+```tmux
+set -g set-clipboard on
+set -g allow-passthrough on
+```
+
+Run `/terminal-setup` inside the TUI for the live capability report.
+
+### Esc vs cancel
+
+In the modern TUI, **Esc never cancels a turn** (it clears the draft or dismisses a modal). Use **Ctrl+C** to cancel. See [Keyboard shortcuts](./keyboard-shortcuts.mdx).
+
 ## Still Stuck?
 
 - Run `/doctor` for a full environment health check
+- Run `/terminal-setup` for TUI/terminal diagnostics
 - Check [GitHub Issues](https://github.com/avala-ai/agent-code/issues) for known problems
 - Open a new issue with: agent version (`agent --version`), OS, and steps to reproduce

@@ -621,6 +621,54 @@ pub(crate) const COLOR_THEME_NAMES: &[&str] = &[
     "auto",
 ];
 
+/// True if `name` (without `/`) is a built-in command or alias.
+pub fn is_builtin_command(name: &str) -> bool {
+    let name = name.trim().trim_start_matches('/');
+    let head = name.split_whitespace().next().unwrap_or("");
+    if head.is_empty() {
+        return false;
+    }
+    COMMANDS.iter().any(|c| {
+        c.name.eq_ignore_ascii_case(head) || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(head))
+    })
+}
+
+/// Tab-completion candidates for a partial slash command (name only).
+pub fn complete_slash(partial: &str) -> Vec<&'static str> {
+    let partial = partial.trim().trim_start_matches('/').to_ascii_lowercase();
+    let mut out: Vec<&'static str> = COMMANDS
+        .iter()
+        .filter(|c| !c.hidden)
+        .filter(|c| partial.is_empty() || c.name.starts_with(&partial))
+        .map(|c| c.name)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[cfg(test)]
+mod slash_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn is_builtin_matches_name_and_alias() {
+        assert!(is_builtin_command("help"));
+        assert!(is_builtin_command("/help"));
+        assert!(is_builtin_command("h")); // alias
+        assert!(is_builtin_command("diff"));
+        assert!(!is_builtin_command("definitely-not-a-cmd"));
+    }
+
+    #[test]
+    fn complete_slash_prefix() {
+        let c = complete_slash("hel");
+        assert!(c.contains(&"help"));
+        let empty = complete_slash("");
+        assert!(empty.len() > 10);
+    }
+}
+
 pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
     let input = input.trim_start_matches('/');
     let (cmd, args) = input
@@ -3973,13 +4021,18 @@ fn execute_copy(engine: &QueryEngine) {
         return;
     }
 
-    match copy_to_clipboard(&text) {
-        Ok(cmd) => println!("Copied {} byte(s) to clipboard (via {cmd}).", text.len()),
+    match crate::clipboard::copy_text(&text) {
+        Ok(result) => println!(
+            "Copied {} byte(s) to clipboard (via {}).",
+            text.len(),
+            result.summary()
+        ),
         Err(e) => {
             eprintln!("Failed to copy to clipboard: {e}");
             eprintln!(
                 "Install one of: pbcopy (macOS), xclip or xsel (Linux X11), \
-                 wl-copy (Wayland), or clip (Windows)."
+                 wl-copy (Wayland), or clip (Windows). OSC 52 is attempted as a \
+                 fallback when the terminal supports it."
             );
         }
     }
@@ -4001,70 +4054,6 @@ fn last_assistant_text(engine: &QueryEngine) -> Option<String> {
         }
     }
     None
-}
-
-/// Pipe `text` into the first working platform clipboard command and
-/// return its name. Probes in order of least-surprise for the current
-/// platform. Returns `Err` if none succeeded.
-fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
-    let candidates: &[(&'static str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbcopy", &[])]
-    } else if cfg!(target_os = "windows") {
-        &[("clip", &[])]
-    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ]
-    } else {
-        &[
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-            ("wl-copy", &[]),
-        ]
-    };
-
-    let mut last_err: Option<String> = None;
-    for (cmd, args) in candidates {
-        match std::process::Command::new(cmd)
-            .args(*args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
-                use std::io::Write;
-                if let Some(mut stdin) = child.stdin.take() {
-                    if let Err(e) = stdin.write_all(text.as_bytes()) {
-                        last_err = Some(format!("{cmd}: write error: {e}"));
-                        let _ = child.wait();
-                        continue;
-                    }
-                    drop(stdin);
-                }
-                match child.wait() {
-                    Ok(status) if status.success() => return Ok(cmd),
-                    Ok(status) => {
-                        last_err = Some(format!("{cmd} exited with {status}"));
-                        continue;
-                    }
-                    Err(e) => {
-                        last_err = Some(format!("{cmd}: wait error: {e}"));
-                        continue;
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                last_err = Some(format!("{cmd}: {e}"));
-                continue;
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| "no clipboard command available on this platform".into()))
 }
 
 /// Per-category context breakdown. The fields are independent
@@ -6345,33 +6334,7 @@ mod tests {
         assert_eq!(mask_secret(""), "(empty)");
     }
 
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn copy_to_clipboard_errors_with_empty_path() {
-        // Force `copy_to_clipboard` to have no candidates on PATH by
-        // temporarily emptying PATH. This verifies the error path
-        // returns a helpful string instead of silently succeeding.
-        //
-        // Windows-only: `clip.exe` lives in `%SYSTEMROOT%\System32` and
-        // Windows' `CreateProcess` searches the system directory even
-        // with an empty PATH, so clearing PATH doesn't actually hide
-        // it. The test is an assertion about the fallback code path on
-        // *nix; the Windows probe (`clip` only) has a simpler path.
-        //
-        // SAFETY: single-threaded test, restored before exit.
-        let prev = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", "");
-        }
-        let result = copy_to_clipboard("hello");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-        assert!(result.is_err(), "expected error on empty PATH");
-    }
+    // Clipboard cascade tests live in `crate::clipboard` (native + tmux + OSC 52).
 
     // ---- /ctxviz breakdown accounting ----
 

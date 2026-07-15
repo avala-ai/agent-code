@@ -1,130 +1,134 @@
 <p align="center">
-  <img src="https://siuhyr0peaacfwst.public.blob.vercel-storage.com/avala-marketing-site/news/avala-bot-no-bg.png" alt="Agent Code" width="200">
+  <img src="https://siuhyr0peaacfwst.public.blob.vercel-storage.com/avala-marketing-site/news/avala-bot-no-bg.png" alt="Agent Code" width="120">
 </p>
 
 <h1 align="center">Agent Code</h1>
 
 <p align="center">
-  AI coding agent for the terminal. Built in Rust.<br>
+  <strong>Open-source AI coding agent for the terminal.</strong><br>
+  Fullscreen TUI, multi-provider, headless &amp; ACP — written in Rust.<br>
   <a href="https://github.com/avala-ai">Avala AI</a>
 </p>
 
 <p align="center">
   <a href="https://crates.io/crates/agent-code"><img src="https://img.shields.io/crates/v/agent-code.svg" alt="crates.io"></a>
-  <a href="https://github.com/avala-ai/agent-code/actions"><img src="https://github.com/avala-ai/agent-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/gh/avala-ai/agent-code"><img src="https://codecov.io/gh/avala-ai/agent-code/branch/main/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://github.com/avala-ai/agent-code/actions"><img src="https://img.shields.io/github/actions/workflow/status/avala-ai/agent-code/ci.yml?branch=main&label=CI" alt="CI"></a>
   <a href="https://github.com/avala-ai/agent-code/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://codecov.io/gh/avala-ai/agent-code"><img src="https://codecov.io/gh/avala-ai/agent-code/branch/main/graph/badge.svg" alt="Coverage"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#ways-to-run">Ways to run</a> ·
+  <a href="#documentation">Documentation</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#repository-layout">Layout</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#license">License</a>
 </p>
 
 ---
 
+**Agent Code** understands your repo, edits files, runs shell commands, searches the web, and drives multi-step engineering work — interactively in a fullscreen TUI, headlessly in scripts and CI, or embedded in editors via the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
+
+It is **MIT licensed**, multi-provider by default, and does **not** send telemetry home unless you opt in.
+
 ## Install
+
+Prebuilt binaries for macOS, Linux, and Windows:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/avala-ai/agent-code/main/install.sh | bash
+agent --version
 ```
 
-Or: `cargo install agent-code` / `brew install avala-ai/tap/agent-code`
+Other options:
+
+| Method | Command |
+|--------|---------|
+| Cargo | `cargo install agent-code` |
+| Homebrew | `brew install avala-ai/tap/agent-code` |
+| Docker | `docker run --rm -it ghcr.io/avala-ai/agent-code` |
+| From source | `cargo build --release -p agent-code` → `target/release/agent` |
+
+See [Installation](docs/installation.mdx) for platform notes and data directories.
 
 ## Quickstart
 
 ```bash
-agent                         # interactive mode (runs setup wizard on first launch)
-agent --prompt "fix the tests" # one-shot mode
-agent --model gpt-5.4         # use a specific model
+# Interactive TUI (default) — setup wizard on first launch
+agent
+
+# One-shot (headless)
+agent -p "fix the failing tests and summarize what changed"
+
+# Pick a model / provider
+agent --model claude-sonnet-5
+agent --model gpt-5.5 --provider openai
 ```
 
-The agent reads your codebase, runs commands, edits files, and handles multi-step tasks. Type `?` for keyboard shortcuts.
-
-## LLM Providers
-
-Works with any LLM. Set one env var and go:
-
-| Provider | Env Variable | Default Model |
-|----------|-------------|---------------|
-| OpenAI | `OPENAI_API_KEY` | gpt-5.5 |
-| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-5 |
-| xAI | `XAI_API_KEY` | grok-4.3 |
-| Google | `GOOGLE_API_KEY` | gemini-3-pro |
-| DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
-| Groq | `GROQ_API_KEY` | llama-3.3-70b |
-| Mistral | `MISTRAL_API_KEY` | mistral-large |
-| Together | `TOGETHER_API_KEY` | meta-llama-3.1-70b |
-| Zhipu (z.ai) | `ZHIPU_API_KEY` | glm-4.7 |
-| Ollama | (none) | qwen3:latest |
-| AWS Bedrock | `AGENT_CODE_USE_BEDROCK` | claude-sonnet-5 |
-| Google Vertex | `AGENT_CODE_USE_VERTEX` | claude-sonnet-5 |
-| OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-5 |
-| Cohere | `COHERE_API_KEY` | command-r-plus |
-| Perplexity | `PERPLEXITY_API_KEY` | sonar-pro |
-
-Plus any OpenAI-compatible endpoint: `agent --api-base-url http://localhost:8080/v1`
-
-**Use a subscription instead of an API key:**
+**Authentication** — set a provider API key, or sign in with a subscription:
 
 ```bash
-# ChatGPT / Codex (Plus/Pro)
-agent login codex
-agent --auth-mode codex_chatgpt --model gpt-5.5
-
-# SuperGrok / X Premium (same path as OpenCode — https://x.ai/news/grok-opencode)
-agent login xai
-agent --auth-mode xai_oauth --model grok-build-0.1
+export ANTHROPIC_API_KEY=…   # or OPENAI_API_KEY, XAI_API_KEY, …
+# or
+agent login codex            # ChatGPT / Codex subscription
+agent login xai              # SuperGrok / X Premium (device / OAuth)
 ```
 
-First-run setup also offers both subscription options. Already signed in via the
-`codex` CLI? agent-code reuses that `~/.codex` session. Already ran `grok login`?
-agent-code reuses `~/.grok/auth.json` the same way.
+In the TUI: type a task and press **Enter**. **Shift+Tab** cycles permission modes. **Ctrl+C** cancels a running turn; **Esc** never cancels (clears draft / dismisses modals). Full bindings: [Keyboard shortcuts](docs/tui/KEYBINDINGS.md).
 
-## Input Modes
+## Ways to run
 
-| Prefix | Action |
-|--------|--------|
-| (none) | Chat with the agent |
-| `!` | Run shell command directly |
-| `/` | Slash commands (tab-complete) |
-| `@` | Attach file to prompt |
-| `&` | Run prompt in background |
-| `?` | Toggle shortcuts panel |
-| `\` + Enter | Multi-line input |
+| Mode | How | Use when |
+|------|-----|----------|
+| **Interactive TUI** | `agent` | Daily coding — transcript, modals, queue, tasks pane |
+| **Headless** | `agent -p "…"` | Scripts, CI, piping |
+| **HTTP API** | `agent --serve` | Local clients / Flutter GUI |
+| **ACP** | `agent acp` | IDE integrations (stdio JSON-RPC) |
+| **Security scan** | `agent security-scan` | Whole-repo vulnerability MapReduce |
 
-## Built-in Tools
+## LLM providers
 
-File ops, search, shell, git worktrees, web access, LSP diagnostics, MCP resources, notebooks, background-task monitoring, scheduled routines, remote triggers, briefs, scoped config updates, MCP auth, tasks, and more. Tools execute during LLM streaming for faster turns. [Full list ->](docs/reference/tools.mdx)
+Works with any major API — set one env var and go:
 
-## Bundled Skills
+| Provider | Env | Notes |
+|----------|-----|--------|
+| Anthropic | `ANTHROPIC_API_KEY` | Claude models |
+| OpenAI | `OPENAI_API_KEY` | GPT / o-series |
+| Azure OpenAI | Azure endpoint + key | |
+| xAI | `XAI_API_KEY` | Grok models |
+| Google | `GOOGLE_API_KEY` | Gemini |
+| DeepSeek, Groq, Mistral, Together, Zhipu, Cohere, Perplexity | respective `*_API_KEY` | |
+| OpenRouter | `OPENROUTER_API_KEY` | Multi-model router |
+| Bedrock / Vertex | `AGENT_CODE_USE_BEDROCK` / `AGENT_CODE_USE_VERTEX` | Cloud Claude |
+| Ollama / local | `--api-base-url http://localhost:11434/v1` | OpenAI-compatible |
 
-| Skill | Purpose |
-|-------|---------|
-| `/commit` | Create well-crafted git commits |
-| `/review` | Review diff for bugs and security issues |
-| `/test` | Run tests and fix failures |
-| `/explain` | Explain how code works |
-| `/debug` | Debug errors with root cause analysis |
-| `/pr` | Create pull requests |
-| `/refactor` | Refactor code for quality |
-| `/init` | Initialize project configuration |
-| `/security-review` | OWASP-oriented vulnerability scan |
-| `/pentest` | White-box penetration test with proof-of-concept gating |
-| `/advisor` | Architecture and dependency health analysis |
-| `/bughunter` | Systematic bug search |
-| `/plan` | Structured implementation planning |
-| `/changelog` | Generate changelog entries from commit history |
-| `/release` | Cut a versioned release |
-| `/benchmark` | Run and compare benchmarks |
-| `/coverage` | Measure and report test coverage |
-| `/migrate` | Apply codebase-wide migrations |
-| `/docs` | Generate or update documentation |
-| `/remember` | Save a specific insight to user memory (two-step write discipline) |
-| `/stuck` | Step back and try a different angle when the agent is looping |
-| `/simplify` | Review-then-simplify pass: flag dead weight in the current diff |
-| `/batch` | Apply the same change across many files or branches with preview/confirm |
-| `/loop` | Run a prompt or check on a recurring interval until a condition holds |
-| `/verify` | Independent verification pass after a non-trivial implementation |
-| `/app-builder` | Scaffold a new app and iterate on it turn by turn (prompt-only) |
-| `/skillify` | Extract the successful workflow from this session into a reusable skill |
+Subscription logins reuse existing sessions when present (`~/.codex/auth.json`, `~/.grok/auth.json`). Details: [Authentication](docs/authentication.mdx).
 
-Add custom skills as markdown files in `.agent/skills/` or `~/.config/agent-code/skills/`.
+## What you get
+
+- **Fullscreen modern TUI** — streaming transcript, permission / plan / question modals, prompt queue, mode badge, tasks pane ([TUI docs](docs/tui/README.md))
+- **30+ tools** — files, search, shell, apply_patch, worktrees, web, LSP, MCP, subagents, monitors, cron, notebooks, …
+- **Skills & plugins** — reusable workflows (`/commit`, `/review`, `/plan`, …) plus project skills under `.agent/skills/`
+- **Permissions & sandbox** — ask / allow / plan / accept_edits, protected dirs, destructive-command guards, optional OS sandbox
+- **Sessions** — persist, resume, fork, rewind, compact
+- **Security-scan** — Agentic MapReduce over whole repos ([guide](docs/guides/security-scan.mdx))
+- **No default telemetry** — outbound traffic is the LLM you configure (and MCP servers you add)
+
+## Documentation
+
+| Start here | |
+|------------|---|
+| [User guide index](docs/user-guide/README.md) | Tiered guide: essentials → features → advanced |
+| [Quickstart](docs/quickstart.mdx) | First hour walkthrough |
+| [Keyboard shortcuts](docs/tui/KEYBINDINGS.md) | Modern TUI bindings |
+| [Slash commands](docs/reference/commands.mdx) | Full `/command` list |
+| [Configuration](docs/configuration/settings.mdx) | `config.toml`, env, flags |
+| [Security](SECURITY.md) | Permissions model & invariants |
+
+Online / Mintlify site config: [`docs/docs.json`](docs/docs.json). Architecture notes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Configuration
 
@@ -132,71 +136,72 @@ Add custom skills as markdown files in `.agent/skills/` or `~/.config/agent-code
 # ~/.config/agent-code/config.toml
 
 [api]
-model = "gpt-5.4"
+model = "claude-sonnet-5"
 
 [permissions]
 default_mode = "ask"   # ask | allow | deny | accept_edits | plan
 
-[features]
-token_budget = true
-extract_memories = true
-auto_theme = true
+[ui]
+theme = "midnight"
 
 [security]
-mcp_server_allowlist = ["github", "filesystem"]
-disable_bypass_permissions = true
+disable_bypass_permissions = true   # enterprise: lock YOLO flags
 ```
 
-## Architecture
+Precedence: **CLI flags → environment → project config → user config → defaults**.
+
+## Repository layout
 
 ```
 crates/
-  lib/   agent-code-lib    Engine: providers, tools, query loop, memory
-  cli/   agent-code        Binary: REPL, TUI, commands, setup wizard
-  eval/  agent-code-eval   Evaluation harness for benchmarking the engine
+  lib/     agent-code-lib   Engine: providers, tools, query loop, memory, permissions
+  cli/     agent            Binary: TUI, slash commands, ACP, --serve
+  eval/    agent-code-eval  Behavioral evaluation harness
 
-packages/
-  agent_code_client        Dart client library for talking to the engine
-
-client/                    Cross-platform Flutter desktop/web GUI (see client/README.md)
+client/                    Flutter desktop/web GUI (talks to --serve)
+packages/                  TypeScript / Dart client packages
+docs/                      User guides (Mintlify + mdBook sources)
+evals/                     Eval fixtures
 ```
 
-The engine is a reusable library. The CLI binary is a thin wrapper. The Flutter client in `client/` is a separate front-end that talks to the engine via the `agent_code_client` package.
+The engine is an embeddable library; the CLI is a thin product surface on top.
 
-## Slash Commands
+## Development
 
-Session management, context control, git operations, agent coordination, configuration, diagnostics, and more. [Full list ->](docs/reference/commands.mdx)
-
-Highlights: `/theme`, `/output-style`, `/plugin`, `/tools`, `/team-remember`, `/profile`, `/tokens`, `/thinkback`, `/pr-comments`, `/autofix-pr`, `/perf-issue`, `/release-notes`, `/summary`, `/update`, `/uninstall`, `/doctor`, `/model`, `/cost`, `/usage`, `/scroll`, `/rewind`, `/fork`, `/rename`, `/add-dir`, `/btw`
-
-## Security
-
-Protected directories (`.git/`, `.husky/`, `node_modules/`) are blocked from writes regardless of permission settings. Destructive shell commands trigger warnings. [Learn more ->](SECURITY.md)
-
-**Whole-repo security scanning.** `agent security-scan` finds exploitable vulnerabilities across an entire codebase using an Agentic MapReduce engine (plan → shard → map → reduce): deterministic selectors pick out relevant code, parallel read-only workers investigate each shard, and a reducer deduplicates, composes cross-shard attack chains, and prioritizes. Supports incremental diff-only runs and JSON/Markdown output. [Guide ->](docs/guides/security-scan.mdx)
-
-## Platforms
-
-| Platform | Architecture | Install |
-|----------|-------------|---------|
-| Linux | x86_64, aarch64 | curl, cargo, homebrew, prebuilt binary |
-| macOS | x86_64, Apple Silicon | curl, cargo, homebrew, prebuilt binary |
-| Windows | x86_64 | cargo, prebuilt binary (.zip) |
-| Docker | any | `docker run ghcr.io/avala-ai/agent-code` |
-
-## Contributing
+Requirements: Rust (see `rust-toolchain.toml` if present; otherwise recent stable), and for full tool use: `git`, `rg`.
 
 ```bash
 git clone https://github.com/avala-ai/agent-code.git
 cd agent-code
+
 cargo check --all-targets
-cargo test --all-targets
+cargo test  --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
+
+cargo run -p agent-code --                 # launch TUI
+cargo run -p agent-code -- -p "say hi"     # headless smoke
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, [RELEASING.md](RELEASING.md) for release steps, and [ROADMAP.md](ROADMAP.md) for planned improvements.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) (agent instructions for this repo), [RELEASING.md](RELEASING.md), and [ROADMAP.md](ROADMAP.md).
+
+## Security
+
+- Writes to `.git/`, `.husky/`, and `node_modules/` are **unconditionally blocked**
+- Destructive shell patterns warn / block; system paths are protected
+- Plan mode is read-only (except the plan surface)
+- `--dangerously-skip-permissions` can be globally disabled via config
+
+Details: [SECURITY.md](SECURITY.md) and [Permissions](docs/concepts/permissions.mdx).
+
+## Platforms
+
+| Platform | Arch | Install |
+|----------|------|---------|
+| Linux | x86_64, aarch64 | curl, cargo, brew, binary, Docker |
+| macOS | x86_64, Apple Silicon | curl, cargo, brew, binary |
+| Windows | x86_64 | cargo, binary (.zip) |
 
 ## License
 
-MIT
+[MIT](LICENSE) — © Avala AI.

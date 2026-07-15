@@ -1,43 +1,38 @@
 ---
 title: "Overview"
-description: "An AI coding agent that lives in your terminal"
+description: "Open-source AI coding agent for the terminal — TUI, headless, ACP"
 ---
 
-# What is agent-code?
+# What is Agent Code?
 
-agent-code is an open-source, AI-powered coding agent for the terminal. You describe what you want in natural language, and the agent reads your codebase, runs commands, edits files, and iterates until the task is done.
+**Agent Code** is an open-source, AI-powered coding agent for the terminal. You describe what you want; it reads your codebase, runs commands, edits files, and iterates until the task is done.
 
-It's built in pure Rust for speed, safety, and a single static binary with zero runtime dependencies.
+It is written in **Rust** (single static binary), **MIT licensed**, **multi-provider**, and **does not phone home** unless you opt into telemetry.
 
 ## What can it do?
 
 <CardGroup cols={2}>
   <Card title="Read and understand code" icon="magnifying-glass">
-    Searches your codebase, reads files, traces dependencies, and explains how things work.
+    Search, read, trace dependencies, and explain how systems work.
   </Card>
   <Card title="Write and edit code" icon="pen">
-    Creates files, makes targeted edits, refactors code, adds features, and fixes bugs.
+    Create files, targeted edits, apply_patch, refactors, and multi-file changes.
   </Card>
   <Card title="Run commands" icon="terminal">
-    Executes shell commands, runs tests, manages git operations, and handles build tools.
+    Shell, tests, git, builds — with permissions and optional OS sandbox.
   </Card>
-  <Card title="Multi-step tasks" icon="diagram-project">
-    Chains together reading, writing, and running to complete complex engineering tasks autonomously.
+  <Card title="Multi-step agent work" icon="diagram-project">
+    Tool loops, subagents, plan mode, skills, MCP, and session resume.
   </Card>
 </CardGroup>
 
 ## How it works
 
-The core loop is simple:
-
-1. You type a request
-2. The agent sends your request + conversation history to an LLM
-3. The LLM responds with text and tool calls
-4. The agent executes the tools (file reads, edits, shell commands, etc.)
-5. Tool results are fed back to the LLM
-6. Repeat until the task is done
-
-Every tool call passes through a permission system before executing. You stay in control.
+1. You type a request (TUI, `-p`, ACP, or HTTP)
+2. The query engine sends context + history to your configured LLM
+3. The model streams text and tool calls
+4. Tools run under the permission system (and optional sandbox)
+5. Results feed back into the model until the turn finishes
 
 ```
 You: "add input validation to the signup endpoint"
@@ -45,54 +40,34 @@ You: "add input validation to the signup endpoint"
 Agent:
   → FileRead src/routes/signup.rs
   → Grep "validate" src/
-  → FileEdit src/routes/signup.rs (add validation logic)
+  → FileEdit src/routes/signup.rs
   → Bash "cargo test"
-  → FileEdit src/routes/signup.rs (fix test failure)
-  → Bash "cargo test"
-  ✓ All tests pass. Validation added.
+  ✓ Tests pass. Validation added.
 ```
+
+## Surfaces
+
+| Surface | Command | Role |
+|---------|---------|------|
+| Interactive TUI | `agent` | Fullscreen transcript, modals, queue, tasks |
+| Headless | `agent -p "…"` | Scripts and CI |
+| HTTP | `agent --serve` | Local API / Flutter client |
+| ACP | `agent acp` | IDE stdio bridge |
+| Security scan | `agent security-scan` | Whole-repo AMR scan |
 
 ## Key features
 
-- **32 built-in tools** for file operations, shell commands, code search, web access, language servers, and more
-- **42 slash commands** for git, session management, diagnostics, sharing, and agent control
-- **12 bundled skills** including security review, architecture advisor, bug hunter, and implementation planner
-- **12 LLM providers** — Anthropic, OpenAI, xAI, Google, DeepSeek, Groq, Mistral, Together, Zhipu, Ollama, AWS Bedrock, Google Vertex
-- **Permission system** with configurable rules per tool, pattern matching, and protected directories
-- **MCP support** for connecting external tool servers
-- **Memory system** for persistent context across sessions
-- **Plugin system** for bundling skills, hooks, and configuration
-- **Session persistence** with save, resume, share, fork, and rewind
-- **Plan mode** for safe read-only exploration
-- **Extended thinking** for complex reasoning tasks
-- **Cross-platform** — Linux, macOS, and Windows
+- **Modern fullscreen TUI** with streaming, HITL modals, mode badge, prompt queue
+- **30+ tools** — files, shell, search, worktrees, web, LSP, MCP, subagents, monitors, cron
+- **Multi-provider** — Anthropic, OpenAI, Azure, xAI, Google, OpenRouter, local OpenAI-compatible, and more
+- **Skills & plugins** — reusable workflows and project conventions (`AGENTS.md`)
+- **Permissions** — ask / allow / plan / accept_edits, protected dirs, bypass lock
+- **Sessions** — save, resume, fork, rewind, compact
+- **Security-scan** — plan → shard → map → reduce vulnerability hunting
+- **Privacy default** — no product telemetry unless you opt in
 
-## Architecture
+## Where to go next
 
-```
-                        ┌─────────────┐
-                        │   CLI / REPL │
-                        └──────┬───────┘
-                               │
-              ┌────────────────▼────────────────┐
-              │          Query Engine            │
-              │  stream → tools → loop → compact │
-              └──┬──────────┬──────────┬────────┘
-                 │          │          │
-        ┌────────▼──┐ ┌────▼─────┐ ┌──▼───────┐
-        │   Tools   │ │ Perms    │ │  Hooks   │
-        │  31 built │ │ allow    │ │ pre/post │
-        │  + MCP    │ │ deny/ask │ │ shell    │
-        └───────────┘ └──────────┘ └──────────┘
-```
-
-## Next steps
-
-<CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Get up and running in 2 minutes.
-  </Card>
-  <Card title="Installation" icon="download" href="/installation">
-    All the ways to install agent-code.
-  </Card>
-</CardGroup>
+- [Install](./installation.mdx) · [Quickstart](./quickstart.mdx) · [User guide index](./user-guide/README.md)
+- [Keyboard shortcuts](./keyboard-shortcuts.mdx) · [Authentication](./authentication.mdx)
+- [World-class TUI plan](./design/tui-world-class-parity.md) (product bar for the interactive UI)

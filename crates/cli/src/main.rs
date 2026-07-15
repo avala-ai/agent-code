@@ -9,12 +9,14 @@
 
 mod acp;
 mod attach;
+mod clipboard;
 mod commands;
 mod daemon;
 mod harden;
 mod output;
 mod security_scan;
 mod serve;
+mod stdout_capture;
 mod ui;
 mod update;
 
@@ -596,7 +598,7 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && !is_headless_subcommand
     {
-        eprintln!("No API key found. Starting setup...\n");
+        eprintln!("No credentials found — starting first-run setup…\n");
         run_setup_wizard();
         config = Config::load()?;
     }
