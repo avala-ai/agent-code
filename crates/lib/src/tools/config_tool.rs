@@ -982,6 +982,15 @@ mod tests {
             perms.set_mode(0o500);
             std::fs::set_permissions(&agent_dir, perms).unwrap();
 
+            // Root (and some sandboxes) bypass directory write bits, so the
+            // failure this test depends on never happens — probe and skip
+            // instead of failing on such runners.
+            if std::fs::write(agent_dir.join(".probe"), b"x").is_ok() {
+                let _ = std::fs::remove_file(agent_dir.join(".probe"));
+                eprintln!("skipping: read-only dir not enforced (running as root?)");
+                return;
+            }
+
             let ctx = make_ctx(project_root.to_path_buf());
             let res = ConfigTool
                 .call(

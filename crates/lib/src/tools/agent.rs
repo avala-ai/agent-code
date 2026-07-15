@@ -232,6 +232,10 @@ impl Tool for AgentTool {
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // The cancel/timeout arms below DROP the `output()` future; without
+        // kill_on_drop the child kept running (and burning provider tokens)
+        // untracked after the user cancelled.
+        cmd.kill_on_drop(true);
 
         let timeout = std::time::Duration::from_secs(300); // 5 minute timeout.
 
@@ -252,11 +256,6 @@ impl Tool for AgentTool {
                             content.push_str(&format!("\nAgent errors:\n{stderr}"));
                         }
 
-                        // Clean up worktree if it was created.
-                        if isolation == Some("worktree") {
-                            let _ = cleanup_worktree(&agent_cwd).await;
-                        }
-
                         Ok(ToolResult {
                             content,
                             is_error: !output.status.success(),
@@ -274,6 +273,12 @@ impl Tool for AgentTool {
                 Err(ToolError::Cancelled)
             }
         };
+
+        // Clean up the worktree on EVERY exit path — the cancel/timeout
+        // arms previously leaked it (cleanup only ran on success).
+        if isolation == Some("worktree") {
+            let _ = cleanup_worktree(&agent_cwd).await;
+        }
 
         result
     }
