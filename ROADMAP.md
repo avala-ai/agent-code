@@ -88,13 +88,11 @@ Good documentation is the highest-leverage improvement. Every other phase benefi
 - [x] Add `///` doc comments to all key public structs, enums, and traits
 - [x] Publish rustdoc via CI (GitHub Pages at `/api/`)
 
-### 1.10 Compatibility Matrix
+### 1.10 Feature inventory (optional)
 
-Living document comparing agent-code feature coverage against the broader terminal coding-agent landscape. Helps prospective users understand tradeoffs and gives us an honest internal gap tracker.
+Optional living checklist of agent-code capabilities for release notes — **product features only**, not external product rankings.
 
-- [ ] Create `docs/compat-matrix.mdx` with rows for features (tools, sandboxing, MCP, LSP, multi-agent, providers, platforms, session resume, image input, profiles, etc.) and columns for agent-code plus 3–5 peer projects
-- [ ] Wire into Mintlify nav under "Reference"
-- [ ] Add a CI check that fails if a new `feature:` tag is added to source without a matching row in the matrix
+- [ ] Maintain a short feature inventory in docs (tools, sandbox, MCP, multi-agent, providers, platforms, sessions)
 - [ ] Refresh per release as part of the CHANGELOG workflow
 
 ### 1.11 Public SDK Documentation

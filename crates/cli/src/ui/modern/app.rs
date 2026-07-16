@@ -97,10 +97,20 @@ pub(crate) fn try_expand_skill_slash(
             | "clear"
             | "help"
             | "terminal-setup"
+            | "copy"
             | "minimal"
             | "fullscreen"
             | "stats"
             | "model"
+            | "cost"
+            | "usage"
+            | "version"
+            | "status"
+            | "plan"
+            | "theme"
+            | "permissions"
+            | "queue"
+            | "tasks"
     ) {
         return None;
     }
@@ -211,7 +221,21 @@ pub struct App {
     pub viewport_h: usize,
 
     pub input: String,
+    /// Byte index into `input` (must land on a char boundary).
     pub cursor: usize,
+    /// When true: Enter inserts newline; Alt/Shift+Enter submit.
+    /// When false (default): Enter submits; Alt/Shift+Enter insert newline.
+    /// Toggle with Ctrl+M (prompt-focused).
+    pub multiline_mode: bool,
+    /// Past submitted prompts (oldest first). ↑ on empty input browses.
+    pub prompt_history: Vec<String>,
+    /// When `Some(i)`, the composer is showing `prompt_history[i]`.
+    pub history_browse: Option<usize>,
+    /// Transcript item indices whose bodies are fully expanded (tools /
+    /// thinking). Default is collapsed (clamped renderer head).
+    pub expanded: std::collections::HashSet<usize>,
+    /// Currently selected transcript item (for fold / turn jumps).
+    pub selected_item: Option<usize>,
 
     pub turn_count: usize,
     pub tokens_in: u64,
@@ -229,6 +253,11 @@ pub struct App {
     /// `/clear` also clears the ENGINE conversation; applied by the run
     /// loop under try_lock (mirrors `pending_model`).
     pub pending_clear: bool,
+    /// Classic slash line deferred to the run loop (needs engine + stdout
+    /// capture). Full built-in command parity with the classic REPL.
+    pub pending_slash: Option<String>,
+    /// `!cmd` shell passthrough deferred to the run loop.
+    pub pending_shell: Option<String>,
     /// Whether a turn task currently exists (set by the run loop). Lets
     /// modal resolution decide between returning to Streaming (turn still
     /// running) and Idle (modal outlived its turn).
@@ -239,6 +268,10 @@ pub struct App {
     pub transcript_bottom_row: u16,
     /// Prompts typed mid-turn, sent FIFO when the turn ends (plan §M5).
     pub queue: std::collections::VecDeque<String>,
+    /// Queue pane open (Ctrl+; / `/queue`). Shows full list + selection.
+    pub show_queue_pane: bool,
+    /// Selected row in the queue pane (0 = head).
+    pub queue_selected: usize,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -296,13 +329,18 @@ impl App {
             waiting_on: WaitingOn::Model,
             modals: std::collections::VecDeque::new(),
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Shift+Tab mode · Esc/Ctrl+C cancel turn / quit · Enter send".into(),
+                "Modern TUI · Enter send · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
             )],
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
             viewport_h: 0,
             input: String::new(),
             cursor: 0,
+            multiline_mode: false,
+            prompt_history: Vec::new(),
+            history_browse: None,
+            expanded: std::collections::HashSet::new(),
+            selected_item: None,
             turn_count: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -313,9 +351,13 @@ impl App {
             pending_submit: None,
             pending_model: None,
             pending_clear: false,
+            pending_slash: None,
+            pending_shell: None,
             turn_live: false,
             transcript_bottom_row: 0,
             queue: std::collections::VecDeque::new(),
+            show_queue_pane: false,
+            queue_selected: 0,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),
@@ -539,6 +581,24 @@ impl App {
         let idx = self.cursor.min(self.input.len());
         self.input.insert(idx, c);
         self.cursor = idx + c.len_utf8();
+        self.history_browse = None; // in-place edit leaves history mode
+        self.dirty = true;
+    }
+
+    /// Insert a newline at the cursor (Alt+Enter / Shift+Enter in normal mode).
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    /// Toggle multiline compose mode (Ctrl+M). Flips Enter vs Alt/Shift+Enter.
+    pub fn toggle_multiline_mode(&mut self) {
+        self.multiline_mode = !self.multiline_mode;
+        self.status_message = if self.multiline_mode {
+            "multiline on — Enter newline · Alt/Shift+Enter send".into()
+        } else {
+            "multiline off — Enter send · Alt/Shift+Enter newline".into()
+        };
+        self.dirty = true;
     }
 
     /// Insert a pasted string at the cursor (bracketed paste / Event::Paste).
@@ -556,6 +616,7 @@ impl App {
         let idx = self.cursor.min(self.input.len());
         self.input.insert_str(idx, &normalized);
         self.cursor = idx + normalized.len();
+        self.history_browse = None;
         self.dirty = true;
     }
 
@@ -571,6 +632,7 @@ impl App {
         if let Some((i, _)) = prev {
             self.input.remove(i);
             self.cursor = i;
+            self.dirty = true;
         }
     }
 
@@ -585,12 +647,106 @@ impl App {
         } else {
             self.cursor = 0;
         }
+        self.dirty = true;
     }
 
     pub fn move_right(&mut self) {
         if let Some((i, c)) = self.input[self.cursor..].char_indices().next() {
             self.cursor += i + c.len_utf8();
+            self.dirty = true;
         }
+    }
+
+    /// Move cursor to the previous visual line (same column when possible).
+    pub fn move_up_line(&mut self) {
+        let (line, col) = self.cursor_line_col();
+        if line == 0 {
+            return;
+        }
+        self.cursor = self.byte_at_line_col(line - 1, col);
+        self.dirty = true;
+    }
+
+    /// Move cursor to the next visual line (same column when possible).
+    pub fn move_down_line(&mut self) {
+        let (line, col) = self.cursor_line_col();
+        let lines = self.input_line_count();
+        if line + 1 >= lines {
+            return;
+        }
+        self.cursor = self.byte_at_line_col(line + 1, col);
+        self.dirty = true;
+    }
+
+    /// Home of current line (not whole buffer).
+    pub fn move_line_start(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        self.cursor = self.byte_at_line_col(line, 0);
+        self.dirty = true;
+    }
+
+    /// End of current line.
+    pub fn move_line_end(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        let len = self.line_char_len(line);
+        self.cursor = self.byte_at_line_col(line, len);
+        self.dirty = true;
+    }
+
+    /// Number of lines in the composer (at least 1).
+    pub fn input_line_count(&self) -> usize {
+        // "a\n" is two lines (second empty); `lines()` would count only one.
+        self.input.chars().filter(|c| *c == '\n').count() + 1
+    }
+
+    /// (line, col) of the cursor; col is a char index on that line.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let cursor = self.cursor.min(self.input.len());
+        let before = &self.input[..cursor];
+        let line = before.chars().filter(|c| *c == '\n').count();
+        let col = before
+            .rsplit('\n')
+            .next()
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        (line, col)
+    }
+
+    fn line_char_len(&self, line: usize) -> usize {
+        self.input
+            .split('\n')
+            .nth(line)
+            .map(|s| s.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn byte_at_line_col(&self, line: usize, col: usize) -> usize {
+        let mut cur_line = 0usize;
+        let mut cur_col = 0usize;
+        for (bi, ch) in self.input.char_indices() {
+            if cur_line == line && cur_col == col {
+                return bi;
+            }
+            if ch == '\n' {
+                if cur_line == line {
+                    // Past end of requested line — clamp to EOL.
+                    return bi;
+                }
+                cur_line += 1;
+                cur_col = 0;
+            } else {
+                cur_col += 1;
+            }
+        }
+        if cur_line == line {
+            return self.input.len();
+        }
+        self.input.len()
+    }
+
+    /// True when the composer holds more than one line (or trailing newline).
+    pub fn input_is_multiline(&self) -> bool {
+        self.input.contains('\n')
     }
 
     pub fn submit(&mut self) {
@@ -624,10 +780,9 @@ impl App {
         }
         if text == "/help" {
             self.transcript.push(TranscriptItem::System(
-                "Keys: Enter send · Shift+Tab mode · Esc/Ctrl+C cancel turn (again to quit) · \
-                 Ctrl+T tasks · permission prompt: y once / a session / n deny · \
-                 Skills: /commit /review /test /… (same as classic) · \
-                 /model [id] · /clear /terminal-setup /stats /exit"
+                "Keys: Enter send · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels · \
+                 Ctrl+T tasks · Ctrl+; queue · y/Y copy block · e expand · \
+                 /model /copy /cost /status /plan /theme /queue /terminal-setup /stats /exit · skills: /commit …"
                     .into(),
             ));
             self.input.clear();
@@ -636,6 +791,12 @@ impl App {
         }
         if text == "/terminal-setup" {
             self.emit_terminal_setup();
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/copy" {
+            self.copy_last_assistant();
             self.input.clear();
             self.cursor = 0;
             return;
@@ -666,6 +827,88 @@ impl App {
             self.cursor = 0;
             return;
         }
+        if text == "/cost" || text == "/usage" {
+            let tok = self.tokens_in + self.tokens_out;
+            self.transcript.push(TranscriptItem::System(format!(
+                "usage: turn {} · {} in / {} out ({} total) · ${:.4} · model {}",
+                self.turn_count, self.tokens_in, self.tokens_out, tok, self.cost_usd, self.model
+            )));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/version" {
+            self.transcript.push(TranscriptItem::System(format!(
+                "agent-code {} · modern TUI",
+                self.version
+            )));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/status" {
+            self.transcript.push(TranscriptItem::System(format!(
+                "status: model={} · mode={} · phase={:?} · cwd={} · sid={} · queue={}",
+                self.model,
+                self.mode.label(),
+                self.phase,
+                self.cwd,
+                self.session_id,
+                self.queue.len()
+            )));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/plan" {
+            self.mode = SessionMode::Plan;
+            self.status_message = "mode → PLAN".into();
+            self.transcript.push(TranscriptItem::System(
+                "mode → PLAN (Shift+Tab to cycle)".into(),
+            ));
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
+        if text == "/theme" {
+            // Cycle skins for now (full theme pack is later).
+            self.skin = match self.skin {
+                Skin::Fullscreen => Skin::Minimal,
+                Skin::Minimal => Skin::Fullscreen,
+            };
+            self.status_message = format!("skin → {:?}", self.skin);
+            self.transcript.push(TranscriptItem::System(format!(
+                "skin → {:?}  (/minimal · /fullscreen)",
+                self.skin
+            )));
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
+        if text == "/permissions" {
+            self.transcript.push(TranscriptItem::System(format!(
+                "permissions: mode={} · Shift+Tab cycles Manual/Normal/AcceptEdits/Plan · \
+                 modal: y once / a session / n deny",
+                self.mode.label()
+            )));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/queue" {
+            self.toggle_queue_pane();
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/tasks" {
+            self.toggle_tasks();
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
         // /model needs the engine lock (run loop applies). Handled even
         // mid-turn so a switch is not sent to the LLM as a prompt.
         if let Some(action) = parse_model_slash(&text) {
@@ -675,6 +918,35 @@ impl App {
             self.dirty = true;
             return;
         }
+        // `!shell` passthrough — run loop captures output into history.
+        if let Some(cmd) = text.strip_prefix('!').map(str::trim)
+            && !cmd.is_empty()
+        {
+            self.pending_shell = Some(cmd.to_string());
+            self.transcript
+                .push(TranscriptItem::User(format!("!{cmd}")));
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
+
+        // Classic slash commands not handled above → full command bridge.
+        if text.starts_with('/') {
+            let name = text
+                .trim_start_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if crate::commands::is_builtin_command(name) {
+                self.pending_slash = Some(text.clone());
+                self.input.clear();
+                self.cursor = 0;
+                self.dirty = true;
+                return;
+            }
+        }
+
         // Mid-turn: queue the prompt instead of dropping it (plan §M5).
         // Skill expansion happens when the queue head is dispatched so the
         // expanded body is what the engine sees.
@@ -686,6 +958,53 @@ impl App {
             return;
         }
         self.enqueue_turn(text);
+    }
+
+    /// Tab-complete a partial slash command in the composer.
+    pub fn complete_slash_tab(&mut self) {
+        let trimmed = self.input.trim();
+        if !trimmed.starts_with('/') {
+            return;
+        }
+        // Only complete the command token (before first space).
+        if trimmed.contains(char::is_whitespace) {
+            return;
+        }
+        let partial = trimmed.trim_start_matches('/');
+        let cands = crate::commands::complete_slash(partial);
+        match cands.as_slice() {
+            [] => {
+                self.status_message = "no matching commands".into();
+            }
+            [only] => {
+                self.input = format!("/{only} ");
+                self.cursor = self.input.len();
+                self.status_message = format!("/{only}");
+            }
+            many => {
+                // Longest common prefix among candidates.
+                let mut prefix = many[0].to_string();
+                for c in &many[1..] {
+                    while !c.starts_with(&prefix) && !prefix.is_empty() {
+                        prefix.pop();
+                    }
+                }
+                if prefix.len() > partial.len() {
+                    self.input = format!("/{prefix}");
+                    self.cursor = self.input.len();
+                }
+                let list = many.iter().take(12).copied().collect::<Vec<_>>().join(" ");
+                let more = if many.len() > 12 {
+                    format!(" …+{}", many.len() - 12)
+                } else {
+                    String::new()
+                };
+                self.transcript
+                    .push(TranscriptItem::System(format!("commands: {list}{more}")));
+                self.status_message = format!("{} matches", many.len());
+            }
+        }
+        self.dirty = true;
     }
 
     /// Apply a deferred `/model` action against live engine state.
@@ -714,43 +1033,243 @@ impl App {
         self.dirty = true;
     }
 
+    /// Enqueue a prompt produced by a slash command (`CommandResult::Prompt`).
+    pub fn enqueue_turn_from_command(&mut self, text: String) {
+        self.enqueue_turn(text);
+    }
+
     /// Resolve user text into a turn: expand `/skill` invocations the same
-    /// way classic REPL does via `commands::execute` skill lookup.
+    /// way slash dispatch does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
-        let (display, prompt) = match try_expand_skill_slash(
-            &text,
-            &self.cwd,
-            self.disable_skill_shell,
-        ) {
-            Some(expanded) => {
-                // Keep the slash visible in the transcript; send the expanded
-                // skill body to the engine as the real user message.
-                (text, expanded)
-            }
-            None => {
-                // A slash input that is neither a built-in nor a skill is
-                // a typo or a classic-only command — sending it to the
-                // model as a prompt costs a turn and does nothing.
-                if text.starts_with('/') {
-                    self.transcript.push(TranscriptItem::System(format!(
-                            "unknown command {text} — /help lists modern-TUI                              commands (some classic commands are not available                              here yet)"
-                        )));
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.dirty = true;
-                    return;
+        let (display, prompt) =
+            match try_expand_skill_slash(&text, &self.cwd, self.disable_skill_shell) {
+                Some(expanded) => {
+                    // Keep the slash visible in the transcript; send the expanded
+                    // skill body to the engine as the real user message.
+                    (text, expanded)
                 }
-                (text.clone(), text)
-            }
-        };
+                None => {
+                    // A slash input that is neither a built-in nor a skill is a
+                    // typo — sending it to the model as a prompt costs a turn
+                    // and does nothing useful.
+                    if text.starts_with('/') {
+                        self.transcript.push(TranscriptItem::System(format!(
+                            "unknown command {text} — /help lists available commands"
+                        )));
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.dirty = true;
+                        return;
+                    }
+                    (text.clone(), text)
+                }
+            };
+        self.push_prompt_history(&display);
         self.transcript.push(TranscriptItem::User(display));
         self.input.clear();
         self.cursor = 0;
+        self.history_browse = None;
         self.pending_submit = Some(prompt);
         self.phase = Phase::Streaming;
         // Jump back to the live tail when the user sends.
         self.scroll = ScrollState::Follow;
         self.dirty = true;
+    }
+
+    const HISTORY_CAP: usize = 100;
+
+    fn push_prompt_history(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() {
+            return;
+        }
+        // De-dupe consecutive identical entries.
+        if self.prompt_history.last().map(|s| s.as_str()) == Some(t) {
+            return;
+        }
+        self.prompt_history.push(t.to_string());
+        if self.prompt_history.len() > Self::HISTORY_CAP {
+            let drop_n = self.prompt_history.len() - Self::HISTORY_CAP;
+            self.prompt_history.drain(0..drop_n);
+        }
+    }
+
+    /// ↑ on empty composer: step backward through prompt history.
+    pub fn history_older(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match self.history_browse {
+            None => self.prompt_history.len().saturating_sub(1),
+            Some(0) => 0,
+            Some(i) => i.saturating_sub(1),
+        };
+        self.history_browse = Some(next);
+        self.input = self.prompt_history[next].clone();
+        self.cursor = self.input.len();
+        self.dirty = true;
+    }
+
+    /// ↓ while browsing history: step forward; past newest clears the draft.
+    pub fn history_newer(&mut self) {
+        let Some(i) = self.history_browse else {
+            return;
+        };
+        if i + 1 >= self.prompt_history.len() {
+            self.history_browse = None;
+            self.input.clear();
+            self.cursor = 0;
+        } else {
+            self.history_browse = Some(i + 1);
+            self.input = self.prompt_history[i + 1].clone();
+            self.cursor = self.input.len();
+        }
+        self.dirty = true;
+    }
+
+    /// Leave history browse when the user edits the draft in place.
+    pub fn history_note_edit(&mut self) {
+        self.history_browse = None;
+    }
+
+    /// Toggle full body for the selected transcript item (tools / thinking).
+    pub fn toggle_expand_selected(&mut self) {
+        if self.selected_item.is_none() {
+            if let Some(i) = self.last_foldable_index() {
+                self.selected_item = Some(i);
+            } else {
+                self.status_message = "nothing to expand".into();
+                self.dirty = true;
+                return;
+            }
+        }
+        let idx = self.selected_item.expect("set above");
+        if !self.item_is_foldable(idx) {
+            self.status_message = "selected block has no fold body".into();
+            self.dirty = true;
+            return;
+        }
+        if self.expanded.contains(&idx) {
+            self.expanded.remove(&idx);
+            self.status_message = "collapsed".into();
+        } else {
+            self.expanded.insert(idx);
+            self.status_message = "expanded".into();
+        }
+        self.dirty = true;
+    }
+
+    /// Expand or collapse every thinking block.
+    pub fn toggle_expand_all_thinking(&mut self) {
+        let thinking: Vec<usize> = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| matches!(t, TranscriptItem::Thinking(_)).then_some(i))
+            .collect();
+        if thinking.is_empty() {
+            self.status_message = "no thinking blocks".into();
+            self.dirty = true;
+            return;
+        }
+        let all_open = thinking.iter().all(|i| self.expanded.contains(i));
+        if all_open {
+            for i in thinking {
+                self.expanded.remove(&i);
+            }
+            self.status_message = "thinking collapsed".into();
+        } else {
+            for i in thinking {
+                self.expanded.insert(i);
+            }
+            self.status_message = "thinking expanded".into();
+        }
+        self.dirty = true;
+    }
+
+    fn item_is_foldable(&self, idx: usize) -> bool {
+        matches!(
+            self.transcript.get(idx),
+            Some(
+                TranscriptItem::Tool {
+                    result: Some(r),
+                    ..
+                }
+            ) if !r.is_empty()
+        ) || matches!(self.transcript.get(idx), Some(TranscriptItem::Thinking(t)) if !t.is_empty())
+            || matches!(self.transcript.get(idx), Some(TranscriptItem::Assistant(t)) if t.lines().count() > 12)
+    }
+
+    fn last_foldable_index(&self) -> Option<usize> {
+        (0..self.transcript.len())
+            .rev()
+            .find(|&i| self.item_is_foldable(i))
+    }
+
+    /// Shift+Left: previous user turn — select + scroll into view.
+    pub fn jump_prev_user_turn(&mut self) {
+        let cur = self.selected_item.unwrap_or(self.transcript.len());
+        let prev = (0..cur.min(self.transcript.len()))
+            .rev()
+            .find(|&i| matches!(self.transcript.get(i), Some(TranscriptItem::User(_))));
+        if let Some(i) = prev {
+            self.selected_item = Some(i);
+            self.scroll_to_item(i);
+            self.dirty = true;
+        }
+    }
+
+    /// Shift+Right: next user turn.
+    pub fn jump_next_user_turn(&mut self) {
+        let start = self.selected_item.map(|i| i + 1).unwrap_or(0);
+        let next = (start..self.transcript.len())
+            .find(|&i| matches!(self.transcript.get(i), Some(TranscriptItem::User(_))));
+        if let Some(i) = next {
+            self.selected_item = Some(i);
+            self.scroll_to_item(i);
+            self.dirty = true;
+        }
+    }
+
+    /// Select previous/next transcript item (empty composer only).
+    pub fn select_prev_item(&mut self) {
+        let cur = self.selected_item.unwrap_or(self.transcript.len());
+        if cur == 0 {
+            return;
+        }
+        let i = cur.saturating_sub(1);
+        self.selected_item = Some(i);
+        self.scroll_to_item(i);
+        self.dirty = true;
+    }
+
+    pub fn select_next_item(&mut self) {
+        let start = self.selected_item.map(|i| i + 1).unwrap_or(0);
+        if start >= self.transcript.len() {
+            return;
+        }
+        self.selected_item = Some(start);
+        self.scroll_to_item(start);
+        self.dirty = true;
+    }
+
+    /// Scroll so `item` is near the top of the Free viewport.
+    fn scroll_to_item(&mut self, item: usize) {
+        // Layout may be stale; best-effort using last sync's block map.
+        let display = super::toolcard::plan_display(&self.transcript);
+        let Some(d_idx) = display.iter().position(|d| match d {
+            super::toolcard::Display::Single(i) => *i == item,
+            super::toolcard::Display::Group(idxs) => idxs.contains(&item),
+        }) else {
+            return;
+        };
+        let line = self.layout.block_start_line(d_idx);
+        let total = self.layout.total_lines().max(1);
+        let h = self.viewport_h.max(1);
+        // Free scroll anchored so the block is visible.
+        self.scroll = super::scroll::ScrollState::Free {
+            top_line: line.min(total.saturating_sub(h)),
+        };
     }
 
     /// Dispatch the head of the queue as the next turn, if idle and non-empty.
@@ -763,6 +1282,38 @@ impl App {
         if let Some(text) = self.queue.pop_front() {
             self.enqueue_turn(text);
         }
+    }
+
+    /// Interject / send-now: cancel the live turn (if any) and send the
+    /// composer text — or the head of the queue when the composer is empty.
+    /// Idle with text behaves like a normal submit.
+    pub fn interject(&mut self) {
+        let text = if !self.input.trim().is_empty() {
+            let t = std::mem::take(&mut self.input);
+            self.cursor = 0;
+            Some(t)
+        } else {
+            self.queue.pop_front()
+        };
+        let Some(text) = text else {
+            self.status_message = "nothing to send now".into();
+            self.dirty = true;
+            return;
+        };
+        if self.turn_live || self.phase == Phase::Streaming {
+            // Stage the next turn, then ask the run loop to cancel the current.
+            // Skill expansion / transcript row happen in enqueue_turn; keep
+            // phase Streaming so cancel still sees a live turn.
+            self.transcript.push(TranscriptItem::System(
+                "interject — cancelling turn to send now…".into(),
+            ));
+            // enqueue_turn clears input (already empty) and sets pending_submit.
+            self.enqueue_turn(text);
+            self.request_cancel();
+        } else {
+            self.enqueue_turn(text);
+        }
+        self.dirty = true;
     }
 
     /// Pop the newest queued prompt back into the editor for editing
@@ -862,6 +1413,10 @@ impl App {
             yn(c.kitty_keyboard)
         ));
         report.push_str(&format!("  tmux                : {}\n", yn(c.tmux)));
+        report.push_str("  clipboard routes:\n");
+        for line in crate::clipboard::describe_routes() {
+            report.push_str(&format!("    {line}\n"));
+        }
         let rem = c.remediation();
         if !rem.is_empty() {
             report.push_str("  remediation:\n");
@@ -871,6 +1426,171 @@ impl App {
         }
         self.transcript
             .push(TranscriptItem::System(report.trim_end().to_string()));
+        self.dirty = true;
+    }
+
+    /// `/copy` — last assistant transcript text → clipboard cascade.
+    pub fn copy_last_assistant(&mut self) {
+        let text = self.transcript.iter().rev().find_map(|item| match item {
+            TranscriptItem::Assistant(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        });
+        let Some(text) = text else {
+            self.report_copy_err("no assistant message in the transcript yet");
+            return;
+        };
+        self.copy_text_report(&text, "assistant");
+    }
+
+    /// `y` — copy selected block body (or last assistant if none selected).
+    pub fn copy_selected_content(&mut self) {
+        let text = if let Some(idx) = self.selected_item {
+            self.block_copy_text(idx, false)
+        } else {
+            self.transcript.iter().rev().find_map(|item| match item {
+                TranscriptItem::Assistant(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let Some(text) = text else {
+            self.report_copy_err("nothing to copy — select a block (←/→) or wait for a reply");
+            return;
+        };
+        self.copy_text_report(&text, "block");
+    }
+
+    /// `Y` — copy selected block metadata (tool name/detail, user prompt, …).
+    pub fn copy_selected_meta(&mut self) {
+        let Some(idx) = self.selected_item else {
+            self.report_copy_err("select a block first (←/→ when composer empty)");
+            return;
+        };
+        let Some(text) = self.block_copy_text(idx, true) else {
+            self.report_copy_err("selected block has no metadata");
+            return;
+        };
+        self.copy_text_report(&text, "meta");
+    }
+
+    fn block_copy_text(&self, idx: usize, meta_only: bool) -> Option<String> {
+        match self.transcript.get(idx)? {
+            TranscriptItem::User(s) => Some(s.clone()),
+            TranscriptItem::Assistant(s) => Some(s.clone()),
+            TranscriptItem::Thinking(s) => Some(s.clone()),
+            TranscriptItem::System(s) | TranscriptItem::Error(s) | TranscriptItem::Warning(s) => {
+                Some(s.clone())
+            }
+            TranscriptItem::Tool {
+                name,
+                detail,
+                result,
+                ..
+            } => {
+                if meta_only {
+                    Some(format!("{name} · {detail}"))
+                } else {
+                    let body = result.as_deref().unwrap_or("");
+                    if body.is_empty() {
+                        Some(format!("{name} · {detail}"))
+                    } else {
+                        Some(format!("{name} · {detail}\n{body}"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn copy_text_report(&mut self, text: &str, label: &str) {
+        match crate::clipboard::copy_text(text) {
+            Ok(result) => {
+                let msg = format!(
+                    "copied {label} ({} bytes) via {}",
+                    text.len(),
+                    result.summary()
+                );
+                self.status_message = msg.clone();
+                self.transcript.push(TranscriptItem::System(msg));
+            }
+            Err(e) => self.report_copy_err(&e),
+        }
+        self.dirty = true;
+    }
+
+    fn report_copy_err(&mut self, e: &str) {
+        let msg = format!("copy: {e}");
+        self.status_message = msg.clone();
+        self.transcript.push(TranscriptItem::System(msg));
+        self.dirty = true;
+    }
+
+    /// Toggle the full queue pane (Ctrl+; / `/queue`).
+    pub fn toggle_queue_pane(&mut self) {
+        self.show_queue_pane = !self.show_queue_pane;
+        if self.show_queue_pane && self.queue_selected >= self.queue.len() {
+            self.queue_selected = self.queue.len().saturating_sub(1);
+        }
+        self.status_message = if self.show_queue_pane {
+            format!("queue pane on · {} item(s)", self.queue.len())
+        } else {
+            "queue pane off".into()
+        };
+        self.dirty = true;
+    }
+
+    pub fn queue_select_prev(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        self.queue_selected = self.queue_selected.saturating_sub(1);
+        self.dirty = true;
+    }
+
+    pub fn queue_select_next(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let max = self.queue.len().saturating_sub(1);
+        self.queue_selected = (self.queue_selected + 1).min(max);
+        self.dirty = true;
+    }
+
+    /// Send the selected queue row now (cancel live turn if needed).
+    pub fn queue_send_selected(&mut self) {
+        if self.queue.is_empty() {
+            self.status_message = "queue empty".into();
+            self.dirty = true;
+            return;
+        }
+        let idx = self.queue_selected.min(self.queue.len() - 1);
+        let text = self.queue.remove(idx).unwrap_or_default();
+        self.queue_selected = idx.min(self.queue.len().saturating_sub(1));
+        if self.queue.is_empty() {
+            self.show_queue_pane = false;
+        }
+        if self.turn_live || self.phase == Phase::Streaming {
+            self.transcript.push(TranscriptItem::System(
+                "queue send-now — cancelling turn…".into(),
+            ));
+            self.enqueue_turn(text);
+            self.request_cancel();
+        } else {
+            self.enqueue_turn(text);
+        }
+        self.dirty = true;
+    }
+
+    /// Delete the selected queue row.
+    pub fn queue_delete_selected(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let idx = self.queue_selected.min(self.queue.len() - 1);
+        self.queue.remove(idx);
+        self.queue_selected = idx.min(self.queue.len().saturating_sub(1));
+        self.status_message = format!("{} queued", self.queue.len());
+        if self.queue.is_empty() {
+            self.show_queue_pane = false;
+        }
         self.dirty = true;
     }
 
@@ -910,7 +1630,8 @@ mod tests {
             app.transcript
                 .push(TranscriptItem::System(format!("line {i}")));
         }
-        app.layout.sync(&app.transcript, 80);
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
         app.viewport_h = viewport_h;
         app
     }
@@ -939,7 +1660,8 @@ mod tests {
             app.apply_engine(EngineEvent::Text(format!("stream {i}\n")));
         }
         app.flush_stream();
-        app.layout.sync(&app.transcript, 80);
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
         let top_after = app.scroll.top(app.layout.total_lines(), app.viewport_h);
         assert_eq!(top_before, top_after, "viewport must not move while Free");
     }
@@ -1230,6 +1952,184 @@ mod tests {
     }
 
     #[test]
+    fn interject_mid_turn_stages_prompt_and_cancels() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.turn_live = true;
+        app.input = "stop and do this".into();
+        app.cursor = app.input.len();
+        app.interject();
+        assert!(app.cancel_requested, "interject must cancel the live turn");
+        assert_eq!(app.pending_submit.as_deref(), Some("stop and do this"));
+        assert!(app.input.is_empty());
+        assert!(
+            app.transcript
+                .iter()
+                .any(|t| matches!(t, TranscriptItem::System(s) if s.contains("interject"))),
+            "status line for interject"
+        );
+    }
+
+    #[test]
+    fn interject_empty_composer_sends_queue_head() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.turn_live = true;
+        app.queue.push_back("from queue".into());
+        app.interject();
+        assert!(app.cancel_requested);
+        assert_eq!(app.pending_submit.as_deref(), Some("from queue"));
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn interject_idle_with_text_is_normal_submit() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello".into();
+        app.cursor = 5;
+        app.interject();
+        assert!(!app.cancel_requested);
+        assert_eq!(app.pending_submit.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn insert_newline_and_line_col_tracking() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.insert_str("ab");
+        app.insert_newline();
+        app.insert_str("cd");
+        assert_eq!(app.input, "ab\ncd");
+        assert_eq!(app.input_line_count(), 2);
+        assert_eq!(app.cursor_line_col(), (1, 2));
+        app.move_up_line();
+        assert_eq!(app.cursor_line_col(), (0, 2));
+        app.move_line_start();
+        assert_eq!(app.cursor_line_col(), (0, 0));
+        app.move_line_end();
+        assert_eq!(app.cursor_line_col(), (0, 2));
+    }
+
+    #[test]
+    fn multiline_mode_toggle_flips_flag() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.multiline_mode);
+        app.toggle_multiline_mode();
+        assert!(app.multiline_mode);
+        app.toggle_multiline_mode();
+        assert!(!app.multiline_mode);
+    }
+
+    #[test]
+    fn prompt_history_up_down() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.enqueue_turn("first".into());
+        app.pending_submit = None;
+        app.phase = Phase::Idle;
+        app.enqueue_turn("second".into());
+        app.pending_submit = None;
+        app.phase = Phase::Idle;
+        app.input.clear();
+        app.history_older();
+        assert_eq!(app.input, "second");
+        app.history_older();
+        assert_eq!(app.input, "first");
+        app.history_newer();
+        assert_eq!(app.input, "second");
+        app.history_newer();
+        assert!(app.input.is_empty());
+        assert!(app.history_browse.is_none());
+    }
+
+    #[test]
+    fn expand_toggles_tool_body() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::Tool {
+            call_id: "1".into(),
+            name: "Bash".into(),
+            detail: "ls".into(),
+            result: Some("a\nb\nc\nd\ne".into()),
+            is_error: false,
+        });
+        let idx = app.transcript.len() - 1;
+        app.selected_item = Some(idx);
+        assert!(!app.expanded.contains(&idx));
+        app.toggle_expand_selected();
+        assert!(app.expanded.contains(&idx));
+        app.toggle_expand_selected();
+        assert!(!app.expanded.contains(&idx));
+    }
+
+    #[test]
+    fn block_copy_text_tool_meta_and_body() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::Tool {
+            call_id: "1".into(),
+            name: "Bash".into(),
+            detail: "ls -la".into(),
+            result: Some("file.rs\n".into()),
+            is_error: false,
+        });
+        let idx = app.transcript.len() - 1;
+        app.selected_item = Some(idx);
+        assert_eq!(
+            app.block_copy_text(idx, true).as_deref(),
+            Some("Bash · ls -la")
+        );
+        let body = app.block_copy_text(idx, false).unwrap();
+        assert!(body.contains("ls -la"));
+        assert!(body.contains("file.rs"));
+    }
+
+    #[test]
+    fn queue_pane_send_selected_idle() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.queue.push_back("a".into());
+        app.queue.push_back("b".into());
+        app.show_queue_pane = true;
+        app.queue_selected = 1;
+        app.queue_send_selected();
+        assert_eq!(app.pending_submit.as_deref(), Some("b"));
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.front().map(|s| s.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn cost_slash_reports_usage() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.tokens_in = 10;
+        app.tokens_out = 5;
+        app.cost_usd = 0.01;
+        app.input = "/cost".into();
+        app.cursor = 5;
+        app.submit();
+        assert!(app.transcript.iter().any(
+            |t| matches!(t, TranscriptItem::System(s) if s.contains("usage:") && s.contains("15"))
+        ),);
+    }
+
+    #[test]
+    fn jump_user_turns() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::User("one".into()));
+        app.transcript.push(TranscriptItem::Assistant("a1".into()));
+        app.transcript.push(TranscriptItem::User("two".into()));
+        app.jump_prev_user_turn();
+        assert_eq!(app.selected_item, Some(app.transcript.len() - 1));
+        app.jump_prev_user_turn();
+        let first_user = app
+            .transcript
+            .iter()
+            .position(|t| matches!(t, TranscriptItem::User(s) if s == "one"));
+        assert_eq!(app.selected_item, first_user);
+        app.jump_next_user_turn();
+        let second = app
+            .transcript
+            .iter()
+            .position(|t| matches!(t, TranscriptItem::User(s) if s == "two"));
+        assert_eq!(app.selected_item, second);
+    }
+
+    #[test]
     fn unknown_slash_rejected_with_hint_not_sent() {
         let mut app = App::new("m", "/tmp", "s");
         app.input = "/definitely-not-a-command".into();
@@ -1497,7 +2397,8 @@ mod tests {
     fn stats_command_reports_counts() {
         let mut app = App::new("m", "/tmp", "s");
         app.frame_count = 7;
-        app.layout.sync(&app.transcript, 80);
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
         app.input = "/stats".into();
         app.cursor = app.input.len();
         app.submit();
@@ -1527,9 +2428,44 @@ mod tests {
         assert!(last.contains("terminal-setup"));
         assert!(last.contains("synchronized output : ✓"));
         assert!(last.contains("tmux                : ✓"));
+        assert!(
+            last.contains("clipboard routes:"),
+            "terminal-setup must report clipboard cascade"
+        );
+        assert!(last.contains("native candidates"));
         // tmux + no-truecolor + no-kitty → remediation lines present.
         assert!(last.contains("allow-passthrough"));
         assert!(last.contains("COLORTERM=truecolor"));
+    }
+
+    #[test]
+    fn copy_reports_no_assistant_when_empty() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.copy_last_assistant();
+        assert!(
+            app.transcript
+                .iter()
+                .any(|t| matches!(t, TranscriptItem::System(s) if s.contains("no assistant"))),
+            "empty transcript should say nothing to copy"
+        );
+    }
+
+    #[test]
+    fn copy_slash_clears_input_and_targets_last_assistant() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript
+            .push(TranscriptItem::Assistant("hello from agent".into()));
+        app.input = "/copy".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(app.input.is_empty());
+        assert!(
+            app.transcript.iter().any(|t| matches!(
+                t,
+                TranscriptItem::System(s) if s.contains("copied") || s.contains("copy failed")
+            )),
+            "copy should report success or failure"
+        );
     }
 
     #[test]

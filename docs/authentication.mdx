@@ -1,0 +1,95 @@
+---
+title: "Authentication"
+description: "API keys, subscription login, and session reuse"
+---
+
+Agent Code talks to LLM providers with either an **API key** or a **subscription login**. Pick whichever matches how you already pay for models.
+
+## API keys (default)
+
+Set the env var for your provider before launching:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-…
+# or OPENAI_API_KEY, XAI_API_KEY, GOOGLE_API_KEY, OPENROUTER_API_KEY, …
+agent
+```
+
+| Provider | Environment variable |
+|----------|----------------------|
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| xAI | `XAI_API_KEY` |
+| Google | `GOOGLE_API_KEY` |
+| DeepSeek | `DEEPSEEK_API_KEY` |
+| Groq | `GROQ_API_KEY` |
+| Mistral | `MISTRAL_API_KEY` |
+| Together | `TOGETHER_API_KEY` |
+| Zhipu | `ZHIPU_API_KEY` |
+| Cohere | `COHERE_API_KEY` |
+| Perplexity | `PERPLEXITY_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+
+Override base URL for Azure, proxies, or local servers:
+
+```bash
+agent --api-base-url https://my-proxy.example/v1 --model gpt-5.5
+# or Ollama
+agent --api-base-url http://127.0.0.1:11434/v1 --model llama3.2
+```
+
+Keys are **never** written into config files. Env vars and the OS keychain/session stores used by login flows only.
+
+## Subscription login
+
+### ChatGPT / Codex
+
+```bash
+agent login codex
+agent --auth-mode codex_chatgpt --model gpt-5.5
+```
+
+Uses the same session file as the official Codex CLI (`~/.codex/auth.json`). If you already ran `codex login`, Agent Code reuses that session — no second browser dance.
+
+### SuperGrok / X Premium (xAI)
+
+```bash
+agent login xai
+agent --auth-mode xai_oauth --model grok-build-0.1
+```
+
+Device-code / OAuth flow. If you already authenticated via the official `grok login`, Agent Code can reuse `~/.grok/auth.json`.
+
+### First-run setup
+
+Launching `agent` with no credentials starts the setup wizard, which offers API key entry and both subscription options.
+
+## Selecting auth mode
+
+| Mechanism | Example |
+|-----------|---------|
+| CLI | `agent --auth-mode api_key` · `codex_chatgpt` · `xai_oauth` |
+| Env | `AGENT_CODE_AUTH_MODE=codex_chatgpt` |
+| Config | `[api] auth_mode = "xai_oauth"` in `config.toml` |
+
+## Headless / CI
+
+Prefer API keys in CI:
+
+```bash
+export ANTHROPIC_API_KEY="…"
+agent -p "run the unit tests and report failures" --permission-mode allow
+```
+
+Do not commit `.env` files or paste keys into the repo. For org policies that forbid bypass flags, set:
+
+```toml
+[security]
+disable_bypass_permissions = true
+```
+
+## Related
+
+- [Providers](./configuration/providers.mdx) — model IDs and multi-provider setup
+- [Headless mode](./headless.mdx) — scripting and CI flags
+- [Security](./security.mdx) — what never leaves the machine by default

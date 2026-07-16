@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **Modern TUI agent-screen parity** — multiline composer, prompt history, fold/expand, queue pane, interject (Ctrl+Enter), full slash-command bridge with Tab complete and stdout capture, `!` shell passthrough, y/Y block copy, shared clipboard (native → tmux → OSC 52), and setup hero polish.
+
+### Removed
+
+- **Classic rustyline REPL** — interactive sessions always use the modern fullscreen TUI. Removed `--tui`, `AGENT_CODE_TUI`, `[ui] tui`, and the `ui/repl.rs` path. Headless (`-p`), `--serve`, and ACP are unchanged.
 
 ## [0.26.0] - 2026-07-10
 

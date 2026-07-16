@@ -4,8 +4,10 @@
 
 # Getting Started
 
-- [Quickstart](quickstart.md)
 - [Installation](installation.md)
+- [Quickstart](quickstart.md)
+- [Authentication](authentication.md)
+- [Keyboard shortcuts](keyboard-shortcuts.md)
 
 # Tutorials
 
@@ -19,8 +21,15 @@
 - [Agent Loop](concepts/agent-loop.md)
 - [Tools](concepts/tools.md)
 - [Permissions](concepts/permissions.md)
+- [Plan mode](plan-mode.md)
 - [Memory](concepts/memory.md)
 - [Sessions](concepts/sessions.md)
+
+# Using Agent Code
+
+- [Headless & scripting](headless.md)
+- [Sandbox](sandbox.md)
+- [Terminal support](terminal-support.md)
 
 # Configuration
 

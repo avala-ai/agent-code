@@ -2,9 +2,8 @@
 //!
 //! Tool calls are classified by name into a [`ToolKind`] so each renders as
 //! a typed card (icon + label + kind-specific summary), and consecutive
-//! read-only successes fold into a single group line (Grok's
-//! `group_tool_verbs`). Grouping is a *view* — the underlying transcript
-//! items are never destroyed, so expanding shows the individual cards.
+//! read-only successes fold into a single group line. Grouping is a *view*
+//! — the underlying transcript items are never destroyed.
 
 use super::app::TranscriptItem;
 

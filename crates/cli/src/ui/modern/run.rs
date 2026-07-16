@@ -273,6 +273,110 @@ pub(super) async fn event_loop(
             app.dirty = true;
         }
 
+        // Full classic slash-command bridge (stdout captured → transcript).
+        // Run off the async worker via `block_in_place`: many slash arms call
+        // `Handle::block_on` / spawn+join, which panic if invoked directly on
+        // a Tokio worker without parking it first.
+        if let Some(slash) = app.pending_slash.take() {
+            match session.engine().try_lock() {
+                Ok(mut eng) => {
+                    let (result, captured) = tokio::task::block_in_place(|| {
+                        crate::stdout_capture::capture_stdout(|| {
+                            crate::commands::execute(&slash, &mut eng)
+                        })
+                    });
+                    match result {
+                        crate::commands::CommandResult::Exit => {
+                            app.should_quit = true;
+                        }
+                        crate::commands::CommandResult::Prompt(p) => {
+                            app.enqueue_turn_from_command(p);
+                        }
+                        crate::commands::CommandResult::Passthrough(p) => {
+                            app.enqueue_turn_from_command(p);
+                        }
+                        crate::commands::CommandResult::Handled => {
+                            let text = captured.trim();
+                            if !text.is_empty() {
+                                for line in text.lines() {
+                                    // Strip ANSI for the transcript view.
+                                    let plain = strip_ansi_simple(line);
+                                    if !plain.is_empty() {
+                                        app.transcript
+                                            .push(super::app::TranscriptItem::System(plain));
+                                    }
+                                }
+                            }
+                            app.status_message = format!("ran {slash}");
+                        }
+                    }
+                    app.dirty = true;
+                }
+                Err(_) => {
+                    // Turn holds the lock — retry next loop.
+                    app.pending_slash = Some(slash);
+                }
+            }
+        }
+
+        // `!cmd` shell passthrough (classic parity).
+        if let Some(cmd) = app.pending_shell.take() {
+            match session.engine().try_lock() {
+                Ok(mut eng) => {
+                    use agent_code_lib::services::shell_passthrough;
+                    use std::sync::{Arc, Mutex};
+                    let cwd = std::path::PathBuf::from(&app.cwd);
+                    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                    let out_l = lines.clone();
+                    let err_l = lines.clone();
+                    match shell_passthrough::run_and_capture(
+                        &cmd,
+                        &cwd,
+                        move |line| {
+                            if let Ok(mut g) = out_l.lock() {
+                                g.push(line.to_string());
+                            }
+                        },
+                        move |line| {
+                            if let Ok(mut g) = err_l.lock() {
+                                g.push(format!("[stderr] {line}"));
+                            }
+                        },
+                    ) {
+                        Ok(output) => {
+                            if let Ok(g) = lines.lock() {
+                                for line in g.iter() {
+                                    app.transcript
+                                        .push(super::app::TranscriptItem::System(line.clone()));
+                                }
+                            }
+                            // Also show truncated capture if streaming missed.
+                            if !output.text.is_empty() {
+                                let preview: String = output.text.chars().take(500).collect();
+                                if lines.lock().map(|g| g.is_empty()).unwrap_or(true) {
+                                    app.transcript
+                                        .push(super::app::TranscriptItem::System(preview));
+                                }
+                            }
+                            if let Some(msg) =
+                                shell_passthrough::build_context_message(&cmd, &output)
+                            {
+                                eng.state_mut().push_message(msg);
+                            }
+                            app.status_message = format!("! done · exit {:?}", output.exit_code);
+                        }
+                        Err(e) => {
+                            app.transcript.push(super::app::TranscriptItem::Error(e));
+                        }
+                    }
+                    app.dirty = true;
+                }
+                Err(_) => {
+                    app.pending_shell = Some(cmd);
+                }
+            }
+        }
+
         // Start a pending turn if idle.
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
@@ -358,20 +462,20 @@ pub(super) async fn event_loop(
 
                 // Queue handling (plan §M5): auto-send the head on a clean
                 // finish; on abort/error keep the queue and tell the user.
+                // Interject leaves `pending_submit` set so we start it even
+                // after Aborted (send-now cancel-and-send).
                 if completed_ok {
                     app.dispatch_queue_head();
-                    // Start the dispatched head NOW. The spawn check lives at
-                    // the top of the loop; falling through to `select!` here
-                    // parks the loop, and the queued prompt would sit
-                    // unstarted until an unrelated input event arrives
-                    // (caught by the fake_engine queue test).
-                    if app.pending_submit.is_some() {
-                        continue;
-                    }
-                } else if !app.queue.is_empty() {
+                } else if app.pending_submit.is_none() && !app.queue.is_empty() {
                     app.transcript.push(super::app::TranscriptItem::System(
                         "queued prompts kept — press Enter to send".into(),
                     ));
+                }
+                // Start a pending turn NOW (auto-queue head or interject).
+                // The spawn check lives at the top of the loop; falling
+                // through to `select!` would park until an unrelated event.
+                if app.pending_submit.is_some() {
+                    continue;
                 }
             }
         }
@@ -476,14 +580,54 @@ pub(super) async fn event_loop(
     }
 }
 
-/// True for Esc, Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
+/// Strip common CSI/OSC ANSI sequences for transcript display.
+fn strip_ansi_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC … BEL or ST
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x == '\u{7}' {
+                            break;
+                        }
+                        if x == '\u{1b}' {
+                            let _ = chars.next(); // skip \
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// True for Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
 ///
-/// Classic REPL: "Esc / Ctrl+C cancel". Real terminals often set extra
-/// modifier bits (e.g. SHIFT with Ctrl+C) so exact `KeyModifiers::CONTROL`
-/// equality silently drops the key — use `.contains(CONTROL)` instead.
-fn is_interrupt_chord(key: &KeyEvent) -> bool {
+/// **Not Esc.** Esc is navigate / dismiss / clear only — never cancels a
+/// turn (world-class agent-screen contract; see ACCEPTANCE + KEYBINDINGS).
+/// Real terminals often set extra modifier bits (e.g. SHIFT with Ctrl+C)
+/// so exact `KeyModifiers::CONTROL` equality silently drops the key —
+/// use `.contains(CONTROL)` instead.
+fn is_cancel_chord(key: &KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc => true,
         // Raw ETX (0x03) — some paths deliver the byte without CONTROL.
         KeyCode::Char('\u{3}') => true,
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => {
@@ -494,6 +638,10 @@ fn is_interrupt_chord(key: &KeyEvent) -> bool {
     }
 }
 
+fn is_esc(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Esc)
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Ignore key release on platforms that emit them. Accept Repeat so a
     // held Ctrl+C still counts (double-tap quit / cancel).
@@ -501,22 +649,20 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Permission modal captures all input until answered. Interrupt/Esc mean
-    // deny (and interrupt also cancels the in-flight turn).
+    // Permission modal captures all input until answered.
+    // Esc = dismiss only. Ctrl+C = dismiss + cancel turn ("get me out").
     if app.phase == super::app::Phase::Permission {
         use super::app::Modal;
-        if is_interrupt_chord(&key) {
+        if is_cancel_chord(&key) {
             match app.front_modal() {
                 Some(Modal::Permission(_)) => {
                     app.resolve_permission(PermissionResponse::Deny);
-                    // Also stop the turn — "get me out" not just "deny this tool".
                     app.request_cancel();
                 }
                 Some(Modal::Plan(_)) => {
                     app.resolve_plan(false, false);
                 }
                 Some(Modal::Question(_)) => {
-                    // Drop respond channel (ask fails closed) and cancel turn.
                     app.deny_all_modals();
                     app.phase = super::app::Phase::Streaming;
                     app.request_cancel();
@@ -524,6 +670,29 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 None => {
                     app.request_cancel();
                 }
+            }
+            return;
+        }
+        if is_esc(&key) {
+            match app.front_modal() {
+                Some(Modal::Permission(_)) => {
+                    app.resolve_permission(PermissionResponse::Deny);
+                }
+                Some(Modal::Plan(_)) => {
+                    app.resolve_plan(false, false);
+                }
+                Some(Modal::Question(_)) => {
+                    // Drop respond channel (ask fails closed) without
+                    // cancelling the turn — Esc is dismiss, not interrupt.
+                    app.deny_all_modals();
+                    if app.turn_live {
+                        app.phase = super::app::Phase::Streaming;
+                    } else {
+                        app.phase = super::app::Phase::Idle;
+                    }
+                    app.dirty = true;
+                }
+                None => {}
             }
             return;
         }
@@ -535,7 +704,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);
                 }
-                (_, KeyCode::Esc) | (_, KeyCode::Char('n')) | (_, KeyCode::Char('3')) => {
+                (_, KeyCode::Char('n')) | (_, KeyCode::Char('3')) => {
                     app.resolve_permission(PermissionResponse::Deny);
                 }
                 _ => {}
@@ -547,20 +716,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('k')) => {
                     app.resolve_plan(false, true);
                 }
-                (_, KeyCode::Esc) => {
-                    app.resolve_plan(false, false);
-                }
                 _ => {}
             },
             Some(Modal::Question(_)) => match (key.modifiers, key.code) {
                 (_, KeyCode::Up) => app.question_move(-1),
                 (_, KeyCode::Down) => app.question_move(1),
                 (_, KeyCode::Enter) => app.question_select(None),
-                (_, KeyCode::Esc) => {
-                    app.deny_all_modals();
-                    app.phase = super::app::Phase::Streaming;
-                    app.request_cancel();
-                }
                 (_, KeyCode::Char(c)) if c.is_ascii_digit() && c != '0' => {
                     // Out-of-range digits are ignored by question_select.
                     app.question_select(Some(c as usize - '1' as usize));
@@ -572,18 +733,43 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Any keypress other than the arming interrupt disarms quit; capture the
-    // prior arm state so a second Ctrl+C can act on it (§5 Ctrl+C machine).
+    // Any keypress other than the arming chord disarms quit; capture the
+    // prior arm state so a second Ctrl+C / Esc can act on it.
     let was_armed = app.quit_armed;
     app.quit_armed = false;
 
-    if is_interrupt_chord(&key) {
-        if app.phase == super::app::Phase::Streaming {
-            // Esc / Ctrl+C cancel the running turn (classic REPL parity).
-            app.request_cancel();
+    // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
+    if is_esc(&key) {
+        if !app.input.is_empty() {
+            app.clear_prompt();
+        } else if app.phase == super::app::Phase::Streaming {
+            // Mid-turn empty Esc is a no-op (use Ctrl+C to cancel).
+            app.status_message = "Ctrl+C to cancel turn".into();
+            app.dirty = true;
+        } else if was_armed {
+            app.should_quit = true;
+        } else {
+            app.quit_armed = true;
+            app.status_message = "press Esc/Ctrl+C again to quit".into();
             app.transcript.push(super::app::TranscriptItem::System(
-                "interrupted — cancelling turn…".into(),
+                "Esc or Ctrl+C again to quit · or type /exit · or Ctrl+D".into(),
             ));
+        }
+        return;
+    }
+
+    // Ctrl+C (and Super+C / ETX): cancel turn, clear draft, or double-quit.
+    if is_cancel_chord(&key) {
+        if app.phase == super::app::Phase::Streaming {
+            // With a non-empty draft mid-turn: clear draft first, keep turn.
+            if !app.input.is_empty() {
+                app.clear_prompt();
+            } else {
+                app.request_cancel();
+                app.transcript.push(super::app::TranscriptItem::System(
+                    "interrupted — cancelling turn…".into(),
+                ));
+            }
         } else if !app.input.is_empty() {
             app.clear_prompt();
         } else if was_armed {
@@ -591,7 +777,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         } else {
             app.quit_armed = true;
             app.status_message = "press Esc/Ctrl+C again to quit".into();
-            // Status bar alone is easy to miss — also pin a transcript line.
             app.transcript.push(super::app::TranscriptItem::System(
                 "Esc or Ctrl+C again to quit · or type /exit · or Ctrl+D".into(),
             ));
@@ -616,22 +801,140 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
         }
+        // Queue pane toggle (Ctrl+; / Ctrl+').
+        (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
+            app.toggle_queue_pane();
+        }
+        // When the queue pane is open, arrows and Enter drive it.
+        (_, KeyCode::Up) if app.show_queue_pane && !app.queue.is_empty() => {
+            app.queue_select_prev();
+        }
+        (_, KeyCode::Down) if app.show_queue_pane && !app.queue.is_empty() => {
+            app.queue_select_next();
+        }
+        (_, KeyCode::Enter)
+            if app.show_queue_pane && !app.queue.is_empty() && app.input.is_empty() =>
+        {
+            app.queue_send_selected();
+        }
+        (_, KeyCode::Backspace | KeyCode::Delete)
+            if app.show_queue_pane && !app.queue.is_empty() && app.input.is_empty() =>
+        {
+            app.queue_delete_selected();
+        }
+        // Block copy: y = body, Y = metadata (only when a block is selected).
+        (_, KeyCode::Char('y')) if app.input.is_empty() && app.selected_item.is_some() => {
+            app.copy_selected_content();
+        }
+        (_, KeyCode::Char('Y')) if app.input.is_empty() && app.selected_item.is_some() => {
+            app.copy_selected_meta();
+        }
+        // Interject / send-now: Ctrl+Enter (kitty keyboard) or Ctrl+I alt.
+        (m, KeyCode::Enter) if m.contains(KeyModifiers::CONTROL) => {
+            app.interject();
+        }
+        (m, KeyCode::Char('i') | KeyCode::Char('I')) if m.contains(KeyModifiers::CONTROL) => {
+            // Alt chord when the terminal does not distinguish Ctrl+Enter.
+            app.interject();
+        }
+        // Multiline compose: Ctrl+M toggles Enter vs Alt/Shift+Enter semantics.
+        (m, KeyCode::Char('m') | KeyCode::Char('M')) if m.contains(KeyModifiers::CONTROL) => {
+            app.toggle_multiline_mode();
+        }
+        // Alt+Enter / Shift+Enter: newline in normal mode, submit in multiline mode.
+        (m, KeyCode::Enter) if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::SHIFT) => {
+            if app.multiline_mode {
+                app.submit();
+            } else {
+                app.insert_newline();
+            }
+        }
         (_, KeyCode::Enter) => {
-            app.submit();
+            if app.multiline_mode {
+                app.insert_newline();
+            } else {
+                app.submit();
+            }
         }
         (_, KeyCode::Backspace) => app.backspace(),
+        // Tab completes slash commands when drafting `/…`.
+        (_, KeyCode::Tab) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.complete_slash_tab();
+        }
+        // Turn navigation (Shift+Left/Right) — before bare arrows.
+        (m, KeyCode::Left) if m.contains(KeyModifiers::SHIFT) => {
+            app.jump_prev_user_turn();
+        }
+        (m, KeyCode::Right) if m.contains(KeyModifiers::SHIFT) => {
+            app.jump_next_user_turn();
+        }
+        // Fold / expand selected block (`e`) and all thinking (Ctrl+E).
+        (m, KeyCode::Char('e') | KeyCode::Char('E')) if m.contains(KeyModifiers::CONTROL) => {
+            app.toggle_expand_all_thinking();
+        }
+        // Only steal `e` when a block is already selected — otherwise it types.
+        (_, KeyCode::Char('e')) if app.input.is_empty() && app.selected_item.is_some() => {
+            app.toggle_expand_selected();
+        }
+        // Select prev/next block when composer is empty (scrollback focus lite).
+        (_, KeyCode::Left) if app.input.is_empty() => {
+            app.select_prev_item();
+        }
+        (_, KeyCode::Right) if app.input.is_empty() => {
+            app.select_next_item();
+        }
         (_, KeyCode::Left) => app.move_left(),
         (_, KeyCode::Right) => app.move_right(),
-        // Transcript scrolling. Up/wheel enters Free; End/Home jump.
-        (_, KeyCode::Up) => app.scroll_up(1),
-        (_, KeyCode::Down) => app.scroll_down(1),
+        // In a multi-line draft, ↑/↓ move within the composer; empty ↑ is
+        // prompt history; otherwise scroll transcript.
+        (_, KeyCode::Up) => {
+            if app.input.is_empty() || app.history_browse.is_some() {
+                app.history_older();
+            } else if app.input_is_multiline() || app.multiline_mode {
+                let (line, _) = app.cursor_line_col();
+                if line > 0 {
+                    app.move_up_line();
+                } else {
+                    app.scroll_up(1);
+                }
+            } else {
+                app.scroll_up(1);
+            }
+        }
+        (_, KeyCode::Down) => {
+            if app.history_browse.is_some() {
+                app.history_newer();
+            } else if app.input_is_multiline() || app.multiline_mode {
+                let (line, _) = app.cursor_line_col();
+                if line + 1 < app.input_line_count() {
+                    app.move_down_line();
+                } else {
+                    app.scroll_down(1);
+                }
+            } else {
+                app.scroll_down(1);
+            }
+        }
         (_, KeyCode::PageUp) => app.scroll_up(app.viewport_h.max(1)),
         (_, KeyCode::PageDown) => app.scroll_down(app.viewport_h.max(1)),
         (m, KeyCode::Char('u') | KeyCode::Char('U')) if m.contains(KeyModifiers::CONTROL) => {
             app.scroll_up(app.viewport_h / 2)
         }
-        (_, KeyCode::Home) => app.scroll_to_top(),
-        (_, KeyCode::End) => app.scroll_to_bottom(),
+        // Home/End: line bounds when composing; transcript jump when empty.
+        (_, KeyCode::Home) => {
+            if app.input.is_empty() {
+                app.scroll_to_top();
+            } else {
+                app.move_line_start();
+            }
+        }
+        (_, KeyCode::End) => {
+            if app.input.is_empty() {
+                app.scroll_to_bottom();
+            } else {
+                app.move_line_end();
+            }
+        }
         // Only plain / shifted characters type into the prompt; Ctrl/Alt/Super
         // chords must not fall through as literal input.
         (m, KeyCode::Char(c))
@@ -822,17 +1125,110 @@ mod tests {
     }
 
     #[test]
-    fn esc_while_streaming_cancels_turn() {
+    fn alt_enter_inserts_newline_in_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hi".into();
+        app.cursor = 2;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.input, "hi\n");
+        assert!(app.pending_submit.is_none());
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_in_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "x".into();
+        app.cursor = 1;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.input, "x\n");
+    }
+
+    #[test]
+    fn multiline_mode_enter_inserts_newline_shift_enter_sends() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.multiline_mode = true;
+        app.input = "line".into();
+        app.cursor = 4;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input, "line\n");
+        assert!(app.pending_submit.is_none());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.pending_submit.as_deref(), Some("line"));
+    }
+
+    #[test]
+    fn ctrl_m_toggles_multiline() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('m'));
+        assert!(app.multiline_mode);
+        handle_key(&mut app, ctrl('m'));
+        assert!(!app.multiline_mode);
+    }
+
+    #[test]
+    fn ctrl_enter_interjects() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.turn_live = true;
+        app.input = "now".into();
+        app.cursor = 3;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(app.cancel_requested);
+        assert_eq!(app.pending_submit.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn ctrl_i_interjects_as_alt_chord() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.turn_live = true;
+        app.input = "alt".into();
+        app.cursor = 3;
+        handle_key(&mut app, ctrl('i'));
+        assert!(app.cancel_requested);
+        assert_eq!(app.pending_submit.as_deref(), Some("alt"));
+    }
+
+    #[test]
+    fn esc_while_streaming_clears_draft_does_not_cancel() {
+        // World-class contract: Esc never cancels. Ctrl+C cancels.
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
         app.input = "typed while running".into();
         app.cursor = app.input.len();
         handle_key(&mut app, key(KeyCode::Esc));
-        assert!(
-            app.cancel_requested,
-            "Esc cancels a running turn (classic parity)"
-        );
+        assert!(!app.cancel_requested, "Esc must not cancel a running turn");
+        assert!(app.input.is_empty(), "Esc clears mid-turn draft");
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_while_streaming_empty_is_noop() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.cancel_requested);
+        assert!(!app.should_quit);
+        assert!(!app.quit_armed, "mid-turn empty Esc must not arm quit");
+    }
+
+    #[test]
+    fn ctrl_c_mid_turn_with_draft_clears_before_cancel() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.input = "note".into();
+        app.cursor = 4;
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.input.is_empty());
+        assert!(
+            !app.cancel_requested,
+            "first Ctrl+C with draft clears draft only"
+        );
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.cancel_requested, "second Ctrl+C on empty cancels");
     }
 
     #[test]
@@ -901,7 +1297,8 @@ mod tests {
                     "l {i}"
                 )));
         }
-        app.layout.sync(&app.transcript, 80);
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
         app.viewport_h = 20;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 5));
         assert!(!app.scroll.is_following(), "wheel up enters Free");
@@ -922,7 +1319,8 @@ mod tests {
                     "l {i}"
                 )));
         }
-        app.layout.sync(&app.transcript, 80);
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
         app.viewport_h = 20;
         app.transcript_bottom_row = 22;
         app.scroll_up(30);
@@ -997,6 +1395,10 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Deny)));
         assert!(!app.should_quit);
+        assert!(
+            !app.cancel_requested,
+            "Esc on permission denies without cancelling the turn"
+        );
         assert!(app.front_permission().is_none());
     }
 }

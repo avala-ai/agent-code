@@ -8,6 +8,7 @@
 //! aware on grapheme clusters so a wide char is never split and no line
 //! ever exceeds the width.
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -50,9 +51,11 @@ impl Clone for LayoutCache {
     }
 }
 
-fn hash_item(item: &TranscriptItem) -> u64 {
+fn hash_item(item: &TranscriptItem, expanded: bool, selected: bool) -> u64 {
     let mut h = DefaultHasher::new();
     item.hash(&mut h);
+    expanded.hash(&mut h);
+    selected.hash(&mut h);
     h.finish()
 }
 
@@ -61,7 +64,13 @@ impl LayoutCache {
     /// every block; otherwise only blocks whose content hash changed (or
     /// new blocks) are re-rendered. Returns nothing; query with
     /// [`Self::total_lines`] / [`Self::viewport`].
-    pub fn sync(&mut self, items: &[TranscriptItem], width: u16) {
+    pub fn sync(
+        &mut self,
+        items: &[TranscriptItem],
+        width: u16,
+        expanded: &HashSet<usize>,
+        selected: Option<usize>,
+    ) {
         let width_changed = width != self.width;
         self.width = width;
         if width_changed {
@@ -78,15 +87,23 @@ impl LayoutCache {
             let (hash, render): (u64, Box<dyn Fn() -> Vec<Line<'static>>>) = match d {
                 super::toolcard::Display::Single(idx) => {
                     let item = &items[*idx];
-                    (hash_item(item), Box::new(move || render_item(item)))
+                    let exp = expanded.contains(idx);
+                    let sel = selected == Some(*idx);
+                    (
+                        hash_item(item, exp, sel),
+                        Box::new(move || render_item(item, exp, sel)),
+                    )
                 }
                 super::toolcard::Display::Group(idxs) => {
                     let mut h = DefaultHasher::new();
                     "group".hash(&mut h);
                     for &idx in idxs {
                         items[idx].hash(&mut h);
+                        expanded.contains(&idx).hash(&mut h);
                     }
-                    (h.finish(), Box::new(move || render_group(items, idxs)))
+                    let sel = selected.is_some_and(|s| idxs.contains(&s));
+                    sel.hash(&mut h);
+                    (h.finish(), Box::new(move || render_group(items, idxs, sel)))
                 }
             };
             match self.blocks.get(i) {
@@ -107,6 +124,11 @@ impl LayoutCache {
 
     pub fn total_lines(&self) -> usize {
         self.total
+    }
+
+    /// Absolute top line of display block `idx` (0 if out of range).
+    pub fn block_start_line(&self, idx: usize) -> usize {
+        self.blocks.iter().take(idx).map(|b| b.lines.len()).sum()
     }
 
     /// (`display block count`, `cached line count`) for the /stats command.
@@ -149,39 +171,81 @@ impl LayoutCache {
 }
 
 /// Render one transcript block to logical (pre-wrap) lines.
-pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
+pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let sel = if selected {
+        Span::styled("▌", Style::default().fg(palette().accent))
+    } else {
+        Span::raw(" ")
+    };
     match item {
         TranscriptItem::User(t) => {
             let accent = palette().accent;
             lines.push(Line::from(vec![
+                sel.clone(),
                 Span::styled("❯ ", Style::default().fg(accent)),
                 Span::styled(t.clone(), Style::default().fg(Color::White)),
             ]));
             lines.push(Line::from(""));
         }
         TranscriptItem::Assistant(t) => {
-            // Full markdown rendering (headings, code, lists, links…).
-            lines.extend(super::markdown::render_markdown(t).lines);
+            let mut body = super::markdown::render_markdown(t).lines;
+            if !expanded {
+                let max = 12;
+                let total = body.len();
+                if total > max {
+                    body.truncate(max);
+                    body.push(Line::from(Span::styled(
+                        "  … folded · press e to expand".to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+            if let Some(first) = body.first_mut() {
+                first.spans.insert(0, sel.clone());
+            } else {
+                lines.push(Line::from(sel.clone()));
+            }
+            lines.extend(body);
             lines.push(Line::from(""));
         }
         TranscriptItem::Thinking(t) => {
-            // Thinking is dimmed; render its markdown then overlay a dim
-            // italic style so it reads as secondary reasoning.
-            lines.push(Line::from(Span::styled(
-                "  thinking…",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )));
-            for mut line in super::markdown::render_markdown(t).lines {
-                for span in &mut line.spans {
-                    span.style = span
-                        .style
+            // Thinking is dimmed; collapsed by default to one line.
+            lines.push(Line::from(vec![
+                sel.clone(),
+                Span::styled(
+                    if expanded {
+                        "  thinking…".to_string()
+                    } else {
+                        let preview: String = t.chars().take(60).collect();
+                        format!(
+                            "  thinking… {}{}",
+                            preview,
+                            if t.chars().count() > 60 { "…" } else { "" }
+                        )
+                    },
+                    Style::default()
                         .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            if expanded {
+                for mut line in super::markdown::render_markdown(t).lines {
+                    for span in &mut line.spans {
+                        span.style = span
+                            .style
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC);
+                    }
+                    lines.push(line);
                 }
-                lines.push(line);
+            } else if !t.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "     (e expand · Ctrl+E all thinking)".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
         }
         TranscriptItem::Tool {
@@ -190,24 +254,31 @@ pub fn render_item(item: &TranscriptItem) -> Vec<Line<'static>> {
             result,
             is_error,
             ..
-        } => lines.extend(render_tool_card(name, detail, result.as_deref(), *is_error)),
+        } => lines.extend(render_tool_card(
+            name,
+            detail,
+            result.as_deref(),
+            *is_error,
+            expanded,
+            selected,
+        )),
         TranscriptItem::System(t) => {
-            lines.push(Line::from(Span::styled(
-                format!("  · {t}"),
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                sel,
+                Span::styled(format!(" · {t}"), Style::default().fg(Color::DarkGray)),
+            ]));
         }
         TranscriptItem::Error(t) => {
-            lines.push(Line::from(Span::styled(
-                format!("  ✗ {t}"),
-                Style::default().fg(Color::Red),
-            )));
+            lines.push(Line::from(vec![
+                sel,
+                Span::styled(format!(" ✗ {t}"), Style::default().fg(Color::Red)),
+            ]));
         }
         TranscriptItem::Warning(t) => {
-            lines.push(Line::from(Span::styled(
-                format!("  ! {t}"),
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::from(vec![
+                sel,
+                Span::styled(format!(" ! {t}"), Style::default().fg(Color::Yellow)),
+            ]));
         }
     }
     lines
@@ -220,6 +291,8 @@ fn render_tool_card(
     detail: &str,
     result: Option<&str>,
     is_error: bool,
+    expanded: bool,
+    selected: bool,
 ) -> Vec<Line<'static>> {
     use super::toolcard::ToolKind;
     let kind = ToolKind::classify(name);
@@ -228,7 +301,13 @@ fn render_tool_card(
         (Some(_), false) => ("✓", Color::Green), // ok
         (Some(_), true) => ("✗", Color::Red),    // failed
     };
+    let sel = if selected {
+        Span::styled("▌", Style::default().fg(palette().accent))
+    } else {
+        Span::raw(" ")
+    };
     let mut lines = vec![Line::from(vec![
+        sel,
         Span::styled(format!("{glyph} "), Style::default().fg(status_color)),
         Span::styled(
             format!("{} {} ", kind.icon(), kind.label()),
@@ -239,10 +318,8 @@ fn render_tool_card(
         Span::styled("· ", Style::default().fg(Color::DarkGray)),
         Span::styled(detail.to_string(), Style::default().fg(Color::Gray)),
     ])];
-    // Errors keep more of their output visible; successes stay compact.
-    // The card holds the FULL result (spill/expand is the M4.2 follow-up);
-    // the renderer clamps to a head so a huge output can't flood the
-    // transcript, with an elision count so truncation is never silent.
+    // Errors keep more of their output visible; successes stay compact
+    // unless the user expanded the card (`e`).
     if let Some(r) = result
         && !r.is_empty()
     {
@@ -251,8 +328,14 @@ fn render_tool_card(
         } else {
             Color::DarkGray
         };
-        let head = if is_error { 5 } else { 1 };
         let total = r.lines().count();
+        let head = if expanded {
+            total
+        } else if is_error {
+            5
+        } else {
+            1
+        };
         for (i, line) in r.lines().take(head).enumerate() {
             let prefix = if i == 0 { "   ↳ " } else { "     " };
             lines.push(Line::from(Span::styled(
@@ -260,9 +343,9 @@ fn render_tool_card(
                 Style::default().fg(color),
             )));
         }
-        if total > head {
+        if !expanded && total > head {
             lines.push(Line::from(Span::styled(
-                format!("     … +{} more lines", total - head),
+                format!("     … +{} more lines · e expand", total - head),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -274,7 +357,7 @@ fn render_tool_card(
 
 /// Render a folded read-only group as a single summary line (plan §M4):
 /// `▸ read N (first, second, …)`.
-fn render_group(items: &[TranscriptItem], idxs: &[usize]) -> Vec<Line<'static>> {
+fn render_group(items: &[TranscriptItem], idxs: &[usize], selected: bool) -> Vec<Line<'static>> {
     let details: Vec<String> = idxs
         .iter()
         .filter_map(|&i| match &items[i] {
@@ -291,7 +374,13 @@ fn render_group(items: &[TranscriptItem], idxs: &[usize]) -> Vec<Line<'static>> 
     let more = if details.len() > 2 { ", …" } else { "" };
     let n = idxs.len();
     let accent = palette().accent;
+    let sel = if selected {
+        Span::styled("▌", Style::default().fg(accent))
+    } else {
+        Span::raw(" ")
+    };
     vec![Line::from(vec![
+        sel,
         Span::styled("▸ ", Style::default().fg(accent)),
         Span::styled(
             format!("read {n} "),
@@ -363,7 +452,12 @@ mod tests {
     fn total_lines_counts_wrapped_rows() {
         let mut c = LayoutCache::default();
         // "  · " prefix (4) + 40 chars = 44 cols; at width 20 wraps to 3 rows.
-        c.sync(&[item(&"x".repeat(40))], 20);
+        c.sync(
+            &[item(&"x".repeat(40))],
+            20,
+            &std::collections::HashSet::new(),
+            None,
+        );
         assert_eq!(c.total_lines(), 3);
     }
 
@@ -371,14 +465,14 @@ mod tests {
     fn only_changed_block_rerenders_on_append() {
         let mut c = LayoutCache::default();
         let mut items = vec![item("stable one"), item("stable two")];
-        c.sync(&items, 40);
-        let h0 = super::hash_item(&items[0]);
-        c.sync(&items, 40);
+        c.sync(&items, 40, &std::collections::HashSet::new(), None);
+        let h0 = super::hash_item(&items[0], false, false);
+        c.sync(&items, 40, &std::collections::HashSet::new(), None);
         // Block 0's hash is unchanged → same identity retained.
         assert_eq!(c.blocks[0].hash, h0);
         // Append a new streaming block; earlier blocks keep their cache.
         items.push(item("streaming tail"));
-        c.sync(&items, 40);
+        c.sync(&items, 40, &std::collections::HashSet::new(), None);
         assert_eq!(c.block_count(), 3);
         assert_eq!(c.blocks[0].hash, h0);
     }
@@ -386,9 +480,19 @@ mod tests {
     #[test]
     fn width_change_invalidates_all() {
         let mut c = LayoutCache::default();
-        c.sync(&[item(&"y".repeat(30))], 40);
+        c.sync(
+            &[item(&"y".repeat(30))],
+            40,
+            &std::collections::HashSet::new(),
+            None,
+        );
         let wide = c.total_lines();
-        c.sync(&[item(&"y".repeat(30))], 10);
+        c.sync(
+            &[item(&"y".repeat(30))],
+            10,
+            &std::collections::HashSet::new(),
+            None,
+        );
         assert!(c.total_lines() > wide, "narrower width wraps to more rows");
     }
 
@@ -396,7 +500,7 @@ mod tests {
     fn viewport_returns_requested_slice() {
         let mut c = LayoutCache::default();
         let items: Vec<_> = (0..10).map(|i| item(&format!("line {i}"))).collect();
-        c.sync(&items, 80);
+        c.sync(&items, 80, &std::collections::HashSet::new(), None);
         assert_eq!(c.total_lines(), 10);
         let view = c.viewport(3, 4);
         assert_eq!(view.len(), 4);
@@ -407,7 +511,12 @@ mod tests {
         for width in [8usize, 12, 20, 33, 80] {
             let mut c = LayoutCache::default();
             let content = "日本語テキスト🎉🎉 mixed ascii 日本 more";
-            c.sync(&[item(content)], width as u16);
+            c.sync(
+                &[item(content)],
+                width as u16,
+                &std::collections::HashSet::new(),
+                None,
+            );
             for line in c.viewport(0, c.total_lines()) {
                 let w: usize = line
                     .spans
@@ -437,7 +546,7 @@ mod tests {
     fn three_reads_render_as_one_group_line() {
         let mut c = LayoutCache::default();
         let items = vec![read_ok("a.rs"), read_ok("b.rs"), read_ok("c.rs")];
-        c.sync(&items, 80);
+        c.sync(&items, 80, &std::collections::HashSet::new(), None);
         // One folded block → one display line "▸ read 3 (a.rs, b.rs, …)".
         assert_eq!(c.total_lines(), 1);
         let text = line_text(&c.viewport(0, 1)[0]);
@@ -456,7 +565,7 @@ mod tests {
             result: Some("exit 1".into()),
             is_error: true,
         }];
-        c.sync(&items, 80);
+        c.sync(&items, 80, &std::collections::HashSet::new(), None);
         let all: String = c
             .viewport(0, c.total_lines())
             .iter()
@@ -471,9 +580,14 @@ mod tests {
     #[test]
     fn truncate_drops_removed_blocks() {
         let mut c = LayoutCache::default();
-        c.sync(&[item("a"), item("b"), item("c")], 40);
+        c.sync(
+            &[item("a"), item("b"), item("c")],
+            40,
+            &std::collections::HashSet::new(),
+            None,
+        );
         assert_eq!(c.block_count(), 3);
-        c.sync(&[item("a")], 40); // e.g. after /clear + one push
+        c.sync(&[item("a")], 40, &std::collections::HashSet::new(), None); // e.g. after /clear + one push
         assert_eq!(c.block_count(), 1);
         assert_eq!(c.total_lines(), 1);
     }

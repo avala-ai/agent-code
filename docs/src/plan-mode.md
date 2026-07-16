@@ -1,0 +1,58 @@
+
+Plan mode is a structured planning phase: the agent explores the codebase and designs an approach **before** writing product code. Use it when the task is ambiguous and a wrong approach would waste real work.
+
+## What plan mode does
+
+While plan mode is active:
+
+1. The agent **reads and searches** freely
+2. It drafts a plan (markdown) and may ask clarifying questions
+3. Product-file edits are **rejected** (read-only) except the plan surface
+4. It presents the plan for **approval** before implementation
+
+Permission modes still apply. Plan mode is an extra constraint on write tools.
+
+## How to enter
+
+### From the TUI
+
+- **Shift+Tab** cycles: Manual → Normal → AcceptEdits → **Plan**
+- Slash: `/plan` (or start a turn with a planning-oriented skill)
+
+The mode badge in the status area shows the current mode.
+
+### From the agent
+
+The model can call plan-mode tools (`EnterPlanMode` / `ExitPlanMode` style) when the task warrants it. Exit typically opens a **plan review modal**:
+
+| Action | Key | Effect |
+|--------|-----|--------|
+| Approve | `a` | Leave plan toward AcceptEdits so implementation can run |
+| Keep planning | `k` | Stay in plan mode |
+| Dismiss | `Esc` | Close without approving |
+
+## When to use it
+
+**Good fits**
+
+- “Add authentication” (many architectures)
+- “Redesign the pipeline”
+- “Add caching” (Redis vs in-process vs CDN)
+
+**Usually overkill**
+
+- Fix a typo
+- Add a clear, localized button
+- One-file bugfix with an obvious root cause
+
+## Tips
+
+- Put project conventions in `AGENTS.md` so plans reuse your patterns
+- After approval, stay in **AcceptEdits** or **Normal** for the implementation turn
+- Use `/compact` if a long planning session fills the context window
+
+## Related
+
+- [Permissions](./concepts/permissions.md)
+- [Keyboard shortcuts](../tui/KEYBINDINGS.md)
+- [Sessions](./concepts/sessions.md)

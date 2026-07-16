@@ -1,7 +1,7 @@
 //! Classic theme → ratatui colors for the modern TUI.
 //!
 //! Modern used to hardcode `Color::Cyan` / `Color::Magenta` for brand
-//! highlights. Classic REPL paints prompts, selectors, and badges with
+//! highlights. Shared theme paints prompts, selectors, and badges with
 //! [`crate::ui::theme::Theme::accent`] — purple in the default midnight
 //! theme (`#A422E1`). Route every modern highlight through this palette
 //! so both surfaces stay in sync when the user picks a theme.
@@ -11,10 +11,10 @@ use ratatui::style::Color;
 use crate::ui::theme;
 use crate::ui::tui::theme_to_ratatui;
 
-/// Snapshot of the active classic theme as ratatui colors.
+/// Snapshot of the active product theme as ratatui colors.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
-    /// Brand highlight (classic prompt / selector) — purple on midnight.
+    /// Brand highlight (prompt / selector) — purple on midnight.
     pub accent: Color,
     pub tool: Color,
     pub warning: Color,

@@ -9,12 +9,14 @@
 
 mod acp;
 mod attach;
+mod clipboard;
 mod commands;
 mod daemon;
 mod harden;
 mod output;
 mod security_scan;
 mod serve;
+mod stdout_capture;
 mod ui;
 mod update;
 
@@ -144,11 +146,6 @@ struct Cli {
     /// IDEs spawn `agent acp` and communicate via stdin/stdout JSON-RPC 2.0.
     #[arg(long)]
     acp: bool,
-
-    /// Interactive TUI surface: `modern` (fullscreen ratatui, default) or
-    /// `classic` (rustyline REPL). Overrides `[ui] tui` and `AGENT_CODE_TUI`.
-    #[arg(long, value_name = "KIND")]
-    tui: Option<String>,
 
     /// Subcommand (schedule, daemon).
     #[command(subcommand)]
@@ -601,7 +598,7 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && !is_headless_subcommand
     {
-        eprintln!("No API key found. Starting setup...\n");
+        eprintln!("No credentials found — starting first-run setup…\n");
         run_setup_wizard();
         config = Config::load()?;
     }
@@ -1045,29 +1042,9 @@ async fn async_main() -> anyhow::Result<()> {
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 
-            // Reject bad values instead of silently launching the other surface.
-            if let Some(ref s) = cli.tui
-                && ui::modern::TuiKind::parse(s).is_none()
-            {
-                anyhow::bail!("invalid --tui value '{s}' (expected 'classic' or 'modern')");
-            }
-            let tui_kind =
-                ui::modern::resolve_tui_kind(cli.tui.as_deref(), &engine.state().config.ui.tui);
-            match tui_kind {
-                ui::modern::TuiKind::Modern => {
-                    // Modern TUI takes ownership of the engine via Session
-                    // and fires SessionStop itself on clean exit.
-                    ui::modern::run_modern_tui(engine).await?;
-                }
-                ui::modern::TuiKind::Classic => {
-                    ui::repl::run_repl(&mut engine).await?;
-
-                    // Fire SessionStop once the REPL returns. This is the only
-                    // normal exit path from classic interactive mode; abrupt
-                    // Ctrl+C won't reach here, but any clean `/exit` or EOF will.
-                    let _ = engine.fire_session_stop_hooks().await;
-                }
-            }
+            // Modern TUI takes ownership of the engine via Session and
+            // fires SessionStop itself on clean exit.
+            ui::modern::run_modern_tui(engine).await?;
 
             // Show update notification after session ends.
             if let Ok(Some(check)) = update_handle.await {

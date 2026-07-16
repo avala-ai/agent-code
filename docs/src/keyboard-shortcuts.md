@@ -1,0 +1,51 @@
+
+Interactive sessions use the **fullscreen TUI**.
+
+## Core rules
+
+| Chord | Behavior |
+|-------|----------|
+| **Esc** | **Never cancels a turn.** Clears draft, dismisses modals, or double-press quit when idle |
+| **Ctrl+C** (Ctrl+Shift+C / Cmd+C) | Cancels a running turn (clears mid-turn draft first if non-empty) |
+| **Enter** | Submit · queue while streaming · send next queued when idle + empty |
+| **Shift+Tab** | Cycle mode: Manual → Normal → AcceptEdits → Plan (mid-turn) |
+
+Full tables (modals, scroll, queue, mouse):
+
+**[Modern TUI keybindings →](../tui/KEYBINDINGS.md)**
+
+## Quick reference
+
+### Global
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+T` | Toggle tasks / agents pane |
+| `Ctrl+L` | Force full redraw |
+| `Ctrl+D` | Quit (empty prompt) |
+| `Alt+↑` | Pop newest queued prompt into editor |
+| `Alt+-` | Delete newest queued prompt |
+
+### Transcript
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` / wheel | Scroll (Free mode — stream never jumps viewport) |
+| `PageUp` `PageDown` | Page |
+| `Ctrl+U` | Half page up |
+| `Home` / `End` | Top / follow bottom |
+| Click jump row | Return to live tail |
+
+### Permission modal
+
+| Key | Action |
+|-----|--------|
+| `y` / `1` | Allow once |
+| `a` / `2` | Allow for session |
+| `n` / `3` | Deny |
+| `Esc` | Deny (turn continues) |
+| `Ctrl+C` | Deny and cancel turn |
+
+## Terminal issues
+
+If chords misbehave under tmux or SSH, see [Terminal support](./terminal-support.md) and run `/terminal-setup` inside the TUI.
