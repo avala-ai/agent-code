@@ -274,11 +274,16 @@ pub(super) async fn event_loop(
         }
 
         // Full classic slash-command bridge (stdout captured → transcript).
+        // Run off the async worker via `block_in_place`: many slash arms call
+        // `Handle::block_on` / spawn+join, which panic if invoked directly on
+        // a Tokio worker without parking it first.
         if let Some(slash) = app.pending_slash.take() {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
-                    let (result, captured) = crate::stdout_capture::capture_stdout(|| {
-                        crate::commands::execute(&slash, &mut eng)
+                    let (result, captured) = tokio::task::block_in_place(|| {
+                        crate::stdout_capture::capture_stdout(|| {
+                            crate::commands::execute(&slash, &mut eng)
+                        })
                     });
                     match result {
                         crate::commands::CommandResult::Exit => {
