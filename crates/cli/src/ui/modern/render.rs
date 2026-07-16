@@ -972,14 +972,14 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordere
 
 fn mode_style(mode: SessionMode) -> Style {
     let p = palette();
-    let (fg, bg) = match mode {
-        SessionMode::Manual => (Color::Black, p.warning),
-        SessionMode::Normal => (Color::Black, p.success),
-        SessionMode::AcceptEdits => (Color::Black, Color::Blue),
-        // Classic plan-mode tag color (purple on midnight).
-        SessionMode::Plan => (Color::Black, p.plan),
+    // Text-only badges — no filled color blocks (keeps chrome minimal).
+    let fg = match mode {
+        SessionMode::Manual => p.warning,
+        SessionMode::Normal => p.success,
+        SessionMode::AcceptEdits => p.tool,
+        SessionMode::Plan => p.plan,
     };
-    Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
+    Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
 
 fn truncate_path(path: &str, max: usize) -> String {
