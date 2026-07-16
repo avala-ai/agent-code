@@ -194,10 +194,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize capture tests — they rewrite process-wide fd 1.
+    fn capture_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     #[cfg(unix)]
     fn captures_fd1_write() {
+        let _g = capture_lock();
         // Use libc::write to fd 1 — cargo's test harness may wrap Rust
         // println! buffering, but raw fd 1 is what slash commands hit
         // after libc stdout is flushed.
@@ -217,6 +227,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn captures_more_than_pipe_buffer_without_deadlock() {
+        let _g = capture_lock();
         // Write well past a typical 64 KiB pipe buffer while a concurrent
         // reader drains — must not hang.
         let chunk = b"x".repeat(4096);
@@ -251,6 +262,7 @@ mod tests {
 
     #[test]
     fn block_in_place_compatible_capture() {
+        let _g = capture_lock();
         // Smoke: capture_stdout works when nested under block_in_place as the
         // modern TUI slash bridge does (must not panic on the worker).
         let rt = tokio::runtime::Builder::new_multi_thread()
