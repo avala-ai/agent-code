@@ -1,10 +1,9 @@
-//! Classic theme → ratatui colors for the modern TUI.
+//! Product theme → ratatui colors for the modern TUI.
 //!
-//! Modern used to hardcode `Color::Cyan` / `Color::Magenta` for brand
-//! highlights. Shared theme paints prompts, selectors, and badges with
-//! [`crate::ui::theme::Theme::accent`] — purple in the default midnight
-//! theme (`#A422E1`). Route every modern highlight through this palette
-//! so both surfaces stay in sync when the user picks a theme.
+//! Shared theme paints prompts, selectors, and badges with
+//! [`crate::ui::theme::Theme::accent`] (steel-blue on midnight). Route every
+//! modern highlight through this palette so chrome stays in sync when the
+//! user picks a theme.
 
 use ratatui::style::Color;
 
@@ -14,7 +13,7 @@ use crate::ui::tui::theme_to_ratatui;
 /// Snapshot of the active product theme as ratatui colors.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
-    /// Brand highlight (prompt / selector) — purple on midnight.
+    /// Brand highlight (prompt / selector / borders) — calm steel-blue.
     pub accent: Color,
     pub tool: Color,
     pub warning: Color,
@@ -48,37 +47,32 @@ mod tests {
     use crossterm::style::Color as CtColor;
 
     #[test]
-    fn midnight_accent_is_classic_purple() {
-        // Classic midnight brand color — the highlight purple.
+    fn midnight_accent_is_restrained_steel_blue() {
         let classic = theme::Theme::midnight();
         assert!(
             matches!(
                 classic.accent,
                 CtColor::Rgb {
-                    r: 164,
-                    g: 34,
-                    b: 225
+                    r: 130,
+                    g: 165,
+                    b: 195
                 }
             ),
-            "classic midnight accent drifted: {:?}",
+            "midnight accent drifted: {:?}",
             classic.accent
-        );
-        // theme_to_ratatui preserves truecolor RGB.
-        assert_eq!(
-            theme_to_ratatui(CtColor::Rgb {
-                r: 164,
-                g: 34,
-                b: 225
-            }),
-            Color::Rgb(164, 34, 225)
         );
         crate::ui::theme::init("midnight");
         let p = palette();
-        // Under truecolor emit mode this is exact purple; under 256-color
-        // it may be Indexed — either way it must not fall back to Cyan.
-        assert_ne!(p.accent, Color::Cyan, "modern must not hardcode cyan");
+        // Must not fall back to loud Magenta/Cyan brand hardcodes.
+        assert_ne!(p.accent, Color::Cyan);
+        assert_ne!(p.accent, Color::Magenta);
         if let Color::Rgb(r, g, b) = p.accent {
-            assert_eq!((r, g, b), (164, 34, 225));
+            assert_eq!((r, g, b), (130, 165, 195));
+            // Calm: not a high-chroma purple (red channel should not dominate).
+            assert!(
+                r <= g && g <= b + 40,
+                "accent should stay cool/neutral, got rgb({r},{g},{b})"
+            );
         }
     }
 }

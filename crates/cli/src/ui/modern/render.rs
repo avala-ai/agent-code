@@ -425,10 +425,10 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .take(inner.width.saturating_sub(4) as usize)
             .collect();
         let style = if selected {
+            // Underline + accent fg — calmer than inverted brand fill.
             Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD)
+                .fg(accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -551,16 +551,13 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mode_style = mode_style(app.mode);
     let title = Line::from(vec![
         Span::styled(
-            " agent-code ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD),
+            "agent-code",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(&app.version, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
-        Span::styled(&app.model, Style::default().fg(Color::White)),
+        Span::styled(&app.model, Style::default().fg(Color::Gray)),
         Span::raw("  "),
         Span::styled(format!(" {} ", app.mode.short_badge()), mode_style),
         Span::raw("  "),
@@ -663,9 +660,8 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
         Paragraph::new(Line::from(Span::styled(
             label,
             Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD),
+                .fg(accent)
+                .add_modifier(Modifier::BOLD | Modifier::DIM),
         ))),
         rect,
     );
@@ -976,14 +972,14 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordere
 
 fn mode_style(mode: SessionMode) -> Style {
     let p = palette();
-    let (fg, bg) = match mode {
-        SessionMode::Manual => (Color::Black, p.warning),
-        SessionMode::Normal => (Color::Black, p.success),
-        SessionMode::AcceptEdits => (Color::Black, Color::Blue),
-        // Classic plan-mode tag color (purple on midnight).
-        SessionMode::Plan => (Color::Black, p.plan),
+    // Text-only badges — no filled color blocks (keeps chrome minimal).
+    let fg = match mode {
+        SessionMode::Manual => p.warning,
+        SessionMode::Normal => p.success,
+        SessionMode::AcceptEdits => p.tool,
+        SessionMode::Plan => p.plan,
     };
-    Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
+    Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
 
 fn truncate_path(path: &str, max: usize) -> String {
