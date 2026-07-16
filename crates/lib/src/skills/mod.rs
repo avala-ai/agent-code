@@ -58,16 +58,26 @@ pub struct SkillMetadata {
     /// What this skill does.
     pub description: Option<String>,
     /// When to invoke this skill.
-    #[serde(rename = "whenToUse")]
+    #[serde(alias = "when-to-use", rename = "whenToUse")]
     pub when_to_use: Option<String>,
     /// Whether users can invoke this via `/name`.
-    #[serde(rename = "userInvocable")]
+    #[serde(alias = "user-invocable", rename = "userInvocable")]
     pub user_invocable: bool,
     /// Whether to disable in non-interactive sessions.
-    #[serde(rename = "disableNonInteractive")]
+    #[serde(alias = "disable-non-interactive", rename = "disableNonInteractive")]
     pub disable_non_interactive: bool,
     /// File patterns that trigger this skill suggestion.
     pub paths: Option<Vec<String>>,
+    /// Autocomplete hint for slash-command arguments (e.g. `commit message`).
+    #[serde(alias = "argument-hint", alias = "argumentHint", default)]
+    pub argument_hint: Option<String>,
+    /// Optional model override when this skill runs.
+    pub model: Option<String>,
+    /// Optional reasoning-effort override when this skill runs.
+    pub effort: Option<String>,
+    /// When true, only slash invocation runs the skill (model cannot auto-call).
+    #[serde(alias = "disable-model-invocation", alias = "disableModelInvocation", default)]
+    pub disable_model_invocation: bool,
 }
 
 impl Skill {
@@ -161,22 +171,53 @@ impl SkillRegistry {
     }
 
     /// Load skills from all configured directories.
+    ///
+    /// Priority (first wins on name collision): project `.agent` → project
+    /// compat paths (`.agents`, `.claude`, `.cursor`) → user agent-code →
+    /// user Claude/Cursor → bundled. Matches multi-harness discovery used by
+    /// adjacent coding agents without requiring a config flag.
     pub fn load_all(project_root: Option<&Path>) -> Self {
         let mut registry = Self::new();
 
-        // Load from project-level skills directory.
         if let Some(root) = project_root {
-            let project_skills = root.join(".agent").join("skills");
-            if project_skills.is_dir() {
-                registry.load_from_dir(&project_skills);
+            // Walk from CWD/project root upward so nested workdirs still see
+            // repo-root skills (stop at filesystem root).
+            let mut cur = root.to_path_buf();
+            loop {
+                for rel in SKILL_SCAN_REL_PATHS {
+                    let dir = cur.join(rel);
+                    if dir.is_dir() {
+                        registry.load_from_dir_dedup(&dir);
+                    }
+                }
+                if !cur.pop() {
+                    break;
+                }
+                // Stop at home directory — user-level is loaded separately.
+                if Some(cur.as_path()) == home_dir().as_deref() {
+                    break;
+                }
             }
         }
 
-        // Load from user-level skills directory.
+        // Load from user-level skills directories.
         if let Some(dir) = user_skills_dir()
             && dir.is_dir()
         {
-            registry.load_from_dir(&dir);
+            registry.load_from_dir_dedup(&dir);
+        }
+        if let Some(home) = home_dir() {
+            for rel in &[
+                ".claude/skills",
+                ".claude/commands",
+                ".cursor/skills",
+                ".agents/skills",
+            ] {
+                let dir = home.join(rel);
+                if dir.is_dir() {
+                    registry.load_from_dir_dedup(&dir);
+                }
+            }
         }
 
         // Load bundled skills (shipped with the binary).
@@ -184,6 +225,26 @@ impl SkillRegistry {
 
         debug!("Loaded {} skills", registry.skills.len());
         registry
+    }
+
+    fn load_from_dir_dedup(&mut self, dir: &Path) {
+        let before = self.skills.len();
+        let mut loaded = Self::new();
+        loaded.load_from_dir(dir);
+        for skill in loaded.skills {
+            if self.skills.iter().any(|s| s.name == skill.name) {
+                continue; // higher-priority location already owns this name
+            }
+            // Skip known vendor default noise (shell/statusline chrome skills).
+            if is_vendor_default_skill(&skill.name) {
+                continue;
+            }
+            self.skills.push(skill);
+        }
+        let added = self.skills.len() - before;
+        if added > 0 {
+            debug!("Loaded {added} skills from {}", dir.display());
+        }
     }
 
     /// Load built-in skills that ship with agent-code.
@@ -587,6 +648,10 @@ impl SkillRegistry {
                     user_invocable,
                     disable_non_interactive: false,
                     paths: None,
+                    argument_hint: None,
+                    model: None,
+                    effort: None,
+                    disable_model_invocation: false,
                 },
                 body: body.to_string(),
                 source: std::path::PathBuf::new(),
@@ -823,6 +888,36 @@ fn has_shell_fence(body: &str) -> bool {
     body.lines().any(is_shell_fence)
 }
 
+/// Relative skill roots scanned per project directory (highest priority first
+/// within a single directory level).
+const SKILL_SCAN_REL_PATHS: &[&str] = &[
+    ".agent/skills",
+    ".agent/commands",
+    ".agents/skills",
+    ".agents/commands",
+    ".claude/skills",
+    ".claude/commands",
+    ".cursor/skills",
+    ".cursor/commands",
+    ".grok/skills",
+    ".grok/commands",
+];
+
+/// Vendor-shipped chrome skills that are not useful as agent workflows.
+fn is_vendor_default_skill(name: &str) -> bool {
+    matches!(
+        name,
+        "shell" | "canvas" | "statusline" | "cursor-guide" | "create-rule" | "create-skill"
+            | "migrate-to-skills"
+    )
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
 /// Load a single skill file, parsing frontmatter and body.
 fn load_skill_file(path: &Path) -> Result<Skill, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("Read error: {e}"))?;
@@ -972,6 +1067,59 @@ mod tests {
         assert_eq!(meta.description, Some("Test skill".to_string()));
         assert!(meta.user_invocable);
         assert_eq!(body, "Do the thing.");
+    }
+
+    #[test]
+    fn test_parse_kebab_and_product_fields() {
+        let content = "---\n\
+description: Deploy the service\n\
+when-to-use: When the user wants to deploy\n\
+user-invocable: true\n\
+argument-hint: env name\n\
+model: grok-4\n\
+effort: high\n\
+disable-model-invocation: true\n\
+---\n\nDeploy {{arg}} carefully.";
+        let (meta, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(meta.description.as_deref(), Some("Deploy the service"));
+        assert_eq!(meta.when_to_use.as_deref(), Some("When the user wants to deploy"));
+        assert!(meta.user_invocable);
+        assert_eq!(meta.argument_hint.as_deref(), Some("env name"));
+        assert_eq!(meta.model.as_deref(), Some("grok-4"));
+        assert_eq!(meta.effort.as_deref(), Some("high"));
+        assert!(meta.disable_model_invocation);
+        assert!(body.contains("Deploy"));
+    }
+
+    #[test]
+    fn load_skill_md_directory_and_claude_compat_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        // Directory layout: .claude/skills/my-deploy/SKILL.md
+        let skill_dir = project.join(".claude/skills/my-deploy");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Deploy\nuserInvocable: true\nargument-hint: target\n---\n\nDeploy it.",
+        )
+        .unwrap();
+        // Higher priority .agent should win on name collision.
+        let agent_skills = project.join(".agent/skills");
+        std::fs::create_dir_all(&agent_skills).unwrap();
+        std::fs::write(
+            agent_skills.join("my-deploy.md"),
+            "---\ndescription: Agent wins\nuserInvocable: true\n---\n\nFrom agent.",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_all(Some(project));
+        let skill = reg.find("my-deploy").expect("skill loaded");
+        assert_eq!(skill.metadata.description.as_deref(), Some("Agent wins"));
+        assert!(skill.body.contains("From agent"));
+
+        // Vendor noise filtered.
+        assert!(is_vendor_default_skill("statusline"));
+        assert!(!is_vendor_default_skill("my-deploy"));
     }
 
     #[test]

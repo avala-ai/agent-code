@@ -23,12 +23,12 @@ Interactive sessions use the fullscreen TUI.
 
 Rounded bordered field with `❯` prefix. Height grows with content.
 
-| Key | Normal mode (default) | Multiline mode (`Ctrl+M`) |
+| Key | Normal mode (default) | Multiline mode |
 |---|---|---|
 | `Enter` | **Send** | Insert newline |
 | `Alt+Enter` / `Shift+Enter` | Insert newline | **Send** |
 | `Ctrl+Enter` / `Ctrl+I` | Interject (cancel + send now) | same |
-| `Ctrl+M` | Toggle multiline mode | Toggle off |
+| `Ctrl+M` | **Empty composer / block selected:** model picker · **drafting:** toggle multiline | Toggle off |
 | Paste (bracketed) | Insert at cursor (newlines kept) | same |
 | `Backspace` / `←` / `→` | Edit / move cursor | same |
 | `↑` / `↓` | Scroll transcript (or move lines if draft is multi-line) | Move within draft |
@@ -49,6 +49,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | `←` / `→` (empty composer) | Select previous / next transcript block (`▌` marker) |
 | `e` (empty + block selected) | Expand / collapse tool body, thinking, long assistant |
 | `Ctrl+E` | Expand / collapse **all** thinking blocks |
+| Thinking status | Status bar: `waiting for model…` → `thinking N.Ns…` → `answering…` · collapsed header: **Thought for Xs** |
 | `y` (block selected) | **Copy block body** (clipboard cascade) |
 | `Y` (block selected) | **Copy block metadata** (e.g. tool name · detail) |
 | Mouse wheel | Scroll |

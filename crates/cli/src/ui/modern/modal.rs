@@ -80,13 +80,13 @@ impl App {
         if self.modals.is_empty() && self.phase == Phase::Permission {
             if self.turn_live {
                 self.phase = Phase::Streaming;
-                self.waiting_on = WaitingOn::Model;
+                self.waiting_on = WaitingOn::WaitingForModel;
             } else {
                 // The modal outlived its turn (plan approval arrives right
                 // before TurnComplete). Returning to Streaming here would
                 // show a spinner forever with nothing running.
                 self.phase = Phase::Idle;
-                self.waiting_on = WaitingOn::Model;
+                self.waiting_on = WaitingOn::WaitingForModel;
                 // A prompt queued behind the modal can start now.
                 self.dispatch_queue_head();
             }

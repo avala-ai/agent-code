@@ -100,8 +100,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    // Palette / help never draw over HITL (permission / plan / question).
-    if app.command_palette_open() && app.phase != Phase::Permission {
+    // Palette / model picker / help never draw over HITL.
+    if app.model_picker_open() && app.phase != Phase::Permission {
+        draw_model_picker(frame, area, app);
+    } else if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
     }
 
@@ -126,7 +128,8 @@ fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Ctrl+P / ?      command palette"),
         Line::from("  Ctrl+; / '      queue pane"),
         Line::from("  Ctrl+T          tasks pane"),
-        Line::from("  Ctrl+M          multiline composer"),
+        Line::from("  Ctrl+M          model picker (scrollback) / multiline (prompt)"),
+        Line::from("  /model /effort  switch model · set reasoning effort"),
         Line::from("  ↑/↓ empty       prompt history · scroll when drafting"),
         Line::from("  ←/→ empty       select transcript block"),
         Line::from("  e / Ctrl+E      fold block / expand all thinking"),
@@ -213,6 +216,119 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
         palette().accent,
         Some(key_hint_line(
             "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
+        )),
+    );
+}
+
+fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use crate::ui::modern::app::EFFORT_LEVELS;
+
+    let Some(p) = app.model_picker.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if p.effort_phase {
+        let filtered = p.filtered();
+        let model = filtered
+            .get(p.selected)
+            .map(|(_, id, _)| *id)
+            .unwrap_or(p.current.as_str());
+        lines.push(Line::from(Span::styled(
+            format!("effort for {model}"),
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for (i, level) in EFFORT_LEVELS.iter().enumerate() {
+            let is_sel = i == p.effort_selected;
+            let marker = if is_sel { "❯" } else { " " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let cur = if app.effort.as_deref() == Some(*level) {
+                " ✔"
+            } else {
+                ""
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} {level}{cur}"),
+                style,
+            )));
+        }
+        draw_modal_box(
+            frame,
+            area,
+            lines,
+            " reasoning effort ",
+            palette().accent,
+            Some(key_hint_line(
+                "[↑↓] move   [Enter] apply   [Esc/⌫] back",
+            )),
+        );
+        return;
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("filter: {}", p.query),
+        Style::default()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("current: {}", p.current),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    let filtered = p.filtered();
+    const MAX_ROWS: usize = 12;
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching models",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let start = p
+            .selected
+            .saturating_sub(MAX_ROWS.saturating_sub(1).min(p.selected));
+        let end = (start + MAX_ROWS).min(filtered.len());
+        for (i, (_, id, desc)) in filtered.iter().enumerate().take(end).skip(start) {
+            let is_sel = i == p.selected;
+            let marker = if is_sel { "❯" } else { " " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let cur = if *id == p.current { " ✔" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} {id}{cur}  "), style),
+                Span::styled((*desc).to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if filtered.len() > MAX_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} total", filtered.len()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    draw_modal_box(
+        frame,
+        area,
+        lines,
+        " models ",
+        palette().accent,
+        Some(key_hint_line(
+            "[↑↓] move   [Enter] select   [Tab] effort   [Esc] close",
         )),
     );
 }
@@ -558,6 +674,11 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(&app.version, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
         Span::styled(&app.model, Style::default().fg(Color::Gray)),
+        if let Some(ref e) = app.effort {
+            Span::styled(format!(" ·{e}"), Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw("")
+        },
         Span::raw("  "),
         Span::styled(format!(" {} ", app.mode.short_badge()), mode_style),
         Span::raw("  "),
@@ -761,7 +882,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 pulse_style(app.tick, glyph_color),
             ));
             spans.push(Span::styled(
-                format!("{} ", app.waiting_on.label()),
+                format!(
+                    "{} ",
+                    app.waiting_on
+                        .label_with_elapsed(app.thinking_started_at)
+                ),
                 Style::default().fg(text_color),
             ));
         }

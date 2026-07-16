@@ -11,6 +11,7 @@ mod layout;
 mod markdown;
 mod modal;
 mod mode;
+mod model_picker;
 mod palette;
 mod render;
 mod run;
