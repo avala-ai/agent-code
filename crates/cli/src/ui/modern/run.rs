@@ -555,6 +555,11 @@ pub(super) async fn event_loop(
             // idle after a turn/HITL resets the spinner / "action required"
             // title (anim_tick alone stops once needs_anim_tick is false).
             update_terminal_title(app);
+            // Arm HITL answer keys only after the user has seen a paint of
+            // the modal (+ grace). Stops mid-type keystrokes from auto-allow.
+            if app.phase == super::app::Phase::Permission {
+                app.note_hitl_drawn();
+            }
             app.dirty = false;
         }
 
@@ -803,6 +808,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 None => {}
             }
+            return;
+        }
+        // Answer keys only after first paint + grace (#431). Esc/Ctrl+C above
+        // stay live so the user can always dismiss or cancel.
+        if !app.hitl_answers_ready() {
             return;
         }
         match app.front_modal() {
@@ -1435,10 +1445,63 @@ mod tests {
             },
         ));
         app.phase = Phase::Permission;
+        app.force_hitl_answers_ready();
         // y must reach the modal, not the palette filter.
         handle_key(&mut app, key(KeyCode::Char('y')));
         assert!(!app.command_palette_open());
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    #[test]
+    fn permission_answer_keys_blocked_before_draw_and_grace() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        app.reset_hitl_answer_arm();
+        // In-flight typing the instant the modal appears must not allow-session.
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(
+            rx.try_recv().is_err(),
+            "answer keys must wait for paint + grace"
+        );
+        assert!(app.front_modal().is_some());
+        // After draw arm + forced ready, answers work.
+        app.note_hitl_drawn();
+        assert!(!app.hitl_answers_ready(), "still in grace window");
+        app.force_hitl_answers_ready();
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    #[test]
+    fn permission_esc_works_during_grace() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        app.reset_hitl_answer_arm();
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Deny)));
     }
 
     #[test]
