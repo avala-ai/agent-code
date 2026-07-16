@@ -123,50 +123,59 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Midnight — dark theme with cyan accents.
+    /// Midnight — dark theme with a restrained steel-blue accent.
+    ///
+    /// Kept intentionally desaturated so chrome (borders, badges, selection)
+    /// stays calm; semantic colors (error/warning/success) carry the weight.
     pub fn midnight() -> Self {
         Self {
+            // Soft steel blue — elegant default, not a loud brand purple.
             accent: Color::Rgb {
-                r: 164,
-                g: 34,
-                b: 225,
+                r: 130,
+                g: 165,
+                b: 195,
             },
             error: Color::Rgb {
-                r: 255,
-                g: 107,
-                b: 128,
+                r: 220,
+                g: 115,
+                b: 125,
             },
             warning: Color::Rgb {
-                r: 255,
-                g: 193,
-                b: 7,
+                r: 210,
+                g: 175,
+                b: 90,
             },
             success: Color::Rgb {
-                r: 78,
-                g: 186,
-                b: 101,
+                r: 95,
+                g: 175,
+                b: 125,
             },
             muted: Color::Rgb {
-                r: 100,
-                g: 100,
-                b: 100,
+                r: 110,
+                g: 112,
+                b: 118,
             },
             inactive: Color::Rgb {
-                r: 153,
-                g: 153,
-                b: 153,
+                r: 140,
+                g: 142,
+                b: 148,
             },
+            // Cool gray-blue for tools — less “pastel purple”.
             tool: Color::Rgb {
-                r: 177,
-                g: 185,
-                b: 249,
+                r: 145,
+                g: 160,
+                b: 175,
             },
             plan: Color::Rgb {
-                r: 72,
-                g: 150,
-                b: 140,
+                r: 95,
+                g: 155,
+                b: 150,
             },
-            text: Color::White,
+            text: Color::Rgb {
+                r: 230,
+                g: 232,
+                b: 236,
+            },
             diff_add: Color::Rgb {
                 r: 56,
                 g: 166,
@@ -235,14 +244,14 @@ impl Theme {
                 b: 100,
             },
             accent_shimmer: Color::Rgb {
-                r: 200,
-                g: 110,
-                b: 240,
+                r: 165,
+                g: 195,
+                b: 220,
             },
             muted_shimmer: Color::Rgb {
-                r: 170,
-                g: 170,
-                b: 170,
+                r: 160,
+                g: 162,
+                b: 168,
             },
             diff_added_dimmed: Color::Rgb {
                 r: 30,
@@ -256,87 +265,89 @@ impl Theme {
             },
             diff_added_word: Color::Rgb {
                 r: 90,
-                g: 220,
+                g: 200,
                 b: 130,
             },
             diff_removed_word: Color::Rgb {
-                r: 240,
+                r: 220,
                 g: 130,
-                b: 150,
+                b: 145,
             },
             subagent_red: Color::Rgb {
-                r: 232,
-                g: 75,
-                b: 70,
+                r: 210,
+                g: 100,
+                b: 95,
             },
             subagent_blue: Color::Rgb {
-                r: 80,
-                g: 140,
-                b: 240,
+                r: 100,
+                g: 145,
+                b: 210,
             },
             subagent_green: Color::Rgb {
-                r: 80,
-                g: 200,
-                b: 120,
+                r: 95,
+                g: 180,
+                b: 130,
             },
             subagent_yellow: Color::Rgb {
-                r: 230,
-                g: 200,
-                b: 80,
+                r: 200,
+                g: 175,
+                b: 90,
             },
+            // Subagent id color only — not the product brand.
             subagent_purple: Color::Rgb {
-                r: 175,
-                g: 100,
-                b: 240,
+                r: 155,
+                g: 130,
+                b: 185,
             },
             subagent_orange: Color::Rgb {
-                r: 240,
-                g: 140,
-                b: 60,
+                r: 210,
+                g: 145,
+                b: 90,
             },
             subagent_pink: Color::Rgb {
-                r: 240,
-                g: 110,
-                b: 180,
+                r: 200,
+                g: 130,
+                b: 160,
             },
             subagent_cyan: Color::Rgb {
-                r: 90,
-                g: 200,
-                b: 220,
+                r: 100,
+                g: 175,
+                b: 190,
             },
             rate_limit_fill: Color::Rgb {
-                r: 78,
-                g: 186,
-                b: 101,
+                r: 95,
+                g: 175,
+                b: 125,
             },
             rate_limit_empty: Color::Rgb {
-                r: 60,
-                g: 60,
-                b: 70,
+                r: 48,
+                g: 50,
+                b: 56,
             },
+            // Neutral slate selection — no purple wash.
             selection_bg: Color::Rgb {
-                r: 60,
-                g: 60,
-                b: 110,
+                r: 48,
+                g: 54,
+                b: 64,
             },
             message_action_bg: Color::Rgb {
-                r: 40,
-                g: 40,
-                b: 60,
+                r: 36,
+                g: 38,
+                b: 44,
             },
             user_message_bg: Color::Rgb {
-                r: 30,
-                g: 30,
-                b: 50,
+                r: 32,
+                g: 34,
+                b: 40,
             },
             bash_message_bg: Color::Rgb {
                 r: 30,
-                g: 40,
-                b: 30,
+                g: 36,
+                b: 32,
             },
             memory_message_bg: Color::Rgb {
-                r: 50,
-                g: 35,
+                r: 40,
+                g: 38,
                 b: 30,
             },
             rainbow_red: Color::Rgb {
@@ -365,46 +376,47 @@ impl Theme {
                 b: 240,
             },
             rainbow_indigo: Color::Rgb {
-                r: 110,
-                g: 90,
-                b: 220,
+                r: 120,
+                g: 130,
+                b: 190,
             },
             rainbow_violet: Color::Rgb {
-                r: 175,
-                g: 100,
-                b: 240,
+                r: 150,
+                g: 135,
+                b: 180,
             },
+            // Plan mode badge: same family as accent, slightly cooler.
             plan_mode: Color::Rgb {
-                r: 175,
-                g: 100,
-                b: 240,
+                r: 120,
+                g: 155,
+                b: 185,
             },
             brief_mode: Color::Rgb {
-                r: 240,
-                g: 140,
-                b: 60,
+                r: 200,
+                g: 150,
+                b: 95,
             },
             fast_mode: Color::Rgb {
-                r: 80,
-                g: 200,
-                b: 120,
+                r: 95,
+                g: 175,
+                b: 125,
             },
             fast_mode_shimmer: Color::Rgb {
                 r: 130,
-                g: 230,
-                b: 160,
+                g: 200,
+                b: 155,
             },
             is_dark: true,
         }
     }
 
-    /// Daybreak — light theme with blue accents.
+    /// Daybreak — light theme with soft blue accents.
     pub fn daybreak() -> Self {
         Self {
             accent: Color::Rgb {
-                r: 130,
-                g: 20,
-                b: 180,
+                r: 70,
+                g: 115,
+                b: 160,
             },
             error: Color::Rgb {
                 r: 171,
@@ -510,9 +522,9 @@ impl Theme {
                 b: 20,
             },
             accent_shimmer: Color::Rgb {
-                r: 95,
-                g: 15,
-                b: 135,
+                r: 90,
+                g: 130,
+                b: 170,
             },
             muted_shimmer: Color::Rgb {
                 r: 100,
@@ -640,29 +652,29 @@ impl Theme {
                 b: 216,
             },
             rainbow_indigo: Color::Rgb {
-                r: 67,
-                g: 56,
-                b: 202,
+                r: 80,
+                g: 95,
+                b: 160,
             },
             rainbow_violet: Color::Rgb {
-                r: 126,
-                g: 34,
-                b: 206,
+                r: 110,
+                g: 100,
+                b: 150,
             },
             plan_mode: Color::Rgb {
-                r: 126,
-                g: 34,
-                b: 206,
+                r: 70,
+                g: 115,
+                b: 160,
             },
             brief_mode: Color::Rgb {
-                r: 194,
-                g: 65,
-                b: 12,
+                r: 175,
+                g: 105,
+                b: 55,
             },
             fast_mode: Color::Rgb {
-                r: 21,
-                g: 128,
-                b: 61,
+                r: 40,
+                g: 130,
+                b: 80,
             },
             fast_mode_shimmer: Color::Rgb {
                 r: 30,
@@ -673,53 +685,53 @@ impl Theme {
         }
     }
 
-    /// Midnight Muted — softer dark theme.
+    /// Midnight Muted — softer dark theme (lower-contrast steel accent).
     pub fn midnight_muted() -> Self {
         let mut t = Self::midnight();
         t.accent = Color::Rgb {
-            r: 140,
-            g: 60,
-            b: 190,
+            r: 115,
+            g: 140,
+            b: 160,
         };
         t.error = Color::Rgb {
-            r: 200,
-            g: 100,
-            b: 110,
+            r: 195,
+            g: 115,
+            b: 120,
         };
         t.warning = Color::Rgb {
-            r: 200,
-            g: 170,
-            b: 60,
+            r: 190,
+            g: 160,
+            b: 85,
         };
         t.success = Color::Rgb {
-            r: 80,
-            g: 160,
-            b: 90,
+            r: 90,
+            g: 155,
+            b: 115,
         };
         t.tool = Color::Rgb {
-            r: 150,
-            g: 155,
-            b: 200,
+            r: 130,
+            g: 142,
+            b: 155,
         };
         t.success_shimmer = Color::Rgb {
             r: 120,
-            g: 200,
-            b: 130,
+            g: 175,
+            b: 140,
         };
         t.error_shimmer = Color::Rgb {
-            r: 230,
+            r: 210,
             g: 140,
-            b: 150,
+            b: 145,
         };
         t.warning_shimmer = Color::Rgb {
-            r: 230,
-            g: 200,
-            b: 100,
+            r: 210,
+            g: 185,
+            b: 110,
         };
         t.accent_shimmer = Color::Rgb {
-            r: 180,
-            g: 110,
-            b: 220,
+            r: 145,
+            g: 170,
+            b: 190,
         };
         t.diff_added_word = Color::Rgb {
             r: 110,
