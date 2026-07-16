@@ -296,20 +296,35 @@ impl Builder {
     }
 
     fn emit_code_block(&mut self, lang: &str, content: &str) {
-        let rule = Style::default().fg(Color::DarkGray);
-        // Language tag row.
+        let accent = palette().accent;
+        let muted = Color::DarkGray;
+        let gutter = Style::default().fg(muted);
+        let body_bg = Color::Rgb(24, 24, 32);
         let tag = if lang.is_empty() {
-            "code".into()
+            "code".to_string()
         } else {
             lang.to_string()
         };
+        let n_lines = content.lines().count().max(1);
+        let num_w = n_lines.to_string().len().max(2);
+
+        // Header: accent bar · language pill · line count · copy hint.
         self.lines.push(Line::from(vec![
-            Span::styled("▎ ", rule),
+            Span::styled("╭─ ", Style::default().fg(accent)),
             Span::styled(
-                tag,
+                format!(" {tag} "),
                 Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
+                    .fg(Color::Black)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {n_lines} lines"),
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "  · y copy block",
+                Style::default().fg(muted).add_modifier(Modifier::DIM),
             ),
         ]));
 
@@ -320,27 +335,45 @@ impl Builder {
             .unwrap_or_else(|| ss.find_syntax_plain_text());
         let mut hl = HighlightLines::new(syntax, code_theme());
 
-        for line in LinesWithEndings::from(content) {
-            let mut spans = vec![Span::styled("▎ ", rule)];
+        for (i, line) in LinesWithEndings::from(content).enumerate() {
+            let mut spans = vec![
+                Span::styled("│ ", Style::default().fg(accent)),
+                Span::styled(
+                    format!("{:>width$} ", i + 1, width = num_w),
+                    gutter.add_modifier(Modifier::DIM),
+                ),
+            ];
             match hl.highlight_line(line, ss) {
                 Ok(ranges) => {
+                    let mut any = false;
                     for (sty, text) in ranges {
                         let t = text.trim_end_matches('\n');
                         if t.is_empty() {
                             continue;
                         }
+                        any = true;
                         let c = sty.foreground;
                         spans.push(Span::styled(
                             t.to_string(),
-                            Style::default().fg(Color::Rgb(c.r, c.g, c.b)),
+                            Style::default().fg(Color::Rgb(c.r, c.g, c.b)).bg(body_bg),
                         ));
                         self.spans_emitted += 1;
                     }
+                    if !any {
+                        spans.push(Span::styled(" ", Style::default().bg(body_bg)));
+                    }
                 }
-                Err(_) => spans.push(Span::raw(line.trim_end_matches('\n').to_string())),
+                Err(_) => spans.push(Span::styled(
+                    line.trim_end_matches('\n').to_string(),
+                    Style::default().fg(Color::Gray).bg(body_bg),
+                )),
             }
             self.lines.push(Line::from(spans));
         }
+
+        // Footer rule.
+        self.lines
+            .push(Line::from(Span::styled("╰─", Style::default().fg(accent))));
     }
 }
 
@@ -389,7 +422,11 @@ mod tests {
         assert!(t.contains("cargo test"));
         assert!(t.contains("fn main"));
         assert!(t.contains("rust"), "lang tag missing:\n{t}");
-        assert!(t.contains("▎"), "code left-rule missing:\n{t}");
+        assert!(
+            t.contains("╭─") || t.contains("│"),
+            "code snippet chrome missing:\n{t}"
+        );
+        assert!(t.contains("y copy"), "copy hint missing:\n{t}");
     }
 
     #[test]

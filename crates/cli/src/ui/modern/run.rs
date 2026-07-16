@@ -596,10 +596,21 @@ pub(super) async fn event_loop(
                         app.dirty = true;
                     }
                     Some(Ok(Event::Mouse(m))) => handle_mouse(app, m),
-                    Some(Ok(Event::Resize(_, _))) => { app.dirty = true; }
-                    Some(Ok(_)) => {}
+                    Some(Ok(Event::FocusGained)) => {
+                        app.terminal_focused = true;
+                        app.dirty = true;
+                    }
+                    Some(Ok(Event::FocusLost)) => {
+                        app.terminal_focused = false;
+                        app.dirty = true;
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        app.dirty = true;
+                    }
                     // Stream closed or errored: stop the UI cleanly.
-                    Some(Err(_)) | None => { app.should_quit = true; }
+                    Some(Err(_)) | None => {
+                        app.should_quit = true;
+                    }
                 }
             }
             // Engine → UI events.
@@ -610,10 +621,11 @@ pub(super) async fn event_loop(
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
             }
-            // Spinner animation (only while a turn is live).
-            _ = anim_tick.tick(), if live => {
-                if app.phase == super::app::Phase::Streaming {
+            // Micro-animations: spinner, action-required blink, toast decay.
+            _ = anim_tick.tick(), if live || app.needs_anim_tick() => {
+                if app.needs_anim_tick() {
                     app.tick();
+                    update_terminal_title(app);
                 }
             }
         }
@@ -704,6 +716,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Ignore key release on platforms that emit them. Accept Repeat so a
     // held Ctrl+C still counts (double-tap quit / cancel).
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return;
+    }
+
+    // Shortcuts overlay steals keys first.
+    if app.show_shortcuts {
+        if is_esc(&key)
+            || matches!(
+                key.code,
+                KeyCode::Char('.') | KeyCode::Char('x') | KeyCode::Char('X')
+            ) && key.modifiers.contains(KeyModifiers::CONTROL)
+            || matches!(key.code, KeyCode::Char('?'))
+        {
+            app.show_shortcuts = false;
+            app.dirty = true;
+        }
         return;
     }
 
@@ -811,6 +838,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
     if is_esc(&key) {
+        if app.selection.is_some() {
+            app.clear_selection();
+            return;
+        }
         if !app.input.is_empty() {
             app.clear_prompt();
         } else if app.phase == super::app::Phase::Streaming {
@@ -872,9 +903,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
         }
-        // Command palette (Ctrl+P).
+        // Command palette (Ctrl+P / ?).
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
             app.open_command_palette();
+        }
+        (_, KeyCode::Char('?')) if app.input.is_empty() => {
+            app.open_command_palette();
+        }
+        // Keyboard shortcuts help (Ctrl+. / Ctrl+X).
+        (m, KeyCode::Char('.') | KeyCode::Char('x') | KeyCode::Char('X'))
+            if m.contains(KeyModifiers::CONTROL) =>
+        {
+            app.toggle_shortcuts();
+        }
+        // Copy selection or last assistant (Ctrl+Shift+C).
+        (m, KeyCode::Char('c') | KeyCode::Char('C'))
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            app.copy_selection_or_last();
         }
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
@@ -897,9 +943,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         {
             app.queue_delete_selected();
         }
-        // Block copy: y = body, Y = metadata (only when a block is selected).
-        (_, KeyCode::Char('y')) if app.input.is_empty() && app.selected_item.is_some() => {
-            app.copy_selected_content();
+        // Block copy: y = body (or selection), Y = metadata (only when empty composer).
+        (_, KeyCode::Char('y')) if app.input.is_empty() => {
+            if app.selection.is_some() {
+                app.copy_selection_or_last();
+            } else if app.selected_item.is_some() {
+                app.copy_selected_content();
+            }
         }
         (_, KeyCode::Char('Y')) if app.input.is_empty() && app.selected_item.is_some() => {
             app.copy_selected_meta();
@@ -1061,27 +1111,107 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Shift/Alt-modified drags are left to the terminal's native selection.
+/// Shift/Alt-modified clicks leave native terminal selection alone when
+/// we cannot map the row into the transcript.
 fn handle_mouse(app: &mut App, m: MouseEvent) {
+    // Focus events may arrive as special kinds on some backends; ignore here.
     match m.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
-        // Clicking near the bottom of the transcript jumps to the live tail
-        // (the jump pill target). Cheap heuristic without full hit-testing:
-        // bottom row of the transcript region.
+        MouseEventKind::ScrollUp => {
+            app.scroll_up(3);
+            app.dirty = true;
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_down(3);
+            app.dirty = true;
+        }
+        // Jump pill: bottom transcript row → Follow.
         MouseEventKind::Down(MouseButton::Left)
             if !app.scroll.is_following()
                 && app.transcript_bottom_row != 0
                 && m.row == app.transcript_bottom_row =>
         {
-            // Exactly the transcript's bottom screen row (recorded at last
-            // draw) — comparing against viewport_h (a HEIGHT) made any click
-            // on the lower half of the screen, including the input box,
-            // silently snap the transcript to bottom.
             app.scroll_to_bottom();
+            app.clear_selection();
+        }
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
+            if let Some(abs) = mouse_abs_line(app, m.row) {
+                app.selection = Some(super::app::TextSelection {
+                    start_line: abs,
+                    end_line: abs,
+                });
+                app.dirty = true;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(abs) = mouse_abs_line(app, m.row) {
+                if let Some(sel) = app.selection.as_mut() {
+                    sel.end_line = abs;
+                } else {
+                    app.selection = Some(super::app::TextSelection {
+                        start_line: abs,
+                        end_line: abs,
+                    });
+                }
+                app.dirty = true;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Keep selection for y / Ctrl+Shift+C; toast if non-empty.
+            if let Some(sel) = app.selection
+                && sel.start_line != sel.end_line
+            {
+                app.push_toast("selection ready · Ctrl+Shift+C or y to copy");
+            }
+        }
+        // Middle-click: no OS PRIMARY read without extra deps; hint paste path.
+        MouseEventKind::Down(MouseButton::Middle) if app.phase != super::app::Phase::Permission => {
+            app.push_toast("use Ctrl+Shift+V / terminal paste for clipboard");
         }
         _ => {}
     }
+}
+
+/// Map a screen row to an absolute layout line in the transcript viewport.
+fn mouse_abs_line(app: &App, row: u16) -> Option<usize> {
+    if app.viewport_h == 0 || app.transcript_bottom_row == 0 {
+        return None;
+    }
+    let bottom = app.transcript_bottom_row;
+    let top_row = bottom.saturating_sub(app.viewport_h as u16 - 1);
+    if row < top_row || row > bottom {
+        return None;
+    }
+    let row_in_view = (row - top_row) as usize;
+    let total = app.layout.total_lines();
+    let top = app.scroll.top(total, app.viewport_h);
+    app.layout.abs_line_at(top, row_in_view)
+}
+
+/// OSC 0 window title: braille spinner + model when live; calm idle title.
+fn update_terminal_title(app: &App) {
+    use std::io::Write;
+    let title = match app.phase {
+        super::app::Phase::Streaming => {
+            format!(
+                "{} agent · {} · {}",
+                super::anim::spinner_glyph(app.tick),
+                app.model,
+                app.waiting_on.label()
+            )
+        }
+        super::app::Phase::Permission => {
+            if super::anim::blink_visible(app.tick, app.terminal_focused) {
+                format!("⚠ action required · {}", app.model)
+            } else {
+                format!("agent · {}", app.model)
+            }
+        }
+        _ => format!("agent · {}", app.model),
+    };
+    // OSC 0 ; title BEL
+    let seq = format!("\x1b]0;{title}\x07");
+    let _ = std::io::stdout().write_all(seq.as_bytes());
+    let _ = std::io::stdout().flush();
 }
 
 /// Apply a UI session mode to the engine so it takes effect immediately —

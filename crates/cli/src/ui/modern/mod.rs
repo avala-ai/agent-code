@@ -2,6 +2,7 @@
 //!
 //! The only interactive surface. See `docs/tui/README.md`.
 
+mod anim;
 mod app;
 mod colors;
 #[cfg(test)]

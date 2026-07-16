@@ -53,8 +53,10 @@ Then close **engine / product** gaps that are not pure chrome (checkpoints, gran
 | **Full classic slash bridge** + Tab complete | Done (local WIP) |
 | **`!` shell passthrough** | Done (local WIP) |
 | First-run setup hero + modern default | Done (local WIP) |
-| Mouse drag text selection | Remaining |
+| Mouse drag text selection | Done (local) |
 | In-TUI command palette (Ctrl+P) | Done (local) |
+| Blinking action-required + code snippet chrome | Done (local) |
+| Shortcuts overlay (Ctrl+.) | Done (local) |
 | Full theme pack in modern chrome | Remaining (skin + classic themes partial) |
 | Session picker / multi-session dashboard | Remaining (engine+E1) |
 | File-snapshot rewind, foreign sessions, media | Product gaps after agent-screen |

@@ -13,7 +13,9 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+C` (also `Ctrl+Shift+C`, `Cmd+C`) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit |
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
-| `Ctrl+P` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
+| `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
+| `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
+| `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
 
