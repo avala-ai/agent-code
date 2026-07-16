@@ -304,7 +304,7 @@ pub(super) async fn event_loop(
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     let interactive = crate::commands::is_interactive_slash(&slash);
-                    let editor = crate::commands::is_editor_slash(&slash);
+                    let real_tty = crate::commands::needs_real_tty_stdout(&slash);
                     // Always park the worker: slash arms may call
                     // `Handle::block_on` (e.g. cwd hooks) even after leaving
                     // the alt-screen.
@@ -314,15 +314,16 @@ pub(super) async fn event_loop(
                             // viewer, $EDITOR, and y/N prompts own the real
                             // terminal.
                             with_main_screen(|| {
-                                if editor {
-                                    // `$EDITOR` requires a real TTY on stdout
-                                    // (`isatty`); never redirect fd 1 to a pipe.
+                                if real_tty {
+                                    // `$EDITOR` needs isatty; theme/model/
+                                    // session pickers bail unless
+                                    // stdout().is_terminal(). Never redirect
+                                    // fd 1 to a pipe for these.
                                     let r = crate::commands::execute(&slash, &mut eng);
                                     (r, String::new())
                                 } else {
-                                    // Tee so short-circuit diagnostics still
-                                    // reach the modern transcript after we
-                                    // re-enter the alt-screen.
+                                    // y/N prompts: tee so the Proceed?/Cancel
+                                    // lines still reach the modern transcript.
                                     crate::stdout_capture::capture_stdout_tee(|| {
                                         crate::commands::execute(&slash, &mut eng)
                                     })

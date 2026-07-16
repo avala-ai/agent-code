@@ -697,8 +697,17 @@ pub fn is_interactive_slash(cmd: &str) -> bool {
     ) || slash_needs_stdin_prompt(cmd)
 }
 
-/// True for `/editor` / `/open` — spawned `$EDITOR` requires a real TTY on
-/// stdout (`isatty`), so the modern bridge must not redirect fd 1 to a pipe.
+/// True when the interactive slash must keep a real TTY on stdout (no pipe
+/// tee). Covers `$EDITOR` (`isatty`) and pickers that bail unless
+/// `stdout().is_terminal()` (theme/model/session/scroll/powerup).
+pub fn needs_real_tty_stdout(cmd: &str) -> bool {
+    matches!(
+        resolve_slash_name(cmd).as_str(),
+        "session" | "scroll" | "editor" | "open" | "theme" | "model" | "powerup" | "uninstall"
+    )
+}
+
+/// Back-compat alias used by older call sites / tests.
 pub fn is_editor_slash(cmd: &str) -> bool {
     matches!(resolve_slash_name(cmd).as_str(), "editor" | "open")
 }
@@ -818,6 +827,10 @@ mod slash_lookup_tests {
         assert!(is_interactive_slash("/open src/main.rs"));
         assert!(is_editor_slash("/open src/main.rs"));
         assert!(is_editor_slash("/editor"));
+        assert!(needs_real_tty_stdout("/theme"));
+        assert!(needs_real_tty_stdout("/session"));
+        assert!(needs_real_tty_stdout("/model"));
+        assert!(!needs_real_tty_stdout("/plugin remove x"));
         assert!(!is_editor_slash("/session"));
         assert!(is_interactive_slash("/theme"));
         assert!(is_interactive_slash("/powerup"));
@@ -3614,7 +3627,9 @@ fn team_remember_add(project_root: &std::path::Path, text: &str, force: bool) {
          session that opens this project.",
         target.display()
     );
-    if !confirm_yes_no("Proceed?") {
+    // `--force` skips the y/N prompt (and the modern TUI can keep this
+    // path on stdout capture without hanging on raw-mode stdin).
+    if !force && !confirm_yes_no("Proceed?") {
         println!("Cancelled.");
         return;
     }
