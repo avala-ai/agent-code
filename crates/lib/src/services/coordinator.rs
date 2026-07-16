@@ -444,9 +444,10 @@ pub fn effective_permissions(definition: &AgentDefinition) -> Option<Permissions
 
 /// Compose a child permissions overlay onto a host permissions config.
 ///
-/// Host **restrictions** always win:
-/// - Rules are ordered host-first so first-match evaluation never lets an
-///   overlay `Allow` shadow a project `Deny` (or other host rule).
+/// **Restrictions** always win under first-match evaluation:
+/// - Rule order is deny-first: host Deny → overlay Deny → host other →
+///   overlay other. Host Deny still beats everything; overlay Deny beats
+///   host Allow so a confined subagent cannot inherit a project-wide Allow.
 /// - `allowed_tools` is the intersection when both sides set a list; an
 ///   overlay cannot re-expose a tool the host omitted from its allowlist.
 /// - `disallowed_tools` is the union (either side can forbid).
@@ -456,16 +457,44 @@ pub fn compose_permissions_overlay(
     host: &PermissionsConfig,
     overlay: &PermissionsConfig,
 ) -> PermissionsConfig {
-    // Host rules first: PermissionChecker first-match must not let an
-    // overlay Allow(Bash) shadow host Deny(Bash(rm *)).
-    let mut rules = host.rules.clone();
-    for r in &overlay.rules {
+    // Deny-first merge (#426): first-match PermissionChecker must not let a
+    // host Allow(Bash,*) shadow an overlay Deny(Bash).
+    let mut rules: Vec<PermissionRule> = Vec::new();
+    let push_unique = |rules: &mut Vec<PermissionRule>, r: &PermissionRule| {
         if !rules
             .iter()
             .any(|x| x.tool == r.tool && x.pattern == r.pattern && x.action == r.action)
         {
             rules.push(r.clone());
         }
+    };
+    for r in host
+        .rules
+        .iter()
+        .filter(|r| matches!(r.action, PermissionMode::Deny))
+    {
+        push_unique(&mut rules, r);
+    }
+    for r in overlay
+        .rules
+        .iter()
+        .filter(|r| matches!(r.action, PermissionMode::Deny))
+    {
+        push_unique(&mut rules, r);
+    }
+    for r in host
+        .rules
+        .iter()
+        .filter(|r| !matches!(r.action, PermissionMode::Deny))
+    {
+        push_unique(&mut rules, r);
+    }
+    for r in overlay
+        .rules
+        .iter()
+        .filter(|r| !matches!(r.action, PermissionMode::Deny))
+    {
+        push_unique(&mut rules, r);
     }
     // Visibility: intersect when both sides restrict; never replace a host
     // allowlist with a looser overlay list.
@@ -1365,6 +1394,52 @@ mod coordinator_tests {
         assert!(matches!(
             checker.check("Bash", &serde_json::json!({"command": "ls"})),
             crate::permissions::PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn compose_permissions_overlay_deny_beats_host_allow() {
+        // Host grants Bash; confined subagent overlay denies it — Deny must
+        // win (#426).
+        let host = PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: None,
+                action: PermissionMode::Allow,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let overlay = PermissionsConfig {
+            default_mode: PermissionMode::Plan,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: None,
+                action: PermissionMode::Deny,
+            }],
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+        };
+        let merged = compose_permissions_overlay(&host, &overlay);
+        let deny_pos = merged
+            .rules
+            .iter()
+            .position(|r| r.tool == "Bash" && r.action == PermissionMode::Deny)
+            .expect("overlay deny present");
+        let allow_pos = merged
+            .rules
+            .iter()
+            .position(|r| r.tool == "Bash" && r.action == PermissionMode::Allow)
+            .expect("host allow present");
+        assert!(
+            deny_pos < allow_pos,
+            "overlay Deny must precede host Allow (first-match)"
+        );
+        let checker = crate::permissions::PermissionChecker::from_config(&merged);
+        assert!(matches!(
+            checker.check("Bash", &serde_json::json!({"command": "ls"})),
+            crate::permissions::PermissionDecision::Deny(_)
         ));
     }
 
