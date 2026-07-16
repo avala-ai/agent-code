@@ -246,28 +246,44 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
             lines.extend(body);
             lines.push(Line::from(""));
         }
-        TranscriptItem::Thinking(t) => {
-            // Thinking is dimmed; collapsed by default to one line.
+        TranscriptItem::Thinking { text, duration_ms } => {
+            // Grok-style: collapsed header "Thought" / "Thought for Xs";
+            // expanded body is dim italic markdown.
+            let header = match duration_ms {
+                Some(ms) if *ms > 0 => {
+                    let secs = *ms as f64 / 1000.0;
+                    if secs >= 10.0 {
+                        format!("  Thought for {secs:.0}s")
+                    } else {
+                        format!("  Thought for {secs:.1}s")
+                    }
+                }
+                Some(_) => "  Thought".to_string(),
+                None => {
+                    // Still streaming — show live-ish header + short preview.
+                    if text.is_empty() {
+                        "  Thinking…".to_string()
+                    } else {
+                        let preview: String = text.chars().take(48).collect();
+                        format!(
+                            "  Thinking… {}{}",
+                            preview,
+                            if text.chars().count() > 48 { "…" } else { "" }
+                        )
+                    }
+                }
+            };
             lines.push(Line::from(vec![
                 sel.clone(),
                 Span::styled(
-                    if expanded {
-                        "  thinking…".to_string()
-                    } else {
-                        let preview: String = t.chars().take(60).collect();
-                        format!(
-                            "  thinking… {}{}",
-                            preview,
-                            if t.chars().count() > 60 { "…" } else { "" }
-                        )
-                    },
+                    header,
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
             if expanded {
-                for mut line in super::markdown::render_markdown(t).lines {
+                for mut line in super::markdown::render_markdown(text).lines {
                     for span in &mut line.spans {
                         span.style = span
                             .style
@@ -276,7 +292,7 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
                     }
                     lines.push(line);
                 }
-            } else if !t.is_empty() {
+            } else if !text.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "     (e expand · Ctrl+E all thinking)".to_string(),
                     Style::default().fg(Color::DarkGray),

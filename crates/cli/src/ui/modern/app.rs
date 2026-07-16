@@ -22,19 +22,26 @@ pub const HITL_ANSWER_GRACE: Duration = Duration::from_millis(250);
 // `app::Modal` / `app::PendingPermission` paths keep working.
 pub use super::modal::{Modal, PendingPermission, PlanReview, QuestionState};
 
-/// Local `/model` action deferred to the run loop (needs the engine lock).
-/// Classic uses an interactive stdin selector; under the alt-screen TUI we
-/// list models in the transcript and accept `/model <id>` to switch.
+/// Local `/model` / `/effort` action deferred to the run loop (needs the engine lock).
+/// Classic uses an interactive stdin selector; under the alt-screen TUI we open
+/// an overlay picker (`Show`) or apply a switch without leaving the TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingModelAction {
-    /// Show current model + provider catalog in the transcript.
+    /// Open the in-TUI model picker (Ctrl+M / `/model`).
     Show,
-    /// Set `config.api.model` (and the status-bar badge) to this id.
-    Set(String),
+    /// Set `config.api.model` (and optionally reasoning effort).
+    Set {
+        model: String,
+        effort: Option<String>,
+    },
+    /// Set reasoning effort on the current model only.
+    SetEffort(String),
 }
 
-/// Parse `/model` / `/model <id>` from a slash line. Returns `None` if the
-/// input is not a model command.
+/// Canonical reasoning-effort levels (Grok-compatible vocabulary).
+pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Parse `/model` / `/model <id>` / `/model <id> <effort>` from a slash line.
 pub(crate) fn parse_model_slash(input: &str) -> Option<PendingModelAction> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -45,30 +52,113 @@ pub(crate) fn parse_model_slash(input: &str) -> Option<PendingModelAction> {
         Some((c, a)) => (c, Some(a.trim())),
         None => (rest, None),
     };
-    if !cmd.eq_ignore_ascii_case("model") {
+    if !cmd.eq_ignore_ascii_case("model") && !cmd.eq_ignore_ascii_case("m") {
         return None;
     }
     match args {
         None | Some("") => Some(PendingModelAction::Show),
-        Some(name) => Some(PendingModelAction::Set(name.to_string())),
+        Some(rest) => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            match parts.as_slice() {
+                [] => Some(PendingModelAction::Show),
+                [model] => Some(PendingModelAction::Set {
+                    model: (*model).to_string(),
+                    effort: None,
+                }),
+                [model, effort] if is_effort_level(effort) => Some(PendingModelAction::Set {
+                    model: (*model).to_string(),
+                    effort: Some(normalize_effort(effort)),
+                }),
+                // Multi-word model display names: last token may be effort.
+                many if many.len() >= 2 && is_effort_level(many[many.len() - 1]) => {
+                    let effort = normalize_effort(many[many.len() - 1]);
+                    let model = many[..many.len() - 1].join(" ");
+                    Some(PendingModelAction::Set {
+                        model,
+                        effort: Some(effort),
+                    })
+                }
+                many => Some(PendingModelAction::Set {
+                    model: many.join(" "),
+                    effort: None,
+                }),
+            }
+        }
     }
 }
 
-/// Format `/model` catalog lines for the transcript (no stdin selector).
+/// Parse `/effort <level>` (session-scoped reasoning effort).
+pub(crate) fn parse_effort_slash(input: &str) -> Option<PendingModelAction> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let rest = trimmed.trim_start_matches('/');
+    let (cmd, args) = match rest.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, Some(a.trim())),
+        None => (rest, None),
+    };
+    if !cmd.eq_ignore_ascii_case("effort") {
+        return None;
+    }
+    match args {
+        None | Some("") => None,
+        Some(level) if is_effort_level(level) => {
+            Some(PendingModelAction::SetEffort(normalize_effort(level)))
+        }
+        Some(_) => None,
+    }
+}
+
+fn is_effort_level(s: &str) -> bool {
+    EFFORT_LEVELS
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(s.trim()))
+}
+
+fn normalize_effort(s: &str) -> String {
+    let t = s.trim().to_ascii_lowercase();
+    if t == "max" {
+        "xhigh".into()
+    } else {
+        t
+    }
+}
+
+/// Format `/model` catalog lines for the transcript (fallback when picker closed).
 pub(crate) fn format_model_catalog(current: &str, base_url: &str) -> Vec<String> {
     let provider = agent_code_lib::llm::provider::detect_provider(current, base_url);
     let models = agent_code_lib::llm::provider::models_for_provider(provider);
     let mut lines = vec![format!("Model: {current}")];
     if models.is_empty() {
-        lines.push("Use /model <name> to change.".into());
+        lines.push("Use /model <name> to change · Ctrl+M opens the picker.".into());
     } else {
-        lines.push("Available models (use /model <id>):".into());
+        lines.push("Available models (↑/↓ · Enter · Ctrl+M picker · /model <id> [effort]):".into());
         for (name, desc) in models {
             let mark = if *name == current { " ✔" } else { "" };
             lines.push(format!("  {name}{mark}  — {desc}"));
         }
     }
     lines
+}
+
+/// Provider catalog as `(id, description)` for the model picker overlay.
+pub(crate) fn model_catalog_entries(current: &str, base_url: &str) -> Vec<(String, String)> {
+    let provider = agent_code_lib::llm::provider::detect_provider(current, base_url);
+    agent_code_lib::llm::provider::models_for_provider(provider)
+        .iter()
+        .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+        .collect()
+}
+
+/// Result of expanding a user-invocable skill slash.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpandedSkill {
+    pub prompt: String,
+    pub name: String,
+    pub argument_hint: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Expand a user-invocable skill slash (`/commit`, `/review foo`) to its
@@ -83,6 +173,14 @@ pub(crate) fn try_expand_skill_slash(
     cwd: &str,
     disable_skill_shell: bool,
 ) -> Option<String> {
+    try_expand_skill_slash_full(input, cwd, disable_skill_shell).map(|e| e.prompt)
+}
+
+pub(crate) fn try_expand_skill_slash_full(
+    input: &str,
+    cwd: &str,
+    disable_skill_shell: bool,
+) -> Option<ExpandedSkill> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -127,7 +225,13 @@ pub(crate) fn try_expand_skill_slash(
     if !skill.metadata.user_invocable {
         return None;
     }
-    Some(skill.expand_safe(args, disable_skill_shell))
+    Some(ExpandedSkill {
+        prompt: skill.expand_safe(args, disable_skill_shell),
+        name: skill.name.clone(),
+        argument_hint: skill.metadata.argument_hint.clone(),
+        model: skill.metadata.model.clone(),
+        effort: skill.metadata.effort.clone(),
+    })
 }
 
 /// One row in the scrollable transcript.
@@ -135,7 +239,12 @@ pub(crate) fn try_expand_skill_slash(
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
-    Thinking(String),
+    /// Model reasoning / chain-of-thought. Collapsed by default.
+    Thinking {
+        text: String,
+        /// Wall-clock duration once this block finished streaming (`None` while live).
+        duration_ms: Option<u64>,
+    },
     Tool {
         /// Engine tool-call id used to correlate the result to this card.
         /// Empty when the engine used the legacy id-less callback.
@@ -154,12 +263,16 @@ pub enum TranscriptItem {
 }
 
 /// What a running turn is currently blocked on, for the spinner detail
-/// (plan §M4 waiting-on).
+/// (plan §M4 waiting-on). Mirrors Grok-style phase language: wait → think → answer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WaitingOn {
-    /// Waiting on the model to produce tokens.
+    /// Waiting for the first model token (no reasoning or answer yet).
     #[default]
-    Model,
+    WaitingForModel,
+    /// Reasoning / thinking tokens are streaming.
+    Thinking,
+    /// Assistant answer tokens are streaming.
+    Answering,
     /// A tool is executing.
     Tool(String),
     /// Blocked on the user (permission / question).
@@ -169,8 +282,21 @@ pub enum WaitingOn {
 impl WaitingOn {
     /// Spinner label (the glyph is prepended by the renderer).
     pub fn label(&self) -> String {
+        self.label_with_elapsed(None)
+    }
+
+    /// Spinner label with optional live thinking elapsed time.
+    pub fn label_with_elapsed(&self, thinking_started: Option<Instant>) -> String {
         match self {
-            WaitingOn::Model => "thinking…".to_string(),
+            WaitingOn::WaitingForModel => "waiting for model…".to_string(),
+            WaitingOn::Thinking => {
+                if let Some(started) = thinking_started {
+                    format!("thinking {:.1}s…", started.elapsed().as_secs_f64())
+                } else {
+                    "thinking…".to_string()
+                }
+            }
+            WaitingOn::Answering => "answering…".to_string(),
             WaitingOn::Tool(name) => format!("running {name}"),
             WaitingOn::UserInput => "waiting on your input".to_string(),
         }
@@ -216,6 +342,12 @@ pub struct App {
     pub phase: Phase,
     /// What the running turn is blocked on (drives the status-bar spinner).
     pub waiting_on: WaitingOn,
+    /// When the current thinking stream started (for live elapsed + "Thought for Xs").
+    pub thinking_started_at: Option<Instant>,
+    /// When false, thinking deltas update status only (no transcript blocks).
+    pub show_thinking_blocks: bool,
+    /// Session reasoning effort (mirrors `config.api.effort`).
+    pub effort: Option<String>,
     /// FIFO of modals awaiting the user (permission asks, incl. from
     /// background subagents). The front is displayed (plan §M6).
     pub modals: std::collections::VecDeque<Modal>,
@@ -284,6 +416,8 @@ pub struct App {
     pub queue_selected: usize,
     /// Ctrl+P command palette (slash command picker).
     pub command_palette: Option<super::palette::CommandPalette>,
+    /// Ctrl+M / `/model` in-TUI model picker.
+    pub model_picker: Option<super::model_picker::ModelPicker>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -364,10 +498,13 @@ impl App {
             disable_skill_shell,
             mode: SessionMode::Normal,
             phase: Phase::Idle,
-            waiting_on: WaitingOn::Model,
+            waiting_on: WaitingOn::WaitingForModel,
+            thinking_started_at: None,
+            show_thinking_blocks: true,
+            effort: None,
             modals: std::collections::VecDeque::new(),
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Enter send · Ctrl+P commands · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
+                "Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
             )],
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
@@ -397,6 +534,7 @@ impl App {
             show_queue_pane: false,
             queue_selected: 0,
             command_palette: None,
+            model_picker: None,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),
@@ -454,10 +592,22 @@ impl App {
         // defeated the ≤10 fps coalescer budget. The flush tick sets dirty.
         match ev {
             EngineEvent::Text(t) => {
+                // Leaving thinking for the answer: stamp duration on the open block.
+                if matches!(
+                    self.waiting_on,
+                    WaitingOn::Thinking | WaitingOn::WaitingForModel
+                ) {
+                    self.finalize_open_thinking();
+                }
+                self.waiting_on = WaitingOn::Answering;
                 self.stream_buf.push_assistant(&t);
                 return;
             }
             EngineEvent::Thinking(t) => {
+                if self.thinking_started_at.is_none() {
+                    self.thinking_started_at = Some(Instant::now());
+                }
+                self.waiting_on = WaitingOn::Thinking;
                 self.stream_buf.push_thinking(&t);
                 return;
             }
@@ -476,6 +626,7 @@ impl App {
                 name,
                 detail,
             } => {
+                self.finalize_open_thinking();
                 self.waiting_on = WaitingOn::Tool(name.clone());
                 self.transcript.push(TranscriptItem::Tool {
                     call_id,
@@ -528,7 +679,7 @@ impl App {
                     *live = None;
                 }
                 // Back to waiting on the model once a tool returns.
-                self.waiting_on = WaitingOn::Model;
+                self.waiting_on = WaitingOn::WaitingForModel;
             }
             EngineEvent::ToolOutput { call_id, chunk } => {
                 // Append live stdout/stderr to the matching running card.
@@ -566,7 +717,8 @@ impl App {
             }
             EngineEvent::TurnStart(n) => {
                 self.phase = Phase::Streaming;
-                self.waiting_on = WaitingOn::Model;
+                self.waiting_on = WaitingOn::WaitingForModel;
+                self.thinking_started_at = None;
                 self.turn_count = n;
                 self.status_message = format!("turn {n}");
             }
@@ -585,6 +737,7 @@ impl App {
                 }
             }
             EngineEvent::TurnComplete(n) => {
+                self.finalize_open_thinking();
                 // A pending modal keeps the Permission phase: PlanProposed is
                 // fire-and-forget and typically arrives right before this
                 // event, so flipping to Idle here orphaned the plan-approval
@@ -692,17 +845,66 @@ impl App {
             return;
         }
         let out = self.stream_buf.flush();
-        if !out.thinking.is_empty() {
-            if let Some(TranscriptItem::Thinking(buf)) = self.transcript.last_mut() {
-                buf.push_str(&out.thinking);
-            } else {
-                self.transcript.push(TranscriptItem::Thinking(out.thinking));
+        if !out.thinking.is_empty() && self.show_thinking_blocks {
+            match self.transcript.last_mut() {
+                Some(TranscriptItem::Thinking {
+                    text,
+                    duration_ms: None,
+                }) => {
+                    text.push_str(&out.thinking);
+                }
+                _ => {
+                    self.transcript.push(TranscriptItem::Thinking {
+                        text: out.thinking,
+                        duration_ms: None,
+                    });
+                }
             }
         }
         if !out.assistant.is_empty() {
+            // Answer tokens close any open thinking block (duration stamp).
+            if matches!(
+                self.waiting_on,
+                WaitingOn::Thinking | WaitingOn::WaitingForModel | WaitingOn::Answering
+            ) {
+                // Only finalize if the open thinking block still has no duration.
+                if matches!(
+                    self.transcript.last(),
+                    Some(TranscriptItem::Thinking {
+                        duration_ms: None,
+                        ..
+                    })
+                ) {
+                    self.finalize_open_thinking();
+                }
+            }
+            if !matches!(self.waiting_on, WaitingOn::Tool(_) | WaitingOn::UserInput) {
+                self.waiting_on = WaitingOn::Answering;
+            }
             self.push_or_append_assistant(&out.assistant);
         }
         self.dirty = true;
+    }
+
+    /// Stamp elapsed time on the open thinking block and clear the live timer.
+    pub fn finalize_open_thinking(&mut self) {
+        let elapsed = self
+            .thinking_started_at
+            .take()
+            .map(|t| t.elapsed().as_millis() as u64);
+        if let Some(TranscriptItem::Thinking {
+            duration_ms: slot, ..
+        }) = self.transcript.iter_mut().rev().find(|i| {
+            matches!(
+                i,
+                TranscriptItem::Thinking {
+                    duration_ms: None,
+                    ..
+                }
+            )
+        }) {
+            *slot = elapsed.or(Some(0));
+        }
     }
 
     fn push_or_append_assistant(&mut self, t: &str) {
@@ -1050,9 +1252,9 @@ impl App {
             self.cursor = 0;
             return;
         }
-        // /model needs the engine lock (run loop applies). Handled even
-        // mid-turn so a switch is not sent to the LLM as a prompt.
-        if let Some(action) = parse_model_slash(&text) {
+        // /model and /effort need the engine lock (run loop applies).
+        // Handled even mid-turn so a switch is not sent to the LLM as a prompt.
+        if let Some(action) = parse_model_slash(&text).or_else(|| parse_effort_slash(&text)) {
             self.pending_model = Some(action);
             self.input.clear();
             self.cursor = 0;
@@ -1120,7 +1322,17 @@ impl App {
             [only] => {
                 self.input = format!("/{only} ");
                 self.cursor = self.input.len();
-                self.status_message = format!("/{only}");
+                // Surface skill argument hints when available.
+                let hint = try_expand_skill_slash_full(
+                    &format!("/{only}"),
+                    &self.cwd,
+                    self.disable_skill_shell,
+                )
+                .and_then(|e| e.argument_hint);
+                self.status_message = match hint {
+                    Some(h) => format!("/{only} ‹{h}›"),
+                    None => format!("/{only}"),
+                };
             }
             many => {
                 // Longest common prefix among candidates.
@@ -1148,30 +1360,88 @@ impl App {
         self.dirty = true;
     }
 
-    /// Apply a deferred `/model` action against live engine state.
-    /// Returns `true` if applied (caller should clear `pending_model`).
+    /// Apply a deferred `/model` / `/effort` action against live engine state.
+    /// `set_model` / `set_effort` mutate the engine config.
     pub fn apply_model_action(
         &mut self,
         action: PendingModelAction,
         current_model: &str,
         base_url: &str,
         set_model: impl FnOnce(String),
+        set_effort: impl FnOnce(Option<String>),
     ) {
         match action {
             PendingModelAction::Show => {
-                for line in format_model_catalog(current_model, base_url) {
-                    self.transcript.push(TranscriptItem::System(line));
+                let entries = model_catalog_entries(current_model, base_url);
+                if entries.is_empty() {
+                    for line in format_model_catalog(current_model, base_url) {
+                        self.transcript.push(TranscriptItem::System(line));
+                    }
+                } else {
+                    self.open_model_picker(current_model, entries);
                 }
             }
-            PendingModelAction::Set(name) => {
-                set_model(name.clone());
-                self.model = name.clone();
-                self.status_message = format!("model → {name}");
-                self.transcript
-                    .push(TranscriptItem::System(format!("Model changed to: {name}")));
+            PendingModelAction::Set { model, effort } => {
+                set_model(model.clone());
+                self.model = model.clone();
+                if let Some(ref e) = effort {
+                    set_effort(Some(e.clone()));
+                    self.effort = Some(e.clone());
+                    self.status_message = format!("model → {model} · effort {e}");
+                    self.transcript.push(TranscriptItem::System(format!(
+                        "Model changed to: {model} (effort {e})"
+                    )));
+                } else {
+                    self.status_message = format!("model → {model}");
+                    self.transcript
+                        .push(TranscriptItem::System(format!("Model changed to: {model}")));
+                }
+            }
+            PendingModelAction::SetEffort(level) => {
+                set_effort(Some(level.clone()));
+                self.effort = Some(level.clone());
+                self.status_message = format!("effort → {level}");
+                self.transcript.push(TranscriptItem::System(format!(
+                    "Reasoning effort → {level} (model {})",
+                    self.model
+                )));
             }
         }
         self.dirty = true;
+    }
+
+    /// Open the model picker overlay (Ctrl+M / `/model`).
+    pub fn open_model_picker(&mut self, current: &str, entries: Vec<(String, String)>) {
+        if self.front_modal().is_some() {
+            return;
+        }
+        self.command_palette = None;
+        self.show_shortcuts = false;
+        let selected = entries
+            .iter()
+            .position(|(id, _)| id == current)
+            .unwrap_or(0);
+        self.model_picker = Some(super::model_picker::ModelPicker {
+            query: String::new(),
+            selected,
+            entries,
+            current: current.to_string(),
+            effort_phase: false,
+            effort_selected: 0,
+        });
+        self.status_message =
+            "model picker · type to filter · Enter select · Tab effort · Esc close".into();
+        self.dirty = true;
+    }
+
+    pub fn close_model_picker(&mut self) {
+        if self.model_picker.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
     }
 
     /// Enqueue a prompt produced by a slash command (`CommandResult::Prompt`).
@@ -1183,11 +1453,30 @@ impl App {
     /// way slash dispatch does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
         let (display, prompt) =
-            match try_expand_skill_slash(&text, &self.cwd, self.disable_skill_shell) {
+            match try_expand_skill_slash_full(&text, &self.cwd, self.disable_skill_shell) {
                 Some(expanded) => {
                     // Keep the slash visible in the transcript; send the expanded
                     // skill body to the engine as the real user message.
-                    (text, expanded)
+                    // Surface skill chrome so the user sees which package ran.
+                    let mut chrome = format!("▸ skill /{}", expanded.name);
+                    if let Some(ref hint) = expanded.argument_hint {
+                        chrome.push_str(&format!(" · {hint}"));
+                    }
+                    if expanded.model.is_some() || expanded.effort.is_some() {
+                        let m = expanded.model.as_deref().unwrap_or(&self.model);
+                        let e = expanded.effort.as_deref().unwrap_or("-");
+                        chrome.push_str(&format!(" · model {m} · effort {e}"));
+                        if let Some(m) = expanded.model {
+                            self.pending_model = Some(PendingModelAction::Set {
+                                model: m,
+                                effort: expanded.effort.clone(),
+                            });
+                        } else if let Some(e) = expanded.effort {
+                            self.pending_model = Some(PendingModelAction::SetEffort(e));
+                        }
+                    }
+                    self.transcript.push(TranscriptItem::System(chrome));
+                    (text, expanded.prompt)
                 }
                 None => {
                     // A slash input that is neither a built-in nor a skill is a
@@ -1306,7 +1595,7 @@ impl App {
             .transcript
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| matches!(t, TranscriptItem::Thinking(_)).then_some(i))
+            .filter_map(|(i, t)| matches!(t, TranscriptItem::Thinking { .. }).then_some(i))
             .collect();
         if thinking.is_empty() {
             self.status_message = "no thinking blocks".into();
@@ -1337,7 +1626,7 @@ impl App {
                     ..
                 }
             ) if !r.is_empty()
-        ) || matches!(self.transcript.get(idx), Some(TranscriptItem::Thinking(t)) if !t.is_empty())
+        ) || matches!(self.transcript.get(idx), Some(TranscriptItem::Thinking { text, .. }) if !text.is_empty())
             || matches!(self.transcript.get(idx), Some(TranscriptItem::Assistant(t)) if t.lines().count() > 12)
     }
 
@@ -1617,7 +1906,7 @@ impl App {
         match self.transcript.get(idx)? {
             TranscriptItem::User(s) => Some(s.clone()),
             TranscriptItem::Assistant(s) => Some(s.clone()),
-            TranscriptItem::Thinking(s) => Some(s.clone()),
+            TranscriptItem::Thinking { text, .. } => Some(text.clone()),
             TranscriptItem::System(s) | TranscriptItem::Error(s) | TranscriptItem::Warning(s) => {
                 Some(s.clone())
             }
@@ -1935,11 +2224,35 @@ mod tests {
         );
         assert_eq!(
             parse_model_slash("/model grok-4.5"),
-            Some(PendingModelAction::Set("grok-4.5".into()))
+            Some(PendingModelAction::Set {
+                model: "grok-4.5".into(),
+                effort: None
+            })
         );
         assert_eq!(
             parse_model_slash("/MODEL gpt-5.4"),
-            Some(PendingModelAction::Set("gpt-5.4".into()))
+            Some(PendingModelAction::Set {
+                model: "gpt-5.4".into(),
+                effort: None
+            })
+        );
+        assert_eq!(
+            parse_model_slash("/model o3 high"),
+            Some(PendingModelAction::Set {
+                model: "o3".into(),
+                effort: Some("high".into())
+            })
+        );
+        assert_eq!(
+            parse_model_slash("/m gpt-5.4"),
+            Some(PendingModelAction::Set {
+                model: "gpt-5.4".into(),
+                effort: None
+            })
+        );
+        assert_eq!(
+            parse_effort_slash("/effort low"),
+            Some(PendingModelAction::SetEffort("low".into()))
         );
         assert!(parse_model_slash("/help").is_none());
         assert!(parse_model_slash("model").is_none());
@@ -2025,7 +2338,10 @@ mod tests {
         app.submit();
         assert_eq!(
             app.pending_model,
-            Some(PendingModelAction::Set("grok-4.5".into()))
+            Some(PendingModelAction::Set {
+                model: "grok-4.5".into(),
+                effort: None
+            })
         );
         assert!(
             app.queue.is_empty(),
@@ -2038,14 +2354,21 @@ mod tests {
     fn apply_model_action_set_updates_badge_and_transcript() {
         let mut app = App::new("old-model", "/tmp", "s");
         let mut engine_model = "old-model".to_string();
+        let mut engine_effort = None;
         app.apply_model_action(
-            PendingModelAction::Set("new-model".into()),
+            PendingModelAction::Set {
+                model: "new-model".into(),
+                effort: Some("high".into()),
+            },
             "old-model",
             "",
             |name| engine_model = name,
+            |e| engine_effort = e,
         );
         assert_eq!(engine_model, "new-model");
+        assert_eq!(engine_effort.as_deref(), Some("high"));
         assert_eq!(app.model, "new-model");
+        assert_eq!(app.effort.as_deref(), Some("high"));
         assert!(app.pending_model.is_none());
         match app.transcript.last() {
             Some(TranscriptItem::System(s)) => assert!(s.contains("new-model")),
@@ -2054,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_model_action_show_lists_catalog() {
+    fn apply_model_action_show_opens_picker_when_catalog_nonempty() {
         let mut app = App::new("grok-4", "/tmp", "s");
         let before = app.transcript.len();
         app.apply_model_action(
@@ -2062,7 +2385,16 @@ mod tests {
             "grok-4",
             "https://api.x.ai/v1",
             |_| {},
+            |_| {},
         );
+        // xAI catalog is non-empty → open overlay instead of dumping lines.
+        if app.model_picker_open() {
+            assert_eq!(app.transcript.len(), before);
+            let p = app.model_picker.as_ref().unwrap();
+            assert!(!p.entries.is_empty());
+            return;
+        }
+        // Empty catalog fallback: system lines.
         assert!(app.transcript.len() > before);
         let joined: String = app
             .transcript
@@ -2796,7 +3128,7 @@ mod tests {
     fn waiting_on_tracks_tool_lifecycle() {
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::TurnStart(1));
-        assert_eq!(app.waiting_on, WaitingOn::Model);
+        assert_eq!(app.waiting_on, WaitingOn::WaitingForModel);
         app.apply_engine(EngineEvent::ToolStart {
             call_id: "c1".into(),
             name: "Bash".into(),
@@ -2809,7 +3141,7 @@ mod tests {
             content: "ok".into(),
             is_error: false,
         });
-        assert_eq!(app.waiting_on, WaitingOn::Model);
+        assert_eq!(app.waiting_on, WaitingOn::WaitingForModel);
     }
 
     #[test]
@@ -2827,7 +3159,44 @@ mod tests {
         assert_eq!(app.waiting_on, WaitingOn::UserInput);
         assert_eq!(app.waiting_on.label(), "waiting on your input");
         app.resolve_permission(PermissionResponse::AllowOnce);
-        assert_eq!(app.waiting_on, WaitingOn::Model);
+        assert_eq!(app.waiting_on, WaitingOn::WaitingForModel);
+    }
+
+    #[test]
+    fn thinking_status_phases_and_duration() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnStart(1));
+        assert_eq!(app.waiting_on, WaitingOn::WaitingForModel);
+        assert_eq!(app.waiting_on.label(), "waiting for model…");
+
+        app.apply_engine(EngineEvent::Thinking("reason ".into()));
+        assert_eq!(app.waiting_on, WaitingOn::Thinking);
+        assert!(app.thinking_started_at.is_some());
+        app.flush_stream();
+        match app.transcript.last() {
+            Some(TranscriptItem::Thinking {
+                text,
+                duration_ms: None,
+            }) => assert!(text.contains("reason")),
+            other => panic!("expected open thinking block, got {other:?}"),
+        }
+
+        app.apply_engine(EngineEvent::Text("answer".into()));
+        assert_eq!(app.waiting_on, WaitingOn::Answering);
+        app.flush_stream();
+        // Thinking block should be finalized with a duration.
+        let thought = app
+            .transcript
+            .iter()
+            .find_map(|i| match i {
+                TranscriptItem::Thinking {
+                    duration_ms: Some(ms),
+                    ..
+                } => Some(*ms),
+                _ => None,
+            });
+        assert!(thought.is_some(), "thinking duration should be stamped");
+        assert_eq!(app.waiting_on.label(), "answering…");
     }
 
     #[test]

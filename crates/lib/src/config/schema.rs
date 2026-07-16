@@ -461,8 +461,17 @@ pub struct UiConfig {
     pub inherit_fg: bool,
     /// Editing mode: "emacs" or "vi".
     pub edit_mode: String,
+    /// Show model reasoning / thinking blocks in the modern TUI.
+    /// When false, thinking deltas still update the status spinner but
+    /// are not written into the transcript.
+    #[serde(default = "default_true")]
+    pub show_thinking_blocks: bool,
     /// Between-turn status line customization.
     pub statusline: StatusLineConfig,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UiConfig {
@@ -473,6 +482,7 @@ impl Default for UiConfig {
             theme: "dark".to_string(),
             inherit_fg: false,
             edit_mode: "emacs".to_string(),
+            show_thinking_blocks: true,
             statusline: StatusLineConfig::default(),
         }
     }

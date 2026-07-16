@@ -44,6 +44,12 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let session_id = engine.state().session_id.clone();
     let base_permission_mode = engine.state().config.permissions.default_mode;
     let disable_skill_shell = engine.state().config.security.disable_skill_shell_execution;
+    let show_thinking_blocks = engine
+        .state()
+        .config
+        .ui
+        .show_thinking_blocks;
+    let initial_effort = engine.state().config.api.effort.clone();
 
     // Apply theme so any shared color helpers still resolve.
     let configured = engine.state().config.ui.theme.clone();
@@ -68,6 +74,8 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
     let session = Session::new(engine);
     let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
+    app.show_thinking_blocks = show_thinking_blocks;
+    app.effort = initial_effort;
 
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
@@ -274,9 +282,21 @@ pub(super) async fn event_loop(
                 Ok(mut eng) => {
                     let current = eng.state().config.api.model.clone();
                     let base_url = eng.state().config.api.base_url.clone();
-                    app.apply_model_action(action, &current, &base_url, |name| {
+                    let mut next_model: Option<String> = None;
+                    let mut next_effort: Option<Option<String>> = None;
+                    app.apply_model_action(
+                        action,
+                        &current,
+                        &base_url,
+                        |name| next_model = Some(name),
+                        |effort| next_effort = Some(effort),
+                    );
+                    if let Some(name) = next_model {
                         eng.state_mut().config.api.model = name;
-                    });
+                    }
+                    if let Some(effort) = next_effort {
+                        eng.state_mut().config.api.effort = effort;
+                    }
                 }
                 Err(_) => {
                     app.pending_model = Some(action);
@@ -748,6 +768,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.dirty = true;
         }
         app.close_command_palette();
+        app.close_model_picker();
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
@@ -764,6 +785,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.show_shortcuts = false;
             app.dirty = true;
         }
+        return;
+    }
+
+    // Model picker captures input when open (and no HITL modal is up).
+    if app.model_picker_open() {
+        handle_model_picker_key(app, key);
         return;
     }
 
@@ -993,9 +1020,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Alt chord when the terminal does not distinguish Ctrl+Enter.
             app.interject();
         }
-        // Multiline compose: Ctrl+M toggles Enter vs Alt/Shift+Enter semantics.
+        // Ctrl+M: Grok-style — model picker when composer empty / block
+        // selected (scrollback); multiline toggle when drafting.
         (m, KeyCode::Char('m') | KeyCode::Char('M')) if m.contains(KeyModifiers::CONTROL) => {
-            app.toggle_multiline_mode();
+            if app.input.is_empty() || app.selected_item.is_some() {
+                app.request_model_picker();
+            } else {
+                app.toggle_multiline_mode();
+            }
         }
         // Alt+Enter / Shift+Enter: newline in normal mode, submit in multiline mode.
         (m, KeyCode::Enter) if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::SHIFT) => {
@@ -1142,6 +1174,34 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
+    // Ctrl+M toggles closed; Esc / Ctrl+C dismiss.
+    if matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.close_model_picker();
+        return;
+    }
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.close_model_picker();
+        return;
+    }
+    match key.code {
+        KeyCode::Up => app.model_picker_move(-1),
+        KeyCode::Down => app.model_picker_move(1),
+        KeyCode::Enter => app.model_picker_accept(),
+        KeyCode::Tab => app.model_picker_enter_effort(),
+        KeyCode::Backspace => app.model_picker_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.model_picker_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
 /// Shift/Alt-modified clicks leave native terminal selection alone when
 /// we cannot map the row into the transcript.
 fn handle_mouse(app: &mut App, m: MouseEvent) {
@@ -1241,7 +1301,8 @@ fn update_terminal_title(app: &App) {
                 "{} agent · {} · {}",
                 super::anim::spinner_glyph(app.tick),
                 model,
-                app.waiting_on.label()
+                app.waiting_on
+                    .label_with_elapsed(app.thinking_started_at)
             )
         }
         super::app::Phase::Permission => {
@@ -1556,10 +1617,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_toggles_multiline() {
+    fn ctrl_m_empty_requests_model_picker() {
         let mut app = App::new("m", "/tmp", "s");
         handle_key(&mut app, ctrl('m'));
+        assert_eq!(
+            app.pending_model,
+            Some(super::super::app::PendingModelAction::Show)
+        );
+        assert!(!app.multiline_mode);
+    }
+
+    #[test]
+    fn ctrl_m_with_draft_toggles_multiline() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "draft".into();
+        app.cursor = 5;
+        handle_key(&mut app, ctrl('m'));
         assert!(app.multiline_mode);
+        assert!(app.pending_model.is_none());
         handle_key(&mut app, ctrl('m'));
         assert!(!app.multiline_mode);
     }
