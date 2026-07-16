@@ -736,7 +736,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
-    if app.show_shortcuts && app.phase != super::app::Phase::Permission {
+    // Ctrl+C / Cmd+C always fall through so a live turn can still be cancelled
+    // while help is open (the overlay itself documents that chord).
+    if app.show_shortcuts && app.phase != super::app::Phase::Permission && !is_cancel_chord(&key) {
         if is_esc(&key)
             || matches!(
                 key.code,
@@ -1307,6 +1309,18 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.cancel_requested);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_through_shortcuts_overlay() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.show_shortcuts = true;
+        handle_key(&mut app, ctrl('c'));
+        assert!(
+            app.cancel_requested,
+            "Ctrl+C must cancel even while help overlay is open"
+        );
     }
 
     #[test]
