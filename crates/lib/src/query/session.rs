@@ -120,7 +120,12 @@ impl Session {
     /// [`TurnHandle`] carries a status receiver and a cancel handle that
     /// work *without* the engine lock, so the turn can be observed and
     /// cancelled while it runs.
-    pub async fn spawn_turn(&self, input: String, sink: Arc<dyn StreamSink>) -> TurnHandle {
+    ///
+    /// Returns an error if a turn is already [`TurnStatus::Running`] so a
+    /// second `begin_turn` cannot replace the first turn's cancel token
+    /// or status channel (issue #425). Callers must wait for the prior
+    /// handle to finish (or cancel it) before spawning again.
+    pub async fn spawn_turn(&self, input: String, sink: Arc<dyn StreamSink>) -> Result<TurnHandle> {
         // Start the turn's lifecycle up front (install this turn's
         // cancel token + publish `Running`) *before* grabbing the
         // handles, so the returned handle binds to this turn: its cancel
@@ -129,6 +134,11 @@ impl Session {
         // channel by a previous turn.
         let (status, cancel, steer) = {
             let mut engine = self.engine.lock().await;
+            if matches!(*engine.turn_status().borrow(), TurnStatus::Running) {
+                return Err(Error::Other(
+                    "a turn is already running; wait for it to finish or cancel it first".into(),
+                ));
+            }
             engine.begin_turn();
             (
                 engine.turn_status(),
@@ -143,12 +153,12 @@ impl Session {
             engine.run_turn_spawned(&input, sink.as_ref()).await
         });
 
-        TurnHandle {
+        Ok(TurnHandle {
             join,
             status,
             cancel,
             steer,
-        }
+        })
     }
 }
 
@@ -221,3 +231,6 @@ mod tests {
         assert!(TurnStatus::Errored("x".into()).is_final());
     }
 }
+
+// Concurrent-spawn regression lives in `query/mod.rs` next to the other
+// Session lifecycle tests (needs Provider mocks).
