@@ -272,6 +272,8 @@ pub struct App {
     pub show_queue_pane: bool,
     /// Selected row in the queue pane (0 = head).
     pub queue_selected: usize,
+    /// Ctrl+P command palette (slash command picker).
+    pub command_palette: Option<super::palette::CommandPalette>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -329,7 +331,7 @@ impl App {
             waiting_on: WaitingOn::Model,
             modals: std::collections::VecDeque::new(),
             transcript: vec![TranscriptItem::System(
-                "Modern TUI · Enter send · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
+                "Modern TUI · Enter send · Ctrl+P commands · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
             )],
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
@@ -358,6 +360,7 @@ impl App {
             queue: std::collections::VecDeque::new(),
             show_queue_pane: false,
             queue_selected: 0,
+            command_palette: None,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),
@@ -517,12 +520,16 @@ impl App {
                     input_preview,
                     respond,
                 }));
+                // HITL always wins: drop the Ctrl+P palette so keys reach
+                // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
+                self.command_palette = None;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
             EngineEvent::PlanProposed { plan_md, path } => {
                 self.modals
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
+                self.command_palette = None;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -537,6 +544,7 @@ impl App {
                         answers: Vec::new(),
                         respond,
                     }));
+                    self.command_palette = None;
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
                 }

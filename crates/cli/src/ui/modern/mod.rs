@@ -10,6 +10,7 @@ mod layout;
 mod markdown;
 mod modal;
 mod mode;
+mod palette;
 mod render;
 mod run;
 mod scroll;
