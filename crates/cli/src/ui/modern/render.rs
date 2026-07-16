@@ -100,12 +100,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    // Palette never draws over HITL (permission / plan / question).
+    // Palette / help never draw over HITL (permission / plan / question).
     if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
     }
 
-    if app.show_shortcuts {
+    if app.show_shortcuts && app.phase != Phase::Permission {
         draw_shortcuts_overlay(frame, area);
     }
 }

@@ -689,20 +689,23 @@ fn strip_ansi_simple(s: &str) -> String {
     out
 }
 
-/// True for Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
+/// True for Ctrl+C / Cmd+C (Super), or raw ETX — but **not** Ctrl+Shift+C.
+///
+/// Ctrl+Shift+C is reserved for "copy selection / last reply". Bare Ctrl+C
+/// still cancels. Some terminals set extra modifiers; we still treat
+/// CONTROL without SHIFT as cancel (SHIFT alone no longer forces cancel).
 ///
 /// **Not Esc.** Esc is navigate / dismiss / clear only — never cancels a
 /// turn (world-class agent-screen contract; see ACCEPTANCE + KEYBINDINGS).
-/// Real terminals often set extra modifier bits (e.g. SHIFT with Ctrl+C)
-/// so exact `KeyModifiers::CONTROL` equality silently drops the key —
-/// use `.contains(CONTROL)` instead.
 fn is_cancel_chord(key: &KeyEvent) -> bool {
     match key.code {
         // Raw ETX (0x03) — some paths deliver the byte without CONTROL.
         KeyCode::Char('\u{3}') => true,
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => {
-            key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::SUPER)
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER);
+            // Leave Ctrl+Shift+C for the copy shortcut.
+            ctrl && !key.modifiers.contains(KeyModifiers::SHIFT)
         }
         _ => false,
     }
@@ -719,8 +722,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Shortcuts overlay steals keys first.
-    if app.show_shortcuts {
+    // HITL always wins: dismiss help + palette so y/a/n reach the modal.
+    if app.phase == super::app::Phase::Permission {
+        if app.show_shortcuts {
+            app.show_shortcuts = false;
+            app.dirty = true;
+        }
+        app.close_command_palette();
+    }
+
+    // Shortcuts overlay steals keys only when no HITL modal is up.
+    if app.show_shortcuts && app.phase != super::app::Phase::Permission {
         if is_esc(&key)
             || matches!(
                 key.code,
@@ -732,13 +744,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.dirty = true;
         }
         return;
-    }
-
-    // HITL modals always win over the command palette. A permission ask
-    // can arrive while the palette is open (streaming turn); dismiss the
-    // palette so y/a/n, Esc, and Ctrl+C reach the modal.
-    if app.phase == super::app::Phase::Permission {
-        app.close_command_palette();
     }
 
     // Command palette captures input when open (and no HITL modal is up).
@@ -1274,17 +1279,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_and_uppercase_still_cancel() {
-        // Terminals often set SHIFT with Ctrl+C; exact-modifier match used to drop these.
-        let mut app = App::new("m", "/tmp", "s");
-        app.phase = Phase::Streaming;
-        handle_key(&mut app, ctrl_shift('c'));
-        assert!(app.cancel_requested, "Ctrl+Shift+c must cancel");
-
+    fn ctrl_c_uppercase_still_cancels() {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
         handle_key(&mut app, ctrl('C'));
         assert!(app.cancel_requested, "Ctrl+C (uppercase) must cancel");
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_not_cancels() {
+        // Ctrl+Shift+C is copy selection / last reply — not cancel.
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.transcript
+            .push(super::super::app::TranscriptItem::Assistant("hi".into()));
+        handle_key(&mut app, ctrl_shift('c'));
+        assert!(!app.cancel_requested, "Ctrl+Shift+C must not cancel a turn");
+        // Copy path leaves a toast (or status) rather than arming quit.
+        assert!(!app.quit_armed);
     }
 
     #[test]
@@ -1325,12 +1337,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_double_press_quits() {
+    fn ctrl_shift_c_idle_does_not_quit() {
         let mut app = App::new("m", "/tmp", "s");
         handle_key(&mut app, ctrl_shift('c'));
-        assert!(app.quit_armed);
+        assert!(!app.should_quit);
+        assert!(!app.quit_armed);
         handle_key(&mut app, ctrl_shift('C'));
-        assert!(app.should_quit);
+        assert!(!app.should_quit);
     }
 
     #[test]

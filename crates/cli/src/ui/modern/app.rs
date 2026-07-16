@@ -550,6 +550,7 @@ impl App {
                 // HITL always wins: drop the Ctrl+P palette so keys reach
                 // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
                 self.command_palette = None;
+                self.show_shortcuts = false;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -557,6 +558,7 @@ impl App {
                 self.modals
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
                 self.command_palette = None;
+                self.show_shortcuts = false;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -572,6 +574,7 @@ impl App {
                         respond,
                     }));
                     self.command_palette = None;
+                    self.show_shortcuts = false;
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
                 }
@@ -1587,10 +1590,11 @@ impl App {
     }
 
     /// True while micro-animations should keep the event loop awake.
+    ///
+    /// Static mouse selection must **not** keep the timer running — that
+    /// would repaint forever and break the idle zero-frame invariant.
     pub fn needs_anim_tick(&self) -> bool {
-        matches!(self.phase, Phase::Streaming | Phase::Permission)
-            || self.toast.is_some()
-            || self.selection.is_some()
+        matches!(self.phase, Phase::Streaming | Phase::Permission) || self.toast.is_some()
     }
 
     /// Toggle the full queue pane (Ctrl+; / `/queue`).
@@ -1852,6 +1856,22 @@ mod tests {
         app.phase = Phase::Streaming;
         app.insert_str("queued paste");
         assert_eq!(app.input, "queued paste");
+    }
+
+    #[test]
+    fn needs_anim_tick_ignores_static_selection() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.needs_anim_tick(), "idle must not tick");
+        app.selection = Some(TextSelection {
+            start_line: 0,
+            end_line: 1,
+        });
+        assert!(
+            !app.needs_anim_tick(),
+            "static mouse selection must not keep anim timer alive"
+        );
+        app.phase = Phase::Streaming;
+        assert!(app.needs_anim_tick());
     }
 
     #[test]
