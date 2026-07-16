@@ -117,9 +117,9 @@ where
     };
     let tmp_handle = tmp.as_file().as_raw_handle();
 
-    // SAFETY: Win32 console handle APIs.
+    // SAFETY: Win32 console handle APIs (edition 2024 requires unsafe extern).
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetStdHandle(n_std_handle: u32) -> RawHandle;
         fn SetStdHandle(n_std_handle: u32, h: RawHandle) -> i32;
         fn DuplicateHandle(
