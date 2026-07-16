@@ -329,7 +329,7 @@ impl QueryEngine {
             "cause": cause,
         });
         self.hooks
-            .run_hooks(&HookEvent::CwdChanged, None, &ctx)
+            .run_hooks(&HookEvent::CwdChanged, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -351,7 +351,7 @@ impl QueryEngine {
             "mcp_count": mcp_count,
         });
         self.hooks
-            .run_hooks(&HookEvent::ConfigChange, None, &ctx)
+            .run_hooks(&HookEvent::ConfigChange, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -372,7 +372,7 @@ impl QueryEngine {
             "is_error": is_error,
         });
         self.hooks
-            .run_hooks(&HookEvent::FileChanged, None, &ctx)
+            .run_hooks(&HookEvent::FileChanged, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -397,7 +397,7 @@ impl QueryEngine {
             "notification_type": notification_type,
         });
         self.hooks
-            .run_hooks(&HookEvent::Notification, None, &ctx)
+            .run_hooks(&HookEvent::Notification, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -415,7 +415,7 @@ impl QueryEngine {
             "estimated_freed_tokens": estimated_freed_tokens,
         });
         self.hooks
-            .run_hooks(&HookEvent::PreCompact, None, &ctx)
+            .run_hooks(&HookEvent::PreCompact, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -443,7 +443,9 @@ impl QueryEngine {
             "turn_count": self.state.turn_count,
             "last_assistant_message": last_assistant_message,
         });
-        self.hooks.run_hooks(&HookEvent::Stop, None, &ctx).await
+        self.hooks
+            .run_hooks(&HookEvent::Stop, None, &ctx, Some(&self.cancel))
+            .await
     }
 
     /// Run any configured `TaskCompleted` hooks for a finished background
@@ -468,7 +470,7 @@ impl QueryEngine {
             "duration_secs": duration_secs,
         });
         self.hooks
-            .run_hooks(&HookEvent::TaskCompleted, None, &ctx)
+            .run_hooks(&HookEvent::TaskCompleted, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -488,7 +490,9 @@ impl QueryEngine {
             "stage": stage,
             "message": message,
         });
-        self.hooks.run_hooks(&HookEvent::Error, None, &ctx).await
+        self.hooks
+            .run_hooks(&HookEvent::Error, None, &ctx, Some(&self.cancel))
+            .await
     }
 
     /// Run `PermissionDenied` hooks for every new denial since the
@@ -516,7 +520,12 @@ impl QueryEngine {
             });
             let mut r = self
                 .hooks
-                .run_hooks(&HookEvent::PermissionDenied, Some(&record.tool_name), &ctx)
+                .run_hooks(
+                    &HookEvent::PermissionDenied,
+                    Some(&record.tool_name),
+                    &ctx,
+                    Some(&self.cancel),
+                )
                 .await;
             results.append(&mut r);
         }
@@ -536,7 +545,7 @@ impl QueryEngine {
             "freed_tokens": freed_tokens,
         });
         self.hooks
-            .run_hooks(&HookEvent::PostCompact, None, &ctx)
+            .run_hooks(&HookEvent::PostCompact, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -555,7 +564,7 @@ impl QueryEngine {
             "model": self.state.config.api.model,
         });
         self.hooks
-            .run_hooks(&HookEvent::SessionStart, None, &ctx)
+            .run_hooks(&HookEvent::SessionStart, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -571,7 +580,7 @@ impl QueryEngine {
             "total_tokens": self.state.total_usage.total(),
         });
         self.hooks
-            .run_hooks(&HookEvent::SessionStop, None, &ctx)
+            .run_hooks(&HookEvent::SessionStop, None, &ctx, Some(&self.cancel))
             .await
     }
 
@@ -703,6 +712,7 @@ impl QueryEngine {
                         "turn": self.state.turn_count,
                         "steered": true,
                     }),
+                    Some(&self.cancel),
                 )
                 .await;
             self.state.push_message(user_message(&trimmed));
@@ -737,6 +747,7 @@ impl QueryEngine {
                     "user_input": user_input,
                     "turn": self.state.turn_count + 1,
                 }),
+                Some(&self.cancel),
             )
             .await;
 
@@ -755,6 +766,7 @@ impl QueryEngine {
                     "turn": self.state.turn_count + 1,
                     "user_input_preview": user_input.chars().take(200).collect::<String>(),
                 }),
+                Some(&self.cancel),
             )
             .await;
 
@@ -1438,6 +1450,7 @@ impl QueryEngine {
                             "turn": turn + 1,
                             "total_turns": self.state.turn_count,
                         }),
+                        Some(&self.cancel),
                     )
                     .await;
 
@@ -1601,7 +1614,12 @@ impl QueryEngine {
                 }
                 let hook_results = self
                     .hooks
-                    .run_hooks(&HookEvent::PreToolUse, Some(&call.name), &call.input)
+                    .run_hooks(
+                        &HookEvent::PreToolUse,
+                        Some(&call.name),
+                        &call.input,
+                        Some(&self.cancel),
+                    )
                     .await;
                 if let Some(failed) = hook_results.iter().find(|r| !r.success) {
                     // Prefer stderr for the veto reason — convention
@@ -1709,6 +1727,7 @@ impl QueryEngine {
                             "tool": result.tool_name,
                             "is_error": result.result.is_error,
                         }),
+                        Some(&self.cancel),
                     )
                     .await;
 
