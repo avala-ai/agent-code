@@ -1224,6 +1224,7 @@ mod tests {
             detail: "cargo test".into(),
             result: Some("ok".into()),
             is_error: false,
+            live: None,
         });
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());

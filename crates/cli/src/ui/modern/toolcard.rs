@@ -127,6 +127,7 @@ mod tests {
             detail: detail.into(),
             result: Some("ok".into()),
             is_error: false,
+            live: None,
         }
     }
     fn bash() -> TranscriptItem {
@@ -136,6 +137,7 @@ mod tests {
             detail: "ls".into(),
             result: Some("ok".into()),
             is_error: false,
+            live: None,
         }
     }
     fn running_read() -> TranscriptItem {
@@ -145,6 +147,7 @@ mod tests {
             detail: "x".into(),
             result: None,
             is_error: false,
+            live: None,
         }
     }
 

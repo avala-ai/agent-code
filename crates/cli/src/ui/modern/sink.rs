@@ -39,8 +39,18 @@ pub enum EngineEvent {
         content: String,
         is_error: bool,
     },
+    /// Progressive tool stdout/stderr (bash live-tail). Correlated by `call_id`.
+    ToolOutput {
+        call_id: String,
+        chunk: String,
+    },
     TurnStart(usize),
     TurnComplete(usize),
+    /// Terminal outcome for a finished turn (`error` / `cancelled` / `max_turns` / …).
+    TurnOutcome {
+        turn: usize,
+        outcome: String,
+    },
     Error(String),
     Warning(String),
     Usage {
@@ -230,6 +240,23 @@ impl StreamSink for ChannelSink {
 
     fn on_turn_complete(&self, turn: usize) {
         self.send(EngineEvent::TurnComplete(turn));
+    }
+
+    fn on_tool_output(&self, call_id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.send(EngineEvent::ToolOutput {
+            call_id: call_id.to_string(),
+            chunk: chunk.to_string(),
+        });
+    }
+
+    fn on_turn_outcome(&self, turn: usize, outcome: &str) {
+        self.send(EngineEvent::TurnOutcome {
+            turn,
+            outcome: outcome.to_string(),
+        });
     }
 
     fn on_error(&self, error: &str) {

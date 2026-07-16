@@ -144,6 +144,9 @@ pub enum TranscriptItem {
         detail: String,
         result: Option<String>,
         is_error: bool,
+        /// Live stdout/stderr chunks while the tool is still running
+        /// (`result` is `None`). Cleared when the final result lands.
+        live: Option<String>,
     },
     System(String),
     Error(String),
@@ -480,6 +483,7 @@ impl App {
                     detail,
                     result: None,
                     is_error: false,
+                    live: None,
                 });
             }
             EngineEvent::ToolResult {
@@ -511,6 +515,7 @@ impl App {
                 if let Some(TranscriptItem::Tool {
                     result,
                     is_error: err,
+                    live,
                     ..
                 }) = idx.and_then(|i| self.transcript.get_mut(i))
                 {
@@ -520,15 +525,64 @@ impl App {
                     // useless line with no way to see more.
                     *result = Some(content);
                     *err = is_error;
+                    *live = None;
                 }
                 // Back to waiting on the model once a tool returns.
                 self.waiting_on = WaitingOn::Model;
+            }
+            EngineEvent::ToolOutput { call_id, chunk } => {
+                // Append live stdout/stderr to the matching running card.
+                let by_id = (!call_id.is_empty())
+                    .then(|| {
+                        self.transcript.iter().position(|i| {
+                            matches!(
+                                i,
+                                TranscriptItem::Tool { call_id: c, result: None, .. }
+                                    if *c == call_id
+                            )
+                        })
+                    })
+                    .flatten();
+                let idx = by_id.or_else(|| {
+                    self.transcript
+                        .iter()
+                        .rposition(|i| matches!(i, TranscriptItem::Tool { result: None, .. }))
+                });
+                if let Some(TranscriptItem::Tool { live, .. }) =
+                    idx.and_then(|i| self.transcript.get_mut(i))
+                {
+                    let buf = live.get_or_insert_with(String::new);
+                    // Cap live tail so a runaway process cannot blow RAM.
+                    const LIVE_CAP: usize = 32_000;
+                    if buf.len() < LIVE_CAP {
+                        let room = LIVE_CAP - buf.len();
+                        let take = chunk.chars().take(room).collect::<String>();
+                        buf.push_str(&take);
+                        if chunk.chars().count() > room {
+                            buf.push_str("\n…(live output truncated)");
+                        }
+                    }
+                }
             }
             EngineEvent::TurnStart(n) => {
                 self.phase = Phase::Streaming;
                 self.waiting_on = WaitingOn::Model;
                 self.turn_count = n;
                 self.status_message = format!("turn {n}");
+            }
+            EngineEvent::TurnOutcome { turn, outcome } => {
+                let label = match outcome.as_str() {
+                    "error" => format!("turn {turn} failed"),
+                    "cancelled" | "aborted" => format!("turn {turn} cancelled"),
+                    "max_turns" => format!("turn {turn} hit max turns"),
+                    other => format!("turn {turn}: {other}"),
+                };
+                self.status_message = label.clone();
+                if outcome == "error" || outcome == "max_turns" {
+                    self.transcript.push(TranscriptItem::Error(label));
+                } else if outcome == "cancelled" || outcome == "aborted" {
+                    self.transcript.push(TranscriptItem::System(label));
+                }
             }
             EngineEvent::TurnComplete(n) => {
                 // A pending modal keeps the Permission phase: PlanProposed is
@@ -2213,6 +2267,7 @@ mod tests {
             detail: "ls".into(),
             result: Some("a\nb\nc\nd\ne".into()),
             is_error: false,
+            live: None,
         });
         let idx = app.transcript.len() - 1;
         app.selected_item = Some(idx);
@@ -2232,6 +2287,7 @@ mod tests {
             detail: "ls -la".into(),
             result: Some("file.rs\n".into()),
             is_error: false,
+            live: None,
         });
         let idx = app.transcript.len() - 1;
         app.selected_item = Some(idx);
@@ -2603,6 +2659,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_appends_live_tail() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::ToolStart {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            detail: "echo hi".into(),
+        });
+        app.apply_engine(EngineEvent::ToolOutput {
+            call_id: "c1".into(),
+            chunk: "hello\n".into(),
+        });
+        app.apply_engine(EngineEvent::ToolOutput {
+            call_id: "c1".into(),
+            chunk: "world\n".into(),
+        });
+        match app.transcript.last() {
+            Some(TranscriptItem::Tool {
+                live: Some(l),
+                result: None,
+                ..
+            }) => {
+                assert!(l.contains("hello"));
+                assert!(l.contains("world"));
+            }
+            other => panic!("expected live tool card, got {other:?}"),
+        }
+        app.apply_engine(EngineEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            content: "final".into(),
+            is_error: false,
+        });
+        match app.transcript.last() {
+            Some(TranscriptItem::Tool {
+                live: None,
+                result: Some(r),
+                ..
+            }) => {
+                assert_eq!(r, "final");
+            }
+            other => panic!("expected finalized tool card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_outcome_error_sets_status_and_transcript() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TurnOutcome {
+            turn: 3,
+            outcome: "error".into(),
+        });
+        assert!(app.status_message.contains("failed"));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(_))
+        ));
+    }
+
     fn copy_reports_no_assistant_when_empty() {
         let mut app = App::new("m", "/tmp", "s");
         app.copy_last_assistant();
