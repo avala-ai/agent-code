@@ -37,11 +37,24 @@ use crate::services::subagent_colors::SubagentColor;
 /// `subagent_id` field through the JSON input to anchor the color
 /// to a known id; otherwise we generate one so the assignment is
 /// still deterministic across the rest of the call.
-fn resolve_subagent_id(input: &serde_json::Value) -> String {
+/// Stable id for tasks-pane / color correlation.
+///
+/// Prefer explicit `subagent_id`, then description (same prefix the stream
+/// start event uses), else a random UUID. Must stay aligned with
+/// `emit_agent_subagent_update` / `emit_agent_result_update` in the query
+/// loop so start and result hit the same tasks-pane row (#424).
+pub fn resolve_subagent_id(input: &serde_json::Value) -> String {
     if let Some(id) = input.get("subagent_id").and_then(|v| v.as_str())
         && !id.is_empty()
     {
         return id.to_string();
+    }
+    if let Some(desc) = input
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return desc.chars().take(32).collect();
     }
     uuid::Uuid::new_v4().to_string()
 }
@@ -215,8 +228,9 @@ impl Tool for AgentTool {
             )
             .await;
             return Ok(ToolResult::success(format!(
-                "Agent ({description}, type={subagent_type}) started in the background as task {id}. \
-                 Its result surfaces automatically when it completes — do not wait on it."
+                "Agent ({description}, type={subagent_type}) started in the background as task {id} \
+                 (subagent_id={subagent_id}). Its result surfaces automatically when it completes — \
+                 do not wait on it."
             )));
         }
 
@@ -247,7 +261,7 @@ impl Tool for AgentTool {
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
                         let mut content = format!(
-                            "Agent ({description}, type={subagent_type}) completed.\n\n"
+                            "Agent ({description}, type={subagent_type}, subagent_id={subagent_id}) completed.\n\n"
                         );
                         if !stdout.is_empty() {
                             content.push_str(&stdout);
@@ -721,5 +735,40 @@ mod tests {
 
         // Don't leave the child running past the test.
         let _ = tm.kill(&id).await;
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::resolve_subagent_id;
+    use serde_json::json;
+
+    #[test]
+    fn resolve_subagent_id_prefers_explicit_field() {
+        let id = resolve_subagent_id(&json!({
+            "subagent_id": "abc-123",
+            "description": "other",
+        }));
+        assert_eq!(id, "abc-123");
+    }
+
+    #[test]
+    fn resolve_subagent_id_falls_back_to_description_prefix() {
+        let id = resolve_subagent_id(&json!({
+            "description": "explore the auth module thoroughly",
+            "prompt": "find login",
+        }));
+        assert_eq!(id, "explore the auth module thorough");
+        assert_eq!(id.chars().count(), 32);
+    }
+
+    #[test]
+    fn resolve_subagent_id_stable_across_start_and_result_paths() {
+        // Same input must yield the same id for tasks-pane correlation (#424).
+        let input = json!({
+            "description": "scan deps",
+            "prompt": "list outdated crates",
+        });
+        assert_eq!(resolve_subagent_id(&input), resolve_subagent_id(&input));
     }
 }

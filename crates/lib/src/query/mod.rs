@@ -1761,7 +1761,12 @@ impl QueryEngine {
 
                 sink.on_tool_call_result(&result.tool_use_id, &result.tool_name, &result.result);
                 if result.tool_name == "Agent" {
-                    emit_agent_result_update(sink, &result.result);
+                    emit_agent_result_update(
+                        sink,
+                        &result.result,
+                        &tool_calls,
+                        &result.tool_use_id,
+                    );
                 }
 
                 // Fire post-tool-use hooks.
@@ -1907,20 +1912,7 @@ fn forward_tool_event(sink: &dyn StreamSink, evt: crate::tools::event_sink::Tool
 
 /// Emit a subagent lifecycle event from an Agent tool input payload.
 fn emit_agent_subagent_update(sink: &dyn StreamSink, input: &serde_json::Value, state: &str) {
-    let agent_id = input
-        .get("subagent_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            input
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent")
-                .chars()
-                .take(32)
-                .collect()
-        });
+    let agent_id = crate::tools::agent::resolve_subagent_id(input);
     let headline = input
         .get("description")
         .and_then(|v| v.as_str())
@@ -1935,7 +1927,14 @@ fn emit_agent_subagent_update(sink: &dyn StreamSink, input: &serde_json::Value, 
     sink.on_subagent_update(&agent_id, state, &full_headline);
 }
 
-fn emit_agent_result_update(sink: &dyn StreamSink, result: &crate::tools::ToolResult) {
+/// Result-side subagent update: resolve id from the original tool input
+/// (same rules as start), not by scanning result prose (#424).
+fn emit_agent_result_update(
+    sink: &dyn StreamSink,
+    result: &crate::tools::ToolResult,
+    tool_calls: &[crate::tools::executor::PendingToolCall],
+    tool_use_id: &str,
+) {
     let state = if result.is_error {
         "failed"
     } else if result.content.contains("started in the background") {
@@ -1945,17 +1944,26 @@ fn emit_agent_result_update(sink: &dyn StreamSink, result: &crate::tools::ToolRe
     };
     let headline = result.content.lines().next().unwrap_or(state);
     let headline: String = headline.chars().take(120).collect();
-    let agent_id = result
-        .content
-        .split_whitespace()
-        .find(|w| {
-            w.starts_with("task-")
-                || w.starts_with("agent-")
-                || (w.len() > 8 && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    let agent_id = tool_calls
+        .iter()
+        .find(|c| c.id == tool_use_id && c.name == "Agent")
+        .map(|c| crate::tools::agent::resolve_subagent_id(&c.input))
+        .or_else(|| {
+            // Fallback: parse `subagent_id=…` from the tool result body.
+            result.content.lines().find_map(|line| {
+                line.split("subagent_id=")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.split_whitespace()
+                            .next()
+                            .unwrap_or(rest)
+                            .trim_end_matches(['.', ',', ')', ';'])
+                            .to_string()
+                    })
+                    .filter(|s| !s.is_empty())
+            })
         })
-        .unwrap_or("agent")
-        .trim_end_matches(['.', ',', ';', ':'])
-        .to_string();
+        .unwrap_or_else(|| "agent".into());
     sink.on_subagent_update(&agent_id, state, &headline);
 }
 
