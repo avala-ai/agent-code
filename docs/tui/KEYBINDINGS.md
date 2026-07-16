@@ -92,9 +92,15 @@ for the filterable command palette. Output is captured into the transcript
 
 Fast-path locals (no engine lock): `/help` `/clear` `/copy` `/cost` `/usage`
 `/version` `/status` `/plan` `/theme` `/permissions` `/queue` `/tasks` `/model`
-`/terminal-setup` `/minimal` `/fullscreen` `/stats` `/exit`
+`/effort` `/terminal-setup` `/minimal` `/fullscreen` `/stats` `/exit`
 
-Plus user-invocable **skills**. Truly unknown `/names` are rejected with a hint.
+**Model:** `/model` or empty-composer `Ctrl+M` opens the in-TUI picker
+(↑/↓ · Enter · Tab for effort). `/model <id> [effort]` and `/effort <level>`
+switch without the picker. Effort shows on the header badge.
+
+Plus user-invocable **skills** (`/name`, Tab completes, arg hints when set).
+Skills load from `.agent/skills`, `.agents/`, Claude/Cursor/Grok compat paths,
+and `dir/SKILL.md`. Truly unknown `/names` are rejected with a hint.
 
 ### Input prefixes
 
