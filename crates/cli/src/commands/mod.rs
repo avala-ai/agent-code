@@ -654,6 +654,13 @@ pub fn complete_slash(partial: &str) -> Vec<&'static str> {
 
 /// True when a slash built-in needs the real terminal (picker, pager, or
 /// `$EDITOR`) rather than captured stdout under the alt-screen TUI.
+///
+/// **Only** commands that take over stdin/stdout UI belong here. List-only
+/// commands (`/sessions`, `/mcp`, `/plugins`, `/color`, `/add-dir`, …) stay
+/// on the captured path so their output lands in the modern transcript.
+///
+/// Matches the typed head (name or alias) against the command table so
+/// `/tutorial` and `/powerup` resolve the same way `execute` does.
 pub fn is_interactive_slash(cmd: &str) -> bool {
     let head = cmd
         .trim()
@@ -662,22 +669,27 @@ pub fn is_interactive_slash(cmd: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    let name = COMMANDS
+        .iter()
+        .find(|c| {
+            c.name.eq_ignore_ascii_case(&head)
+                || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(&head))
+        })
+        .map(|c| c.name)
+        .unwrap_or(head.as_str());
     matches!(
-        head.as_str(),
+        name,
+        // Session picker (not `/sessions`, which only prints a list).
         "session"
-            | "sessions"
+            // Scrollback pager.
             | "scroll"
+            // `$EDITOR` owners.
             | "editor"
             | "open"
+            // Theme / model / tutorial pickers.
             | "theme"
-            | "color"
-            | "resume"
-            | "login"
-            | "add-dir"
-            | "add_dir"
-            | "plugin"
-            | "plugins"
-            | "mcp"
+            | "model"
+            | "powerup"
     )
 }
 
@@ -748,8 +760,19 @@ mod slash_lookup_tests {
     #[test]
     fn interactive_slash_detection() {
         assert!(is_interactive_slash("/session"));
+        assert!(is_interactive_slash("/pick-session")); // alias of session
         assert!(is_interactive_slash("editor foo"));
         assert!(is_interactive_slash("/open src/main.rs"));
+        assert!(is_interactive_slash("/theme"));
+        assert!(is_interactive_slash("/powerup"));
+        assert!(is_interactive_slash("/tutorial")); // alias of powerup
+        // Output-only: must stay on captured path (transcript), not main-screen.
+        assert!(!is_interactive_slash("/sessions"));
+        assert!(!is_interactive_slash("/mcp"));
+        assert!(!is_interactive_slash("/plugins"));
+        assert!(!is_interactive_slash("/add-dir"));
+        assert!(!is_interactive_slash("/color"));
+        assert!(!is_interactive_slash("/resume"));
         assert!(!is_interactive_slash("/help"));
         assert!(!is_interactive_slash("/cost"));
     }

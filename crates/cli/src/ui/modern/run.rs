@@ -304,20 +304,23 @@ pub(super) async fn event_loop(
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     let interactive = crate::commands::is_interactive_slash(&slash);
-                    let (result, captured) = if interactive {
-                        // Leave alt-screen/raw mode so pickers, scrollback
-                        // viewer, and $EDITOR can own the real terminal.
-                        with_main_screen(|| {
-                            let r = crate::commands::execute(&slash, &mut eng);
-                            (r, String::new())
-                        })
-                    } else {
-                        tokio::task::block_in_place(|| {
+                    // Always park the worker: slash arms may call
+                    // `Handle::block_on` (e.g. cwd hooks) even after leaving
+                    // the alt-screen.
+                    let (result, captured) = tokio::task::block_in_place(|| {
+                        if interactive {
+                            // Leave alt-screen/raw mode so pickers, scrollback
+                            // viewer, and $EDITOR can own the real terminal.
+                            with_main_screen(|| {
+                                let r = crate::commands::execute(&slash, &mut eng);
+                                (r, String::new())
+                            })
+                        } else {
                             crate::stdout_capture::capture_stdout(|| {
                                 crate::commands::execute(&slash, &mut eng)
                             })
-                        })
-                    };
+                        }
+                    });
                     match result {
                         crate::commands::CommandResult::Exit => {
                             app.should_quit = true;
