@@ -429,7 +429,7 @@ mod tests {
         script.push((ms(2), key(KeyCode::Enter)));
         // The modal pops once the tool's Ask decision reaches the prompter;
         // answer it with 'y' (allow once) a bit later in virtual time.
-        script.push((ms(300), key(KeyCode::Char('y'))));
+        script.push((ms(800), key(KeyCode::Char('y'))));
         script.push((ms(3000), key(KeyCode::Char(' '))));
 
         let (app, _frames) = run_script(h, script).await;
@@ -464,7 +464,7 @@ mod tests {
 
         let mut script = type_str("try", ms(1));
         script.push((ms(2), key(KeyCode::Enter)));
-        script.push((ms(300), key(KeyCode::Char('n'))));
+        script.push((ms(800), key(KeyCode::Char('n'))));
         script.push((ms(3000), key(KeyCode::Char(' '))));
 
         let (app, _frames) = run_script(h, script).await;
