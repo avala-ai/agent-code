@@ -7,19 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+*No changes yet.*
 
-- **Calmer default theme** — midnight/daybreak accents move from loud purple to restrained steel-blue; selection and message backgrounds stay neutral slate; header brand is text accent instead of filled purple pill.
-
-### Added
-
-- **Modern TUI agent-screen parity** — multiline composer, prompt history, fold/expand, queue pane, interject (Ctrl+Enter), full slash-command bridge with Tab complete and stdout capture, `!` shell passthrough, y/Y block copy, shared clipboard (native → tmux → OSC 52), and setup hero polish.
-- **Ctrl+P command palette** — filterable slash-command picker in the modern TUI (Enter fills `/cmd `).
-- **Modern TUI visual polish** — braille spinner + blinking action-required status (focus-aware), OSC window-title spinner, fenced **code snippet cards** (language pill, line numbers, copy hint), mouse drag text selection with highlight, copy toast (no transcript spam), `Ctrl+Shift+C` / `y` selection copy, `Ctrl+.` shortcuts overlay.
+## [0.27.0] - 2026-07-16
 
 ### Removed
 
-- **Classic rustyline REPL** — interactive sessions always use the modern fullscreen TUI. Removed `--tui`, `AGENT_CODE_TUI`, `[ui] tui`, and the `ui/repl.rs` path. Headless (`-p`), `--serve`, and ACP are unchanged.
+- **Classic rustyline REPL** (#444) — interactive sessions always use the modern fullscreen TUI. Removed `--tui`, `AGENT_CODE_TUI`, `[ui] tui`, and the classic `ui/repl.rs` path. Headless (`-p`), `--serve`, and ACP are unchanged.
+
+### Added
+
+- **Modern TUI agent-screen parity** (#444, #445, #449) — multiline composer, prompt history, fold/expand, queue pane, interject (Ctrl+Enter), full slash-command bridge with Tab complete and stdout capture (including interactive slash suspend for pickers/`$EDITOR`), `!` shell passthrough, y/Y block copy, shared clipboard (native → tmux → OSC 52), and setup hero polish.
+- **Ctrl+P command palette** (#446) — filterable slash-command picker (Enter fills `/cmd `); Tab complete stays name-only so aliases do not pollute completions.
+- **Modern TUI visual polish** (#447) — braille spinner + blinking action-required status (focus-aware), OSC window-title spinner (control-char sanitized), fenced **code snippet cards** (language pill, line numbers, copy hint), mouse drag text selection with highlight, copy toast (no sticky status), `Ctrl+Shift+C` / `y` selection copy, `Ctrl+.` shortcuts overlay; Ctrl+C still cancels through the help overlay.
+- **Live tool output + turn outcomes** (#455 / #430) — bash stdout/stderr tails onto running tool cards; turn `error` / `cancelled` / `max_turns` outcomes surface in status and transcript.
+- **Markdown tables + heading styles** (#457 / #432) — tables render as separate rows with `│` separators; headings use bold/accent styling.
+
+### Changed
+
+- **Calmer default theme** (#448) — midnight/daybreak accents move from loud purple to restrained steel-blue; selection and message backgrounds stay neutral slate; header brand is text accent instead of a filled purple pill; mode badges are text-only.
+- **Permissions overlay merge is deny-first** (#452 / #426) — host Deny, then overlay Deny, then non-Deny rules so a project-wide Allow cannot defeat a confined subagent's Deny.
+- **WebFetch uses full permission check** (#451 / #429) — network fetch is not treated as a pure filesystem read under AcceptEdits/Ask/Deny.
+
+### Fixed
+
+- **HITL answer-key grace** (#450 / #431) — y/a/n (and plan/question answers) wait until the modal is painted plus ~250 ms so mid-stream typing cannot auto-allow a permission ask.
+- **Streaming tool path validation and denial audit** (#451 / #429) — streaming read-only tools run `validate_input`; Deny records to the denial tracker; Ask defers to the serial executor (HITL prompter).
+- **Concurrent `Session::spawn_turn` rejected** (#453 / #425) — a second spawn while status is `Running` fails instead of hijacking cancel/status.
+- **Hook hang bound** (#454 / #427) — shell/HTTP hooks timeout at 30s, honor the turn cancel token, and use `kill_on_drop` on hook children.
+- **Subagent tasks-pane correlation** (#456 / #424) — start/result use a stable `subagent_id` (explicit field or description prefix) instead of scanning result prose.
+- **Interactive slash + cwd sync** (#449) — pickers/editor leave alt-screen; `/cd` refreshes `app.cwd` for `!` shell and the header.
 
 ## [0.26.0] - 2026-07-10
 
@@ -561,7 +578,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/avala-ai/agent-code/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/avala-ai/agent-code/compare/v0.25.3...v0.26.0
 [0.25.3]: https://github.com/avala-ai/agent-code/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/avala-ai/agent-code/compare/v0.25.1...v0.25.2
