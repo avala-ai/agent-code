@@ -1196,27 +1196,42 @@ fn mouse_abs_line(app: &App, row: u16) -> Option<usize> {
     app.layout.abs_line_at(top, row_in_view)
 }
 
+/// Strip C0/C1 control bytes (and DEL) so untrusted title components
+/// (e.g. `[api].model` from project config) cannot break out of OSC 0
+/// via embedded BEL/ESC sequences.
+fn sanitize_osc_title(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let u = *c as u32;
+            // Keep printable ASCII + all non-control Unicode; drop C0, DEL, C1.
+            !matches!(u, 0x00..=0x1F | 0x7F | 0x80..=0x9F)
+        })
+        .collect()
+}
+
 /// OSC 0 window title: braille spinner + model when live; calm idle title.
 fn update_terminal_title(app: &App) {
     use std::io::Write;
+    let model = sanitize_osc_title(&app.model);
     let title = match app.phase {
         super::app::Phase::Streaming => {
             format!(
                 "{} agent · {} · {}",
                 super::anim::spinner_glyph(app.tick),
-                app.model,
+                model,
                 app.waiting_on.label()
             )
         }
         super::app::Phase::Permission => {
             if super::anim::blink_visible(app.tick, app.terminal_focused) {
-                format!("⚠ action required · {}", app.model)
+                format!("⚠ action required · {model}")
             } else {
-                format!("agent · {}", app.model)
+                format!("agent · {model}")
             }
         }
-        _ => format!("agent · {}", app.model),
+        _ => format!("agent · {model}"),
     };
+    let title = sanitize_osc_title(&title);
     // OSC 0 ; title BEL
     let seq = format!("\x1b]0;{title}\x07");
     let _ = std::io::stdout().write_all(seq.as_bytes());
@@ -1254,6 +1269,18 @@ fn apply_mode_to_engine(
 mod tests {
     use super::*;
     use crate::ui::modern::app::Phase;
+
+    #[test]
+    fn sanitize_osc_title_strips_control_breakouts() {
+        // Malicious model name trying to terminate OSC early and inject CSI.
+        let dirty = "evil\x07\x1b[31mred\x1b[0m";
+        let clean = sanitize_osc_title(dirty);
+        assert!(!clean.contains('\x07'));
+        assert!(!clean.contains('\x1b'));
+        assert_eq!(clean, "evil[31mred[0m");
+        // Normal model names and unicode remain.
+        assert_eq!(sanitize_osc_title("grok-4 · β"), "grok-4 · β");
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
