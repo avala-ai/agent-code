@@ -3,6 +3,8 @@
 //! Pure data + reducers. Drawing lives in [`super::render`]; I/O in
 //! [`super::run`]. This split keeps visual tests free of a live terminal.
 
+use std::time::{Duration, Instant};
+
 use super::layout::LayoutCache;
 use super::mode::SessionMode;
 use super::scroll::ScrollState;
@@ -10,6 +12,11 @@ use super::sink::EngineEvent;
 use super::stream_buffer::StreamBuffer;
 use super::tasks::TaskEntry;
 use super::terminal_caps::TerminalCaps;
+
+/// Grace after the first paint of a HITL modal before y/a/n (etc.) are accepted.
+/// Prevents in-flight typing from auto-answering a permission ask that just
+/// appeared mid-keystroke (issue #431).
+pub const HITL_ANSWER_GRACE: Duration = Duration::from_millis(250);
 
 // Modal types + resolvers live in `modal.rs`; re-export so existing
 // `app::Modal` / `app::PendingPermission` paths keep working.
@@ -305,6 +312,10 @@ pub struct App {
     pub selection: Option<TextSelection>,
     /// Whether the keyboard-shortcuts overlay is open (Ctrl+. / Ctrl+X).
     pub show_shortcuts: bool,
+    /// When HITL answer keys (y/a/n, plan a/k, question digits) become
+    /// eligible. `None` until the modal has been drawn at least once; then
+    /// set to `now + HITL_ANSWER_GRACE`. Esc/Ctrl+C always work.
+    pub hitl_answers_eligible_at: Option<Instant>,
 
     /// Coalesces streaming text deltas so heavy streaming repaints at
     /// ≤10 fps instead of once per delta (plan §2.2).
@@ -395,11 +406,39 @@ impl App {
             toast: None,
             selection: None,
             show_shortcuts: false,
+            hitl_answers_eligible_at: None,
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
             dirty: true,
             force_full_redraw: false,
         }
+    }
+
+    /// Call after painting a HITL modal. Arms answer-key eligibility after
+    /// [`HITL_ANSWER_GRACE`] so keystrokes already in flight cannot approve.
+    pub fn note_hitl_drawn(&mut self) {
+        if self.phase == Phase::Permission && self.hitl_answers_eligible_at.is_none() {
+            self.hitl_answers_eligible_at = Some(Instant::now() + HITL_ANSWER_GRACE);
+        }
+    }
+
+    /// True when y/a/n (and other modal answer keys) may resolve the front modal.
+    pub fn hitl_answers_ready(&self) -> bool {
+        match self.hitl_answers_eligible_at {
+            Some(at) => Instant::now() >= at,
+            None => false,
+        }
+    }
+
+    /// Reset HITL arming (new modal front or leaving Permission).
+    pub fn reset_hitl_answer_arm(&mut self) {
+        self.hitl_answers_eligible_at = None;
+    }
+
+    /// Test helper: skip the post-draw grace so unit tests can answer immediately.
+    #[cfg(test)]
+    pub fn force_hitl_answers_ready(&mut self) {
+        self.hitl_answers_eligible_at = Some(Instant::now() - Duration::from_secs(1));
     }
 
     pub fn apply_engine(&mut self, ev: EngineEvent) {
@@ -551,6 +590,10 @@ impl App {
                 // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
                 self.command_palette = None;
                 self.show_shortcuts = false;
+                // Re-arm answer grace so in-flight typing cannot auto-allow.
+                if self.modals.len() == 1 {
+                    self.reset_hitl_answer_arm();
+                }
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -559,6 +602,9 @@ impl App {
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
                 self.command_palette = None;
                 self.show_shortcuts = false;
+                if self.modals.len() == 1 {
+                    self.reset_hitl_answer_arm();
+                }
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -575,6 +621,9 @@ impl App {
                     }));
                     self.command_palette = None;
                     self.show_shortcuts = false;
+                    if self.modals.len() == 1 {
+                        self.reset_hitl_answer_arm();
+                    }
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
                 }

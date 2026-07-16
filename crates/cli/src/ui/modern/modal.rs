@@ -90,6 +90,10 @@ impl App {
                 // A prompt queued behind the modal can start now.
                 self.dispatch_queue_head();
             }
+            self.reset_hitl_answer_arm();
+        } else if !self.modals.is_empty() {
+            // Next modal in the FIFO must be painted + grace before answers.
+            self.reset_hitl_answer_arm();
         }
         self.dirty = true;
     }
