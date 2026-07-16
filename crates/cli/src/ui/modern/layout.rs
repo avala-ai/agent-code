@@ -288,15 +288,16 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
             detail,
             result,
             is_error,
+            live,
             ..
-        } => lines.extend(render_tool_card(
-            name,
-            detail,
-            result.as_deref(),
-            *is_error,
-            expanded,
-            selected,
-        )),
+        } => {
+            // Prefer final result; while running, show live tail if any.
+            let body = result.as_deref().or(live.as_deref());
+            let running = result.is_none();
+            lines.extend(render_tool_card(
+                name, detail, body, *is_error, expanded, selected, running,
+            ))
+        }
         TranscriptItem::System(t) => {
             lines.push(Line::from(vec![
                 sel,
@@ -328,13 +329,14 @@ fn render_tool_card(
     is_error: bool,
     expanded: bool,
     selected: bool,
+    running: bool,
 ) -> Vec<Line<'static>> {
     use super::toolcard::ToolKind;
     let kind = ToolKind::classify(name);
-    let (glyph, status_color) = match (result, is_error) {
-        (None, _) => ("⚡", Color::Yellow),      // running
-        (Some(_), false) => ("✓", Color::Green), // ok
-        (Some(_), true) => ("✗", Color::Red),    // failed
+    let (glyph, status_color) = match (running, is_error) {
+        (true, _) => ("⚡", Color::Yellow), // running (may have live tail)
+        (false, false) => ("✓", Color::Green), // ok
+        (false, true) => ("✗", Color::Red), // failed
     };
     let sel = if selected {
         Span::styled("▌", Style::default().fg(palette().accent))
@@ -570,6 +572,7 @@ mod tests {
             detail: detail.into(),
             result: Some("42 lines".into()),
             is_error: false,
+            live: None,
         }
     }
 
@@ -599,6 +602,7 @@ mod tests {
             detail: "cargo test".into(),
             result: Some("exit 1".into()),
             is_error: true,
+            live: None,
         }];
         c.sync(&items, 80, &std::collections::HashSet::new(), None);
         let all: String = c
