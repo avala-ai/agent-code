@@ -99,6 +99,11 @@ struct Builder {
     // Heading level currently being built (styled on end).
     pending_heading: Option<HeadingLevel>,
 
+    // Table state: cells accumulate per row; row flushes on TagEnd::TableRow.
+    in_table: bool,
+    table_row: Vec<String>,
+    table_cell: String,
+
     // Fenced-code state.
     code: Option<(String, String)>, // (lang, accumulated content)
 }
@@ -169,6 +174,8 @@ impl Builder {
             Event::Text(t) => {
                 if let Some((_, buf)) = self.code.as_mut() {
                     buf.push_str(&t);
+                } else if self.in_table {
+                    self.table_cell.push_str(&t);
                 } else {
                     let style = self.inline_style();
                     self.push_text(&t, style);
@@ -238,6 +245,19 @@ impl Builder {
                 };
                 self.code = Some((lang, String::new()));
             }
+            Tag::Table(_) => {
+                self.blank_line();
+                self.in_table = true;
+                self.table_row.clear();
+                self.table_cell.clear();
+            }
+            Tag::TableHead | Tag::TableRow => {
+                self.table_row.clear();
+                self.table_cell.clear();
+            }
+            Tag::TableCell => {
+                self.table_cell.clear();
+            }
             _ => {}
         }
     }
@@ -247,7 +267,26 @@ impl Builder {
             TagEnd::Paragraph => self.blank_line(),
             TagEnd::Heading(_) => {
                 let level = self.pending_heading.take();
-                // Re-style the heading line we just built as bold+accent.
+                // Apply heading style to the spans on the current line, then
+                // flush. H1 also gets a dim underline rule.
+                let style = match level {
+                    Some(HeadingLevel::H1) => Style::default()
+                        .fg(palette().accent)
+                        .add_modifier(Modifier::BOLD),
+                    Some(HeadingLevel::H2) => Style::default()
+                        .fg(palette().accent)
+                        .add_modifier(Modifier::BOLD),
+                    Some(HeadingLevel::H3) => Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                    Some(_) => Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                    None => Style::default().add_modifier(Modifier::BOLD),
+                };
+                for sp in &mut self.cur {
+                    sp.style = style;
+                }
                 self.finish_line();
                 if let Some(HeadingLevel::H1) = level
                     && let Some(last) = self.lines.last()
@@ -263,6 +302,31 @@ impl Builder {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
+                self.blank_line();
+            }
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.table_cell);
+                self.table_row.push(cell.trim().to_string());
+            }
+            TagEnd::TableRow | TagEnd::TableHead => {
+                if !self.table_row.is_empty() {
+                    let line = self
+                        .table_row
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" │ ");
+                    self.lines.push(Line::from(Span::styled(
+                        format!(" {line} "),
+                        Style::default().fg(Color::Gray),
+                    )));
+                    self.table_row.clear();
+                }
+            }
+            TagEnd::Table => {
+                self.in_table = false;
+                self.table_row.clear();
+                self.table_cell.clear();
                 self.blank_line();
             }
             TagEnd::Strong => self.bold = false,
@@ -403,6 +467,28 @@ mod tests {
         assert!(t.contains("bold"));
         // H1 emits an underline rule row.
         assert!(t.contains("───"), "H1 underline missing:\n{t}");
+        // Heading text itself is bold (not only the underline rule).
+        let title_bold = md.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.as_ref().contains("Title")
+                    && s.style.add_modifier.contains(Modifier::BOLD)
+            })
+        });
+        assert!(title_bold, "heading span should be bold:\n{t}");
+    }
+
+    #[test]
+    fn tables_emit_row_breaks_and_cell_separators() {
+        let md = render_markdown("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
+        let t = text_of(&md);
+        assert!(t.contains('│'), "cell separator missing:\n{t}");
+        // Rows must not collapse to a single run-on line.
+        let data_rows = t
+            .lines()
+            .filter(|l| l.contains('│') && (l.contains('1') || l.contains('3')))
+            .count();
+        assert!(data_rows >= 2, "expected separate table rows, got:\n{t}");
+        assert!(t.contains('1') && t.contains('2') && t.contains('3') && t.contains('4'));
     }
 
     #[test]
