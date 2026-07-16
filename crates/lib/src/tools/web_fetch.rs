@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::{Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
+use crate::permissions::{PermissionChecker, PermissionDecision};
 
 /// Maximum content size to return (100KB).
 const MAX_CONTENT_SIZE: usize = 100_000;
@@ -43,6 +44,8 @@ impl Tool for WebFetchTool {
     }
 
     fn is_read_only(&self) -> bool {
+        // Content is not mutated on disk, but network egress is a side
+        // effect — permissions use the full checker (see check_permissions).
         true
     }
 
@@ -50,22 +53,41 @@ impl Tool for WebFetchTool {
         true
     }
 
-    async fn call(
+    /// Network fetch is not a pure filesystem read: under AcceptEdits /
+    /// Ask / Deny defaults it must still prompt or deny via `checker.check`,
+    /// not the always-allow `check_read` path (#429).
+    async fn check_permissions(
         &self,
-        input: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
+        input: &serde_json::Value,
+        checker: &PermissionChecker,
+    ) -> PermissionDecision {
+        checker.check(self.name(), input)
+    }
+
+    fn validate_input(&self, input: &serde_json::Value) -> Result<(), ToolError> {
         let url = input
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("'url' is required".into()))?;
-
-        // Validate URL.
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(ToolError::InvalidInput(
                 "URL must start with http:// or https://".into(),
             ));
         }
+        Ok(())
+    }
+
+    async fn call(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        // Shape already enforced by validate_input; re-check for direct call().
+        self.validate_input(&input)?;
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("'url' is required".into()))?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -220,4 +242,44 @@ fn strip_html_tags(html: &str) -> String {
     }
 
     collapsed.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PermissionMode, PermissionsConfig};
+    use crate::permissions::PermissionChecker;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn accept_edits_asks_for_webfetch() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::AcceptEdits,
+            rules: vec![],
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+        let tool = WebFetchTool;
+        let decision = tool
+            .check_permissions(&json!({"url": "https://example.com"}), &checker)
+            .await;
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "WebFetch must Ask under AcceptEdits, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn validate_input_rejects_bad_urls() {
+        let tool = WebFetchTool;
+        assert!(tool.validate_input(&json!({})).is_err());
+        assert!(
+            tool.validate_input(&json!({"url": "ftp://example.com"}))
+                .is_err()
+        );
+        assert!(
+            tool.validate_input(&json!({"url": "https://example.com"}))
+                .is_ok()
+        );
+    }
 }

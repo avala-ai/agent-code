@@ -1211,64 +1211,110 @@ impl QueryEngine {
                                         emit_agent_subagent_update(sink, input, "working");
                                     }
 
-                                    // Start read-only tools immediately during streaming.
+                                    // Start read-only tools immediately during streaming
+                                    // when they are fully allowed. Ask must wait for the
+                                    // serial executor (has prompter); Deny records and
+                                    // returns an error result without calling the tool.
                                     if let Some(tool) = self.tools.get(name)
                                         && tool.is_read_only()
                                         && tool.is_concurrency_safe()
                                     {
                                         let tool = tool.clone();
                                         let input = input.clone();
-                                        let cwd = std::path::PathBuf::from(&self.state.cwd);
-                                        let cancel = self.cancel.clone();
-                                        let perm = self.permissions.clone();
                                         let tool_id = id.clone();
                                         let tool_name = name.clone();
-                                        let tool_events = Some(tool_event_tx.clone());
-                                        let active_call_id = Some(tool_id.clone());
 
-                                        let handle = tokio::spawn(async move {
-                                            // Enforce permissions on the streaming fast-path too.
-                                            // Read-only tools are started here without going
-                                            // through the executor's check, so a read scope or
-                                            // deny rule would otherwise be bypassed.
-                                            if let crate::permissions::PermissionDecision::Deny(
-                                                reason,
-                                            ) = tool.check_permissions(&input, &perm).await
-                                            {
-                                                return crate::tools::ToolResult::error(reason);
-                                            }
-                                            match tool
-                                                .call(
-                                                    input,
-                                                    &ToolContext {
-                                                        cwd,
-                                                        cancel,
-                                                        permission_checker: perm.clone(),
-                                                        verbose: false,
-                                                        plan_mode: false,
-                                                        file_cache: None,
-                                                        denial_tracker: None,
-                                                        task_manager: None,
-                                                        subagent_colors: None,
-                                                        session_allows: None,
-                                                        permission_prompter: None,
-                                                        question_asker: None,
-                                                        agent_origin: None,
-                                                        sandbox: None,
-                                                        active_disk_output_style: None,
-                                                        agent_limiter: None,
-                                                        tool_events,
-                                                        active_call_id,
-                                                    },
-                                                )
-                                                .await
-                                            {
-                                                Ok(r) => r,
-                                                Err(e) => crate::tools::ToolResult::error(e.to_string()),
-                                            }
-                                        });
+                                        // Engine-level validation before any side effect
+                                        // (#429) — same gate as the non-streaming path.
+                                        if let Err(err) = tool.validate_input(&input) {
+                                            let reason = format!("{err}");
+                                            let short = reason
+                                                .lines()
+                                                .next()
+                                                .unwrap_or(&reason)
+                                                .to_string();
+                                            self.denial_tracker.lock().await.record(
+                                                &tool_name,
+                                                &tool_id,
+                                                &format!("rejected at validation: {short}"),
+                                                &input,
+                                            );
+                                            let handle = tokio::spawn(async move {
+                                                crate::tools::ToolResult::error(reason)
+                                            });
+                                            streaming_tool_handles
+                                                .push((tool_id, tool_name, handle));
+                                            content_blocks.push(block);
+                                            continue;
+                                        }
 
-                                        streaming_tool_handles.push((tool_id, tool_name, handle));
+                                        let decision =
+                                            tool.check_permissions(&input, &self.permissions).await;
+                                        match decision {
+                                            crate::permissions::PermissionDecision::Ask(_) => {
+                                                // Need HITL prompter — leave for serial
+                                                // executor after the stream ends.
+                                            }
+                                            crate::permissions::PermissionDecision::Deny(reason) => {
+                                                self.denial_tracker.lock().await.record(
+                                                    &tool_name,
+                                                    &tool_id,
+                                                    &reason,
+                                                    &input,
+                                                );
+                                                let msg = format!("Permission denied: {reason}");
+                                                let handle = tokio::spawn(async move {
+                                                    crate::tools::ToolResult::error(msg)
+                                                });
+                                                streaming_tool_handles
+                                                    .push((tool_id, tool_name, handle));
+                                            }
+                                            crate::permissions::PermissionDecision::Allow => {
+                                                let cwd =
+                                                    std::path::PathBuf::from(&self.state.cwd);
+                                                let cancel = self.cancel.clone();
+                                                let perm = self.permissions.clone();
+                                                let tool_events = Some(tool_event_tx.clone());
+                                                let active_call_id = Some(tool_id.clone());
+                                                let denial_tracker =
+                                                    Some(self.denial_tracker.clone());
+                                                let handle = tokio::spawn(async move {
+                                                    match tool
+                                                        .call(
+                                                            input,
+                                                            &ToolContext {
+                                                                cwd,
+                                                                cancel,
+                                                                permission_checker: perm.clone(),
+                                                                verbose: false,
+                                                                plan_mode: false,
+                                                                file_cache: None,
+                                                                denial_tracker,
+                                                                task_manager: None,
+                                                                subagent_colors: None,
+                                                                session_allows: None,
+                                                                permission_prompter: None,
+                                                                question_asker: None,
+                                                                agent_origin: None,
+                                                                sandbox: None,
+                                                                active_disk_output_style: None,
+                                                                agent_limiter: None,
+                                                                tool_events,
+                                                                active_call_id,
+                                                            },
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(r) => r,
+                                                        Err(e) => crate::tools::ToolResult::error(
+                                                            e.to_string(),
+                                                        ),
+                                                    }
+                                                });
+                                                streaming_tool_handles
+                                                    .push((tool_id, tool_name, handle));
+                                            }
+                                        }
                                     }
                                 }
                                 if let ContentBlock::Thinking { ref thinking, .. } = block {
