@@ -292,8 +292,19 @@ pub struct App {
     /// zero-frame invariant.
     pub frame_count: u64,
 
-    /// Spinner frame index while streaming.
+    /// Spinner / blink frame index (advanced while streaming, HITL, toast).
     pub tick: u64,
+    /// Terminal focus (from focus-in/out events). Suppresses action-required
+    /// blink oscillation while the user is interacting.
+    pub terminal_focused: bool,
+    /// Ephemeral status toast: (message, remaining anim ticks). Prefer this
+    /// over transcript spam for copy / paste feedback.
+    pub toast: Option<(String, u8)>,
+    /// In-app mouse drag selection over absolute transcript line indices
+    /// (layout coordinates). `None` when no selection.
+    pub selection: Option<TextSelection>,
+    /// Whether the keyboard-shortcuts overlay is open (Ctrl+. / Ctrl+X).
+    pub show_shortcuts: bool,
 
     /// Coalesces streaming text deltas so heavy streaming repaints at
     /// ≤10 fps instead of once per delta (plan §2.2).
@@ -305,6 +316,13 @@ pub struct App {
     /// backend buffer on the next draw so leftover main-screen content does
     /// not ghost under the TUI.
     pub force_full_redraw: bool,
+}
+
+/// Absolute-line selection in the virtualized transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 impl App {
@@ -373,6 +391,10 @@ impl App {
             skin: Skin::Fullscreen,
             frame_count: 0,
             tick: 0,
+            terminal_focused: true,
+            toast: None,
+            selection: None,
+            show_shortcuts: false,
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
             dirty: true,
@@ -528,6 +550,7 @@ impl App {
                 // HITL always wins: drop the Ctrl+P palette so keys reach
                 // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
                 self.command_palette = None;
+                self.show_shortcuts = false;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -535,6 +558,7 @@ impl App {
                 self.modals
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
                 self.command_palette = None;
+                self.show_shortcuts = false;
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
             }
@@ -550,6 +574,7 @@ impl App {
                         respond,
                     }));
                     self.command_palette = None;
+                    self.show_shortcuts = false;
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
                 }
@@ -1521,8 +1546,7 @@ impl App {
                     text.len(),
                     result.summary()
                 );
-                self.status_message = msg.clone();
-                self.transcript.push(TranscriptItem::System(msg));
+                self.push_toast(msg);
             }
             Err(e) => self.report_copy_err(&e),
         }
@@ -1530,10 +1554,50 @@ impl App {
     }
 
     fn report_copy_err(&mut self, e: &str) {
-        let msg = format!("copy: {e}");
-        self.status_message = msg.clone();
-        self.transcript.push(TranscriptItem::System(msg));
+        self.push_toast(format!("copy: {e}"));
         self.dirty = true;
+    }
+
+    /// Ephemeral status toast (~2s at 80ms ticks).
+    ///
+    /// Does **not** write `status_message` — that field is durable chrome
+    /// (mode changes, queue notes, slash status). When the toast expires the
+    /// status bar falls back to whatever durable message was already there,
+    /// not a stale copy of the toast text.
+    pub fn push_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), 28));
+        self.dirty = true;
+    }
+
+    /// Copy current mouse/keyboard selection, else last assistant, else fail.
+    pub fn copy_selection_or_last(&mut self) {
+        if let Some(sel) = self.selection
+            && let Some(text) = self.layout.plain_range(sel.start_line, sel.end_line)
+            && !text.trim().is_empty()
+        {
+            self.copy_text_report(&text, "selection");
+            return;
+        }
+        self.copy_last_assistant();
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    pub fn toggle_shortcuts(&mut self) {
+        self.show_shortcuts = !self.show_shortcuts;
+        self.dirty = true;
+    }
+
+    /// True while micro-animations should keep the event loop awake.
+    ///
+    /// Static mouse selection must **not** keep the timer running — that
+    /// would repaint forever and break the idle zero-frame invariant.
+    pub fn needs_anim_tick(&self) -> bool {
+        matches!(self.phase, Phase::Streaming | Phase::Permission) || self.toast.is_some()
     }
 
     /// Toggle the full queue pane (Ctrl+; / `/queue`).
@@ -1625,6 +1689,12 @@ impl App {
 
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        if let Some((_, ref mut left)) = self.toast {
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                self.toast = None;
+            }
+        }
         self.dirty = true;
     }
 }
@@ -1789,6 +1859,38 @@ mod tests {
         app.phase = Phase::Streaming;
         app.insert_str("queued paste");
         assert_eq!(app.input, "queued paste");
+    }
+
+    #[test]
+    fn needs_anim_tick_ignores_static_selection() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.needs_anim_tick(), "idle must not tick");
+        app.selection = Some(TextSelection {
+            start_line: 0,
+            end_line: 1,
+        });
+        assert!(
+            !app.needs_anim_tick(),
+            "static mouse selection must not keep anim timer alive"
+        );
+        app.phase = Phase::Streaming;
+        assert!(app.needs_anim_tick());
+    }
+
+    #[test]
+    fn push_toast_does_not_clobber_status_message() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.status_message = "mode → PLAN".into();
+        app.push_toast("copied selection (4 bytes) via osc52");
+        assert_eq!(app.status_message, "mode → PLAN");
+        assert!(app.toast.is_some());
+        // Expire toast: status must still be the durable message.
+        if let Some((_, ref mut left)) = app.toast {
+            *left = 1;
+        }
+        app.tick();
+        assert!(app.toast.is_none());
+        assert_eq!(app.status_message, "mode → PLAN");
     }
 
     #[test]
@@ -2455,11 +2557,10 @@ mod tests {
     fn copy_reports_no_assistant_when_empty() {
         let mut app = App::new("m", "/tmp", "s");
         app.copy_last_assistant();
+        let toast = app.toast.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
         assert!(
-            app.transcript
-                .iter()
-                .any(|t| matches!(t, TranscriptItem::System(s) if s.contains("no assistant"))),
-            "empty transcript should say nothing to copy"
+            toast.contains("no assistant") || app.status_message.contains("no assistant"),
+            "empty transcript should toast nothing-to-copy, got {toast:?}"
         );
     }
 
@@ -2472,12 +2573,13 @@ mod tests {
         app.cursor = app.input.len();
         app.submit();
         assert!(app.input.is_empty());
+        let toast = app.toast.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
         assert!(
-            app.transcript.iter().any(|t| matches!(
-                t,
-                TranscriptItem::System(s) if s.contains("copied") || s.contains("copy failed")
-            )),
-            "copy should report success or failure"
+            toast.contains("copied")
+                || toast.contains("copy:")
+                || app.status_message.contains("copied")
+                || app.status_message.contains("copy:"),
+            "copy should toast success or failure, got {toast:?}"
         );
     }
 

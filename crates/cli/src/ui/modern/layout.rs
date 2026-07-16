@@ -168,6 +168,41 @@ impl LayoutCache {
         }
         out
     }
+
+    /// Plain (unstyled) text for absolute lines in `[start, end]` inclusive.
+    pub fn plain_range(&self, start: usize, end: usize) -> Option<String> {
+        let lo = start.min(end);
+        let hi = start.max(end);
+        if self.total == 0 {
+            return None;
+        }
+        let hi = hi.min(self.total.saturating_sub(1));
+        let mut parts = Vec::new();
+        let mut idx = 0usize;
+        for b in &self.blocks {
+            for line in &b.lines {
+                if idx >= lo && idx <= hi {
+                    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    parts.push(plain);
+                }
+                idx += 1;
+                if idx > hi {
+                    return Some(parts.join("\n"));
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
+    /// Absolute layout line index under a viewport-relative row.
+    pub fn abs_line_at(&self, top: usize, row_in_view: usize) -> Option<usize> {
+        let abs = top.saturating_add(row_in_view);
+        if abs < self.total { Some(abs) } else { None }
+    }
 }
 
 /// Render one transcript block to logical (pre-wrap) lines.

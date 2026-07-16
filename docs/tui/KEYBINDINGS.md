@@ -10,10 +10,12 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+Enter` (alt: `Ctrl+I`) | **Send now / interject**: cancel the live turn and send the composer (or the head of the queue if empty) |
 | `Shift+Tab` | Cycle mode: Manual → Normal → AcceptEdits → Plan (applies mid-turn) |
 | `Esc` | **Never cancels a turn.** Modal: deny/dismiss only · non-empty prompt: clear draft · idle empty: press twice within 1.5 s to quit · mid-turn empty: no-op (status hints Ctrl+C) |
-| `Ctrl+C` (also `Ctrl+Shift+C`, `Cmd+C`) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit |
+| `Ctrl+C` (also `Cmd+C` / Super+C) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit · **not** `Ctrl+Shift+C` (that is copy) |
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
-| `Ctrl+P` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
+| `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
+| `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
+| `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
 

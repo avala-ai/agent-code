@@ -551,6 +551,10 @@ pub(super) async fn event_loop(
                 loop_err = Some(e);
                 break;
             }
+            // Keep OSC window title in sync with phase on every paint so
+            // idle after a turn/HITL resets the spinner / "action required"
+            // title (anim_tick alone stops once needs_anim_tick is false).
+            update_terminal_title(app);
             app.dirty = false;
         }
 
@@ -596,10 +600,21 @@ pub(super) async fn event_loop(
                         app.dirty = true;
                     }
                     Some(Ok(Event::Mouse(m))) => handle_mouse(app, m),
-                    Some(Ok(Event::Resize(_, _))) => { app.dirty = true; }
-                    Some(Ok(_)) => {}
+                    Some(Ok(Event::FocusGained)) => {
+                        app.terminal_focused = true;
+                        app.dirty = true;
+                    }
+                    Some(Ok(Event::FocusLost)) => {
+                        app.terminal_focused = false;
+                        app.dirty = true;
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        app.dirty = true;
+                    }
                     // Stream closed or errored: stop the UI cleanly.
-                    Some(Err(_)) | None => { app.should_quit = true; }
+                    Some(Err(_)) | None => {
+                        app.should_quit = true;
+                    }
                 }
             }
             // Engine → UI events.
@@ -610,10 +625,11 @@ pub(super) async fn event_loop(
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
             }
-            // Spinner animation (only while a turn is live).
-            _ = anim_tick.tick(), if live => {
-                if app.phase == super::app::Phase::Streaming {
+            // Micro-animations: spinner, action-required blink, toast decay.
+            _ = anim_tick.tick(), if live || app.needs_anim_tick() => {
+                if app.needs_anim_tick() {
                     app.tick();
+                    update_terminal_title(app);
                 }
             }
         }
@@ -677,20 +693,23 @@ fn strip_ansi_simple(s: &str) -> String {
     out
 }
 
-/// True for Ctrl+C / Ctrl+Shift+C / Cmd+C (Super), or raw ETX.
+/// True for Ctrl+C / Cmd+C (Super), or raw ETX — but **not** Ctrl+Shift+C.
+///
+/// Ctrl+Shift+C is reserved for "copy selection / last reply". Bare Ctrl+C
+/// still cancels. Some terminals set extra modifiers; we still treat
+/// CONTROL without SHIFT as cancel (SHIFT alone no longer forces cancel).
 ///
 /// **Not Esc.** Esc is navigate / dismiss / clear only — never cancels a
 /// turn (world-class agent-screen contract; see ACCEPTANCE + KEYBINDINGS).
-/// Real terminals often set extra modifier bits (e.g. SHIFT with Ctrl+C)
-/// so exact `KeyModifiers::CONTROL` equality silently drops the key —
-/// use `.contains(CONTROL)` instead.
 fn is_cancel_chord(key: &KeyEvent) -> bool {
     match key.code {
         // Raw ETX (0x03) — some paths deliver the byte without CONTROL.
         KeyCode::Char('\u{3}') => true,
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') => {
-            key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::SUPER)
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER);
+            // Leave Ctrl+Shift+C for the copy shortcut.
+            ctrl && !key.modifiers.contains(KeyModifiers::SHIFT)
         }
         _ => false,
     }
@@ -707,11 +726,30 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // HITL modals always win over the command palette. A permission ask
-    // can arrive while the palette is open (streaming turn); dismiss the
-    // palette so y/a/n, Esc, and Ctrl+C reach the modal.
+    // HITL always wins: dismiss help + palette so y/a/n reach the modal.
     if app.phase == super::app::Phase::Permission {
+        if app.show_shortcuts {
+            app.show_shortcuts = false;
+            app.dirty = true;
+        }
         app.close_command_palette();
+    }
+
+    // Shortcuts overlay steals keys only when no HITL modal is up.
+    // Ctrl+C / Cmd+C always fall through so a live turn can still be cancelled
+    // while help is open (the overlay itself documents that chord).
+    if app.show_shortcuts && app.phase != super::app::Phase::Permission && !is_cancel_chord(&key) {
+        if is_esc(&key)
+            || matches!(
+                key.code,
+                KeyCode::Char('.') | KeyCode::Char('x') | KeyCode::Char('X')
+            ) && key.modifiers.contains(KeyModifiers::CONTROL)
+            || matches!(key.code, KeyCode::Char('?'))
+        {
+            app.show_shortcuts = false;
+            app.dirty = true;
+        }
+        return;
     }
 
     // Command palette captures input when open (and no HITL modal is up).
@@ -811,6 +849,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
     if is_esc(&key) {
+        if app.selection.is_some() {
+            app.clear_selection();
+            return;
+        }
         if !app.input.is_empty() {
             app.clear_prompt();
         } else if app.phase == super::app::Phase::Streaming {
@@ -872,9 +914,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
         }
-        // Command palette (Ctrl+P).
+        // Command palette (Ctrl+P / ?).
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
             app.open_command_palette();
+        }
+        (_, KeyCode::Char('?')) if app.input.is_empty() => {
+            app.open_command_palette();
+        }
+        // Keyboard shortcuts help (Ctrl+. / Ctrl+X).
+        (m, KeyCode::Char('.') | KeyCode::Char('x') | KeyCode::Char('X'))
+            if m.contains(KeyModifiers::CONTROL) =>
+        {
+            app.toggle_shortcuts();
+        }
+        // Copy selection or last assistant (Ctrl+Shift+C).
+        (m, KeyCode::Char('c') | KeyCode::Char('C'))
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            app.copy_selection_or_last();
         }
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
@@ -897,9 +954,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         {
             app.queue_delete_selected();
         }
-        // Block copy: y = body, Y = metadata (only when a block is selected).
-        (_, KeyCode::Char('y')) if app.input.is_empty() && app.selected_item.is_some() => {
-            app.copy_selected_content();
+        // Block copy: y = body (or selection), Y = metadata (only when empty composer).
+        (_, KeyCode::Char('y')) if app.input.is_empty() => {
+            if app.selection.is_some() {
+                app.copy_selection_or_last();
+            } else if app.selected_item.is_some() {
+                app.copy_selected_content();
+            }
         }
         (_, KeyCode::Char('Y')) if app.input.is_empty() && app.selected_item.is_some() => {
             app.copy_selected_meta();
@@ -1061,27 +1122,122 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Shift/Alt-modified drags are left to the terminal's native selection.
+/// Shift/Alt-modified clicks leave native terminal selection alone when
+/// we cannot map the row into the transcript.
 fn handle_mouse(app: &mut App, m: MouseEvent) {
+    // Focus events may arrive as special kinds on some backends; ignore here.
     match m.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
-        // Clicking near the bottom of the transcript jumps to the live tail
-        // (the jump pill target). Cheap heuristic without full hit-testing:
-        // bottom row of the transcript region.
+        MouseEventKind::ScrollUp => {
+            app.scroll_up(3);
+            app.dirty = true;
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_down(3);
+            app.dirty = true;
+        }
+        // Jump pill: bottom transcript row → Follow.
         MouseEventKind::Down(MouseButton::Left)
             if !app.scroll.is_following()
                 && app.transcript_bottom_row != 0
                 && m.row == app.transcript_bottom_row =>
         {
-            // Exactly the transcript's bottom screen row (recorded at last
-            // draw) — comparing against viewport_h (a HEIGHT) made any click
-            // on the lower half of the screen, including the input box,
-            // silently snap the transcript to bottom.
             app.scroll_to_bottom();
+            app.clear_selection();
+        }
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
+            if let Some(abs) = mouse_abs_line(app, m.row) {
+                app.selection = Some(super::app::TextSelection {
+                    start_line: abs,
+                    end_line: abs,
+                });
+                app.dirty = true;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(abs) = mouse_abs_line(app, m.row) {
+                if let Some(sel) = app.selection.as_mut() {
+                    sel.end_line = abs;
+                } else {
+                    app.selection = Some(super::app::TextSelection {
+                        start_line: abs,
+                        end_line: abs,
+                    });
+                }
+                app.dirty = true;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Keep selection for y / Ctrl+Shift+C; toast if non-empty.
+            if let Some(sel) = app.selection
+                && sel.start_line != sel.end_line
+            {
+                app.push_toast("selection ready · Ctrl+Shift+C or y to copy");
+            }
+        }
+        // Middle-click: no OS PRIMARY read without extra deps; hint paste path.
+        MouseEventKind::Down(MouseButton::Middle) if app.phase != super::app::Phase::Permission => {
+            app.push_toast("use Ctrl+Shift+V / terminal paste for clipboard");
         }
         _ => {}
     }
+}
+
+/// Map a screen row to an absolute layout line in the transcript viewport.
+fn mouse_abs_line(app: &App, row: u16) -> Option<usize> {
+    if app.viewport_h == 0 || app.transcript_bottom_row == 0 {
+        return None;
+    }
+    let bottom = app.transcript_bottom_row;
+    let top_row = bottom.saturating_sub(app.viewport_h as u16 - 1);
+    if row < top_row || row > bottom {
+        return None;
+    }
+    let row_in_view = (row - top_row) as usize;
+    let total = app.layout.total_lines();
+    let top = app.scroll.top(total, app.viewport_h);
+    app.layout.abs_line_at(top, row_in_view)
+}
+
+/// Strip C0/C1 control bytes (and DEL) so untrusted title components
+/// (e.g. `[api].model` from project config) cannot break out of OSC 0
+/// via embedded BEL/ESC sequences.
+fn sanitize_osc_title(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let u = *c as u32;
+            // Keep printable ASCII + all non-control Unicode; drop C0, DEL, C1.
+            !matches!(u, 0x00..=0x1F | 0x7F | 0x80..=0x9F)
+        })
+        .collect()
+}
+
+/// OSC 0 window title: braille spinner + model when live; calm idle title.
+fn update_terminal_title(app: &App) {
+    use std::io::Write;
+    let model = sanitize_osc_title(&app.model);
+    let title = match app.phase {
+        super::app::Phase::Streaming => {
+            format!(
+                "{} agent · {} · {}",
+                super::anim::spinner_glyph(app.tick),
+                model,
+                app.waiting_on.label()
+            )
+        }
+        super::app::Phase::Permission => {
+            if super::anim::blink_visible(app.tick, app.terminal_focused) {
+                format!("⚠ action required · {model}")
+            } else {
+                format!("agent · {model}")
+            }
+        }
+        _ => format!("agent · {model}"),
+    };
+    let title = sanitize_osc_title(&title);
+    // OSC 0 ; title BEL
+    let seq = format!("\x1b]0;{title}\x07");
+    let _ = std::io::stdout().write_all(seq.as_bytes());
+    let _ = std::io::stdout().flush();
 }
 
 /// Apply a UI session mode to the engine so it takes effect immediately —
@@ -1116,6 +1272,18 @@ mod tests {
     use super::*;
     use crate::ui::modern::app::Phase;
 
+    #[test]
+    fn sanitize_osc_title_strips_control_breakouts() {
+        // Malicious model name trying to terminate OSC early and inject CSI.
+        let dirty = "evil\x07\x1b[31mred\x1b[0m";
+        let clean = sanitize_osc_title(dirty);
+        assert!(!clean.contains('\x07'));
+        assert!(!clean.contains('\x1b'));
+        assert_eq!(clean, "evil[31mred[0m");
+        // Normal model names and unicode remain.
+        assert_eq!(sanitize_osc_title("grok-4 · β"), "grok-4 · β");
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1144,17 +1312,36 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_and_uppercase_still_cancel() {
-        // Terminals often set SHIFT with Ctrl+C; exact-modifier match used to drop these.
+    fn ctrl_c_cancels_through_shortcuts_overlay() {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
-        handle_key(&mut app, ctrl_shift('c'));
-        assert!(app.cancel_requested, "Ctrl+Shift+c must cancel");
+        app.show_shortcuts = true;
+        handle_key(&mut app, ctrl('c'));
+        assert!(
+            app.cancel_requested,
+            "Ctrl+C must cancel even while help overlay is open"
+        );
+    }
 
+    #[test]
+    fn ctrl_c_uppercase_still_cancels() {
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
         handle_key(&mut app, ctrl('C'));
         assert!(app.cancel_requested, "Ctrl+C (uppercase) must cancel");
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_not_cancels() {
+        // Ctrl+Shift+C is copy selection / last reply — not cancel.
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.transcript
+            .push(super::super::app::TranscriptItem::Assistant("hi".into()));
+        handle_key(&mut app, ctrl_shift('c'));
+        assert!(!app.cancel_requested, "Ctrl+Shift+C must not cancel a turn");
+        // Copy path leaves a toast (or status) rather than arming quit.
+        assert!(!app.quit_armed);
     }
 
     #[test]
@@ -1195,12 +1382,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_double_press_quits() {
+    fn ctrl_shift_c_idle_does_not_quit() {
         let mut app = App::new("m", "/tmp", "s");
         handle_key(&mut app, ctrl_shift('c'));
-        assert!(app.quit_armed);
+        assert!(!app.should_quit);
+        assert!(!app.quit_armed);
         handle_key(&mut app, ctrl_shift('C'));
-        assert!(app.should_quit);
+        assert!(!app.should_quit);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
+use super::anim::{blink_visible, pulse_style, spinner_glyph, toast_style};
 use super::app::{App, PendingPermission, Phase};
 use super::colors::palette;
 use super::mode::SessionMode;
@@ -99,10 +100,55 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    // Palette never draws over HITL (permission / plan / question).
+    // Palette / help never draw over HITL (permission / plan / question).
     if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
     }
+
+    if app.show_shortcuts && app.phase != Phase::Permission {
+        draw_shortcuts_overlay(frame, area);
+    }
+}
+
+fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
+    let accent = palette().accent;
+    let lines = vec![
+        Line::from(Span::styled(
+            " keyboard shortcuts ",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  Enter           send · queue mid-turn · send next when idle"),
+        Line::from("  Ctrl+Enter/I    interject (cancel + send now)"),
+        Line::from("  Esc             never cancels · clear draft / dismiss modal"),
+        Line::from("  Ctrl+C          cancel turn · double-press quit"),
+        Line::from("  Shift+Tab       cycle mode Manual → Normal → AcceptEdits → Plan"),
+        Line::from("  Ctrl+P / ?      command palette"),
+        Line::from("  Ctrl+; / '      queue pane"),
+        Line::from("  Ctrl+T          tasks pane"),
+        Line::from("  Ctrl+M          multiline composer"),
+        Line::from("  ↑/↓ empty       prompt history · scroll when drafting"),
+        Line::from("  ←/→ empty       select transcript block"),
+        Line::from("  e / Ctrl+E      fold block / expand all thinking"),
+        Line::from("  y / Y           copy block body / metadata"),
+        Line::from("  Ctrl+Shift+C    copy selection or last reply"),
+        Line::from("  drag mouse      select transcript text · release keeps selection"),
+        Line::from("  !cmd            shell passthrough"),
+        Line::from("  Ctrl+. / Ctrl+X this help"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc or Ctrl+. to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    draw_modal_box(
+        frame,
+        area,
+        lines,
+        " help ",
+        accent,
+        Some(key_hint_line("[Esc] close")),
+    );
 }
 
 fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -557,16 +603,33 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let top = app.scroll.top(total, height);
     let view = app.layout.viewport(top, height);
 
-    let title_block =
-        Block::default()
-            .borders(Borders::NONE)
-            .title(if app.phase == Phase::Streaming {
-                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                let f = frames[(app.tick as usize) % frames.len()];
-                format!(" {f} streaming ")
+    // Apply selection highlight on the visible slice.
+    let view = apply_selection_highlight(view, top, app.selection);
+
+    let title = match app.phase {
+        Phase::Streaming => {
+            let f = spinner_glyph(app.tick);
+            format!(" {f} streaming ")
+        }
+        Phase::Permission => {
+            if blink_visible(app.tick, app.terminal_focused) {
+                format!(" {} action required ", spinner_glyph(app.tick))
             } else {
-                " transcript ".into()
-            });
+                "  action required ".into()
+            }
+        }
+        _ => " transcript ".into(),
+    };
+    let title_style = match app.phase {
+        Phase::Streaming => pulse_style(app.tick, palette().accent),
+        Phase::Permission => Style::default()
+            .fg(palette().warning)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+    let title_block = Block::default()
+        .borders(Borders::NONE)
+        .title(Span::styled(title, title_style));
     // Lines are pre-wrapped by the layout cache; no widget wrapping.
     frame.render_widget(Paragraph::new(view).block(title_block), area);
 
@@ -608,7 +671,32 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
     );
 }
 
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+fn apply_selection_highlight(
+    mut view: Vec<Line<'static>>,
+    top: usize,
+    selection: Option<super::app::TextSelection>,
+) -> Vec<Line<'static>> {
+    let Some(sel) = selection else {
+        return view;
+    };
+    let lo = sel.start_line.min(sel.end_line);
+    let hi = sel.start_line.max(sel.end_line);
+    let accent = palette().accent;
+    for (i, line) in view.iter_mut().enumerate() {
+        let abs = top + i;
+        if abs >= lo && abs <= hi {
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            *line = Line::from(Span::styled(
+                plain,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    view
+}
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let tokens = app.tokens_in + app.tokens_out;
@@ -662,35 +750,74 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::raw("│"));
     }
 
-    // Waiting-on spinner while a turn runs (plan §M4); otherwise the last
-    // status message.
+    // Live spinner / blinking action-required / toast / idle message.
     let accent = palette().accent;
     let warning = palette().warning;
-    if app.phase == Phase::Streaming {
-        let glyph = SPINNER[(app.tick as usize) % SPINNER.len()];
-        let (glyph_color, text_color) = match app.waiting_on {
-            super::app::WaitingOn::UserInput => (warning, warning),
-            _ => (accent, Color::Gray),
-        };
-        spans.push(Span::styled(
-            format!(" {glyph} "),
-            Style::default().fg(glyph_color),
-        ));
-        spans.push(Span::styled(
-            format!("{} ", app.waiting_on.label()),
-            Style::default().fg(text_color),
-        ));
-    } else {
-        spans.push(Span::styled(
-            format!(" {} ", app.status_message),
-            Style::default().fg(Color::Gray),
-        ));
+    match app.phase {
+        Phase::Streaming => {
+            let glyph = spinner_glyph(app.tick);
+            let (glyph_color, text_color) = match app.waiting_on {
+                super::app::WaitingOn::UserInput => (warning, warning),
+                _ => (accent, Color::Gray),
+            };
+            spans.push(Span::styled(
+                format!(" {glyph} "),
+                pulse_style(app.tick, glyph_color),
+            ));
+            spans.push(Span::styled(
+                format!("{} ", app.waiting_on.label()),
+                Style::default().fg(text_color),
+            ));
+        }
+        Phase::Permission => {
+            let show = blink_visible(app.tick, app.terminal_focused);
+            if show {
+                spans.push(Span::styled(
+                    format!(" {} ", spinner_glyph(app.tick)),
+                    Style::default().fg(warning).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    " action required ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "  · waiting for you ·  ",
+                    Style::default().fg(warning).add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+        _ => {
+            if let Some((ref msg, left)) = app.toast {
+                spans.push(Span::styled(format!(" {msg} "), toast_style(left)));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {} ", app.status_message),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+        }
     }
     if !app.queue.is_empty() {
         spans.push(Span::raw("│"));
+        let q_style = if app.phase == Phase::Streaming {
+            pulse_style(app.tick, accent)
+        } else {
+            Style::default().fg(accent)
+        };
         spans.push(Span::styled(
             format!(" ⧉ {} queued ", app.queue.len()),
-            Style::default().fg(accent),
+            q_style,
+        ));
+    }
+    if app.selection.is_some() {
+        spans.push(Span::raw("│"));
+        spans.push(Span::styled(
+            " sel · Ctrl+Shift+C copy ",
+            Style::default().fg(accent).add_modifier(Modifier::DIM),
         ));
     }
     spans.push(Span::raw("│"));
