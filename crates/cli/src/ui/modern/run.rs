@@ -440,11 +440,21 @@ pub(super) async fn event_loop(
             && let Some(prompt) = app.pending_submit.take()
         {
             let sink = ChannelSink::new(eng_tx.clone());
-            let handle = session.spawn_turn(prompt, sink).await;
-            turn = Some(handle);
-            app.turn_live = true;
-            app.phase = super::app::Phase::Streaming;
-            app.dirty = true;
+            match session.spawn_turn(prompt.clone(), sink).await {
+                Ok(handle) => {
+                    turn = Some(handle);
+                    app.turn_live = true;
+                    app.phase = super::app::Phase::Streaming;
+                    app.dirty = true;
+                }
+                Err(e) => {
+                    // Should be rare: TUI serializes turns. Put the prompt
+                    // back so the next idle loop can retry.
+                    app.pending_submit = Some(prompt);
+                    app.status_message = format!("turn busy: {e}");
+                    app.dirty = true;
+                }
+            }
         }
 
         // Cancel if requested.

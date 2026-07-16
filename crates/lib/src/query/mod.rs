@@ -3192,11 +3192,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_spawn_turn_rejects_while_running() {
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new(build_engine(Arc::new(CancelAwareHangingProvider {
+            exit_flag: exit_flag.clone(),
+        })));
+        let handle = session
+            .spawn_turn("first".to_string(), Arc::new(NullSink))
+            .await
+            .expect("first spawn");
+        // Second spawn while Running must fail (generation guard, #425).
+        let second = session
+            .spawn_turn("second".to_string(), Arc::new(NullSink))
+            .await;
+        assert!(
+            second.is_err(),
+            "second spawn while running must fail, got Ok"
+        );
+        let msg = second.err().unwrap().to_string();
+        assert!(msg.contains("already running"), "unexpected error: {msg}");
+        handle.cancel();
+        handle.join().await.ok();
+    }
+
+    #[tokio::test]
     async fn session_spawn_turn_runs_detached_and_completes() {
         let session = Session::new(build_engine(Arc::new(CompletingProvider)));
         let mut handle = session
             .spawn_turn("hi".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
 
         let final_status =
             tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
@@ -3215,7 +3240,8 @@ mod tests {
         })));
         let mut handle = session
             .spawn_turn("hi".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
 
         // Let the turn start, then cancel it via the handle (no engine
         // lock needed even though the turn holds it).
@@ -3241,7 +3267,8 @@ mod tests {
         })));
         let handle = session
             .spawn_turn("hang".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
 
         // Advance just enough for the turn task to acquire the engine lock
         // and enter the stream loop.
@@ -3342,7 +3369,8 @@ mod tests {
         // Turn 2 hangs. Its handle must NOT inherit turn 1's terminal.
         let mut handle = session
             .spawn_turn("two".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
         assert_eq!(
             handle.status(),
             TurnStatus::Running,
@@ -3447,7 +3475,8 @@ mod tests {
 
         let mut handle = session
             .spawn_turn("orig".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_status())
             .await
             .expect("turn finishes");
@@ -3471,7 +3500,8 @@ mod tests {
         })));
         let mut handle = session
             .spawn_turn("orig".to_string(), Arc::new(NullSink))
-            .await;
+            .await
+            .expect("spawn turn");
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(handle.steer("nudge"), "steer should deliver while running");
