@@ -1,9 +1,12 @@
-//! First-run setup wizard.
+//! First-run bootstrap and credentials.
 //!
-//! First-run setup wizard: hero welcome, numbered steps with progress,
-//! provider/subscription sign-in, permissions, safety notes, modern TUI
-//! defaults, and a post-setup tips screen. Runs when no config exists
-//! (or when the CLI re-invokes setup for a missing API key).
+//! Interactive launch mirrors Grok Build: **no multi-step wizard**. Missing
+//! config is written with calm defaults; if credentials are still missing we
+//! only run sign-in (device/browser OAuth or env API keys), then drop into the
+//! modern TUI.
+//!
+//! The legacy multi-step Appearance → Sign-in → Permissions → Safety flow is
+//! kept as [`run_setup_wizard_legacy`] for callers that opt in explicitly.
 
 use std::io::Write;
 
@@ -12,16 +15,179 @@ use crossterm::style::Stylize;
 
 use super::selector::{SelectOption, select};
 
-/// Total interactive steps shown in the progress rail.
+/// Total interactive steps shown in the progress rail (legacy wizard only).
 const TOTAL_STEPS: u8 = 4;
 
-/// Check if the setup wizard should run.
+/// Check if a default config.toml should be created.
 pub fn needs_setup() -> bool {
     let config_path = agent_code_lib::config::agent_config_dir().map(|d| d.join("config.toml"));
     match config_path {
         Some(path) => !path.exists(),
         None => true,
     }
+}
+
+/// Default first-run config: calm midnight theme, accept-edits, xAI endpoint.
+///
+/// Auth is left empty until env keys or OAuth fill it in.
+pub fn default_setup_result() -> SetupResult {
+    SetupResult {
+        api_key: String::new(),
+        auth_mode: "api_key".into(),
+        provider: "xai".into(),
+        base_url: Some("https://api.x.ai/v1".into()),
+        model: Some("grok-build-0.1".into()),
+        theme: "midnight".into(),
+        permission_mode: "accept_edits".into(),
+    }
+}
+
+/// Write calm defaults when no config exists. Silent — no hero UI.
+pub fn ensure_default_config() {
+    if !needs_setup() {
+        return;
+    }
+    write_config_quiet(&default_setup_result());
+}
+
+/// Prefer API keys already present in the environment (no interactive UI).
+fn try_env_credentials() -> Option<SetupResult> {
+    // (env var, provider, base_url, default model)
+    const CANDIDATES: &[(&str, &str, &str, &str)] = &[
+        (
+            "XAI_API_KEY",
+            "xai",
+            "https://api.x.ai/v1",
+            "grok-build-0.1",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-5.4",
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-4-20250514",
+        ),
+        (
+            "AGENT_CODE_API_KEY",
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-5.4",
+        ),
+        (
+            "GOOGLE_API_KEY",
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.5-flash",
+        ),
+        (
+            "OPENROUTER_API_KEY",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            "openrouter/auto",
+        ),
+    ];
+    for (env, provider, url, model) in CANDIDATES {
+        if let Ok(key) = std::env::var(env)
+            && !key.trim().is_empty()
+        {
+            return Some(SetupResult {
+                api_key: key,
+                auth_mode: "api_key".into(),
+                provider: (*provider).into(),
+                base_url: Some((*url).into()),
+                model: Some((*model).into()),
+                theme: "midnight".into(),
+                permission_mode: "accept_edits".into(),
+            });
+        }
+    }
+    None
+}
+
+/// Grok-style first-run: defaults on disk + sign-in only (no multi-step wizard).
+///
+/// Called when interactive launch has no usable credentials. If config is
+/// missing it is bootstrapped first. Then env API keys are preferred; otherwise
+/// xAI device/browser OAuth runs (same product motion as Grok Build).
+pub fn run_setup() -> Option<SetupResult> {
+    ensure_default_config();
+
+    if let Some(from_env) = try_env_credentials() {
+        write_config(&from_env);
+        println!(
+            "  {} Using {} from the environment.",
+            "✓".green(),
+            if from_env.provider == "xai" {
+                "XAI_API_KEY"
+            } else {
+                "API key"
+            }
+        );
+        println!();
+        return Some(from_env);
+    }
+
+    // Single-step sign-in — no Appearance / Permissions / Safety screens.
+    println!();
+    println!(
+        "  {} Signing in with xAI (browser / device code)…",
+        "→".dark_cyan().bold()
+    );
+    println!(
+        "  {}",
+        "Complete the flow in your browser. Credentials persist for later launches.".dark_grey()
+    );
+    println!(
+        "  {}",
+        "Skip: export XAI_API_KEY / OPENAI_API_KEY, or run `agent login codex`.".dark_grey()
+    );
+    println!();
+
+    match run_xai_device_login() {
+        Ok(path) => {
+            println!(
+                "  {} Signed in. Session saved to {}",
+                "✓".green(),
+                path.display()
+            );
+            println!();
+            let result = SetupResult {
+                api_key: String::new(),
+                auth_mode: "xai_oauth".into(),
+                provider: "xai".into(),
+                base_url: Some("https://api.x.ai/v1".into()),
+                model: Some("grok-build-0.1".into()),
+                theme: "midnight".into(),
+                permission_mode: "accept_edits".into(),
+            };
+            write_config(&result);
+            Some(result)
+        }
+        Err(e) => {
+            println!("  {} Sign-in failed: {e}", "✗".red());
+            println!(
+                "  {}",
+                "Set XAI_API_KEY / OPENAI_API_KEY / AGENT_CODE_API_KEY, or run:".yellow()
+            );
+            println!("    {}", "agent login xai   ·  agent login codex".yellow());
+            println!();
+            None
+        }
+    }
+}
+
+/// Legacy multi-step wizard (Appearance → Sign-in → Permissions → Safety).
+///
+/// Kept for explicit re-runs / tests; interactive first launch uses
+/// [`run_setup`] instead.
+#[allow(dead_code)]
+pub fn run_setup_wizard_legacy() -> Option<SetupResult> {
+    run_setup_wizard_legacy_impl()
 }
 
 fn print_hero() {
@@ -160,8 +326,8 @@ fn print_ready_tips(result: &SetupResult) {
     println!();
 }
 
-/// Run the interactive setup wizard.
-pub fn run_setup() -> Option<SetupResult> {
+/// Legacy multi-step interactive wizard implementation.
+fn run_setup_wizard_legacy_impl() -> Option<SetupResult> {
     print_hero();
 
     // Step 1: Theme.
@@ -701,7 +867,7 @@ fn render_config_toml(result: &SetupResult) -> String {
     toml::to_string_pretty(&toml::Value::Table(root)).unwrap_or_default()
 }
 
-/// Write config file from setup result.
+/// Write config file from setup result (prints path on success).
 ///
 /// Persists atomically with owner-only (`0600`) permissions — the file
 /// holds the API key — and surfaces failures to the user instead of
@@ -710,14 +876,25 @@ fn render_config_toml(result: &SetupResult) -> String {
 /// working while nothing reached disk, so the next launch re-ran the
 /// wizard (issue #288).
 pub fn write_config(result: &SetupResult) {
+    write_config_impl(result, true);
+}
+
+/// Persist defaults without chatty "Config saved" lines (Grok-style launch).
+fn write_config_quiet(result: &SetupResult) {
+    write_config_impl(result, false);
+}
+
+fn write_config_impl(result: &SetupResult, announce: bool) {
     let Some(config_dir) = agent_code_lib::config::agent_config_dir() else {
-        println!(
-            "  {}",
-            "Could not determine a config directory — setup was not saved. \
-             Set AGENT_CODE_API_KEY in your environment to use the agent."
-                .yellow()
-        );
-        println!();
+        if announce {
+            println!(
+                "  {}",
+                "Could not determine a config directory — setup was not saved. \
+                 Set AGENT_CODE_API_KEY in your environment to use the agent."
+                    .yellow()
+            );
+            println!();
+        }
         return;
     };
 
@@ -726,27 +903,31 @@ pub fn write_config(result: &SetupResult) {
 
     match atomic_write_secret(&config_path, body.as_bytes()) {
         Ok(()) => {
-            println!(
-                "{}",
-                format!("  Config saved to {}", config_path.display()).dark_grey()
-            );
-            // Setup already chose a theme — skip the separate first-run
-            // onboarding theme picker on the next launch.
+            if announce {
+                println!(
+                    "{}",
+                    format!("  Config saved to {}", config_path.display()).dark_grey()
+                );
+                println!();
+            }
+            // Skip the separate first-run theme picker on the next launch.
             super::onboarding::mark_onboarded();
         }
         Err(e) => {
-            println!(
-                "  {}",
-                format!(
-                    "Could not save config to {} ({e}). \
-                     Set AGENT_CODE_API_KEY in your environment to use the agent.",
-                    config_path.display()
-                )
-                .yellow()
-            );
+            if announce {
+                println!(
+                    "  {}",
+                    format!(
+                        "Could not save config to {} ({e}). \
+                         Set AGENT_CODE_API_KEY in your environment to use the agent.",
+                        config_path.display()
+                    )
+                    .yellow()
+                );
+                println!();
+            }
         }
     }
-    println!();
 }
 
 pub struct SetupResult {

@@ -422,7 +422,9 @@ async fn async_main() -> anyhow::Result<()> {
         return attach::run_attach(cli.port, session_filter).await;
     }
 
-    // Run setup wizard on first launch (no config file). Skip for non-interactive modes.
+    // Grok-style first launch: silent default config (no multi-step wizard).
+    // Theme / permission defaults land on disk; credentials are handled
+    // below only when still missing.
     if cli.prompt.is_none()
         && !cli.dump_system_prompt
         && !cli.serve
@@ -432,15 +434,12 @@ async fn async_main() -> anyhow::Result<()> {
         && cli_auth_mode != Some(ApiAuthMode::XaiOauth)
         && ui::setup::needs_setup()
     {
-        run_setup_wizard();
+        ui::setup::ensure_default_config();
     }
 
-    // First-run onboarding (welcome banner + theme picker with live
-    // diff preview). Independent of the API-key wizard so users who
-    // already have keys configured still see the polished theme
-    // picker once on first launch. The sentinel ensures the picker
-    // only ever fires once unless the user explicitly invokes
-    // `/theme` later.
+    // Skip the separate welcome/theme onboarding picker — first launch
+    // goes straight to the modern TUI (Grok Build product motion). Users
+    // can still change themes later via `/theme`.
     if cli.prompt.is_none()
         && !cli.dump_system_prompt
         && !cli.serve
@@ -448,7 +447,7 @@ async fn async_main() -> anyhow::Result<()> {
         && cli.command.is_none()
         && !ui::onboarding::already_onboarded()
     {
-        ui::onboarding::run_first_run();
+        ui::onboarding::mark_onboarded();
     }
 
     // Detect session environment.
@@ -598,7 +597,7 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && !is_headless_subcommand
     {
-        eprintln!("No credentials found — starting first-run setup…\n");
+        // Sign-in only (env key or xAI OAuth) — no Appearance/Permissions wizard.
         run_setup_wizard();
         config = Config::load()?;
     }
