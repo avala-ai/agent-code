@@ -633,23 +633,52 @@ pub fn is_builtin_command(name: &str) -> bool {
     })
 }
 
-/// Tab-completion candidates for a partial slash command (**name/alias
-/// prefix only** — not description substrings).
+/// Tab-completion candidates for a partial slash command.
+///
+/// Matches **canonical command names only** (prefix). Aliases are intentionally
+/// omitted so a unique name prefix like `hist` still completes to `/history`
+/// even when some other command has an alias such as `history-view`.
+/// Use the Ctrl+P palette ([`list_slash_for_palette`]) to discover aliases.
 pub fn complete_slash(partial: &str) -> Vec<&'static str> {
     let partial = partial.trim().trim_start_matches('/').to_ascii_lowercase();
     let mut out: Vec<&'static str> = COMMANDS
         .iter()
         .filter(|c| !c.hidden)
-        .filter(|c| {
-            partial.is_empty()
-                || c.name.starts_with(&partial)
-                || c.aliases.iter().any(|a| a.starts_with(partial.as_str()))
-        })
+        .filter(|c| partial.is_empty() || c.name.starts_with(&partial))
         .map(|c| c.name)
         .collect();
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// True when a slash built-in needs the real terminal (picker, pager, or
+/// `$EDITOR`) rather than captured stdout under the alt-screen TUI.
+pub fn is_interactive_slash(cmd: &str) -> bool {
+    let head = cmd
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        head.as_str(),
+        "session"
+            | "sessions"
+            | "scroll"
+            | "editor"
+            | "open"
+            | "theme"
+            | "color"
+            | "resume"
+            | "login"
+            | "add-dir"
+            | "add_dir"
+            | "plugin"
+            | "plugins"
+            | "mcp"
+    )
 }
 
 /// Slash-command entries for the Ctrl+P palette.
@@ -702,6 +731,27 @@ mod slash_lookup_tests {
         );
         let empty = complete_slash("");
         assert!(empty.len() > 10);
+    }
+
+    #[test]
+    fn complete_slash_prefers_name_over_alias_prefix() {
+        // `/hist` must complete to history even if some other command has a
+        // `history-*` alias (e.g. scroll → history-view).
+        let c = complete_slash("hist");
+        assert!(c.contains(&"history"), "got {c:?}");
+        assert!(
+            !c.contains(&"scroll"),
+            "alias-only hits must not pollute Tab: {c:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_slash_detection() {
+        assert!(is_interactive_slash("/session"));
+        assert!(is_interactive_slash("editor foo"));
+        assert!(is_interactive_slash("/open src/main.rs"));
+        assert!(!is_interactive_slash("/help"));
+        assert!(!is_interactive_slash("/cost"));
     }
 
     #[test]

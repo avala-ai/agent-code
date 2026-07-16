@@ -301,6 +301,10 @@ pub struct App {
     /// Set whenever visible state changed and the frame must be redrawn.
     /// Idle (no events, no pending deltas) leaves this false → zero frames.
     pub dirty: bool,
+    /// After leaving alt-screen for an interactive slash command, clear the
+    /// backend buffer on the next draw so leftover main-screen content does
+    /// not ghost under the TUI.
+    pub force_full_redraw: bool,
 }
 
 impl App {
@@ -372,6 +376,7 @@ impl App {
             stream_buf: StreamBuffer::new(),
             // Draw the first frame.
             dirty: true,
+            force_full_redraw: false,
         }
     }
 

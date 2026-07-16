@@ -166,6 +166,25 @@ fn restore_terminal(terminal: &mut Term) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Temporarily leave alt-screen / raw mode so an interactive slash command
+/// (picker, scrollback viewer, `$EDITOR`) can own the real terminal, then
+/// re-enter the modern TUI modes.
+fn with_main_screen<R>(f: impl FnOnce() -> R) -> R {
+    restore_stdout_modes();
+    let result = f();
+    // Best-effort re-enter; draw path will recover on the next frame.
+    let _ = enable_raw_mode();
+    let _ = execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableFocusChange,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+        crossterm::cursor::Hide,
+    );
+    result
+}
+
 /// Chain a panic hook that restores the terminal (raw mode off, focus/paste
 /// reporting off, leave alt screen, cursor visible) before the default hook
 /// prints the panic, so a panic never leaves the user's shell unusable or
@@ -183,6 +202,10 @@ fn install_panic_restore_hook() {
 /// begin/end are best-effort; a terminal that ignores them just renders
 /// normally.
 fn draw_frame(terminal: &mut Term, app: &mut App, caps: TerminalCaps) -> anyhow::Result<()> {
+    if app.force_full_redraw {
+        let _ = terminal.clear();
+        app.force_full_redraw = false;
+    }
     if caps.sync_output {
         let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
     }
@@ -280,11 +303,21 @@ pub(super) async fn event_loop(
         if let Some(slash) = app.pending_slash.take() {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
-                    let (result, captured) = tokio::task::block_in_place(|| {
-                        crate::stdout_capture::capture_stdout(|| {
-                            crate::commands::execute(&slash, &mut eng)
+                    let interactive = crate::commands::is_interactive_slash(&slash);
+                    let (result, captured) = if interactive {
+                        // Leave alt-screen/raw mode so pickers, scrollback
+                        // viewer, and $EDITOR can own the real terminal.
+                        with_main_screen(|| {
+                            let r = crate::commands::execute(&slash, &mut eng);
+                            (r, String::new())
                         })
-                    });
+                    } else {
+                        tokio::task::block_in_place(|| {
+                            crate::stdout_capture::capture_stdout(|| {
+                                crate::commands::execute(&slash, &mut eng)
+                            })
+                        })
+                    };
                     match result {
                         crate::commands::CommandResult::Exit => {
                             app.should_quit = true;
@@ -310,6 +343,12 @@ pub(super) async fn event_loop(
                             app.status_message = format!("ran {slash}");
                         }
                     }
+                    // Keep TUI header/path and `!` shell in sync with engine
+                    // after `/cd` (and any other cwd-changing command).
+                    app.cwd = eng.state().cwd.clone();
+                    if interactive {
+                        app.force_full_redraw = true;
+                    }
                     app.dirty = true;
                 }
                 Err(_) => {
@@ -325,6 +364,8 @@ pub(super) async fn event_loop(
                 Ok(mut eng) => {
                     use agent_code_lib::services::shell_passthrough;
                     use std::sync::{Arc, Mutex};
+                    // Prefer engine cwd (source of truth after `/cd`).
+                    app.cwd = eng.state().cwd.clone();
                     let cwd = std::path::PathBuf::from(&app.cwd);
                     let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
                     let out_l = lines.clone();
