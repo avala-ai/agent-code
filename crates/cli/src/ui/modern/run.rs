@@ -304,6 +304,7 @@ pub(super) async fn event_loop(
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     let interactive = crate::commands::is_interactive_slash(&slash);
+                    let editor = crate::commands::is_editor_slash(&slash);
                     // Always park the worker: slash arms may call
                     // `Handle::block_on` (e.g. cwd hooks) even after leaving
                     // the alt-screen.
@@ -311,13 +312,21 @@ pub(super) async fn event_loop(
                         if interactive {
                             // Leave alt-screen/raw mode so pickers, scrollback
                             // viewer, $EDITOR, and y/N prompts own the real
-                            // terminal. Tee stdout so short-circuit diagnostics
-                            // (empty session list, missing file, …) still reach
-                            // the modern transcript after we re-enter.
+                            // terminal.
                             with_main_screen(|| {
-                                crate::stdout_capture::capture_stdout_tee(|| {
-                                    crate::commands::execute(&slash, &mut eng)
-                                })
+                                if editor {
+                                    // `$EDITOR` requires a real TTY on stdout
+                                    // (`isatty`); never redirect fd 1 to a pipe.
+                                    let r = crate::commands::execute(&slash, &mut eng);
+                                    (r, String::new())
+                                } else {
+                                    // Tee so short-circuit diagnostics still
+                                    // reach the modern transcript after we
+                                    // re-enter the alt-screen.
+                                    crate::stdout_capture::capture_stdout_tee(|| {
+                                        crate::commands::execute(&slash, &mut eng)
+                                    })
+                                }
                             })
                         } else {
                             crate::stdout_capture::capture_stdout(|| {

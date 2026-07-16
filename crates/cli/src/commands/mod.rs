@@ -652,16 +652,8 @@ pub fn complete_slash(partial: &str) -> Vec<&'static str> {
     out
 }
 
-/// True when a slash built-in needs the real terminal (picker, pager, or
-/// `$EDITOR`) rather than captured stdout under the alt-screen TUI.
-///
-/// **Only** commands that take over stdin/stdout UI belong here. List-only
-/// commands (`/sessions`, `/mcp`, `/plugins`, `/color`, `/add-dir`, …) stay
-/// on the captured path so their output lands in the modern transcript.
-///
-/// Matches the typed head (name or alias) against the command table so
-/// `/tutorial` and `/powerup` resolve the same way `execute` does.
-pub fn is_interactive_slash(cmd: &str) -> bool {
+/// Resolve the typed slash head (name or alias) to the canonical command name.
+fn resolve_slash_name(cmd: &str) -> String {
     let head = cmd
         .trim()
         .trim_start_matches('/')
@@ -669,6 +661,57 @@ pub fn is_interactive_slash(cmd: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    COMMANDS
+        .iter()
+        .find(|c| {
+            c.name.eq_ignore_ascii_case(&head)
+                || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(&head))
+        })
+        .map(|c| c.name.to_string())
+        .unwrap_or(head)
+}
+
+/// True when a slash built-in needs the real terminal (picker, pager,
+/// `$EDITOR`, or a y/N stdin prompt) rather than captured stdout under the
+/// alt-screen TUI.
+///
+/// List-only commands (`/sessions`, `/mcp`, `/plugin list`, …) stay on the
+/// captured path so their output lands in the modern transcript.
+pub fn is_interactive_slash(cmd: &str) -> bool {
+    let name = resolve_slash_name(cmd);
+    matches!(
+        name.as_str(),
+        // Session picker (not `/sessions`, which only prints a list).
+        "session"
+            // Scrollback pager.
+            | "scroll"
+            // `$EDITOR` owners — must keep a real TTY on stdout (no pipe tee).
+            | "editor"
+            | "open"
+            // Theme / model / tutorial pickers.
+            | "theme"
+            | "model"
+            | "powerup"
+            // Full interactive uninstall flow.
+            | "uninstall"
+    ) || slash_needs_stdin_prompt(cmd)
+}
+
+/// True for `/editor` / `/open` — spawned `$EDITOR` requires a real TTY on
+/// stdout (`isatty`), so the modern bridge must not redirect fd 1 to a pipe.
+pub fn is_editor_slash(cmd: &str) -> bool {
+    matches!(resolve_slash_name(cmd).as_str(), "editor" | "open")
+}
+
+/// Only the subcommands that block on `stdin().read_line` for y/N.
+///
+/// Output-only arms (`/plugin list`, `/team-remember list`, …) stay on the
+/// normal captured path so transcript output is preserved (especially on
+/// Windows, where the interactive tee path intentionally skips capture).
+fn slash_needs_stdin_prompt(cmd: &str) -> bool {
+    let raw = cmd.trim().trim_start_matches('/');
+    let mut parts = raw.split_whitespace();
+    let head = parts.next().unwrap_or("").to_ascii_lowercase();
     let name = COMMANDS
         .iter()
         .find(|c| {
@@ -677,24 +720,30 @@ pub fn is_interactive_slash(cmd: &str) -> bool {
         })
         .map(|c| c.name)
         .unwrap_or(head.as_str());
-    matches!(
-        name,
-        // Session picker (not `/sessions`, which only prints a list).
-        "session"
-            // Scrollback pager.
-            | "scroll"
-            // `$EDITOR` owners.
-            | "editor"
-            | "open"
-            // Theme / model / tutorial pickers.
-            | "theme"
-            | "model"
-            | "powerup"
-            // stdin y/N confirmations (raw-mode hung without main screen).
-            | "team-remember"
-            | "plugin"
-            | "uninstall"
-    )
+
+    match name {
+        "team-remember" => {
+            // `/team-remember list` / `remove` — no prompt.
+            // `/team-remember <text> [--force]` — prompts unless `--force`.
+            let rest: Vec<&str> = parts.collect();
+            if rest.is_empty() {
+                return false;
+            }
+            let sub = rest[0].to_ascii_lowercase();
+            if sub == "list" || sub == "remove" {
+                return false;
+            }
+            !rest.contains(&"--force")
+        }
+        "plugin" => {
+            // Only `remove` / `uninstall` ask y/N.
+            matches!(
+                parts.next().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("remove") | Some("uninstall")
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Slash-command entries for the Ctrl+P palette.
@@ -767,12 +816,20 @@ mod slash_lookup_tests {
         assert!(is_interactive_slash("/pick-session")); // alias of session
         assert!(is_interactive_slash("editor foo"));
         assert!(is_interactive_slash("/open src/main.rs"));
+        assert!(is_editor_slash("/open src/main.rs"));
+        assert!(is_editor_slash("/editor"));
+        assert!(!is_editor_slash("/session"));
         assert!(is_interactive_slash("/theme"));
         assert!(is_interactive_slash("/powerup"));
         assert!(is_interactive_slash("/tutorial")); // alias of powerup
-        // stdin y/N confirmations.
-        assert!(is_interactive_slash("/team-remember note --force"));
+        // stdin y/N confirmations only (not list/help/force-add).
+        assert!(is_interactive_slash("/team-remember keep this note"));
+        assert!(!is_interactive_slash("/team-remember note --force"));
+        assert!(!is_interactive_slash("/team-remember list"));
+        assert!(!is_interactive_slash("/team-remember remove x"));
         assert!(is_interactive_slash("/plugin remove foo"));
+        assert!(!is_interactive_slash("/plugin list"));
+        assert!(!is_interactive_slash("/plugin help"));
         assert!(is_interactive_slash("/uninstall"));
         // Output-only: must stay on captured path (transcript), not main-screen.
         assert!(!is_interactive_slash("/sessions"));
