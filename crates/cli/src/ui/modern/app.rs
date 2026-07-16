@@ -1559,10 +1559,13 @@ impl App {
     }
 
     /// Ephemeral status toast (~2s at 80ms ticks).
+    ///
+    /// Does **not** write `status_message` — that field is durable chrome
+    /// (mode changes, queue notes, slash status). When the toast expires the
+    /// status bar falls back to whatever durable message was already there,
+    /// not a stale copy of the toast text.
     pub fn push_toast(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        self.status_message = msg.clone();
-        self.toast = Some((msg, 28));
+        self.toast = Some((msg.into(), 28));
         self.dirty = true;
     }
 
@@ -1872,6 +1875,22 @@ mod tests {
         );
         app.phase = Phase::Streaming;
         assert!(app.needs_anim_tick());
+    }
+
+    #[test]
+    fn push_toast_does_not_clobber_status_message() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.status_message = "mode → PLAN".into();
+        app.push_toast("copied selection (4 bytes) via osc52");
+        assert_eq!(app.status_message, "mode → PLAN");
+        assert!(app.toast.is_some());
+        // Expire toast: status must still be the durable message.
+        if let Some((_, ref mut left)) = app.toast {
+            *left = 1;
+        }
+        app.tick();
+        assert!(app.toast.is_none());
+        assert_eq!(app.status_message, "mode → PLAN");
     }
 
     #[test]

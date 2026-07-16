@@ -551,6 +551,10 @@ pub(super) async fn event_loop(
                 loop_err = Some(e);
                 break;
             }
+            // Keep OSC window title in sync with phase on every paint so
+            // idle after a turn/HITL resets the spinner / "action required"
+            // title (anim_tick alone stops once needs_anim_tick is false).
+            update_terminal_title(app);
             app.dirty = false;
         }
 
