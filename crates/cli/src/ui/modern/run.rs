@@ -310,10 +310,14 @@ pub(super) async fn event_loop(
                     let (result, captured) = tokio::task::block_in_place(|| {
                         if interactive {
                             // Leave alt-screen/raw mode so pickers, scrollback
-                            // viewer, and $EDITOR can own the real terminal.
+                            // viewer, $EDITOR, and y/N prompts own the real
+                            // terminal. Tee stdout so short-circuit diagnostics
+                            // (empty session list, missing file, …) still reach
+                            // the modern transcript after we re-enter.
                             with_main_screen(|| {
-                                let r = crate::commands::execute(&slash, &mut eng);
-                                (r, String::new())
+                                crate::stdout_capture::capture_stdout_tee(|| {
+                                    crate::commands::execute(&slash, &mut eng)
+                                })
                             })
                         } else {
                             crate::stdout_capture::capture_stdout(|| {

@@ -690,6 +690,10 @@ pub fn is_interactive_slash(cmd: &str) -> bool {
             | "theme"
             | "model"
             | "powerup"
+            // stdin y/N confirmations (raw-mode hung without main screen).
+            | "team-remember"
+            | "plugin"
+            | "uninstall"
     )
 }
 
@@ -766,6 +770,10 @@ mod slash_lookup_tests {
         assert!(is_interactive_slash("/theme"));
         assert!(is_interactive_slash("/powerup"));
         assert!(is_interactive_slash("/tutorial")); // alias of powerup
+        // stdin y/N confirmations.
+        assert!(is_interactive_slash("/team-remember note --force"));
+        assert!(is_interactive_slash("/plugin remove foo"));
+        assert!(is_interactive_slash("/uninstall"));
         // Output-only: must stay on captured path (transcript), not main-screen.
         assert!(!is_interactive_slash("/sessions"));
         assert!(!is_interactive_slash("/mcp"));

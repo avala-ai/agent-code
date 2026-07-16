@@ -12,11 +12,35 @@ where
 {
     #[cfg(unix)]
     {
-        capture_stdout_unix(f)
+        capture_stdout_unix(f, false)
     }
     #[cfg(windows)]
     {
-        capture_stdout_windows(f)
+        capture_stdout_windows(f, false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (f(), String::new())
+    }
+}
+
+/// Like [`capture_stdout`], but also mirrors bytes to the original terminal.
+///
+/// Used for interactive slash commands (pickers / `$EDITOR` / y-N prompts) so
+/// short-circuit diagnostics still land in the modern transcript without
+/// hiding the live UI. On platforms without a tee path, falls back to plain
+/// capture (Windows: capture then replay to the console after `f`).
+pub fn capture_stdout_tee<F, R>(f: F) -> (R, String)
+where
+    F: FnOnce() -> R,
+{
+    #[cfg(unix)]
+    {
+        capture_stdout_unix(f, true)
+    }
+    #[cfg(windows)]
+    {
+        capture_stdout_windows(f, true)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -25,12 +49,12 @@ where
 }
 
 #[cfg(unix)]
-fn capture_stdout_unix<F, R>(f: F) -> (R, String)
+fn capture_stdout_unix<F, R>(f: F, tee: bool) -> (R, String)
 where
     F: FnOnce() -> R,
 {
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, RawFd};
 
     let mut pair = [0i32; 2];
@@ -41,7 +65,7 @@ where
     let read_fd: RawFd = pair[0];
     let write_fd: RawFd = pair[1];
 
-    // SAFETY: duplicate current stdout.
+    // SAFETY: duplicate current stdout (restore target).
     let saved = unsafe { libc::dup(1) };
     if saved < 0 {
         unsafe {
@@ -51,10 +75,29 @@ where
         return (f(), String::new());
     }
 
+    // Optional second dup for the tee writer thread (live mirror).
+    let tee_fd = if tee {
+        let d = unsafe { libc::dup(saved) };
+        if d < 0 {
+            unsafe {
+                libc::close(saved);
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return (f(), String::new());
+        }
+        Some(d)
+    } else {
+        None
+    };
+
     // SAFETY: redirect stdout to the pipe write end.
     if unsafe { libc::dup2(write_fd, 1) } < 0 {
         unsafe {
             libc::close(saved);
+            if let Some(t) = tee_fd {
+                libc::close(t);
+            }
             libc::close(read_fd);
             libc::close(write_fd);
         }
@@ -69,12 +112,30 @@ where
     // Drain the pipe concurrently. If we only read after `f` returns, a
     // command that prints more than the OS pipe buffer (often ~64 KiB) can
     // block forever inside `println!` / `write(1, …)`.
-    // SAFETY: exclusive ownership of `read_fd` moves into the reader thread.
+    // SAFETY: exclusive ownership of `read_fd` (and tee_fd) moves into the
+    // reader thread.
     let reader = std::thread::spawn(move || {
         let mut file = unsafe { File::from_raw_fd(read_fd) };
         let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
-        // File drop closes read_fd.
+        if let Some(tfd) = tee_fd {
+            let mut real = unsafe { File::from_raw_fd(tfd) };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match file.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = real.write_all(&chunk[..n]);
+                        let _ = real.flush();
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+            // real + file drop close their fds.
+        } else {
+            let _ = file.read_to_end(&mut buf);
+            // File drop closes read_fd.
+        }
         buf
     });
 
@@ -103,10 +164,17 @@ where
 /// talk through the process STD_OUTPUT_HANDLE; a temp-file swap is the
 /// portable capture path without pulling extra native crates.
 #[cfg(windows)]
-fn capture_stdout_windows<F, R>(f: F) -> (R, String)
+fn capture_stdout_windows<F, R>(f: F, tee: bool) -> (R, String)
 where
     F: FnOnce() -> R,
 {
+    // Live pickers / y-N prompts need the real console. A full live tee is
+    // Unix-only; on Windows interactive calls skip capture so the UI works
+    // (diagnostics flash on the main screen during with_main_screen).
+    if tee {
+        return (f(), String::new());
+    }
+
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
@@ -257,6 +325,23 @@ mod tests {
             out.len() > 64 * 1024,
             "must exceed typical pipe buffer (got {})",
             out.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tee_captures_and_mirrors() {
+        let _g = capture_lock();
+        let ((), out) = capture_stdout_tee(|| {
+            let msg = b"hello-tee\n";
+            unsafe {
+                libc::write(1, msg.as_ptr().cast(), msg.len());
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        });
+        assert!(
+            out.contains("hello-tee"),
+            "tee must still capture for transcript, got {out:?}"
         );
     }
 
