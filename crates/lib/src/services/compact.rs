@@ -504,6 +504,7 @@ pub async fn compact_with_llm(
     // minimum 5 messages with text content).
     let keep_count = calculate_keep_count(messages);
     let split_point = messages.len().saturating_sub(keep_count);
+    let split_point = adjust_split_for_tool_pairing(messages, split_point);
 
     if split_point < 2 {
         return None; // Not enough to summarize.
@@ -571,6 +572,54 @@ pub async fn compact_with_llm(
     Some(removed)
 }
 
+/// Move a compaction cut backwards until it no longer separates a
+/// `tool_use` from its `tool_result`.
+///
+/// The token-budget cut can land between an assistant `tool_use` and
+/// the user `tool_result` that answers it. Keeping that tail verbatim
+/// produces a result whose originating call was summarized away, and
+/// strict providers reject such history outright. Widening the kept
+/// tail (never shrinking it) until every kept `tool_result` has its
+/// `tool_use` in the tail preserves the keep-recent guarantee; the
+/// loop terminates at 0 in the worst case, where the caller's
+/// minimum-size check skips compaction for this round.
+fn adjust_split_for_tool_pairing(messages: &[Message], mut split: usize) -> usize {
+    use std::collections::HashSet;
+
+    while split > 0 {
+        let head_use_ids: HashSet<&str> = messages[..split]
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a.content.iter().filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // A pair is split only when a kept result's originating call is
+        // in the summarized head. Results whose call exists nowhere in
+        // the history (already-corrupt input) must not pin the cut at
+        // zero and permanently disable compaction — normalization
+        // repairs those before the next request.
+        let splits_pair = messages[split..].iter().any(|m| match m {
+            Message::User(u) => u.content.iter().any(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    head_use_ids.contains(tool_use_id.as_str())
+                }
+                _ => false,
+            }),
+            _ => false,
+        });
+        if !splits_pair {
+            break;
+        }
+        split -= 1;
+    }
+    split
+}
+
 /// Calculate how many recent messages to keep during compaction.
 ///
 /// Keeps at least 5 messages with text content, or messages totaling
@@ -622,6 +671,111 @@ fn calculate_keep_count(messages: &[Message]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::message::{AssistantMessage, tool_result_message, user_message};
+
+    fn assistant_text(text: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })
+    }
+
+    fn assistant_tool_use(ids: &[&str]) -> Message {
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: ids
+                .iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                })
+                .collect(),
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })
+    }
+
+    #[test]
+    fn split_moves_back_to_keep_tool_pair_together() {
+        let messages = vec![
+            user_message("start"),
+            assistant_text("ok"),
+            user_message("run it"),
+            assistant_tool_use(&["t1"]),
+            tool_result_message("t1", "done", false),
+            assistant_text("finished"),
+        ];
+        // A cut at the tool_result would orphan it from t1's tool_use.
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 4), 3);
+        // A cut inside the pair's assistant message is already safe.
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 3), 3);
+    }
+
+    #[test]
+    fn split_moves_past_multiple_results_of_one_exchange() {
+        let messages = vec![
+            user_message("start"),
+            assistant_text("ok"),
+            assistant_tool_use(&["t1", "t2"]),
+            tool_result_message("t1", "one", false),
+            tool_result_message("t2", "two", false),
+            assistant_text("finished"),
+        ];
+        // Cutting between the two results must walk back past the
+        // tool_use message so both kept results stay paired.
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 4), 2);
+    }
+
+    #[test]
+    fn safe_split_is_unchanged() {
+        let messages = vec![
+            user_message("start"),
+            assistant_tool_use(&["t1"]),
+            tool_result_message("t1", "done", false),
+            assistant_text("finished"),
+            user_message("next question"),
+            assistant_text("answer"),
+        ];
+        // Whole pair is in the head — nothing to fix.
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 3), 3);
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 4), 4);
+    }
+
+    #[test]
+    fn preexisting_orphan_result_does_not_pin_split_at_zero() {
+        // A result whose tool_use exists nowhere (corrupt import) must
+        // not drag the cut to 0 and disable compaction forever.
+        let messages = vec![
+            user_message("start"),
+            assistant_text("ok"),
+            tool_result_message("ghost", "orphan", false),
+            assistant_text("finished"),
+        ];
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 2), 2);
+    }
+
+    #[test]
+    fn split_walks_to_zero_when_history_opens_mid_exchange() {
+        let messages = vec![
+            assistant_tool_use(&["t1"]),
+            tool_result_message("t1", "done", false),
+            assistant_text("finished"),
+        ];
+        // The only safe cut is before the exchange; the caller's
+        // minimum-size check then skips compaction for this round.
+        assert_eq!(adjust_split_for_tool_pairing(&messages, 1), 0);
+    }
 
     #[test]
     fn hash_content_detects_change() {
