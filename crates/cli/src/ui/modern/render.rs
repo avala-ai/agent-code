@@ -91,7 +91,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         let behind = app.pending_modal_count();
         match modal {
             crate::ui::modern::app::Modal::Permission(p) => {
-                draw_permission_modal(frame, area, &p, behind)
+                draw_permission_modal(frame, area, &p, behind, app.perm_scroll)
             }
             crate::ui::modern::app::Modal::Plan(p) => draw_plan_modal(frame, area, &p, behind),
             crate::ui::modern::app::Modal::Question(q) => {
@@ -599,6 +599,7 @@ fn draw_permission_modal(
     area: Rect,
     pending: &PendingPermission,
     pending_behind: usize,
+    scroll: usize,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if pending_behind > 0 {
@@ -624,19 +625,32 @@ fn draw_permission_modal(
     }
     if let Some(ref preview) = pending.input_preview {
         lines.push(Line::from(""));
-        // Keep preview short so description stays readable; key footer is
-        // sticky either way, but a huge body is still noisy.
-        const MAX_PREVIEW: usize = 8;
-        let total = preview.lines().count();
-        for row in preview.lines().take(MAX_PREVIEW) {
+        // Adaptive viewport over the FULL input: tall terminals show
+        // more rows; ↑/↓ (and PgUp/PgDn) pan the rest so a 200-line
+        // tool input can be inspected before answering. The floor
+        // keeps the description readable on small terminals.
+        let viewport = (area.height as usize).saturating_sub(12).clamp(8, 30);
+        let rows: Vec<&str> = preview.lines().collect();
+        let total = rows.len();
+        let scroll = scroll.min(total.saturating_sub(viewport));
+        if scroll > 0 {
             lines.push(Line::from(Span::styled(
-                row.to_string(),
+                format!("… {scroll} earlier lines (↑ to scroll)"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+        for row in rows.iter().skip(scroll).take(viewport) {
+            lines.push(Line::from(Span::styled(
+                (*row).to_string(),
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        if total > MAX_PREVIEW {
+        let below = total.saturating_sub(scroll + viewport);
+        if below > 0 {
             lines.push(Line::from(Span::styled(
-                format!("… {} more lines", total - MAX_PREVIEW),
+                format!("… {below} more lines (↓ to scroll)"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -1203,6 +1217,62 @@ mod tests {
         assert!(s.contains("deny"), "deny hint missing:\n{s}");
         assert!(s.contains("cargo publish"), "buffer:\n{s}");
         assert!(s.contains("from subagent-2"), "origin line missing:\n{s}");
+    }
+
+    #[test]
+    fn permission_modal_scrolls_through_full_input() {
+        // 200-line input: the top shows an adaptive window; scrolling
+        // pans to rows that were previously hidden (#413).
+        let preview: String = (1..=200)
+            .map(|i| format!("\"arg{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let backend = TestBackend::new(90, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: "big input".into(),
+                    origin: None,
+                    input_preview: Some(preview),
+                    respond,
+                },
+            ));
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let top = buffer_to_string(term.backend().buffer());
+        assert!(top.contains("\"arg1\":"), "unscrolled shows head:\n{top}");
+        assert!(!top.contains("\"arg150\":"), "tail hidden at top:\n{top}");
+        assert!(top.contains("more lines (↓"), "below indicator:\n{top}");
+
+        app.perm_scroll = 148;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let scrolled = buffer_to_string(term.backend().buffer());
+        assert!(
+            scrolled.contains("\"arg150\":"),
+            "scrolled view reaches deep rows:\n{scrolled}"
+        );
+        assert!(
+            scrolled.contains("earlier lines (↑"),
+            "above indicator:\n{scrolled}"
+        );
+        assert!(
+            scrolled.contains("[y]") && scrolled.contains("[n]"),
+            "key footer stays visible while scrolled:\n{scrolled}"
+        );
+
+        // Absurd offset clamps to the end instead of blanking the view.
+        app.perm_scroll = 10_000;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let clamped = buffer_to_string(term.backend().buffer());
+        assert!(
+            clamped.contains("\"arg200\": 200"),
+            "clamped to last rows:\n{clamped}"
+        );
     }
 
     #[test]

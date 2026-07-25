@@ -376,6 +376,9 @@ pub struct App {
     pub selected_item: Option<usize>,
 
     pub turn_count: usize,
+    /// Scroll offset (in preview lines) of the front permission modal's
+    /// input view. Reset whenever the modal queue advances.
+    pub perm_scroll: usize,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
@@ -513,6 +516,7 @@ impl App {
             expanded: std::collections::HashSet::new(),
             selected_item: None,
             turn_count: 0,
+            perm_scroll: 0,
             tokens_in: 0,
             tokens_out: 0,
             cost_usd: 0.0,

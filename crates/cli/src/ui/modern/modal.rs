@@ -77,6 +77,8 @@ impl App {
     /// After a modal is answered, close it and return to the turn if the
     /// queue is now empty.
     fn advance_modal_phase(&mut self) {
+        // The scroll belongs to the modal that just closed.
+        self.perm_scroll = 0;
         if self.modals.is_empty() && self.phase == Phase::Permission {
             if self.turn_live {
                 self.phase = Phase::Streaming;
