@@ -302,11 +302,29 @@ fn contained_in(cwd: &Path, path: &Path) -> bool {
 }
 
 /// Label a resolved path for the model: workspace-relative when possible.
+///
+/// Separators are normalized to `/` on every platform. The mention the
+/// user typed uses `/`, and the label is what the model sees and quotes
+/// back in tool calls, so a Windows session emitting `src\main.rs` would
+/// hand the model a path shaped differently from the one it was asked
+/// about.
 fn display_path(cwd: &Path, path: &Path, raw: &str) -> String {
     let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     path.strip_prefix(&cwd_canon)
-        .map(|rel| rel.to_string_lossy().replace('"', "'"))
-        .unwrap_or_else(|_| raw.replace('"', "'"))
+        .map(|rel| sanitize_label(&rel.to_string_lossy()))
+        .unwrap_or_else(|_| sanitize_label(raw))
+}
+
+/// Quote-strip a path label, and on Windows fold `\` to `/`.
+///
+/// The fold is deliberately `cfg`-gated: on Unix a backslash is a legal
+/// character in a filename, so rewriting it there would mislabel a real
+/// file rather than normalize a separator.
+fn sanitize_label(s: &str) -> String {
+    let s = s.replace('"', "'");
+    #[cfg(windows)]
+    let s = s.replace('\\', "/");
+    s
 }
 
 /// Read at most `cap` bytes of `path` as UTF-8 text.
@@ -588,6 +606,21 @@ mod tests {
             out.notes
         );
         assert!(!out.prompt.contains("<file"));
+    }
+
+    #[test]
+    fn file_labels_use_forward_slashes_on_every_platform() {
+        let dir = fixture();
+        let out = expand_mentions("see @src/main.rs", dir.path()).expect("expanded");
+        // The model is handed the same path shape the user typed. On
+        // Windows `strip_prefix` yields `src\main.rs`, which would make
+        // the label disagree with the mention.
+        assert!(
+            out.prompt.contains("<file path=\"src/main.rs\">"),
+            "label kept an OS separator: {}",
+            out.prompt
+        );
+        assert!(!out.prompt.contains("src\\main.rs"));
     }
 
     // Unix-only: creating a symlink on Windows needs developer mode or
