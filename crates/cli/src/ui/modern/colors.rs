@@ -23,6 +23,13 @@ pub struct Palette {
     pub inactive: Color,
     pub text: Color,
     pub plan: Color,
+    // Diff rendering (inline edit cards).
+    pub diff_add: Color,
+    pub diff_remove: Color,
+    pub diff_add_dim: Color,
+    pub diff_remove_dim: Color,
+    pub diff_add_word: Color,
+    pub diff_remove_word: Color,
 }
 
 /// Read the active theme (falls back to midnight if not initialized).
@@ -38,6 +45,12 @@ pub fn palette() -> Palette {
         inactive: theme_to_ratatui(t.inactive),
         text: theme_to_ratatui(t.text),
         plan: theme_to_ratatui(t.plan_mode),
+        diff_add: theme_to_ratatui(t.diff_add),
+        diff_remove: theme_to_ratatui(t.diff_remove),
+        diff_add_dim: theme_to_ratatui(t.diff_added_dimmed),
+        diff_remove_dim: theme_to_ratatui(t.diff_removed_dimmed),
+        diff_add_word: theme_to_ratatui(t.diff_added_word),
+        diff_remove_word: theme_to_ratatui(t.diff_removed_word),
     }
 }
 

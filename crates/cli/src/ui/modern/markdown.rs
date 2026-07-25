@@ -41,12 +41,12 @@ pub struct RenderedMd {
 /// (plan §7 span budget). Beyond this the tail renders unstyled.
 const MAX_SPANS: usize = 20_000;
 
-fn syntax_set() -> &'static SyntaxSet {
+pub(super) fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     SS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn code_theme() -> &'static Theme {
+pub(super) fn code_theme() -> &'static Theme {
     static TS: OnceLock<Theme> = OnceLock::new();
     TS.get_or_init(|| {
         let mut set = ThemeSet::load_defaults();

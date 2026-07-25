@@ -376,33 +376,43 @@ fn render_tool_card(
     if let Some(r) = result
         && !r.is_empty()
     {
-        let color = if is_error {
-            Color::Red
+        // Rich inline diff for successful edit tools: FileEdit/MultiEdit return
+        // a unified diff as their result, so render it as a syntax-highlighted
+        // +/- diff (with word-level emphasis) rather than a flat dim block.
+        // `detail` is the edited file path, used for syntax detection.
+        if !is_error && kind == ToolKind::Edit && super::diffview::looks_like_unified_diff(r) {
+            lines.extend(super::diffview::render_unified_diff(
+                r, detail, expanded, 24,
+            ));
         } else {
-            Color::DarkGray
-        };
-        let total = r.lines().count();
-        let head = if expanded {
-            total
-        } else if is_error {
-            5
-        } else {
-            1
-        };
-        for (i, line) in r.lines().take(head).enumerate() {
-            let prefix = if i == 0 { "   ↳ " } else { "     " };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{line}"),
-                Style::default().fg(color),
-            )));
-        }
-        if !expanded && total > head {
-            lines.push(Line::from(Span::styled(
-                format!("     … +{} more lines · e expand", total - head),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )));
+            let color = if is_error {
+                Color::Red
+            } else {
+                Color::DarkGray
+            };
+            let total = r.lines().count();
+            let head = if expanded {
+                total
+            } else if is_error {
+                5
+            } else {
+                1
+            };
+            for (i, line) in r.lines().take(head).enumerate() {
+                let prefix = if i == 0 { "   ↳ " } else { "     " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{line}"),
+                    Style::default().fg(color),
+                )));
+            }
+            if !expanded && total > head {
+                lines.push(Line::from(Span::styled(
+                    format!("     … +{} more lines · e expand", total - head),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
     }
     lines

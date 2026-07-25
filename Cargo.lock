@@ -30,6 +30,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "similar",
  "syntect",
  "tempfile",
  "termimad",
