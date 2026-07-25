@@ -30,6 +30,11 @@ pub struct Palette {
     pub diff_remove_dim: Color,
     pub diff_add_word: Color,
     pub diff_remove_word: Color,
+    // Message backgrounds — tint the user's own turns so they stand out
+    // from the model's output when scanning back through a transcript.
+    pub user_msg_bg: Color,
+    pub bash_msg_bg: Color,
+    pub memory_msg_bg: Color,
 }
 
 /// Read the active theme (falls back to midnight if not initialized).
@@ -51,6 +56,9 @@ pub fn palette() -> Palette {
         diff_remove_dim: theme_to_ratatui(t.diff_removed_dimmed),
         diff_add_word: theme_to_ratatui(t.diff_added_word),
         diff_remove_word: theme_to_ratatui(t.diff_removed_word),
+        user_msg_bg: theme_to_ratatui(t.user_message_bg),
+        bash_msg_bg: theme_to_ratatui(t.bash_message_bg),
+        memory_msg_bg: theme_to_ratatui(t.memory_message_bg),
     }
 }
 

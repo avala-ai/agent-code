@@ -215,11 +215,31 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
     };
     match item {
         TranscriptItem::User(t) => {
-            let accent = palette().accent;
+            // Tint the user's own turns so they're findable when scanning
+            // back through a long transcript. The prefix selects the tint:
+            // `!` is a shell passthrough and `#` a memory note, which read
+            // as different kinds of input than a prompt.
+            let p = palette();
+            let (marker, bg) = match t.chars().next() {
+                Some('!') => ("!", p.bash_msg_bg),
+                Some('#') => ("#", p.memory_msg_bg),
+                _ => ("❯", p.user_msg_bg),
+            };
+            let body = t.strip_prefix(['!', '#']).unwrap_or(t).trim_start();
+            let text_style = Style::default().fg(p.text).bg(bg);
             lines.push(Line::from(vec![
                 sel.clone(),
-                Span::styled("❯ ", Style::default().fg(accent)),
-                Span::styled(t.clone(), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{marker} "),
+                    Style::default()
+                        .fg(p.accent)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(body.to_string(), text_style),
+                // One cell of trailing tint so the highlight reads as a
+                // block rather than stopping flush against the last glyph.
+                Span::styled(" ", text_style),
             ]));
             lines.push(Line::from(""));
         }
@@ -655,5 +675,54 @@ mod tests {
         c.sync(&[item("a")], 40, &std::collections::HashSet::new(), None); // e.g. after /clear + one push
         assert_eq!(c.block_count(), 1);
         assert_eq!(c.total_lines(), 1);
+    }
+}
+
+#[cfg(test)]
+mod user_message_tint_tests {
+    use super::*;
+
+    fn render_user(text: &str) -> Vec<Line<'static>> {
+        render_item(&TranscriptItem::User(text.into()), false, false)
+    }
+
+    /// Every span of the user's line carries a background, so the turn
+    /// reads as a tinted block. These theme slots existed but nothing
+    /// consumed them, leaving user input visually identical to output.
+    #[test]
+    fn user_turn_is_tinted_across_the_whole_line() {
+        let lines = render_user("hello world");
+        let spans = &lines[0].spans;
+        // Skip the leading selection gutter cell.
+        let painted: Vec<_> = spans.iter().skip(1).collect();
+        assert!(!painted.is_empty());
+        for s in painted {
+            assert!(
+                s.style.bg.is_some(),
+                "every span after the gutter must be tinted: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_selects_a_distinct_tint_per_input_kind() {
+        let bg = |t: &str| render_user(t)[0].spans[2].style.bg.unwrap();
+        let prompt = bg("hello");
+        let shell = bg("!ls -la");
+        let memory = bg("#remember this");
+        assert_ne!(prompt, shell, "shell passthrough needs its own tint");
+        assert_ne!(prompt, memory, "memory note needs its own tint");
+        assert_ne!(shell, memory);
+    }
+
+    #[test]
+    fn marker_is_stripped_from_the_rendered_body() {
+        let lines = render_user("!ls -la");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("ls -la"));
+        assert!(
+            !text.contains("!ls"),
+            "marker should not be duplicated: {text}"
+        );
     }
 }
