@@ -314,7 +314,7 @@ fn path_is_inside(path: &Path, dir: &Path) -> bool {
 /// Lexically normalize a path: collapse `.` and `..` components without
 /// touching the filesystem. Sufficient for prefix comparisons against a
 /// known directory.
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {

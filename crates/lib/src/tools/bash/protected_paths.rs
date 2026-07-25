@@ -113,9 +113,21 @@ fn check_segment(segment: &str, depth: u8) -> Result<(), ProtectedPathViolation>
 /// Refuse `path` if it resolves into any protected directory or
 /// blocked system path.
 fn ensure_not_protected(path: &str, source: &str) -> Result<(), ProtectedPathViolation> {
-    let normalized = normalize_path(path);
+    // Check every spelling the token can denote — see `normalized_forms`.
+    // A path is refused if *any* of them lands somewhere protected.
+    for normalized in normalized_forms(path) {
+        ensure_form_not_protected(&normalized, path, source)?;
+    }
+    Ok(())
+}
+
+fn ensure_form_not_protected(
+    normalized: &str,
+    path: &str,
+    source: &str,
+) -> Result<(), ProtectedPathViolation> {
     for dir in PROTECTED_DIRS {
-        if path_targets_dir(&normalized, dir) {
+        if path_targets_dir(normalized, dir) {
             let display = dir.trim_end_matches(['/', '\\']);
             return Err(ProtectedPathViolation {
                 reason: format!(
@@ -126,7 +138,7 @@ fn ensure_not_protected(path: &str, source: &str) -> Result<(), ProtectedPathVio
         }
     }
     for sys in BLOCKED_WRITE_PATHS {
-        if path_targets_dir(&normalized, sys) {
+        if path_targets_dir(normalized, sys) {
             return Err(ProtectedPathViolation {
                 reason: format!(
                     "{source} would write into system path {sys} ({path}); \
@@ -140,7 +152,7 @@ fn ensure_not_protected(path: &str, source: &str) -> Result<(), ProtectedPathVio
     // `None` for project_root so the component-aware fallback inside
     // `is_team_memory_write_target` runs; the bash tool does not have
     // a project-root handle here.
-    if is_team_memory_write_target(Path::new(&normalized), None) {
+    if is_team_memory_write_target(Path::new(normalized), None) {
         return Err(ProtectedPathViolation {
             reason: format!(
                 "{source} would write into .agent/team-memory/ ({path}); \
@@ -427,6 +439,73 @@ fn path_targets_dir(path: &str, dir: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == dir_clean)
 }
 
+/// Canonical forms of a path token, for matching against the protected
+/// lists.
+///
+/// Returns more than one form because a single spelling is not enough:
+///
+/// * **lexical** — quotes stripped, `.` dropped, `..` resolved, repeated
+///   separators collapsed. Without this `/tmp/../etc/passwd` and
+///   `//etc/passwd` both reached `/etc` while plain `/etc/passwd` was
+///   refused.
+/// * **symlink-resolved** — the deepest existing ancestor canonicalized
+///   and the remainder re-appended, so `ln -s /etc /tmp/e` followed by a
+///   write to `/tmp/e/passwd` is seen for what it is.
+///
+/// The caller checks every form and refuses if any one of them lands in
+/// a protected location. Resolution is best-effort: the write target
+/// usually does not exist yet, so a failure to canonicalize falls back
+/// to the lexical form rather than skipping the check.
+fn normalized_forms(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim_matches(|c: char| c == '"' || c == '\'');
+    let lexical = crate::permissions::lexical_normalize(std::path::Path::new(trimmed))
+        .to_string_lossy()
+        .into_owned();
+
+    let mut forms = vec![lexical.clone()];
+    // Keep the raw spelling too: `lexical_normalize` pops `..` past the
+    // start for relative paths, and the untouched token is what the
+    // segment-equality rules for project-relative dirs were written
+    // against.
+    if trimmed != lexical {
+        forms.push(trimmed.to_string());
+    }
+    if let Some(resolved) = resolve_symlinked_ancestor(&lexical)
+        && !forms.contains(&resolved)
+    {
+        forms.push(resolved);
+    }
+    forms
+}
+
+/// Canonicalize the deepest existing ancestor of `path` and re-append the
+/// components below it, so a symlinked directory in the middle of the
+/// path is followed even when the leaf does not exist yet.
+fn resolve_symlinked_ancestor(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return None;
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    // Bounded so a pathological path cannot spin here.
+    for _ in 0..64 {
+        if let Ok(real) = cur.canonicalize() {
+            let mut out = real;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return Some(out.to_string_lossy().into_owned());
+        }
+        let name = cur.file_name()?.to_os_string();
+        suffix.push(name);
+        if !cur.pop() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Strip surrounding quotes and a trailing slash from a path token.
 fn normalize_path(raw: &str) -> String {
     let trimmed = raw.trim_matches(|c: char| c == '"' || c == '\'');
@@ -553,6 +632,55 @@ fn tokenize(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// `/etc/passwd` was refused but `/tmp/../etc/passwd` was not: the
+    /// check compared the raw token, so any traversal segment walked
+    /// straight past it.
+    #[test]
+    fn traversal_cannot_reach_a_protected_directory() {
+        for cmd in [
+            "echo x > /tmp/../etc/passwd",
+            "echo x > //etc/passwd",
+            "echo x > /etc/./passwd",
+            "cp evil /tmp/../etc/passwd",
+            "tee /var/../etc/passwd",
+            "echo x > /usr/local/../../etc/passwd",
+        ] {
+            assert!(
+                check(cmd).is_err(),
+                "traversal reached a protected path: {cmd}"
+            );
+        }
+    }
+
+    /// A symlinked directory mid-path is followed, so the guard sees
+    /// where the write actually lands rather than how it was spelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_does_not_hide_the_destination() {
+        let td = tempfile::tempdir().unwrap();
+        let link = td.path().join("e");
+        if std::os::unix::fs::symlink("/etc", &link).is_err() {
+            return; // no permission to symlink here; nothing to assert
+        }
+        let cmd = format!("echo x > {}/passwd", link.display());
+        assert!(check(&cmd).is_err(), "symlink hid the destination: {cmd}");
+    }
+
+    /// The normalization must not turn ordinary writes into refusals —
+    /// a guard that blocks everything is its own kind of failure.
+    #[test]
+    fn ordinary_writes_are_still_allowed() {
+        for cmd in [
+            "echo ok > /tmp/fine.txt",
+            "echo ok > ./notes.md",
+            "cp a b",
+            "echo ok > src/main.rs",
+            "tee /tmp/build/../out.log",
+        ] {
+            assert!(check(cmd).is_ok(), "false positive on: {cmd}");
+        }
+    }
+
     use super::*;
 
     fn refuse(cmd: &str) {
