@@ -14,6 +14,7 @@ use super::anim::{blink_visible, pulse_style, spinner_glyph, toast_style};
 use super::app::{App, PendingPermission, Phase};
 use super::colors::palette;
 use super::mode::SessionMode;
+use crate::ui::text_safety::escape_deceptive;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.frame_count = app.frame_count.wrapping_add(1);
@@ -612,13 +613,17 @@ fn draw_permission_modal(
         )));
         lines.push(Line::from(""));
     }
+    // Everything below is model- or tool-supplied text on the surface
+    // where the user authorizes execution. Bidi overrides and zero-width
+    // characters would let the rendering disagree with the bytes that
+    // actually run, so they are made visible before display.
     lines.push(Line::from(Span::styled(
-        pending.description.clone(),
+        escape_deceptive(&pending.description).into_owned(),
         Style::default().fg(Color::White),
     )));
     if let Some(ref origin) = pending.origin {
         lines.push(Line::from(Span::styled(
-            format!("from {origin}"),
+            format!("from {}", escape_deceptive(origin)),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -644,7 +649,7 @@ fn draw_permission_modal(
         }
         for row in rows.iter().skip(scroll).take(viewport) {
             lines.push(Line::from(Span::styled(
-                (*row).to_string(),
+                escape_deceptive(row).into_owned(),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -1189,6 +1194,38 @@ mod tests {
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("PLAN"), "buffer:\n{s}");
         assert!(s.contains("design auth"), "buffer:\n{s}");
+    }
+
+    /// The approval modal is where the user authorizes execution, so what
+    /// it paints has to match the bytes that will run. A bidi override in
+    /// the command would otherwise render as a different command entirely.
+    #[test]
+    fn permission_modal_reveals_a_bidi_override_in_the_command() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        // Displays as `rm -rf /tmp/safe # apply patch` in a terminal that
+        // honours the override.
+        let attack = "rm -rf /tmp/safe \u{202e}# hctap ylppa\u{202c}";
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: format!("Bash: run `{attack}`"),
+                    origin: None,
+                    input_preview: Some(format!("{{\n  \"command\": \"{attack}\"\n}}")),
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            !s.contains('\u{202e}'),
+            "a bidi override reached the screen:\n{s}"
+        );
+        assert!(s.contains("<U+202E>"), "override not surfaced:\n{s}");
     }
 
     #[test]

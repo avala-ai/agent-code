@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::TranscriptItem;
 use super::colors::palette;
+use crate::ui::text_safety::escape_deceptive;
 
 struct Cached {
     hash: u64,
@@ -214,8 +215,64 @@ impl LayoutCache {
     }
 }
 
+/// A copy of `item` with deceptive characters escaped, or `None` when it
+/// has none.
+///
+/// See [`crate::ui::text_safety`]: the transcript renders file contents,
+/// diffs and tool output, all of which can carry text designed to display
+/// differently from the bytes it holds.
+fn scrub_item(item: &TranscriptItem) -> Option<TranscriptItem> {
+    use std::borrow::Cow;
+    let dirty = |s: &str| matches!(escape_deceptive(s), Cow::Owned(_));
+    let esc = |s: &str| escape_deceptive(s).into_owned();
+    let esc_opt = |s: &Option<String>| s.as_deref().map(&esc);
+
+    match item {
+        TranscriptItem::User(t) => dirty(t).then(|| TranscriptItem::User(esc(t))),
+        TranscriptItem::Assistant(t) => dirty(t).then(|| TranscriptItem::Assistant(esc(t))),
+        TranscriptItem::Thinking { text, duration_ms } => {
+            dirty(text).then(|| TranscriptItem::Thinking {
+                text: esc(text),
+                duration_ms: *duration_ms,
+            })
+        }
+        TranscriptItem::System(t) => dirty(t).then(|| TranscriptItem::System(esc(t))),
+        TranscriptItem::Error(t) => dirty(t).then(|| TranscriptItem::Error(esc(t))),
+        TranscriptItem::Warning(t) => dirty(t).then(|| TranscriptItem::Warning(esc(t))),
+        TranscriptItem::Tool {
+            call_id,
+            name,
+            detail,
+            result,
+            is_error,
+            live,
+        } => {
+            let any = dirty(name)
+                || dirty(detail)
+                || result.as_deref().is_some_and(dirty)
+                || live.as_deref().is_some_and(dirty);
+            any.then(|| TranscriptItem::Tool {
+                call_id: call_id.clone(),
+                name: esc(name),
+                detail: esc(detail),
+                result: esc_opt(result),
+                is_error: *is_error,
+                live: esc_opt(live),
+            })
+        }
+    }
+}
+
 /// Render one transcript block to logical (pre-wrap) lines.
 pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec<Line<'static>> {
+    // Make bidi overrides and zero-width characters visible before any
+    // arm renders. Done once here rather than per-variant so a new
+    // `TranscriptItem` cannot quietly arrive unscrubbed, and it costs
+    // nothing for the ordinary case: `scrub_item` returns `None` — no
+    // clone — unless the text actually contains one.
+    let scrubbed = scrub_item(item);
+    let item = scrubbed.as_ref().unwrap_or(item);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     let sel = if selected {
         Span::styled("▌", Style::default().fg(palette().accent))
@@ -534,6 +591,72 @@ fn wrap_one(line: Line<'static>, width: usize, out: &mut Vec<Line<'static>>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tool results carry file contents and command output — the most
+    /// likely place for text authored by someone other than the user.
+    #[test]
+    fn a_tool_result_cannot_smuggle_a_bidi_override_into_the_transcript() {
+        let item = TranscriptItem::Tool {
+            call_id: "c1".into(),
+            name: "FileRead".into(),
+            detail: "src/auth.rs".into(),
+            result: Some("if user.is_admin \u{202e}{ grant() }\u{202c}".into()),
+            is_error: false,
+            live: None,
+        };
+        let text: String = render_item(&item, true, false)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(
+            !text.contains('\u{202e}'),
+            "override reached the transcript: {text:?}"
+        );
+    }
+
+    #[test]
+    fn every_transcript_variant_is_scrubbed() {
+        // Guards the entry-point approach: if a variant were rendered
+        // without going through `scrub_item`, it would show up here.
+        let rlo = "\u{202e}";
+        let items = vec![
+            TranscriptItem::User(format!("u{rlo}")),
+            TranscriptItem::Assistant(format!("a{rlo}")),
+            TranscriptItem::Thinking {
+                text: format!("t{rlo}"),
+                duration_ms: Some(1200),
+            },
+            TranscriptItem::System(format!("s{rlo}")),
+            TranscriptItem::Error(format!("e{rlo}")),
+            TranscriptItem::Warning(format!("w{rlo}")),
+            TranscriptItem::Tool {
+                call_id: "c".into(),
+                name: "Bash".into(),
+                detail: format!("d{rlo}"),
+                result: Some(format!("r{rlo}")),
+                is_error: false,
+                live: None,
+            },
+        ];
+        for item in items {
+            let text: String = render_item(&item, true, false)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+                .collect();
+            assert!(
+                !text.contains(rlo),
+                "unscrubbed variant {item:?} rendered: {text:?}"
+            );
+        }
+    }
+
+    /// Clean text must not be copied or altered on the way to the screen.
+    #[test]
+    fn ordinary_transcript_text_is_untouched() {
+        let item = TranscriptItem::System("plain · text — with dashes".into());
+        assert!(scrub_item(&item).is_none(), "cloned a clean item");
+    }
+
     use super::*;
 
     fn item(s: &str) -> TranscriptItem {
