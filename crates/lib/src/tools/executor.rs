@@ -160,6 +160,7 @@ pub async fn execute_tool_calls(
                                     agent_limiter: None,
                                     tool_events: ctx_events,
                                     active_call_id: None,
+                                    subagent_api_defaults: None,
                                 },
                                 &perm_checker,
                             )

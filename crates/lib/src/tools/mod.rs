@@ -284,6 +284,12 @@ pub struct ToolContext {
     pub tool_events: Option<event_sink::ToolEventTx>,
     /// Id of the tool call currently executing (for correlating events).
     pub active_call_id: Option<String>,
+    /// Config-level provider defaults for spawned subagents (the `[api]`
+    /// `subagent_model` / `subagent_base_url` / `subagent_auth_mode`
+    /// keys). The Agent tool folds these under per-call and
+    /// per-definition overrides when resolving a child's endpoint.
+    /// `None` → subagents inherit the parent's provider settings.
+    pub subagent_api_defaults: Option<crate::services::coordinator::SubagentEndpoint>,
 }
 
 impl ToolContext {
@@ -319,6 +325,7 @@ impl ToolContext {
             agent_limiter: None,
             tool_events: None,
             active_call_id: None,
+            subagent_api_defaults: None,
         }
     }
 
@@ -350,6 +357,7 @@ impl ToolContext {
             agent_limiter: self.agent_limiter.clone(),
             tool_events: self.tool_events.clone(),
             active_call_id: Some(call_id.into()),
+            subagent_api_defaults: self.subagent_api_defaults.clone(),
         }
     }
 }

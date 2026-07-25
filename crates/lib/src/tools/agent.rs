@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use super::{Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
 use crate::services::coordinator::{
-    AgentDefinition, AgentRegistry, apply_agent_definition, compose_agent_prompt,
+    AgentDefinition, AgentRegistry, SubagentEndpoint, apply_agent_definition, compose_agent_prompt,
+    resolve_subagent_endpoint,
 };
 use crate::services::subagent_colors::SubagentColor;
 
@@ -160,6 +161,10 @@ impl Tool for AgentTool {
             .ok_or_else(|| ToolError::InvalidInput("'prompt' is required".into()))?;
 
         let isolation = input.get("isolation").and_then(|v| v.as_str());
+        // Per-call override is model-only by design: the tool input is
+        // model-authored, so it must never be able to pick the endpoint
+        // or auth the child sends credentials to. Those come from the
+        // agent definition / config via resolve_subagent_endpoint.
         let model_override = input.get("model").and_then(|v| v.as_str());
         let subagent_type = input
             .get("subagent_type")
@@ -213,6 +218,12 @@ impl Tool for AgentTool {
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let endpoint = resolve_subagent_endpoint(
+            model_override,
+            Some(&definition),
+            ctx.subagent_api_defaults.as_ref(),
+        );
+
         if let Some(tm) = ctx.task_manager.as_ref().filter(|_| run_in_background) {
             let id = spawn_background_agent(
                 prompt,
@@ -224,7 +235,7 @@ impl Tool for AgentTool {
                 ctx.active_disk_output_style.as_deref(),
                 ctx.agent_limiter.clone(),
                 Some(&definition),
-                model_override,
+                &endpoint,
             )
             .await;
             return Ok(ToolResult::success(format!(
@@ -242,7 +253,7 @@ impl Tool for AgentTool {
             assigned_color,
             ctx.active_disk_output_style.as_deref(),
             Some(&definition),
-            model_override,
+            &endpoint,
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -322,6 +333,9 @@ const SUBAGENT_ENV_PASSTHROUGH: &[&str] = &[
 /// When `definition` is `Some`, also applies type-specific model,
 /// max-turns, read-only plan mode, system-prompt prefix, and
 /// permissions/tool-visibility overlays.
+/// `endpoint` carries the resolved provider overrides (see
+/// [`resolve_subagent_endpoint`]); unset fields inherit the parent's
+/// provider settings exactly as before the field existed.
 /// The caller configures stdio: the foreground path uses `output()`;
 /// the background path hands the command to
 /// [`crate::services::background::TaskManager::spawn_command`], which
@@ -333,7 +347,7 @@ pub fn build_subagent_command(
     color: Option<SubagentColor>,
     disk_output_style: Option<&str>,
     definition: Option<&AgentDefinition>,
-    model_override: Option<&str>,
+    endpoint: &SubagentEndpoint,
 ) -> tokio::process::Command {
     let full_prompt = match definition {
         Some(def) => compose_agent_prompt(def, prompt),
@@ -348,8 +362,8 @@ pub fn build_subagent_command(
     cmd.arg("--prompt").arg(full_prompt).current_dir(cwd);
 
     if let Some(def) = definition {
-        apply_agent_definition(&mut cmd, def, model_override);
-    } else if let Some(model) = model_override {
+        apply_agent_definition(&mut cmd, def, endpoint.model.as_deref());
+    } else if let Some(model) = endpoint.model.as_deref() {
         cmd.arg("--model")
             .arg(crate::services::coordinator::resolve_model_alias(model));
     }
@@ -358,6 +372,18 @@ pub fn build_subagent_command(
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
+    }
+
+    // Provider endpoint/auth overrides. Set after the passthrough loop
+    // so they win over an inherited AGENT_CODE_API_BASE_URL. The child
+    // reads both through its normal env layer (`Config::load` /
+    // clap env), so its provider detection and base-url defaulting see
+    // them exactly as if the user had set them.
+    if let Some(url) = endpoint.base_url.as_deref() {
+        cmd.env("AGENT_CODE_API_BASE_URL", url);
+    }
+    if let Some(mode) = endpoint.auth_mode {
+        cmd.env("AGENT_CODE_AUTH_MODE", mode.as_str());
     }
 
     // Mark the child as a subagent and propagate its id/color so the
@@ -395,7 +421,7 @@ pub async fn spawn_background_agent(
     disk_output_style: Option<&str>,
     limiter: Option<std::sync::Arc<crate::services::agent_control::AgentExecutionLimiter>>,
     definition: Option<&AgentDefinition>,
-    model_override: Option<&str>,
+    endpoint: &SubagentEndpoint,
 ) -> crate::services::background::TaskId {
     use crate::services::background::{TaskKind, TaskPayload};
 
@@ -406,7 +432,7 @@ pub async fn spawn_background_agent(
         color,
         disk_output_style,
         definition,
-        model_override,
+        endpoint,
     );
     let payload = TaskPayload::LocalAgent {
         subagent_kind: Some(
@@ -460,7 +486,7 @@ pub async fn spawn_background_workflow(
         color,
         disk_output_style,
         None,
-        None,
+        &SubagentEndpoint::default(),
     );
     let payload = TaskPayload::LocalWorkflow {
         workflow: workflow.to_string(),
@@ -536,6 +562,102 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn endpoint_with_model(model: &str) -> SubagentEndpoint {
+        SubagentEndpoint {
+            model: Some(model.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn command_envs(cmd: &tokio::process::Command) -> HashMap<String, String> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_subagent_command_wires_endpoint_env_overrides() {
+        let endpoint = SubagentEndpoint {
+            model: Some("gpt-5.4".into()),
+            base_url: Some("https://alt.example/v1".into()),
+            auth_mode: Some(crate::config::ApiAuthMode::CodexChatgpt),
+        };
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            None,
+            None,
+            &endpoint,
+        );
+        let envs = command_envs(&cmd);
+        assert_eq!(
+            envs.get("AGENT_CODE_API_BASE_URL").map(String::as_str),
+            Some("https://alt.example/v1")
+        );
+        assert_eq!(
+            envs.get("AGENT_CODE_AUTH_MODE").map(String::as_str),
+            Some("codex_chatgpt")
+        );
+    }
+
+    #[test]
+    fn build_subagent_command_default_endpoint_sets_no_override_envs() {
+        // Unset endpoint → the child inherits the parent's provider
+        // settings exactly as before the endpoint existed: no explicit
+        // base-url/auth env entries beyond the passthrough of the
+        // parent's own values.
+        let had_parent_base_url = std::env::var("AGENT_CODE_API_BASE_URL").is_ok();
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            None,
+            None,
+            &SubagentEndpoint::default(),
+        );
+        let envs = command_envs(&cmd);
+        if !had_parent_base_url {
+            assert!(!envs.contains_key("AGENT_CODE_API_BASE_URL"));
+        }
+        assert!(!envs.contains_key("AGENT_CODE_AUTH_MODE"));
+    }
+
+    #[test]
+    fn build_subagent_command_endpoint_base_url_wins_over_passthrough() {
+        // The override must be applied after the parent-env passthrough
+        // loop so it wins for the child even when the parent itself has
+        // AGENT_CODE_API_BASE_URL exported. Command::env keeps the last
+        // value set for a key, which this test locks in.
+        let endpoint = SubagentEndpoint {
+            model: None,
+            base_url: Some("https://child.example/v1".into()),
+            auth_mode: None,
+        };
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            None,
+            None,
+            &endpoint,
+        );
+        let envs = command_envs(&cmd);
+        assert_eq!(
+            envs.get("AGENT_CODE_API_BASE_URL").map(String::as_str),
+            Some("https://child.example/v1")
+        );
+    }
+
     #[test]
     fn build_subagent_command_sets_prompt_role_and_id() {
         let cmd = build_subagent_command(
@@ -545,7 +667,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &SubagentEndpoint::default(),
         );
         let std_cmd = cmd.as_std();
 
@@ -588,7 +710,7 @@ mod tests {
             None,
             Some("concise"),
             None,
-            None,
+            &SubagentEndpoint::default(),
         );
         let envs: HashMap<String, String> = cmd
             .as_std()
@@ -617,7 +739,7 @@ mod tests {
             None,
             None,
             Some(def),
-            Some("grok-4"),
+            &endpoint_with_model("grok-4"),
         );
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -682,7 +804,7 @@ mod tests {
             None,
             None,
             None,
-            Some("gpt-5.4"),
+            &endpoint_with_model("gpt-5.4"),
         );
         let args: Vec<String> = cmd
             .as_std()

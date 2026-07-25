@@ -152,6 +152,7 @@ impl TaskExecutor for LocalAgentExecutor {
             agent_limiter: None,
             tool_events: None,
             active_call_id: None,
+            subagent_api_defaults: ctx.subagent_api_defaults.clone(),
         };
 
         let outcome = AgentTool.call(input, &tool_ctx).await;

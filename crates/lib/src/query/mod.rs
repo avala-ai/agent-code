@@ -1302,6 +1302,7 @@ impl QueryEngine {
                                                                 agent_limiter: None,
                                                                 tool_events,
                                                                 active_call_id,
+                                                                subagent_api_defaults: None,
                                                             },
                                                         )
                                                         .await
@@ -1567,6 +1568,11 @@ impl QueryEngine {
                 agent_limiter: Some(self.state.agent_limiter.clone()),
                 tool_events: Some(tool_event_tx),
                 active_call_id: None,
+                subagent_api_defaults: Some(
+                    crate::services::coordinator::SubagentEndpoint::from_api_config(
+                        &self.state.config.api,
+                    ),
+                ),
             };
 
             // Collect streaming tool results first.

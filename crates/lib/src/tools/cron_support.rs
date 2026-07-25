@@ -107,6 +107,7 @@ mod test_helpers {
             agent_limiter: None,
             tool_events: None,
             active_call_id: None,
+            subagent_api_defaults: None,
         }
     }
 }

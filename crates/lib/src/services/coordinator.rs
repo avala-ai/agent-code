@@ -13,7 +13,7 @@
 //! Agents are defined as configurations that customize the tool
 //! set, system prompt, and permission mode.
 
-use crate::config::{PermissionMode, PermissionRule, PermissionsConfig};
+use crate::config::{ApiAuthMode, ApiConfig, PermissionMode, PermissionRule, PermissionsConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +32,16 @@ pub struct AgentDefinition {
     pub system_prompt: Option<String>,
     /// Model override (if different from default).
     pub model: Option<String>,
+    /// Provider base URL override. Lets this agent type run against a
+    /// different endpoint than the parent session (e.g. a local or
+    /// alternate provider for cheap fan-out). `None` → inherit.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Auth mode override (`api_key` / `codex_chatgpt` / `xai_oauth`),
+    /// so different agent types can authenticate against different
+    /// providers in the same session. `None` → inherit.
+    #[serde(default)]
+    pub auth_mode: Option<ApiAuthMode>,
     /// Tools to include (if empty, use all).
     pub include_tools: Vec<String>,
     /// Tools to exclude.
@@ -66,6 +76,8 @@ impl AgentRegistry {
                 description: "General-purpose agent with full tool access.".to_string(),
                 system_prompt: None,
                 model: None,
+                base_url: None,
+                auth_mode: None,
                 include_tools: Vec::new(),
                 exclude_tools: Vec::new(),
                 read_only: false,
@@ -87,6 +99,8 @@ impl AgentRegistry {
                         .to_string(),
                 ),
                 model: None,
+                base_url: None,
+                auth_mode: None,
                 include_tools: vec![
                     "FileRead".into(),
                     "Grep".into(),
@@ -113,6 +127,8 @@ impl AgentRegistry {
                         .to_string(),
                 ),
                 model: None,
+                base_url: None,
+                auth_mode: None,
                 include_tools: vec![
                     "FileRead".into(),
                     "Grep".into(),
@@ -187,6 +203,8 @@ impl AgentRegistry {
 /// name: my-agent
 /// description: A specialized agent
 /// model: gpt-4.1-mini
+/// base_url: http://localhost:11434/v1
+/// auth_mode: api_key
 /// read_only: false
 /// max_turns: 20
 /// include_tools: [FileRead, Grep, Glob]
@@ -217,6 +235,8 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
         .to_string();
     let mut description = String::new();
     let mut model = None;
+    let mut base_url = None;
+    let mut auth_mode = None;
     let mut read_only = false;
     let mut max_turns = None;
     let mut include_tools = Vec::new();
@@ -235,6 +255,10 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
                 "name" => name = value.to_string(),
                 "description" => description = value.to_string(),
                 "model" => model = Some(value.to_string()),
+                "base_url" => {
+                    base_url = Some(value.trim_matches(|c| c == '"' || c == '\'').to_string())
+                }
+                "auth_mode" => auth_mode = parse_auth_mode_keyword(value),
                 "read_only" => read_only = value == "true",
                 "max_turns" => max_turns = value.parse().ok(),
                 "include_tools" => include_tools = parse_list_literal(value),
@@ -261,12 +285,25 @@ fn parse_agent_file(path: &std::path::Path) -> Option<AgentDefinition> {
         description,
         system_prompt,
         model,
+        base_url,
+        auth_mode,
         include_tools,
         exclude_tools,
         read_only,
         max_turns,
         permissions,
     })
+}
+
+/// Parse an auth-mode keyword from agent frontmatter. Returns `None`
+/// for unrecognised values (the agent then inherits the parent's mode).
+fn parse_auth_mode_keyword(value: &str) -> Option<ApiAuthMode> {
+    match value.trim().trim_matches(|c| c == '"' || c == '\'') {
+        "api_key" => Some(ApiAuthMode::ApiKey),
+        "codex_chatgpt" => Some(ApiAuthMode::CodexChatgpt),
+        "xai_oauth" => Some(ApiAuthMode::XaiOauth),
+        _ => None,
+    }
 }
 
 /// Split a YAML-ish inline list value like `[a, b, "c d"]` into items.
@@ -623,6 +660,65 @@ pub struct Coordinator {
     teams: Arc<Mutex<HashMap<String, Team>>>,
     /// Working directory.
     cwd: PathBuf,
+}
+
+/// Provider endpoint for a spawned subagent.
+///
+/// Resolved by [`resolve_subagent_endpoint`]; `None` fields inherit
+/// the parent session's provider settings. This is what lets one
+/// session fan out to heterogeneous providers — e.g. the main loop on
+/// an API-key provider while one agent type runs on a subscription
+/// session and another against a local endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentEndpoint {
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub auth_mode: Option<ApiAuthMode>,
+}
+
+impl SubagentEndpoint {
+    /// Config-level subagent defaults from `[api]`
+    /// (`subagent_model` / `subagent_base_url` / `subagent_auth_mode`).
+    pub fn from_api_config(api: &ApiConfig) -> Self {
+        Self {
+            model: api.subagent_model.clone(),
+            base_url: api.subagent_base_url.clone(),
+            auth_mode: api.subagent_auth_mode,
+        }
+    }
+}
+
+/// Resolve the endpoint a subagent spawn should target.
+///
+/// Priority per field, highest first:
+///
+/// 1. the explicit per-call override (model only — see below),
+/// 2. the agent definition (`model` / `base_url` / `auth_mode`),
+/// 3. the `[api]` `subagent_*` config defaults,
+/// 4. inherit the parent (field stays `None`).
+///
+/// Only the model can be overridden per call: tool input is authored
+/// by the model, and a prompt-injected call that could also pick
+/// `base_url` would redirect the session's credentials to an
+/// arbitrary host. Endpoint and auth therefore come exclusively from
+/// user-authored configuration (agent definition files, config.toml).
+pub fn resolve_subagent_endpoint(
+    call_model: Option<&str>,
+    definition: Option<&AgentDefinition>,
+    config_defaults: Option<&SubagentEndpoint>,
+) -> SubagentEndpoint {
+    SubagentEndpoint {
+        model: call_model
+            .map(str::to_string)
+            .or_else(|| definition.and_then(|d| d.model.clone()))
+            .or_else(|| config_defaults.and_then(|c| c.model.clone())),
+        base_url: definition
+            .and_then(|d| d.base_url.clone())
+            .or_else(|| config_defaults.and_then(|c| c.base_url.clone())),
+        auth_mode: definition
+            .and_then(|d| d.auth_mode)
+            .or_else(|| config_defaults.and_then(|c| c.auth_mode)),
+    }
 }
 
 /// Apply agent-definition flags (model, turns, read-only, permissions)
@@ -1025,6 +1121,132 @@ impl Coordinator {
 mod coordinator_tests {
     use super::*;
 
+    fn def_with_endpoint() -> AgentDefinition {
+        AgentDefinition {
+            name: "local-worker".into(),
+            description: "d".into(),
+            system_prompt: None,
+            model: Some("def-model".into()),
+            base_url: Some("http://localhost:11434/v1".into()),
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            include_tools: vec![],
+            exclude_tools: vec![],
+            read_only: false,
+            max_turns: None,
+            permissions: None,
+        }
+    }
+
+    fn config_defaults() -> SubagentEndpoint {
+        SubagentEndpoint {
+            model: Some("cfg-model".into()),
+            base_url: Some("https://cfg.example/v1".into()),
+            auth_mode: Some(ApiAuthMode::XaiOauth),
+        }
+    }
+
+    #[test]
+    fn endpoint_per_call_model_beats_definition_and_config() {
+        let def = def_with_endpoint();
+        let cfg = config_defaults();
+        let ep = resolve_subagent_endpoint(Some("call-model"), Some(&def), Some(&cfg));
+        assert_eq!(ep.model.as_deref(), Some("call-model"));
+        // base_url / auth_mode have no per-call override by design —
+        // the definition wins for those.
+        assert_eq!(ep.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(ep.auth_mode, Some(ApiAuthMode::ApiKey));
+    }
+
+    #[test]
+    fn endpoint_definition_beats_config_defaults() {
+        let def = def_with_endpoint();
+        let cfg = config_defaults();
+        let ep = resolve_subagent_endpoint(None, Some(&def), Some(&cfg));
+        assert_eq!(ep.model.as_deref(), Some("def-model"));
+        assert_eq!(ep.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(ep.auth_mode, Some(ApiAuthMode::ApiKey));
+    }
+
+    #[test]
+    fn endpoint_config_defaults_apply_when_definition_is_silent() {
+        let mut def = def_with_endpoint();
+        def.model = None;
+        def.base_url = None;
+        def.auth_mode = None;
+        let cfg = config_defaults();
+        let ep = resolve_subagent_endpoint(None, Some(&def), Some(&cfg));
+        assert_eq!(ep.model.as_deref(), Some("cfg-model"));
+        assert_eq!(ep.base_url.as_deref(), Some("https://cfg.example/v1"));
+        assert_eq!(ep.auth_mode, Some(ApiAuthMode::XaiOauth));
+    }
+
+    #[test]
+    fn endpoint_fully_unset_inherits_parent() {
+        let mut def = def_with_endpoint();
+        def.model = None;
+        def.base_url = None;
+        def.auth_mode = None;
+        let ep = resolve_subagent_endpoint(None, Some(&def), None);
+        assert_eq!(ep, SubagentEndpoint::default());
+    }
+
+    #[test]
+    fn endpoint_from_api_config_mirrors_subagent_keys() {
+        let api = ApiConfig {
+            subagent_model: Some("m".into()),
+            subagent_base_url: Some("https://alt.example/v1".into()),
+            subagent_auth_mode: Some(ApiAuthMode::CodexChatgpt),
+            ..ApiConfig::default()
+        };
+        let ep = SubagentEndpoint::from_api_config(&api);
+        assert_eq!(ep.model.as_deref(), Some("m"));
+        assert_eq!(ep.base_url.as_deref(), Some("https://alt.example/v1"));
+        assert_eq!(ep.auth_mode, Some(ApiAuthMode::CodexChatgpt));
+    }
+
+    #[test]
+    fn agent_frontmatter_parses_base_url_and_auth_mode() {
+        let dir = std::env::temp_dir().join(format!("agent-def-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.md");
+        std::fs::write(
+            &path,
+            "---\nname: mixed\ndescription: heterogeneous provider agent\n\
+             model: gpt-5.4\nbase_url: \"https://alt.example/v1\"\nauth_mode: codex_chatgpt\n---\n\
+             Body prompt.",
+        )
+        .unwrap();
+        let def = parse_agent_file(&path).expect("parses");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(def.base_url.as_deref(), Some("https://alt.example/v1"));
+        assert_eq!(def.auth_mode, Some(ApiAuthMode::CodexChatgpt));
+    }
+
+    #[test]
+    fn agent_frontmatter_without_endpoint_keys_inherits() {
+        let dir = std::env::temp_dir().join(format!("agent-def-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.md");
+        std::fs::write(
+            &path,
+            "---\nname: plain\ndescription: no endpoint keys\n---\nBody.",
+        )
+        .unwrap();
+        let def = parse_agent_file(&path).expect("parses");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(def.base_url, None);
+        assert_eq!(def.auth_mode, None);
+    }
+
+    #[test]
+    fn unrecognized_auth_mode_keyword_is_ignored() {
+        assert_eq!(parse_auth_mode_keyword("bogus"), None);
+        assert_eq!(
+            parse_auth_mode_keyword("\"xai_oauth\""),
+            Some(ApiAuthMode::XaiOauth)
+        );
+    }
+
     #[test]
     fn test_agent_status_eq() {
         assert_eq!(AgentStatus::Pending, AgentStatus::Pending);
@@ -1282,6 +1504,8 @@ mod coordinator_tests {
             description: "t".into(),
             system_prompt: None,
             model: None,
+            base_url: None,
+            auth_mode: None,
             include_tools: vec!["FileRead".into()],
             exclude_tools: vec!["Bash".into()],
             read_only: true,
@@ -1475,6 +1699,8 @@ mod coordinator_tests {
             description: "d".into(),
             system_prompt: Some("You are specialized.".into()),
             model: None,
+            base_url: None,
+            auth_mode: None,
             include_tools: vec![],
             exclude_tools: vec![],
             read_only: false,

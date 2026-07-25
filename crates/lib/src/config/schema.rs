@@ -230,6 +230,19 @@ pub enum ApiAuthMode {
     XaiOauth,
 }
 
+impl ApiAuthMode {
+    /// Stable string form — matches the serde representation and the
+    /// values accepted by `AGENT_CODE_AUTH_MODE` / `--auth-mode`, so a
+    /// parent can hand a mode to a spawned child via the environment.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::CodexChatgpt => "codex_chatgpt",
+            Self::XaiOauth => "xai_oauth",
+        }
+    }
+}
+
 /// API connection settings.
 ///
 /// Configures the LLM provider: base URL, model, API key, timeouts,
@@ -252,6 +265,27 @@ pub struct ApiConfig {
     /// remainder of the session. Defaults to None — falls back to a
     /// provider-aware sensible default when toggled.
     pub fast_model: Option<String>,
+    /// Default model for spawned subagents. Overridden by the Agent
+    /// tool's per-call `model` field and by an agent definition's
+    /// `model`. Unset → subagents inherit the parent's model.
+    pub subagent_model: Option<String>,
+    /// Default provider base URL for spawned subagents, so fan-out
+    /// work can run against a different endpoint (e.g. a local or
+    /// cheaper provider) while the main loop stays on `base_url`.
+    /// Overridden by an agent definition's `base_url`; deliberately
+    /// NOT overridable per tool call — the model controls tool input,
+    /// and a prompt-injected call must not be able to redirect
+    /// credentials to an arbitrary host. Unset → subagents inherit
+    /// the parent's endpoint.
+    pub subagent_base_url: Option<String>,
+    /// Default auth mode for spawned subagents (same values as
+    /// `auth_mode`). Lets subagents authenticate differently from the
+    /// main loop — e.g. main on an API key while subagents use a
+    /// subscription session, or the reverse. Overridden by an agent
+    /// definition's `auth_mode`; not overridable per tool call (see
+    /// `subagent_base_url`). Unset → subagents inherit the parent's
+    /// auth mode.
+    pub subagent_auth_mode: Option<ApiAuthMode>,
     /// API key. Resolved from (in order): config, AGENT_CODE_API_KEY,
     /// ANTHROPIC_API_KEY, OPENAI_API_KEY env vars.
     #[serde(skip_serializing)]
@@ -362,6 +396,9 @@ impl Default for ApiConfig {
             model: "gpt-5.4".to_string(),
             auth_mode: ApiAuthMode::ApiKey,
             fast_model: None,
+            subagent_model: None,
+            subagent_base_url: None,
+            subagent_auth_mode: None,
             api_key,
             api_key_helper: None,
             codex_home: None,
@@ -853,6 +890,48 @@ auth_mode = "xai_oauth"
         let cfg: ApiConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.auth_mode, ApiAuthMode::XaiOauth);
         assert_eq!(cfg.model, "grok-build-0.1");
+    }
+
+    #[test]
+    fn api_config_parses_subagent_endpoint_keys_from_toml() {
+        let toml = r#"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-sonnet-4-20250514"
+subagent_model = "grok-build-0.1"
+subagent_base_url = "https://api.x.ai/v1"
+subagent_auth_mode = "xai_oauth"
+"#;
+        let cfg: ApiConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.subagent_model.as_deref(), Some("grok-build-0.1"));
+        assert_eq!(
+            cfg.subagent_base_url.as_deref(),
+            Some("https://api.x.ai/v1")
+        );
+        assert_eq!(cfg.subagent_auth_mode, Some(ApiAuthMode::XaiOauth));
+    }
+
+    #[test]
+    fn api_config_without_subagent_keys_defaults_to_inherit() {
+        let toml = r#"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.4"
+"#;
+        let cfg: ApiConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.subagent_model, None);
+        assert_eq!(cfg.subagent_base_url, None);
+        assert_eq!(cfg.subagent_auth_mode, None);
+    }
+
+    #[test]
+    fn auth_mode_as_str_matches_serde_representation() {
+        for mode in [
+            ApiAuthMode::ApiKey,
+            ApiAuthMode::CodexChatgpt,
+            ApiAuthMode::XaiOauth,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json.trim_matches('"'), mode.as_str());
+        }
     }
 
     #[test]

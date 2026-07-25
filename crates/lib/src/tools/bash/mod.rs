@@ -403,6 +403,7 @@ mod stream_emit_tests {
             agent_limiter: None,
             tool_events: Some(tx),
             active_call_id: Some("call-1".into()),
+            subagent_api_defaults: None,
         };
         let data = b"hello world from bash\n";
         let mut cursor = Cursor::new(&data[..]);

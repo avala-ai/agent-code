@@ -98,6 +98,12 @@ pub struct TaskContext {
     /// dispatch site that hasn't wired config yet preserves today's
     /// behavior; the production driver threads the real flag in.
     pub disable_skill_shell: bool,
+    /// Config-level provider defaults for spawned subagents (mirror of
+    /// the `[api]` `subagent_*` keys — see
+    /// [`crate::tools::ToolContext::subagent_api_defaults`]). `None`
+    /// preserves inherit-parent behavior; the production driver
+    /// threads the real config in.
+    pub subagent_api_defaults: Option<crate::services::coordinator::SubagentEndpoint>,
 }
 
 impl TaskContext {
@@ -108,6 +114,7 @@ impl TaskContext {
             task_manager: None,
             subagent_colors: None,
             disable_skill_shell: false,
+            subagent_api_defaults: None,
         }
     }
 }
