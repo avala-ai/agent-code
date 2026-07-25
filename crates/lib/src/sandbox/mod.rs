@@ -10,7 +10,9 @@
 //! # Platform support
 //!
 //! - **macOS**: `sandbox-exec` (Seatbelt) via [`seatbelt::SeatbeltStrategy`]
-//! - **Linux**: `bwrap` (bubblewrap) via [`bwrap::BwrapStrategy`]
+//! - **Linux**: `bwrap` (bubblewrap) via [`bwrap::BwrapStrategy`], or the
+//!   native `landlock::LandlockStrategy` (Landlock + seccomp) when `bwrap`
+//!   is not installed — no external binary required.
 //! - **Windows**: deferred to a follow-up PR; falls back to [`NoopStrategy`]
 //!
 //! # Wiring
@@ -23,6 +25,8 @@
 //! platform has no strategy, `wrap` returns the command unchanged.
 
 pub mod bwrap;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 pub mod policy;
 pub mod seatbelt;
 
@@ -235,6 +239,8 @@ fn pick_strategy(requested: &str) -> Arc<dyn SandboxStrategy> {
         "none" => Arc::new(NoopStrategy),
         "seatbelt" => make_seatbelt_or_noop(),
         "bwrap" => make_bwrap_or_noop(),
+        #[cfg(target_os = "linux")]
+        "landlock" => make_landlock_or_noop(),
         "auto" | "" => auto_detect(),
         other => {
             warn!("unknown sandbox strategy {other:?}; falling back to noop");
@@ -244,11 +250,24 @@ fn pick_strategy(requested: &str) -> Arc<dyn SandboxStrategy> {
 }
 
 fn auto_detect() -> Arc<dyn SandboxStrategy> {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         make_seatbelt_or_noop()
-    } else if cfg!(target_os = "linux") {
-        make_bwrap_or_noop()
-    } else {
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer bwrap when it's installed (mature, battle-tested namespace
+        // isolation). Otherwise fall back to the native Landlock + seccomp
+        // strategy, which needs no external binary — so a Linux host without
+        // bwrap still gets real OS-level isolation instead of a no-op.
+        if binary_on_path("bwrap") {
+            Arc::new(bwrap::BwrapStrategy)
+        } else {
+            make_landlock_or_noop()
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
         Arc::new(NoopStrategy)
     }
 }
@@ -264,6 +283,17 @@ fn make_seatbelt_or_noop() -> Arc<dyn SandboxStrategy> {
 fn make_bwrap_or_noop() -> Arc<dyn SandboxStrategy> {
     if cfg!(target_os = "linux") && binary_on_path("bwrap") {
         Arc::new(bwrap::BwrapStrategy)
+    } else {
+        Arc::new(NoopStrategy)
+    }
+}
+
+/// Select the native Landlock strategy when the running kernel can enforce
+/// it, otherwise degrade to a no-op. Linux-only.
+#[cfg(target_os = "linux")]
+fn make_landlock_or_noop() -> Arc<dyn SandboxStrategy> {
+    if landlock::landlock_available() {
+        Arc::new(landlock::LandlockStrategy)
     } else {
         Arc::new(NoopStrategy)
     }
@@ -343,14 +373,47 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn auto_detect_on_linux_picks_bwrap_or_noop() {
-        // CI may or may not have bwrap installed; accept either outcome
-        // but forbid accidentally picking seatbelt on Linux.
+    fn auto_detect_on_linux_picks_bwrap_landlock_or_noop() {
+        // CI may or may not have bwrap installed, and Landlock may or may not
+        // be enforceable on the running kernel. Accept any real Linux
+        // outcome but forbid accidentally picking seatbelt.
         let name = auto_detect().name();
         assert!(
-            name == "bwrap" || name == "noop",
-            "expected bwrap or noop on Linux, got {name}"
+            name == "bwrap" || name == "landlock" || name == "noop",
+            "expected bwrap, landlock, or noop on Linux, got {name}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pick_strategy_landlock_on_linux_matches_make_landlock() {
+        // Selecting landlock explicitly resolves to landlock when the kernel
+        // supports it, or degrades to noop otherwise.
+        let name = pick_strategy("landlock").name();
+        assert!(
+            name == "landlock" || name == "noop",
+            "expected landlock or noop on Linux, got {name}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn landlock_available_is_probe_consistent() {
+        // Whatever the probe reports, an explicit landlock selection must
+        // agree with it: available => "landlock", unavailable => "noop".
+        let expected = if landlock::landlock_available() {
+            "landlock"
+        } else {
+            "noop"
+        };
+        assert_eq!(pick_strategy("landlock").name(), expected);
+    }
+
+    #[test]
+    fn sandbox_config_denies_network_by_default() {
+        // Network is off by default: users opt in with allow_network = true.
+        let cfg = SandboxConfig::default();
+        assert!(!cfg.allow_network);
     }
 
     #[test]
