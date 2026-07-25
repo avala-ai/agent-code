@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Commits authored by the agent no longer carry AI co-author trailers by default** (#416, disclosed late — see #435): the built-in system prompt now instructs the model not to add `Co-Authored-By` / "Generated with …" trailers to commits it creates unless the user or project rules explicitly request them. Previously the agent added an attribution trailer by default. Add a rule to your project instructions if you want trailers back.
 - **`schedule_run_no_api_key` test is now hermetic** (#383): it strips every inherited `*_API_KEY` rather than three hardcoded names, so it no longer makes a real request (and spuriously passes/fails) on a machine with e.g. `OPENROUTER_API_KEY` exported. Development tooling; not part of the shipped binary.
 
 ## [0.25.2] - 2026-07-07
