@@ -486,19 +486,21 @@ fn config_load_runs_migrations_against_project_settings_toml() {
     .unwrap();
 
     let prev_cwd = std::env::current_dir().ok();
-    // Some env vars can override loaded settings; clear the relevant
-    // ones to avoid masking the migration behavior under test.
-    let saved_env: Vec<(&str, Option<String>)> = [
-        "AGENT_CODE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "AGENT_CODE_MODEL",
-        "AGENT_CODE_API_BASE_URL",
-        "AGENT_CODE_AUTH_MODE",
-    ]
-    .into_iter()
-    .map(|k| (k, std::env::var(k).ok()))
-    .collect();
+    // Env vars override loaded settings; clear them so ambient keys on
+    // the host can't mask the migration behavior under test. The key
+    // list is the loader's own priority list — a hardcoded subset here
+    // let any provider key outside it (e.g. OPENROUTER_API_KEY) leak
+    // into `config.api.api_key` and fail the assertion below.
+    let saved_env: Vec<(&str, Option<String>)> = agent_code_lib::config::API_KEY_ENV_VARS
+        .iter()
+        .copied()
+        .chain([
+            "AGENT_CODE_MODEL",
+            "AGENT_CODE_API_BASE_URL",
+            "AGENT_CODE_AUTH_MODE",
+        ])
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
     for (k, _) in &saved_env {
         // SAFETY: protected by CWD_GUARD; other tests in this binary
         // serialize on the same mutex so env-var writes don't race.
