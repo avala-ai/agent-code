@@ -119,13 +119,12 @@ impl CreatedLink {
     /// directory; a hard link's target was resolved against the cwd
     /// when it was created, so it is returned as written.
     fn substituted(&self, remainder: &str) -> String {
-        let base =
-            if self.symbolic && !Path::new(&self.target).is_absolute() && !self.name_dir.is_empty()
-            {
-                format!("{}/{}", self.name_dir.trim_end_matches('/'), self.target)
-            } else {
-                self.target.clone()
-            };
+        let base = if self.symbolic && !is_shell_absolute(&self.target) && !self.name_dir.is_empty()
+        {
+            format!("{}/{}", self.name_dir.trim_end_matches('/'), self.target)
+        } else {
+            self.target.clone()
+        };
         if remainder.is_empty() {
             base
         } else {
@@ -298,7 +297,7 @@ fn ensure_not_protected(
     state: &ScanState,
 ) -> Result<(), ProtectedPathViolation> {
     let trimmed = path.trim_matches(|c: char| c == '"' || c == '\'');
-    if matches!(state.anchor, Anchor::Unavailable) && !Path::new(trimmed).is_absolute() {
+    if matches!(state.anchor, Anchor::Unavailable) && !is_shell_absolute(trimmed) {
         return Err(ProtectedPathViolation {
             reason: format!(
                 "{source} writes to relative path {path}, but the command's \
@@ -391,6 +390,20 @@ fn is_literal_path(s: &str) -> bool {
     !s.contains('$') && !s.contains('`')
 }
 
+/// True when a *shell* token denotes an absolute path.
+///
+/// `Path::is_absolute` answers for the host: on Windows it is false for
+/// `/etc` and `/tmp/e`, because those lack a drive prefix. The commands
+/// checked here are bash commands, where a leading separator is
+/// absolute regardless of the platform the check runs on — and the
+/// protected lists (`/etc/`, `/usr/`, …) are written that way. Treating
+/// `/tmp/e` as relative on Windows anchored it under the cwd, which
+/// silently defeated the link and `cd` tracking there while the Linux
+/// tests passed.
+fn is_shell_absolute(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with('\\') || Path::new(s).is_absolute()
+}
+
 /// Brace-group punctuation (`{` / `}`) occupying a token of its own.
 /// Bash requires these to be separate tokens, so a literal `{}` (as in
 /// `find -exec … {} \;`) or a `${VAR}` never matches.
@@ -436,7 +449,7 @@ fn apply_directory_change(head: &str, args: &[String], state: &mut ScanState) {
     }
 
     let path = Path::new(&target);
-    if path.is_absolute() {
+    if is_shell_absolute(&target) {
         // An absolute `cd` pins the directory regardless of where the
         // command started — worth following even from `Anchor::None`.
         let resolved = path
@@ -613,7 +626,7 @@ fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
         // from where the link actually lives.
         let name_dir = name_forms
             .iter()
-            .find(|f| Path::new(f).is_absolute())
+            .find(|f| is_shell_absolute(f))
             .map_or_else(
                 || parent_dir(&name).to_string(),
                 |f| parent_dir(f).to_string(),
@@ -1012,7 +1025,7 @@ fn normalized_forms(raw: &str, anchor: &Anchor) -> Vec<String> {
     // The absolute spelling to resolve symlinks against: the path
     // itself when absolute, or the anchored join when the execution
     // directory is known.
-    let absolute = if Path::new(trimmed).is_absolute() {
+    let absolute = if is_shell_absolute(trimmed) {
         Some(lexical)
     } else if let Anchor::Dir(dir) = anchor {
         let anchored = join_components(&crate::permissions::lexical_normalize(&dir.join(trimmed)));
@@ -1637,6 +1650,22 @@ mod tests {
         allow("(mkdir -p build && echo x > build/out)");
         allow("echo $(date) > /tmp/stamp.txt");
         allow("(echo one; echo two) > /tmp/both.txt");
+    }
+
+    /// A leading `/` is absolute in the bash commands being checked,
+    /// whatever platform the check runs on. `Path::is_absolute` answers
+    /// for the host and is false for `/etc` on Windows, which anchored
+    /// those tokens under the cwd and quietly defeated the link and
+    /// `cd` tracking there while Linux passed. Asserting the predicate
+    /// directly catches that without a Windows runner.
+    #[test]
+    fn shell_paths_are_absolute_on_every_platform() {
+        for p in ["/etc", "/tmp/e", "/etc/passwd", "\\etc"] {
+            assert!(is_shell_absolute(p), "{p} should count as absolute");
+        }
+        for p in ["etc", "out/config", "../.git", "."] {
+            assert!(!is_shell_absolute(p), "{p} should count as relative");
+        }
     }
 
     /// A `cd` moves every later relative destination in the command:
