@@ -103,6 +103,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Palette / model picker / help never draw over HITL.
     if app.model_picker_open() && app.phase != Phase::Permission {
         draw_model_picker(frame, area, app);
+    } else if app.theme_picker_open() && app.phase != Phase::Permission {
+        draw_theme_picker(frame, area, app);
     } else if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
     }
@@ -217,6 +219,70 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
         palette().accent,
         Some(key_hint_line(
             "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
+        )),
+    );
+}
+
+fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(p) = app.theme_picker.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("filter: {}", p.query),
+        Style::default()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("active: {}", p.original),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    let filtered = p.filtered();
+    const MAX_ROWS: usize = 12;
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching themes",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let start = p
+            .selected
+            .saturating_sub(MAX_ROWS.saturating_sub(1).min(p.selected));
+        let end = (start + MAX_ROWS).min(filtered.len());
+        for (i, (_, id, label)) in filtered.iter().enumerate().take(end).skip(start) {
+            let is_sel = i == p.selected;
+            let marker = if is_sel { "\u{276f}" } else { " " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let cur = if *id == p.original { " \u{2714}" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} {id}{cur}"), style),
+                Span::styled(format!("  {label}"), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if filtered.len() > MAX_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("  \u{2026} {} more", filtered.len() - MAX_ROWS),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    draw_modal_box(
+        frame,
+        area,
+        lines,
+        " theme ",
+        palette().accent,
+        Some(key_hint_line(
+            "[\u{2191}\u{2193}] preview   [Enter] keep   [Esc] revert",
         )),
     );
 }
