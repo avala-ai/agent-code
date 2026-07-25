@@ -267,6 +267,39 @@ fn unwrapped_head(argv: &[String]) -> Option<String> {
     None
 }
 
+/// For each invocation, the text with any leading wrapper chain
+/// (`env`, `command`, `nohup`, `setsid` — plus their flags and
+/// VAR=value assignments) stripped: `env -i git status` yields
+/// `git status`. Only invocations that actually had a wrapper are
+/// returned. Lets restrictive permission rules keep matching a
+/// command that has been wrapped — the widening side never uses
+/// this, so unwrapping can only remove permissions, never grant.
+pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
+    let mut out = Vec::new();
+    for argv in &parsed.invocations {
+        let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
+        let mut unwrapped = false;
+        for _ in 0..8 {
+            let Some(first) = tokens.first() else { break };
+            if !COMMAND_WRAPPERS.contains(&base_name(first).as_str()) {
+                break;
+            }
+            let Some(idx) = tokens[1..]
+                .iter()
+                .position(|tok| !tok.starts_with('-') && !is_env_assignment(tok))
+            else {
+                break;
+            };
+            tokens = tokens.split_off(1 + idx);
+            unwrapped = true;
+        }
+        if unwrapped && !tokens.is_empty() {
+            out.push(tokens.join(" "));
+        }
+    }
+    out
+}
+
 /// Check a parsed command against security rules.
 /// Returns a list of security violations found.
 pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {

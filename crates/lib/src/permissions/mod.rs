@@ -195,9 +195,9 @@ impl PermissionChecker {
     /// Rules resolve by **severity, not by position**: `deny` outranks
     /// `ask`, which outranks `allow`. Position-ordered evaluation meant a
     /// `deny` rule listed after a broad `allow` never fired at all, and
-    /// because config layers *replace* the `rules` array wholesale rather
-    /// than concatenating it, which rule came first was not something a
-    /// user could reliably control.
+    /// because config layers *concatenate* their `rules` arrays (see
+    /// `merge_layer_contents`), which rule came first was not something a
+    /// user could reliably control across layers.
     pub fn check(&self, tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
         // Block writes to protected directories regardless of rules.
         if is_write_tool(tool_name) {
@@ -457,9 +457,17 @@ fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
         if glob_match(pattern, command) {
             return true;
         }
-        return parsed
-            .map(|p| p.command_texts.iter().any(|seg| glob_match(pattern, seg)))
-            .unwrap_or(false);
+        let Some(p) = parsed else { return false };
+        if p.command_texts.iter().any(|seg| glob_match(pattern, seg)) {
+            return true;
+        }
+        // A wrapper must not hide an invocation from a restrictive
+        // rule: `env git status && touch x` has to keep matching an
+        // `Auto("git status*")` that would prompt, or the un-matched
+        // rule falls away and a broader allow behind it fires.
+        return crate::tools::bash_parse::unwrapped_invocation_texts(&p)
+            .iter()
+            .any(|seg| glob_match(pattern, seg));
     }
 
     // A universal pattern has no specificity to protect: the user asked
@@ -1318,6 +1326,25 @@ mod tests {
             c.check("Bash", &bash_input("git status")),
             PermissionDecision::Allow
         ));
+    }
+
+    /// A wrapper must not hide an invocation from a restrictive rule:
+    /// `env git status && touch x` still matches `Auto("git status*")`
+    /// (which would prompt for the compound command), so the broader
+    /// `Allow("*")` behind it cannot fire.
+    #[test]
+    fn wrapped_invocation_still_matches_restrictive_rule() {
+        let c = checker(vec![
+            rule("Bash", "git status*", PermissionMode::Auto),
+            rule("Bash", "*", PermissionMode::Allow),
+        ]);
+        assert!(
+            matches!(
+                c.check("Bash", &bash_input("env git status && touch marker")),
+                PermissionDecision::Ask(_)
+            ),
+            "wrapping the matched invocation must not expose the blanket allow"
+        );
     }
 
     #[test]

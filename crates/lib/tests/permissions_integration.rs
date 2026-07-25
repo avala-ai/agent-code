@@ -270,7 +270,7 @@ fn glob_pattern_matching_rs_files() {
 /// listed before a blanket `deny` kept winning. That was the bug: a user
 /// who wrote "deny all Bash" still got `git diff` executed, and which
 /// rule came first was not under their control anyway — config layers
-/// replace the `rules` array rather than concatenating it.
+/// concatenate their `rules` arrays, so every layer's rules stay live.
 #[test]
 fn most_restrictive_rule_wins_over_position() {
     let rules = vec![
