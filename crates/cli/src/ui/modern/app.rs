@@ -419,6 +419,8 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
+    /// Ctrl+F in-transcript search.
+    pub search: Option<super::search::Search>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -572,6 +574,7 @@ impl App {
             queue_selected: 0,
             command_palette: None,
             model_picker: None,
+            search: None,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),

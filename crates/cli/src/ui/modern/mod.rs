@@ -18,6 +18,7 @@ mod palette;
 mod render;
 mod run;
 mod scroll;
+mod search;
 mod sink;
 mod stream_buffer;
 mod tasks;

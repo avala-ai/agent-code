@@ -860,6 +860,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Search captures input when open (and no HITL modal is up).
+    if app.search_open() {
+        handle_search_key(app, key);
+        return;
+    }
+
     // Model picker captures input when open (and no HITL modal is up).
     if app.model_picker_open() {
         handle_model_picker_key(app, key);
@@ -1064,6 +1070,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.request_full_redraw();
         }
         // Command palette (Ctrl+P / ?).
+        // Ctrl+F opens in-transcript search.
+        (m, KeyCode::Char('f') | KeyCode::Char('F')) if m.contains(KeyModifiers::CONTROL) => {
+            app.open_search();
+        }
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
             app.open_command_palette();
         }
@@ -1271,6 +1281,31 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             app.palette_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    // Esc restores the reader's position; Enter keeps it. Ctrl+C is the
+    // cancel chord everywhere else, so it behaves like Esc here.
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.cancel_search();
+        return;
+    }
+    match key.code {
+        KeyCode::Enter => app.search_next(),
+        KeyCode::Down => app.search_next(),
+        KeyCode::Up => app.search_prev(),
+        KeyCode::Backspace => app.search_backspace(),
+        // `n`/`N` only step once there is a query; before that they are
+        // ordinary characters to type.
+        KeyCode::Char('N') if !key.modifiers.contains(KeyModifiers::CONTROL) => app.search_prev(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.search_insert_char(c);
         }
         _ => {}
     }

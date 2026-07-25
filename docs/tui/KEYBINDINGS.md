@@ -18,6 +18,7 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
+| `Ctrl+F` | Search the transcript (smart case; `Enter`/`↓` next, `↑`/`N` prev, `Esc` restores position) |
 
 ## Prompt editing (composer)
 

@@ -108,6 +108,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_command_palette(frame, area, app);
     }
 
+    if app.search_open() && app.phase != Phase::Permission {
+        draw_search_bar(frame, area, app);
+    }
+
     if app.show_shortcuts && app.phase != Phase::Permission {
         draw_shortcuts_overlay(frame, area);
     }
@@ -220,6 +224,43 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
         )),
     );
+}
+
+/// One-line search bar pinned just above the prompt, with the match
+/// counter. A modal box would cover the transcript the user is trying to
+/// look at, which defeats the purpose.
+fn draw_search_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(s) = app.search.as_ref() else {
+        return;
+    };
+    let (pos, total) = s.position();
+    let counter = if s.query.is_empty() {
+        String::new()
+    } else if total == 0 {
+        "  no matches".to_string()
+    } else {
+        format!("  {pos}/{total}")
+    };
+    let p = palette();
+    let style = if total == 0 && !s.query.is_empty() {
+        Style::default().fg(p.error)
+    } else {
+        Style::default().fg(p.accent)
+    };
+    let line = Line::from(vec![
+        Span::styled("  find: ", style.add_modifier(Modifier::BOLD)),
+        Span::styled(s.query.clone(), Style::default().fg(p.text)),
+        Span::styled(counter, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "   [Enter/↓] next  [↑/N] prev  [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    // Sit directly above the prompt row.
+    let y = area.height.saturating_sub(4);
+    let bar = Rect::new(area.x, y, area.width, 1);
+    frame.render_widget(Clear, bar);
+    frame.render_widget(Paragraph::new(line), bar);
 }
 
 fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -735,6 +776,13 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.selected_item,
     );
     app.viewport_h = height;
+    // The transcript may have grown since the query was typed, so the
+    // line indices behind the match list can go stale. Recompute without
+    // resetting the selection, so streaming output does not yank the
+    // reader off the match they are on.
+    if app.search_open() {
+        app.recompute_search(false);
+    }
     // Record the bottom screen row for mouse hit-testing (jump pill).
     app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
     let total = app.layout.total_lines();
@@ -1260,6 +1308,42 @@ mod tests {
             s.contains("deploy<U+202E>hsilbup<U+202C>"),
             "override in the title not surfaced:\n{s}"
         );
+    }
+
+    #[test]
+    fn search_bar_shows_the_query_and_match_count() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        // One frame to populate the layout the search reads.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert!(s.contains("1/2"), "match counter missing:\n{s}");
+    }
+
+    #[test]
+    fn search_bar_says_so_when_nothing_matches() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "zzz".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("no matches"), "buffer:\n{s}");
     }
 
     #[test]
