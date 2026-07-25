@@ -498,8 +498,11 @@ else
         fail "D4: Grep" "code=${HTTP_CODE} tools=${tools}"
     fi
 
-    # D5: Glob
-    api_post "/message" "{\"content\":\"Use the Glob tool to list all .txt files under ${WORKDIR}. Report the filenames.\"}"
+    # D5: Glob. The serve session is shared across D1-D10, so by this
+    # point the model already knows the .txt files from earlier turns
+    # and sometimes answers from memory without any tool call — the
+    # prompt must demand a fresh Glob call for the tool assertion.
+    api_post "/message" "{\"content\":\"Call the Glob tool to list all .txt files under ${WORKDIR}. You MUST call the Glob tool even if you already know the filenames from earlier in this conversation — this verifies the tool works. Report the filenames from the fresh Glob result.\"}"
     if [[ "${HTTP_CODE}" == "200" ]] && has_tool "${HTTP_BODY}" "Glob"; then
         pass "D5: Glob tool used"
     else
