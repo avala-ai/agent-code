@@ -249,8 +249,11 @@ pub fn is_env_assignment(tok: &str) -> bool {
 
 /// `env` short options that take an operand, attached (`-uPATH`) or as
 /// the next token (`-u PATH`). The operand must be consumed, or it gets
-/// mistaken for the wrapped command.
-const ENV_OPERAND_SHORTS: &[char] = &['u', 'C', 'a', 'S'];
+/// mistaken for the wrapped command. Union of GNU (`-u -C -a -S`) and
+/// BSD (`-u -C -P -S -L -U`) — each implementation rejects the other's
+/// options at runtime, so consuming an operand for a foreign option
+/// never mislocates a command that actually executes.
+const ENV_OPERAND_SHORTS: &[char] = &['u', 'C', 'a', 'S', 'P', 'L', 'U'];
 
 /// `env` short options that never take an operand.
 const ENV_PLAIN_SHORTS: &[char] = &['i', '0', 'v'];
@@ -392,9 +395,96 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
 /// `env -S STRING` splits STRING into the leading words of the wrapped
 /// command; the remaining argv tokens follow it.
 fn split_string_tokens(operand: &str, remainder: &[String]) -> Option<Vec<String>> {
-    let mut out: Vec<String> = operand.split_whitespace().map(str::to_string).collect();
+    let mut out = split_env_s(operand)?;
     out.extend_from_slice(remainder);
     (!out.is_empty()).then_some(out)
+}
+
+/// Split an `env -S` string the way GNU env does: whitespace-separated
+/// words, single and double quotes, backslash escapes, `#` comments
+/// and the `\c` terminator. `None` when the executed words cannot be
+/// known at gate time — `${VAR}` expansion — or for sequences env
+/// rejects at runtime, behind which nothing executes anyway.
+fn split_env_s(s: &str) -> Option<Vec<String>> {
+    fn end_word(cur: &mut String, in_word: &mut bool, words: &mut Vec<String>) {
+        if *in_word {
+            words.push(std::mem::take(cur));
+            *in_word = false;
+        }
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars();
+    'outer: while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => end_word(&mut cur, &mut in_word, &mut words),
+            '#' if !in_word => break,
+            '$' => return None,
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        '\\' => match chars.next()? {
+                            esc @ ('\'' | '\\') => cur.push(esc),
+                            _ => return None,
+                        },
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '$' => return None,
+                        '\\' => {
+                            let esc = chars.next()?;
+                            if esc == '_' {
+                                cur.push(' ');
+                            } else {
+                                cur.push(env_s_escape(esc)?);
+                            }
+                        }
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            '\\' => match chars.next()? {
+                'c' => break 'outer,
+                // Outside quotes `\_` separates words.
+                '_' => end_word(&mut cur, &mut in_word, &mut words),
+                esc => {
+                    in_word = true;
+                    cur.push(env_s_escape(esc)?);
+                }
+            },
+            ch => {
+                in_word = true;
+                cur.push(ch);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// One `env -S` backslash escape; `None` for sequences GNU env
+/// rejects.
+fn env_s_escape(c: char) -> Option<char> {
+    Some(match c {
+        '\\' | '#' | '$' | '"' | '\'' => c,
+        'f' => '\x0c',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'v' => '\x0b',
+        _ => return None,
+    })
 }
 
 /// The invocation's tokens with any leading wrapper chain stripped.
@@ -805,6 +895,12 @@ mod tests {
             ("env --deb git status", "git status"),
             ("env --uns PATH git status", "git status"),
             ("env --c /tmp git status", "git status"),
+            // BSD env operand options (macOS targets).
+            ("env -P /usr/bin git status", "git status"),
+            ("env -L nobody git status", "git status"),
+            // `-S` splitting honors quotes and escapes.
+            ("env -S \"'git' status\" && touch marker", "git status"),
+            ("env -S 'git\\_status'", "git status"),
         ];
         for (cmd, expected) in cases {
             let parsed = parse_bash(cmd).unwrap();
@@ -827,6 +923,9 @@ mod tests {
             "env --frobnicate git status",
             "env --i git status",
             "env --de git status",
+            // `${VAR}` in a split-string expands at run time; the
+            // executed command cannot be known at gate time.
+            "env -S 'echo ${X}' git status",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             assert!(
@@ -843,6 +942,10 @@ mod tests {
             "env -a sh rm -rf /tmp/x",
             // Abbreviated long option plus a quote-split command name.
             "env --deb r'm' /tmp/victim",
+            // BSD env option (macOS targets).
+            "env -P /bin rm victim",
+            // Quotes inside a split-string must not hide the command.
+            "env -S \"'rm' -rf /tmp/x\"",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             let violations = check_parsed_security(&parsed);

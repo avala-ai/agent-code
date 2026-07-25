@@ -1363,6 +1363,8 @@ mod tests {
             "env --unset PATH git status && touch marker",
             "env --uns PATH git status && touch marker",
             "env -S 'git status' && touch marker",
+            "env -S \"'git' status\" && touch marker",
+            "env -P /bin git status && touch marker",
         ] {
             assert!(
                 matches!(
