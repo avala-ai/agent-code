@@ -458,9 +458,9 @@ fn path_targets_dir(path: &str, dir: &str) -> bool {
 /// to the lexical form rather than skipping the check.
 fn normalized_forms(raw: &str) -> Vec<String> {
     let trimmed = raw.trim_matches(|c: char| c == '"' || c == '\'');
-    let lexical = crate::permissions::lexical_normalize(std::path::Path::new(trimmed))
-        .to_string_lossy()
-        .into_owned();
+    let lexical = join_components(&crate::permissions::lexical_normalize(
+        std::path::Path::new(trimmed),
+    ));
 
     let mut forms = vec![lexical.clone()];
     // Keep the raw spelling too: `lexical_normalize` pops `..` past the
@@ -476,6 +476,29 @@ fn normalized_forms(raw: &str) -> Vec<String> {
         forms.push(resolved);
     }
     forms
+}
+
+/// Render a path with `/` separators on every platform.
+///
+/// `to_string_lossy` emits `\` on Windows, which made the normalized form
+/// stop matching the `/etc/`-style entries in the protected lists — the
+/// traversal bypass this normalization exists to close stayed open there.
+/// Joining components rather than substituting characters keeps a
+/// backslash that is part of a Unix filename inside its own component.
+fn join_components(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::RootDir => out.push('/'),
+            other => {
+                if !out.is_empty() && !out.ends_with('/') {
+                    out.push('/');
+                }
+                out.push_str(&other.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    if out.is_empty() { ".".to_string() } else { out }
 }
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the
@@ -495,7 +518,7 @@ fn resolve_symlinked_ancestor(path: &str) -> Option<String> {
             for part in suffix.iter().rev() {
                 out.push(part);
             }
-            return Some(out.to_string_lossy().into_owned());
+            return Some(join_components(&out));
         }
         let name = cur.file_name()?.to_os_string();
         suffix.push(name);
@@ -632,6 +655,33 @@ fn tokenize(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The normalized form must use `/` on every platform: the protected
+    /// lists are written with forward slashes, and on Windows a
+    /// `to_string_lossy` rendering produced `\etc\passwd`, which matched
+    /// nothing — the traversal bypass stayed open there while passing on
+    /// Linux. Asserting the rendering directly catches that without a
+    /// Windows runner.
+    #[test]
+    fn normalized_paths_use_forward_slashes_on_every_platform() {
+        for (input, expected) in [
+            ("/tmp/../etc/passwd", "/etc/passwd"),
+            ("//etc/passwd", "/etc/passwd"),
+            ("/etc/./passwd", "/etc/passwd"),
+            ("/usr/local/../../etc/passwd", "/etc/passwd"),
+        ] {
+            let forms = normalized_forms(input);
+            assert!(
+                forms.iter().any(|f| f == expected),
+                "{input} did not normalize to {expected}: {forms:?}"
+            );
+            assert!(
+                !forms[0].contains('\\'),
+                "normalized form kept an OS separator: {:?}",
+                forms[0]
+            );
+        }
+    }
+
     /// `/etc/passwd` was refused but `/tmp/../etc/passwd` was not: the
     /// check compared the raw token, so any traversal segment walked
     /// straight past it.
