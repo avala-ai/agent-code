@@ -843,6 +843,32 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             return;
         }
+        // Scrolling the permission input view is read-only, so it works
+        // during the answer-grace window too — the whole point is to
+        // inspect the full input BEFORE answering.
+        if let Some(super::app::Modal::Permission(p)) = app.front_modal() {
+            let total = p
+                .input_preview
+                .as_deref()
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            let step = match key.code {
+                KeyCode::Up => Some(-1isize),
+                KeyCode::Down => Some(1),
+                KeyCode::PageUp => Some(-10),
+                KeyCode::PageDown => Some(10),
+                _ => None,
+            };
+            if let Some(step) = step {
+                // Loose upper clamp (renderer clamps exactly against its
+                // viewport); keeps the offset from running away.
+                let max = total.saturating_sub(1);
+                app.perm_scroll = app.perm_scroll.saturating_add_signed(step).min(max);
+                app.dirty = true;
+                return;
+            }
+        }
+
         // Answer keys only after first paint + grace (#431). Esc/Ctrl+C above
         // stay live so the user can always dismiss or cancel.
         if !app.hitl_answers_ready() {
@@ -1492,6 +1518,49 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.command_palette_open());
         assert!(app.input.starts_with("/help"));
+    }
+
+    #[test]
+    fn permission_preview_scroll_keys_work_even_during_grace() {
+        let mut app = App::new("m", "/tmp", "s");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: Some(
+                    (1..=50)
+                        .map(|i| format!("line{i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        // Deliberately NOT force_hitl_answers_ready(): scrolling is
+        // read-only and must work while answers are still gated.
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.perm_scroll, 2);
+        handle_key(&mut app, key(KeyCode::PageDown));
+        assert_eq!(app.perm_scroll, 12);
+        handle_key(&mut app, key(KeyCode::PageUp));
+        assert_eq!(app.perm_scroll, 2);
+        handle_key(&mut app, key(KeyCode::Up));
+        handle_key(&mut app, key(KeyCode::Up));
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.perm_scroll, 0, "saturates at the top");
+        // Upper clamp: cannot scroll past the last line.
+        for _ in 0..20 {
+            handle_key(&mut app, key(KeyCode::PageDown));
+        }
+        assert_eq!(app.perm_scroll, 49);
+        // Resolving the modal resets the offset for the next one.
+        app.force_hitl_answers_ready();
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(app.perm_scroll, 0);
     }
 
     #[test]
