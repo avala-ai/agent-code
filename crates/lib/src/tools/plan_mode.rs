@@ -499,10 +499,14 @@ mod tests {
         set_active_plan_path(&plan, Some(&sid)).unwrap();
         assert_eq!(active_plan_path(Some(&sid)), Some(plan.clone()));
 
-        // A different session must not see it via the session pointer;
-        // absent its own pointer it falls back to pid/legacy, so clear
-        // those first to assert isolation.
+        // A different session must not see it via the session pointer.
+        // Absent its own pointer the lookup falls back to pid then legacy,
+        // so clear *those* too — clearing only the session pointer leaves
+        // whatever a session-less context wrote earlier and the assertion
+        // below reads that instead.
         clear_active_plan_path(Some(&sid)).unwrap();
+        clear_active_plan_path(None).unwrap();
+        let _ = std::fs::remove_file(legacy_plan_pointer());
         assert_eq!(active_plan_path(Some(&sid)), None);
 
         // Pointer written without a session id (pid-scoped) is still
@@ -513,7 +517,22 @@ mod tests {
         clear_active_plan_path(None).unwrap();
     }
 
+    /// A tool context with a session id unique to this call.
+    ///
+    /// Deliberately *not* `None`: a session-less context writes the
+    /// process-wide `.active-plan-<pid>` pointer, and every test in this
+    /// binary shares one pid and one plan directory. Two tool tests running
+    /// in parallel would then clobber each other, and the pointer-fallback
+    /// test above would read a plan some other test just wrote. A unique id
+    /// per context keeps each test on its own pointer while exercising the
+    /// same set/read/clear round trip.
     fn test_ctx() -> ToolContext {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sid = format!(
+            "test-ctx-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         ToolContext {
             cwd: PathBuf::from("/tmp"),
             cancel: CancellationToken::new(),
@@ -535,7 +554,7 @@ mod tests {
             active_call_id: None,
             subagent_api_defaults: None,
             live_plan_mode: None,
-            session_id: None,
+            session_id: Some(sid),
         }
     }
 
