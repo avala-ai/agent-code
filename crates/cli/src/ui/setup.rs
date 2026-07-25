@@ -43,55 +43,141 @@ pub fn default_setup_result() -> SetupResult {
 }
 
 /// Write calm defaults when no config exists. Silent — no hero UI.
+///
+/// Credentials already present in the environment pick the provider
+/// section: `Config::load` lets env keys replace only `api.api_key`
+/// while `base_url`/`model` keep the file values, so pinning the xAI
+/// endpoint while e.g. `OPENAI_API_KEY` is exported would send that
+/// key to api.x.ai. The key itself is never persisted here — the
+/// loader re-resolves it from the environment on every launch.
 pub fn ensure_default_config() {
-    if !needs_setup() {
+    if !needs_setup() || env_selects_undescribable_endpoint() {
         return;
     }
-    write_config_quiet(&default_setup_result());
+    let mut result = try_env_credentials().unwrap_or_else(default_setup_result);
+    result.api_key = String::new();
+    write_config_quiet(&result);
 }
+
+/// True when the environment already selects an endpoint the silent
+/// bootstrap cannot describe: Azure/Bedrock/Vertex URLs are assembled
+/// from their own env vars by `ApiConfig::default()`, and subscription
+/// OAuth pins its own base_url/model at load time. A pinned provider
+/// section would misroute the first session, so write nothing and let
+/// env detection take over.
+fn env_selects_undescribable_endpoint() -> bool {
+    const CLOUD_VARS: &[&str] = &[
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AGENT_CODE_USE_BEDROCK",
+        "AGENT_CODE_USE_VERTEX",
+    ];
+    if CLOUD_VARS
+        .iter()
+        .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
+    {
+        return true;
+    }
+    std::env::var("AGENT_CODE_AUTH_MODE").is_ok_and(|v| {
+        matches!(
+            v.as_str(),
+            "codex_chatgpt" | "chatgpt" | "xai_oauth" | "grok_oauth" | "xai" | "grok"
+        )
+    })
+}
+
+/// (env var, provider, base_url, default model) for every provider the
+/// config loader resolves keys for.
+///
+/// Ordered to mirror `agent_code_lib::config::API_KEY_ENV_VARS` (see
+/// the test `env_candidates_match_loader_priority`): when several keys
+/// are exported, the provider defaults persisted from here must belong
+/// to the same key `Config::load` will pick, or the key is sent to
+/// another provider's endpoint.
+const ENV_KEY_CANDIDATES: &[(&str, &str, &str, &str)] = &[
+    (
+        "AGENT_CODE_API_KEY",
+        "openai",
+        "https://api.openai.com/v1",
+        "gpt-5.4",
+    ),
+    (
+        "ANTHROPIC_API_KEY",
+        "anthropic",
+        "https://api.anthropic.com/v1",
+        "claude-sonnet-4-20250514",
+    ),
+    (
+        "OPENAI_API_KEY",
+        "openai",
+        "https://api.openai.com/v1",
+        "gpt-5.4",
+    ),
+    (
+        "XAI_API_KEY",
+        "xai",
+        "https://api.x.ai/v1",
+        "grok-build-0.1",
+    ),
+    (
+        "GOOGLE_API_KEY",
+        "google",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini-2.5-flash",
+    ),
+    (
+        "DEEPSEEK_API_KEY",
+        "deepseek",
+        "https://api.deepseek.com/v1",
+        "deepseek-chat",
+    ),
+    (
+        "GROQ_API_KEY",
+        "groq",
+        "https://api.groq.com/openai/v1",
+        "llama-3.3-70b-versatile",
+    ),
+    (
+        "MISTRAL_API_KEY",
+        "mistral",
+        "https://api.mistral.ai/v1",
+        "mistral-large-latest",
+    ),
+    (
+        "ZHIPU_API_KEY",
+        "zhipu",
+        "https://open.bigmodel.cn/api/paas/v4",
+        "glm-4.7",
+    ),
+    (
+        "TOGETHER_API_KEY",
+        "together",
+        "https://api.together.xyz/v1",
+        "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+    ),
+    (
+        "OPENROUTER_API_KEY",
+        "openrouter",
+        "https://openrouter.ai/api/v1",
+        "openrouter/auto",
+    ),
+    (
+        "COHERE_API_KEY",
+        "cohere",
+        "https://api.cohere.com/v2",
+        "command-r-plus",
+    ),
+    (
+        "PERPLEXITY_API_KEY",
+        "perplexity",
+        "https://api.perplexity.ai",
+        "sonar-pro",
+    ),
+];
 
 /// Prefer API keys already present in the environment (no interactive UI).
 fn try_env_credentials() -> Option<SetupResult> {
-    // (env var, provider, base_url, default model)
-    const CANDIDATES: &[(&str, &str, &str, &str)] = &[
-        (
-            "XAI_API_KEY",
-            "xai",
-            "https://api.x.ai/v1",
-            "grok-build-0.1",
-        ),
-        (
-            "OPENAI_API_KEY",
-            "openai",
-            "https://api.openai.com/v1",
-            "gpt-5.4",
-        ),
-        (
-            "ANTHROPIC_API_KEY",
-            "anthropic",
-            "https://api.anthropic.com/v1",
-            "claude-sonnet-4-20250514",
-        ),
-        (
-            "AGENT_CODE_API_KEY",
-            "openai",
-            "https://api.openai.com/v1",
-            "gpt-5.4",
-        ),
-        (
-            "GOOGLE_API_KEY",
-            "google",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-2.5-flash",
-        ),
-        (
-            "OPENROUTER_API_KEY",
-            "openrouter",
-            "https://openrouter.ai/api/v1",
-            "openrouter/auto",
-        ),
-    ];
-    for (env, provider, url, model) in CANDIDATES {
+    for (env, provider, url, model) in ENV_KEY_CANDIDATES {
         if let Ok(key) = std::env::var(env)
             && !key.trim().is_empty()
         {
@@ -1046,6 +1132,20 @@ mod tests {
             theme: "midnight".to_string(),
             permission_mode: "ask".to_string(),
         }
+    }
+
+    /// The bootstrap's env-credential table must resolve keys in the
+    /// same priority order as `Config::load`, or the provider defaults
+    /// it persists can belong to a different provider than the key the
+    /// loader picks (which sends that key to the wrong endpoint).
+    #[test]
+    fn env_candidates_match_loader_priority() {
+        let candidate_vars: Vec<&str> = ENV_KEY_CANDIDATES.iter().map(|(var, ..)| *var).collect();
+        assert_eq!(
+            candidate_vars.as_slice(),
+            agent_code_lib::config::API_KEY_ENV_VARS,
+            "keep ENV_KEY_CANDIDATES in the same order as API_KEY_ENV_VARS"
+        );
     }
 
     #[test]

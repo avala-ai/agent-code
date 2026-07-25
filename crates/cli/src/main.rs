@@ -424,12 +424,16 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Grok-style first launch: silent default config (no multi-step wizard).
     // Theme / permission defaults land on disk; credentials are handled
-    // below only when still missing.
+    // below only when still missing. `--api-key` carries no provider, so
+    // persisting provider defaults here would pin whatever endpoint they
+    // name before provider detection ever sees the key — skip the write
+    // and let `ApiConfig::default()` / `detect_provider` resolve it.
     if cli.prompt.is_none()
         && !cli.dump_system_prompt
         && !cli.serve
         && !cli.acp
         && cli.command.is_none()
+        && cli.api_key.is_none()
         && cli_auth_mode != Some(ApiAuthMode::CodexChatgpt)
         && cli_auth_mode != Some(ApiAuthMode::XaiOauth)
         && ui::setup::needs_setup()

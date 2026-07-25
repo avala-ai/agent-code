@@ -256,25 +256,38 @@ fn collect_permission_rules(value: &toml::Value, out: &mut Vec<toml::Value>) {
     }
 }
 
+/// Provider API-key environment variables, highest priority first.
+///
+/// This is the single source of truth for which env var wins when
+/// several are exported. Anything that persists provider defaults
+/// based on env credentials (e.g. the first-run bootstrap in
+/// `crates/cli/src/ui/setup.rs`) must follow the same order, or the
+/// persisted `base_url`/`model` can belong to a different provider
+/// than the key this resolver picks at load time.
+pub const API_KEY_ENV_VARS: &[&str] = &[
+    "AGENT_CODE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "ZHIPU_API_KEY",
+    "TOGETHER_API_KEY",
+    "OPENROUTER_API_KEY",
+    "COHERE_API_KEY",
+    "PERPLEXITY_API_KEY",
+];
+
 /// Resolve API key from environment variables.
 ///
 /// Checks each provider's env var in priority order. Returns the first
 /// one found, or None if no API key is set in the environment.
 fn resolve_api_key_from_env() -> Option<String> {
-    std::env::var("AGENT_CODE_API_KEY")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .or_else(|_| std::env::var("XAI_API_KEY"))
-        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
-        .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-        .or_else(|_| std::env::var("GROQ_API_KEY"))
-        .or_else(|_| std::env::var("MISTRAL_API_KEY"))
-        .or_else(|_| std::env::var("ZHIPU_API_KEY"))
-        .or_else(|_| std::env::var("TOGETHER_API_KEY"))
-        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
-        .or_else(|_| std::env::var("COHERE_API_KEY"))
-        .or_else(|_| std::env::var("PERPLEXITY_API_KEY"))
-        .ok()
+    API_KEY_ENV_VARS
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
 }
 
 /// Returns the user-level config file path.
