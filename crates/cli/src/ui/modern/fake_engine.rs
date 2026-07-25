@@ -323,6 +323,10 @@ pub(super) async fn run_script(
         h.eng_tx.clone(),
         h.eng_rx,
         h.base_mode,
+        // Test-mode service: records instead of shelling out to the OS.
+        &agent_code_lib::services::notifier::NotifierService::new_for_test(
+            agent_code_lib::config::NotifierConfig::default(),
+        ),
         &mut term_events,
         &mut draw,
     )

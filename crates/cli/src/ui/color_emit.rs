@@ -16,12 +16,12 @@ use std::sync::OnceLock;
 use crossterm::style::Color;
 
 /// User-facing override env var. Accepts `truecolor`, `ansi256`,
-/// `ansi16`, or `auto` (the default — same as not setting it).
+/// `ansi16`, `mono`, or `auto` (the default — same as not setting it).
 pub const EMIT_MODE_ENV: &str = "AGENT_CODE_COLOR_MODE";
 
 /// Color-emission mode. Controls how `Color::Rgb` values are rendered
-/// to the terminal: pass-through, quantized to ANSI 256, or coerced to
-/// the 16-color ANSI palette.
+/// to the terminal: pass-through, quantized to ANSI 256, coerced to
+/// the 16-color ANSI palette, or stripped entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitMode {
     /// 24-bit truecolor — emits `\x1b[38;2;R;G;Bm`.
@@ -30,6 +30,12 @@ pub enum EmitMode {
     Ansi256,
     /// 16 standard ANSI colors only — emits `\x1b[3Nm` / `\x1b[9Nm`.
     Ansi16,
+    /// No color at all — every foreground/background collapses to the
+    /// terminal default (`\x1b[39m` / `\x1b[49m`). This is what
+    /// <https://no-color.org/> asks for: the spec says *no* color, not
+    /// "fewer colors". Text attributes (bold, dim, italic, underline)
+    /// survive, so structure is still legible without hue.
+    Mono,
 }
 
 static EMIT_MODE: OnceLock<EmitMode> = OnceLock::new();
@@ -56,8 +62,25 @@ where
         return mode;
     }
 
+    // `FORCE_COLOR` is the escape hatch users reach for when the
+    // heuristics guess too low (CI logs, piped-but-colour-capable
+    // viewers). It outranks the disable switches below, which is the
+    // whole point of "force".
+    if let Some(raw) = get("FORCE_COLOR")
+        && let Some(mode) = parse_force_color(&raw)
+    {
+        return mode;
+    }
+
+    // https://no-color.org/ — "when present and not an empty string
+    // (regardless of its value), prevent the addition of ANSI color".
     if get("NO_COLOR").is_some_and(|v| !v.is_empty()) {
-        return EmitMode::Ansi16;
+        return EmitMode::Mono;
+    }
+
+    // The older BSD convention: CLICOLOR=0 means the same thing.
+    if get("CLICOLOR").is_some_and(|v| v.trim() == "0") {
+        return EmitMode::Mono;
     }
 
     if get("TERM_PROGRAM").is_some_and(|v| v == "Apple_Terminal") {
@@ -89,7 +112,21 @@ fn parse_mode_override(raw: &str) -> Option<EmitMode> {
         "truecolor" | "24bit" => Some(EmitMode::Truecolor),
         "ansi256" | "256" => Some(EmitMode::Ansi256),
         "ansi16" | "16" => Some(EmitMode::Ansi16),
+        "mono" | "none" | "off" | "0" => Some(EmitMode::Mono),
         "auto" | "" => None,
+        _ => None,
+    }
+}
+
+/// Parse `FORCE_COLOR` using the level convention shared across the
+/// ecosystem: `0` disables, `1` = 16 colors, `2` = 256, `3` = 24-bit.
+/// A bare (empty) or `true` value means "colour, as good as you have".
+fn parse_force_color(raw: &str) -> Option<EmitMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" => Some(EmitMode::Mono),
+        "1" => Some(EmitMode::Ansi16),
+        "2" => Some(EmitMode::Ansi256),
+        "" | "3" | "true" => Some(EmitMode::Truecolor),
         _ => None,
     }
 }
@@ -98,9 +135,11 @@ fn parse_mode_override(raw: &str) -> Option<EmitMode> {
 /// pass through unchanged on `Truecolor` and `Ansi256` (the named ANSI
 /// variants are universal). On `Ansi16`, RGB is quantized to the
 /// nearest 16-color slot; `AnsiValue` is also collapsed to its closest
-/// 16-color cousin for safety.
+/// 16-color cousin for safety. On `Mono`, every color — named,
+/// indexed, or RGB — becomes the terminal default.
 pub fn adapt(mode: EmitMode, color: Color) -> Color {
     match (mode, color) {
+        (EmitMode::Mono, _) => Color::Reset,
         (EmitMode::Truecolor, c) => c,
         (EmitMode::Ansi256, Color::Rgb { r, g, b }) => {
             Color::AnsiValue(quantize_to_ansi256(r, g, b))
@@ -276,6 +315,12 @@ pub fn format_bg(mode: EmitMode, color: Color) -> String {
 }
 
 fn sgr(mode: EmitMode, color: Color, bg: bool) -> String {
+    // Monochrome resets the colour *slot* only. A full `\x1b[0m` here
+    // would also drop bold/dim/italic/underline, which is exactly the
+    // structure no-color.org expects us to keep.
+    if mode == EmitMode::Mono {
+        return if bg { "\x1b[49m" } else { "\x1b[39m" }.to_string();
+    }
     let adapted = adapt(mode, color);
     let (fg_prefix, bg_prefix) = ("38", "48");
     let prefix = if bg { bg_prefix } else { fg_prefix };
@@ -409,7 +454,124 @@ mod tests {
             "TERM_PROGRAM" => Some("Apple_Terminal".to_string()),
             _ => None,
         };
-        assert_eq!(detect_from_env(env), EmitMode::Ansi16);
+        assert_eq!(detect_from_env(env), EmitMode::Mono);
+    }
+
+    // ---- NO_COLOR / CLICOLOR / FORCE_COLOR ----
+
+    #[test]
+    fn no_color_selects_mono_not_a_smaller_palette() {
+        // The spec says *no* colour. Downgrading to ANSI 16 still emits
+        // colour and violates it.
+        let env = |name: &str| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(env), EmitMode::Mono);
+    }
+
+    #[test]
+    fn no_color_honours_any_non_empty_value() {
+        // "regardless of its value" — only an empty string is ignored.
+        for v in ["1", "0", "false", "yes", " "] {
+            let env = move |name: &str| match name {
+                "NO_COLOR" => Some(v.to_string()),
+                _ => None,
+            };
+            assert_eq!(detect_from_env(env), EmitMode::Mono, "NO_COLOR={v:?}");
+        }
+        let empty = |name: &str| match name {
+            "NO_COLOR" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(empty), EmitMode::Truecolor);
+    }
+
+    #[test]
+    fn clicolor_zero_selects_mono() {
+        let env = |name: &str| match name {
+            "CLICOLOR" => Some("0".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(env), EmitMode::Mono);
+        // Any other CLICOLOR value is not a disable signal.
+        let on = |name: &str| match name {
+            "CLICOLOR" => Some("1".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(on), EmitMode::Truecolor);
+    }
+
+    #[test]
+    fn force_color_overrides_no_color() {
+        let env = |name: &str| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            "FORCE_COLOR" => Some("3".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(env), EmitMode::Truecolor);
+    }
+
+    #[test]
+    fn force_color_overrides_detection_upward() {
+        // Apple Terminal would otherwise be capped at 256 colours.
+        let env = |name: &str| match name {
+            "TERM_PROGRAM" => Some("Apple_Terminal".to_string()),
+            "FORCE_COLOR" => Some("3".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(env), EmitMode::Truecolor);
+    }
+
+    #[test]
+    fn force_color_levels_map_to_palettes() {
+        let with = |v: &'static str| {
+            move |name: &str| match name {
+                "FORCE_COLOR" => Some(v.to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(detect_from_env(with("0")), EmitMode::Mono);
+        assert_eq!(detect_from_env(with("1")), EmitMode::Ansi16);
+        assert_eq!(detect_from_env(with("2")), EmitMode::Ansi256);
+        assert_eq!(detect_from_env(with("3")), EmitMode::Truecolor);
+        assert_eq!(detect_from_env(with("")), EmitMode::Truecolor);
+        assert_eq!(detect_from_env(with("true")), EmitMode::Truecolor);
+        // Junk falls through to the normal heuristics.
+        assert_eq!(detect_from_env(with("banana")), EmitMode::Truecolor);
+    }
+
+    #[test]
+    fn explicit_override_beats_force_color() {
+        let env = |name: &str| match name {
+            EMIT_MODE_ENV => Some("mono".to_string()),
+            "FORCE_COLOR" => Some("3".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_from_env(env), EmitMode::Mono);
+    }
+
+    #[test]
+    fn mono_strips_every_color_to_the_terminal_default() {
+        assert_eq!(
+            adapt(EmitMode::Mono, Color::Rgb { r: 1, g: 2, b: 3 }),
+            Color::Reset
+        );
+        assert_eq!(adapt(EmitMode::Mono, Color::Red), Color::Reset);
+        assert_eq!(adapt(EmitMode::Mono, Color::AnsiValue(196)), Color::Reset);
+    }
+
+    #[test]
+    fn mono_emits_default_slots_and_preserves_attributes() {
+        // SGR 39 / 49 reset only the foreground / background slot. A
+        // blanket `\x1b[0m` would also clear bold/dim/italic/underline,
+        // which is the structure a no-colour user still relies on.
+        let fg = format_fg(EmitMode::Mono, Color::Rgb { r: 9, g: 9, b: 9 });
+        let bg = format_bg(EmitMode::Mono, Color::Rgb { r: 9, g: 9, b: 9 });
+        assert_eq!(fg, "\x1b[39m");
+        assert_eq!(bg, "\x1b[49m");
+        assert!(!fg.contains("[0m"), "must not reset attributes: {fg:?}");
+        assert!(!bg.contains("[0m"), "must not reset attributes: {bg:?}");
     }
 
     #[test]

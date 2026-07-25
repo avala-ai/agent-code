@@ -1071,6 +1071,13 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
         None => {
+            // The TUI owns the terminal; without a TTY on both ends
+            // `enable_raw_mode()` fails with an opaque errno. Refuse up
+            // front with the non-interactive alternatives instead.
+            if let Some(reason) = ui::modern::non_interactive_reason_from_env() {
+                anyhow::bail!(reason);
+            }
+
             // Check for updates in the background (non-blocking).
             let update_handle = tokio::spawn(update::check_for_update());
 

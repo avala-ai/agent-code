@@ -15,8 +15,32 @@ pub struct TerminalCaps {
     pub truecolor: bool,
     /// Kitty keyboard protocol available (disambiguated keys, Shift+Enter).
     pub kitty_keyboard: bool,
+    /// The protocol is available **and** safe to actually turn on here.
+    /// See [`ENHANCEMENT_DENYLIST`].
+    pub kitty_keyboard_safe: bool,
     /// Running inside tmux (passthrough needed for OSC 52 / queries).
     pub tmux: bool,
+}
+
+/// `TERM_PROGRAM` markers for hosts that answer the keyboard-enhancement
+/// query affirmatively but mis-encode shifted printable characters once
+/// the protocol is pushed — typing `A` or `?` starts arriving as escape
+/// noise. These are the browser-engine terminal widgets embedded in code
+/// editors; they share one upstream emulator, so the marker list is short.
+/// Matched case-insensitively as a substring so editor forks that keep the
+/// upstream marker are covered too.
+const ENHANCEMENT_DENYLIST: &[&str] = &["vscode", "cursor", "windsurf", "zed"];
+
+/// Whether the keyboard-enhancement flags may be pushed on this host.
+///
+/// Pure so the decision is unit-testable without a terminal: `enhancement`
+/// is what the terminal answered, `term_program` is `$TERM_PROGRAM`.
+pub fn keyboard_enhancement_allowed(enhancement: bool, term_program: &str) -> bool {
+    if !enhancement {
+        return false;
+    }
+    let program = term_program.to_lowercase();
+    !ENHANCEMENT_DENYLIST.iter().any(|p| program.contains(p))
 }
 
 impl TerminalCaps {
@@ -50,6 +74,7 @@ impl TerminalCaps {
             sync_output,
             truecolor,
             kitty_keyboard: enhancement,
+            kitty_keyboard_safe: keyboard_enhancement_allowed(enhancement, &term_program),
             tmux,
         }
     }
@@ -65,6 +90,12 @@ impl TerminalCaps {
         if !self.kitty_keyboard {
             out.push(
                 "Shift+Enter needs the kitty keyboard protocol — use Alt+Enter instead.".into(),
+            );
+        } else if !self.kitty_keyboard_safe {
+            out.push(
+                "This host reports the kitty keyboard protocol but mis-encodes shifted keys \
+                 under it, so it is left off — use Alt+Enter / Ctrl+I."
+                    .into(),
             );
         }
         if !self.truecolor {
@@ -109,6 +140,43 @@ mod tests {
     fn unknown_terminal_defaults_sync_off() {
         let caps = TerminalCaps::detect(env(&[("TERM", "xterm")]), false);
         assert!(!caps.sync_output);
+    }
+
+    #[test]
+    fn enhancement_allowed_only_when_supported() {
+        assert!(keyboard_enhancement_allowed(true, "kitty"));
+        assert!(keyboard_enhancement_allowed(true, ""));
+        assert!(!keyboard_enhancement_allowed(false, "kitty"));
+        // Unsupported wins even on a host that is not denylisted.
+        assert!(!keyboard_enhancement_allowed(false, ""));
+    }
+
+    #[test]
+    fn editor_embedded_hosts_never_get_the_protocol() {
+        // These hosts answer the query with "yes" but garble shifted
+        // printables once the flags are pushed.
+        for program in ["vscode", "Cursor", "Windsurf", "zed", "vscode-insiders"] {
+            assert!(
+                !keyboard_enhancement_allowed(true, program),
+                "{program} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_marks_denylisted_host_supported_but_unsafe() {
+        let caps = TerminalCaps::detect(env(&[("TERM_PROGRAM", "vscode")]), true);
+        assert!(caps.kitty_keyboard, "the terminal did answer yes");
+        assert!(!caps.kitty_keyboard_safe, "but we must not enable it");
+        let r = caps.remediation().join("\n");
+        assert!(r.contains("mis-encodes"), "{r}");
+    }
+
+    #[test]
+    fn detect_marks_normal_host_safe() {
+        let caps = TerminalCaps::detect(env(&[("TERM_PROGRAM", "ghostty")]), true);
+        assert!(caps.kitty_keyboard && caps.kitty_keyboard_safe);
+        assert!(!caps.remediation().iter().any(|l| l.contains("mis-encodes")));
     }
 
     #[test]

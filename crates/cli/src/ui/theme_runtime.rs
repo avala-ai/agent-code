@@ -312,7 +312,14 @@ fn apply_inherit_fg_with(
 }
 
 fn adapt_for_emit(theme: Theme) -> Theme {
-    let mode = super::color_emit::current();
+    adapt_for_emit_with(theme, super::color_emit::current())
+}
+
+/// Pure variant of [`adapt_for_emit`]. Every palette slot the UI reads
+/// goes through here, so a mode change (256-colour downgrade, or the
+/// monochrome mode `NO_COLOR` selects) applies uniformly instead of
+/// per-callsite.
+fn adapt_for_emit_with(theme: Theme, mode: super::color_emit::EmitMode) -> Theme {
     if mode == super::color_emit::EmitMode::Truecolor {
         return theme;
     }
@@ -372,6 +379,45 @@ fn adapt_for_emit(theme: Theme) -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mono_mode_strips_every_palette_slot() {
+        use super::super::color_emit::EmitMode;
+        let theme = adapt_for_emit_with(Theme::from_name("one-dark"), EmitMode::Mono);
+        let slots: Vec<(&str, Color)> = vec![
+            ("accent", theme.accent),
+            ("error", theme.error),
+            ("warning", theme.warning),
+            ("success", theme.success),
+            ("muted", theme.muted),
+            ("inactive", theme.inactive),
+            ("tool", theme.tool),
+            ("plan", theme.plan),
+            ("text", theme.text),
+            ("diff_add", theme.diff_add),
+            ("diff_remove", theme.diff_remove),
+            ("selection_bg", theme.selection_bg),
+            ("user_message_bg", theme.user_message_bg),
+            ("rate_limit_fill", theme.rate_limit_fill),
+            ("rainbow_red", theme.rainbow_red),
+            ("plan_mode", theme.plan_mode),
+            ("fast_mode", theme.fast_mode),
+        ];
+        for (name, color) in slots {
+            assert_eq!(color, Color::Reset, "slot {name} still carries colour");
+        }
+        for (i, c) in theme.agent_colors.iter().enumerate() {
+            assert_eq!(*c, Color::Reset, "agent_colors[{i}] still carries colour");
+        }
+    }
+
+    #[test]
+    fn non_mono_downgrade_keeps_slots_distinguishable() {
+        use super::super::color_emit::EmitMode;
+        let theme = adapt_for_emit_with(Theme::from_name("one-dark"), EmitMode::Ansi256);
+        assert_ne!(theme.accent, Color::Reset);
+        assert_ne!(theme.error, theme.success);
+    }
 
     #[test]
     fn resolve_non_auto_preserves_configured_name() {

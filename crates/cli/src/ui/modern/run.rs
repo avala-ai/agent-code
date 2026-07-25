@@ -4,13 +4,15 @@
 //! turns through [`Session::spawn_turn`] so drawing never blocks on the
 //! engine lock.
 
-use std::io::{Stdout, stdout};
+use std::io::{Stdout, Write, stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -29,6 +31,7 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_millis(1500);
 
 use agent_code_lib::config::PermissionMode;
 use agent_code_lib::query::{QueryEngine, Session, TurnHandle};
+use agent_code_lib::services::notifier::{NotificationKind, NotifierService};
 use agent_code_lib::tools::PermissionResponse;
 
 use super::app::App;
@@ -46,6 +49,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let disable_skill_shell = engine.state().config.security.disable_skill_shell_execution;
     let show_thinking_blocks = engine.state().config.ui.show_thinking_blocks;
     let initial_effort = engine.state().config.api.effort.clone();
+    let notifier_config = engine.state().config.notifier.clone();
 
     // Apply theme so any shared color helpers still resolve.
     let configured = engine.state().config.ui.theme.clone();
@@ -72,11 +76,18 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
     app.show_thinking_blocks = show_thinking_blocks;
     app.effort = initial_effort;
+    app.notifier_enabled = notifier_config.enabled;
+    // Construction performs no I/O; the first `notify` is what spawns.
+    let notifier = NotifierService::new(notifier_config);
 
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
     let caps = probe_caps();
     app.caps = caps;
+    // Only now does the probe result actually reach the terminal: without
+    // this the Ctrl+Enter / Shift+Enter disambiguation the composer
+    // advertises was detected and then never requested.
+    KEYBOARD_ENHANCEMENT_WANTED.store(caps.kitty_keyboard_safe, Ordering::Relaxed);
 
     let mut terminal = setup_terminal()?;
     let mut term_events = EventStream::new();
@@ -87,6 +98,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
         eng_tx,
         eng_rx,
         base_permission_mode,
+        &notifier,
         &mut term_events,
         &mut draw,
     )
@@ -116,6 +128,45 @@ fn probe_caps() -> TerminalCaps {
     TerminalCaps::detect(|k| std::env::var(k).ok(), enhancement)
 }
 
+/// The only flag we request. `DISAMBIGUATE_ESCAPE_CODES` is what makes
+/// Ctrl+Enter and Shift+Enter distinguishable from a plain Enter — the
+/// disambiguation the composer already advertises. The richer report modes
+/// change how ordinary printable keys arrive and buy nothing here, so they
+/// stay off.
+const KEYBOARD_ENHANCEMENT_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// Set once from the capability probe: may we push the flags at all?
+static KEYBOARD_ENHANCEMENT_WANTED: AtomicBool = AtomicBool::new(false);
+/// Whether the flags are currently on the terminal's stack. Every teardown
+/// path — normal exit, the `with_main_screen` detour, and the panic hook —
+/// consults this so we pop exactly as many times as we pushed. A leaked
+/// keyboard mode makes the user's shell unusable.
+static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+
+fn push_keyboard_enhancement(out: &mut impl Write) {
+    if !KEYBOARD_ENHANCEMENT_WANTED.load(Ordering::Relaxed)
+        || KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    if execute!(
+        out,
+        PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT_FLAGS)
+    )
+    .is_ok()
+    {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, Ordering::Relaxed);
+    }
+}
+
+fn pop_keyboard_enhancement(out: &mut impl Write) {
+    if !KEYBOARD_ENHANCEMENT_PUSHED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+}
+
 fn setup_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
@@ -133,6 +184,8 @@ fn setup_terminal() -> anyhow::Result<Term> {
         let _ = disable_raw_mode();
         return Err(e.into());
     }
+    // Pushed last, so it is popped first on every restore path.
+    push_keyboard_enhancement(&mut out);
     let backend = CrosstermBackend::new(out);
     match Terminal::new(backend) {
         Ok(terminal) => Ok(terminal),
@@ -146,8 +199,11 @@ fn setup_terminal() -> anyhow::Result<Term> {
 /// Undo every terminal mode we enabled, in reverse order. Idempotent and
 /// used by both the normal restore and the panic hook.
 fn restore_stdout_modes() {
+    let mut out = stdout();
+    // Reverse order: the keyboard flags went on last, so they come off first.
+    pop_keyboard_enhancement(&mut out);
     let _ = execute!(
-        stdout(),
+        out,
         DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange,
@@ -158,6 +214,7 @@ fn restore_stdout_modes() {
 }
 
 fn restore_terminal(terminal: &mut Term) -> anyhow::Result<()> {
+    pop_keyboard_enhancement(terminal.backend_mut());
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -178,14 +235,18 @@ fn with_main_screen<R>(f: impl FnOnce() -> R) -> R {
     let result = f();
     // Best-effort re-enter; draw path will recover on the next frame.
     let _ = enable_raw_mode();
+    let mut out = stdout();
     let _ = execute!(
-        stdout(),
+        out,
         EnterAlternateScreen,
         EnableFocusChange,
         EnableBracketedPaste,
         EnableMouseCapture,
         crossterm::cursor::Hide,
     );
+    // `restore_stdout_modes` popped the flags for the interactive command;
+    // put them back last so the teardown order stays the same.
+    push_keyboard_enhancement(&mut out);
     result
 }
 
@@ -236,6 +297,7 @@ pub(super) async fn event_loop(
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     base_permission_mode: PermissionMode,
+    notifier: &NotifierService,
     term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -459,9 +521,7 @@ pub(super) async fn event_loop(
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {
                     turn = Some(handle);
-                    app.turn_live = true;
-                    app.phase = super::app::Phase::Streaming;
-                    app.dirty = true;
+                    app.mark_turn_started();
                 }
                 Err(e) => {
                     // Should be rare: TUI serializes turns. Put the prompt
@@ -562,6 +622,22 @@ pub(super) async fn event_loop(
                     continue;
                 }
             }
+        }
+
+        // Hand any queued desktop notifications to the service. `notify` is
+        // fire-and-forget, but its platform backends probe for the tool
+        // (`which`, `where.exe`) and the macOS focus check runs
+        // `osascript` — both are synchronous fork+exec. Off the loop
+        // thread they go, so a slow or missing notifier can never add a
+        // frame of latency to the UI.
+        for req in app.take_notifications() {
+            let svc = notifier.clone();
+            tokio::task::spawn_blocking(move || match req.duration_secs {
+                Some(secs) if req.kind == NotificationKind::TaskComplete => {
+                    svc.notify_task_complete(&req.title, &req.body, secs);
+                }
+                _ => svc.notify(req.kind, &req.title, &req.body),
+            });
         }
 
         // Draw only when something changed. An idle session with no events
@@ -982,6 +1058,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Toggle the tasks/agents pane (plan §M8).
         (m, KeyCode::Char('t') | KeyCode::Char('T')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_tasks()
+        }
+        // Force full redraw (Ctrl+L) — documented in docs/tui/KEYBINDINGS.md.
+        (m, KeyCode::Char('l') | KeyCode::Char('L')) if m.contains(KeyModifiers::CONTROL) => {
+            app.request_full_redraw();
         }
         // Command palette (Ctrl+P / ?).
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
@@ -1913,6 +1993,85 @@ mod tests {
             s.contains("\x1b[?2004l"),
             "bracketed paste not disabled: {s:?}"
         );
+    }
+
+    #[test]
+    fn keyboard_enhancement_push_requests_disambiguation() {
+        // CSI > 1 u — push flags with DISAMBIGUATE_ESCAPE_CODES (bit 1).
+        let s = ansi_of(PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT_FLAGS));
+        assert_eq!(s, "\x1b[>1u", "unexpected push sequence: {s:?}");
+    }
+
+    #[test]
+    fn keyboard_enhancement_pop_is_emitted_on_teardown() {
+        // CSI < 1 u — pop one entry off the terminal's keyboard-flag stack.
+        // Leaking this makes the user's shell unusable, so the teardown
+        // paths must all emit it.
+        let s = ansi_of(PopKeyboardEnhancementFlags);
+        assert_eq!(s, "\x1b[<1u", "unexpected pop sequence: {s:?}");
+    }
+
+    #[test]
+    fn keyboard_enhancement_pop_only_fires_when_pushed() {
+        // The pop is stack-balanced: popping without a push would eat an
+        // outer application's flags.
+        KEYBOARD_ENHANCEMENT_WANTED.store(false, Ordering::Relaxed);
+        KEYBOARD_ENHANCEMENT_PUSHED.store(false, Ordering::Relaxed);
+        let mut buf: Vec<u8> = Vec::new();
+        push_keyboard_enhancement(&mut buf);
+        assert!(buf.is_empty(), "must not push when unsupported/denylisted");
+        pop_keyboard_enhancement(&mut buf);
+        assert!(buf.is_empty(), "must not pop what we never pushed");
+
+        // With the capability granted the push happens once and the pop
+        // is armed exactly once.
+        KEYBOARD_ENHANCEMENT_WANTED.store(true, Ordering::Relaxed);
+        push_keyboard_enhancement(&mut buf);
+        assert!(KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed));
+        push_keyboard_enhancement(&mut buf);
+        assert_eq!(
+            String::from_utf8_lossy(&buf).matches("\x1b[>").count(),
+            1,
+            "push must be idempotent"
+        );
+        buf.clear();
+        pop_keyboard_enhancement(&mut buf);
+        assert_eq!(String::from_utf8_lossy(&buf), "\x1b[<1u");
+        assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed));
+        buf.clear();
+        pop_keyboard_enhancement(&mut buf);
+        assert!(buf.is_empty(), "double pop must be a no-op");
+        KEYBOARD_ENHANCEMENT_WANTED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn ctrl_l_forces_a_full_redraw_and_drops_the_layout_cache() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript
+            .push(super::super::app::TranscriptItem::User("hello".into()));
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        assert!(app.layout.total_lines() > 0, "cache populated");
+        app.dirty = false;
+        app.force_full_redraw = false;
+
+        handle_key(&mut app, ctrl('l'));
+
+        assert!(app.force_full_redraw, "Ctrl+L must clear the terminal");
+        assert!(app.dirty, "Ctrl+L must schedule a repaint");
+        assert_eq!(
+            app.layout.total_lines(),
+            0,
+            "Ctrl+L must drop the layout cache so every block re-renders"
+        );
+        assert!(
+            app.input.is_empty(),
+            "Ctrl+L must not type a literal into the composer"
+        );
+        // Uppercase variant (some terminals report Ctrl+Shift+L as 'L').
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('L'));
+        assert!(app.force_full_redraw);
     }
 
     #[test]

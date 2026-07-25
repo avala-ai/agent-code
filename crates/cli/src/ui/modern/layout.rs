@@ -122,6 +122,15 @@ impl LayoutCache {
         self.total = self.blocks.iter().map(|b| b.lines.len()).sum();
     }
 
+    /// Drop every cached block so the next [`Self::sync`] re-renders the
+    /// whole transcript. Used by the force-full-redraw chord (Ctrl+L),
+    /// which exists precisely for the case where the cache is correct but
+    /// the screen is not (another process wrote over the alt-screen).
+    pub fn invalidate(&mut self) {
+        self.blocks.clear();
+        self.total = 0;
+    }
+
     pub fn total_lines(&self) -> usize {
         self.total
     }

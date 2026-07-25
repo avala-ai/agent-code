@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use agent_code_lib::services::notifier::NotificationKind;
+
 use super::layout::LayoutCache;
 use super::mode::SessionMode;
 use super::scroll::ScrollState;
@@ -463,6 +465,41 @@ pub struct App {
     /// backend buffer on the next draw so leftover main-screen content does
     /// not ghost under the TUI.
     pub force_full_redraw: bool,
+
+    /// `[notifier].enabled` from config. Mirrored here so the reducers stay
+    /// pure — the run loop owns the service that actually talks to the OS.
+    pub notifier_enabled: bool,
+    /// When the live turn started, for the notifier's `min_duration_secs`
+    /// floor. `None` while idle.
+    pub turn_started_at: Option<Instant>,
+    /// Desktop notifications produced by reducers, drained by the run loop.
+    pub pending_notifications: Vec<NotifyRequest>,
+}
+
+/// A desktop-notification request produced by a reducer.
+///
+/// The reducers cannot fire notifications themselves (that would put a
+/// subprocess spawn inside a pure function), so they queue requests here
+/// and the run loop hands them to the `NotifierService`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyRequest {
+    pub kind: NotificationKind,
+    pub title: String,
+    pub body: String,
+    /// Elapsed turn seconds — only set for `TaskComplete`, where the
+    /// service compares it against `min_duration_secs`.
+    pub duration_secs: Option<u64>,
+}
+
+/// Whether an attention event should raise a desktop notification.
+///
+/// Two gates, both pure: the notifier must be enabled in config, and the
+/// terminal must not be focused. A user already looking at the screen does
+/// not need an OS popup for something that is right in front of them —
+/// and the focus state here comes from the terminal's own focus-change
+/// reporting, which is more reliable than the service's platform probe.
+pub fn should_notify(notifier_enabled: bool, terminal_focused: bool) -> bool {
+    notifier_enabled && !terminal_focused
 }
 
 /// Absolute-line selection in the virtualized transcript.
@@ -552,7 +589,42 @@ impl App {
             // Draw the first frame.
             dirty: true,
             force_full_redraw: false,
+            notifier_enabled: false,
+            turn_started_at: None,
+            pending_notifications: Vec::new(),
         }
+    }
+
+    /// Queue a desktop notification if the user is plausibly away.
+    fn queue_notification(
+        &mut self,
+        kind: NotificationKind,
+        body: impl Into<String>,
+        duration_secs: Option<u64>,
+    ) {
+        if !should_notify(self.notifier_enabled, self.terminal_focused) {
+            return;
+        }
+        self.pending_notifications.push(NotifyRequest {
+            kind,
+            title: "agent-code".to_string(),
+            body: body.into(),
+            duration_secs,
+        });
+    }
+
+    /// Drain queued notifications for the run loop to deliver.
+    pub fn take_notifications(&mut self) -> Vec<NotifyRequest> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    /// Record that a turn just started. The timestamp drives the
+    /// completion notification's duration floor.
+    pub fn mark_turn_started(&mut self) {
+        self.turn_live = true;
+        self.phase = Phase::Streaming;
+        self.turn_started_at = Some(Instant::now());
+        self.dirty = true;
     }
 
     /// Call after painting a HITL modal. Arms answer-key eligibility after
@@ -803,6 +875,15 @@ impl App {
                 }
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
+                let tool = match self.modals.back() {
+                    Some(Modal::Permission(p)) => p.name.clone(),
+                    _ => String::new(),
+                };
+                self.queue_notification(
+                    NotificationKind::PermissionPrompt,
+                    format!("permission needed: {tool}"),
+                    None,
+                );
             }
             EngineEvent::PlanProposed { plan_md, path } => {
                 self.modals
@@ -814,6 +895,11 @@ impl App {
                 }
                 self.phase = Phase::Permission;
                 self.waiting_on = WaitingOn::UserInput;
+                self.queue_notification(
+                    NotificationKind::PermissionPrompt,
+                    "plan review needed",
+                    None,
+                );
             }
             EngineEvent::QuestionAsk { questions, respond } => {
                 if questions.is_empty() {
@@ -833,6 +919,11 @@ impl App {
                     }
                     self.phase = Phase::Permission;
                     self.waiting_on = WaitingOn::UserInput;
+                    self.queue_notification(
+                        NotificationKind::PermissionPrompt,
+                        "the agent is asking you a question",
+                        None,
+                    );
                 }
             }
         }
@@ -1830,6 +1921,17 @@ impl App {
         self.show_tasks && !self.tasks.is_empty()
     }
 
+    /// Force a full repaint (Ctrl+L). Drops the layout cache so every block
+    /// is re-wrapped from scratch and asks the draw path to clear the
+    /// terminal first — the escape hatch for a screen corrupted by another
+    /// process writing over the alt-screen.
+    pub fn request_full_redraw(&mut self) {
+        self.layout.invalidate();
+        self.force_full_redraw = true;
+        self.dirty = true;
+        self.status_message = "redrawn".into();
+    }
+
     /// Emit the `/terminal-setup` diagnostics into the transcript: a
     /// capability table plus copyable remediation lines (plan §M7).
     pub fn emit_terminal_setup(&mut self) {
@@ -2067,6 +2169,20 @@ impl App {
         // Any text still buffered when the turn ends must land now.
         self.flush_stream();
         self.turn_live = false;
+        let elapsed = self
+            .turn_started_at
+            .take()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        // A pending modal means the user is still needed — that already
+        // fired its own notification, so don't stack a second one.
+        if self.modals.is_empty() {
+            self.queue_notification(
+                NotificationKind::TaskComplete,
+                format!("turn finished · {}", self.cwd),
+                Some(elapsed),
+            );
+        }
         // Same rule as TurnComplete: a pending modal (plan approval after a
         // finished plan turn) keeps the Permission phase so it stays visible
         // and answerable; answering it advances to Idle.
@@ -2970,6 +3086,7 @@ mod tests {
             sync_output: true,
             truecolor: false,
             kitty_keyboard: false,
+            kitty_keyboard_safe: false,
             tmux: true,
         };
         app.emit_terminal_setup();
@@ -3111,6 +3228,139 @@ mod tests {
         assert!(!app.tasks_visible(), "toggled off");
         app.toggle_tasks();
         assert!(app.tasks_visible(), "toggled back on");
+    }
+
+    #[test]
+    fn bare_tasks_toggles_pane_but_args_reach_the_command_bridge() {
+        // Bare `/tasks` is the local pane toggle (cheap, no engine lock).
+        let mut app = App::new("m", "/tmp", "s");
+        let before = app.show_tasks;
+        app.input = "/tasks".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.show_tasks, !before, "bare /tasks toggles the pane");
+        assert!(
+            app.pending_slash.is_none(),
+            "bare /tasks must not hit the command bridge"
+        );
+
+        // Anything with an argument is the background-task CLI and must
+        // reach the built-in command bridge instead of toggling the pane.
+        for cmd in [
+            "/tasks output 3",
+            "/tasks kill 3",
+            "/tasks clear",
+            "/tasks list",
+        ] {
+            let mut app = App::new("m", "/tmp", "s");
+            let before = app.show_tasks;
+            app.input = cmd.into();
+            app.cursor = app.input.len();
+            app.submit();
+            assert_eq!(
+                app.pending_slash.as_deref(),
+                Some(cmd),
+                "{cmd} must reach the command bridge"
+            );
+            assert_eq!(app.show_tasks, before, "{cmd} must not toggle the pane");
+        }
+    }
+
+    // ---- desktop notifications ----
+
+    #[test]
+    fn should_notify_requires_enabled_and_unfocused() {
+        assert!(should_notify(true, false), "away + enabled → notify");
+        assert!(!should_notify(true, true), "watching the screen → silent");
+        assert!(!should_notify(false, false), "disabled in config → silent");
+        assert!(!should_notify(false, true));
+    }
+
+    fn permission_ask() -> EngineEvent {
+        let (respond, _rx) = std::sync::mpsc::channel();
+        EngineEvent::PermissionAsk {
+            name: "Bash".into(),
+            description: "rm -rf build".into(),
+            origin: None,
+            input_preview: None,
+            respond,
+        }
+    }
+
+    #[test]
+    fn permission_modal_notifies_only_when_unfocused() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = true;
+        app.terminal_focused = true;
+        app.apply_engine(permission_ask());
+        assert!(
+            app.take_notifications().is_empty(),
+            "focused terminal must stay silent"
+        );
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = true;
+        app.terminal_focused = false;
+        app.apply_engine(permission_ask());
+        let sent = app.take_notifications();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, NotificationKind::PermissionPrompt);
+        assert!(sent[0].body.contains("Bash"), "{:?}", sent[0]);
+        assert_eq!(sent[0].duration_secs, None);
+        assert!(app.take_notifications().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn disabled_notifier_never_queues() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = false;
+        app.terminal_focused = false;
+        app.apply_engine(permission_ask());
+        app.mark_turn_idle();
+        assert!(app.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn question_modal_notifies() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = true;
+        app.terminal_focused = false;
+        app.apply_engine(EngineEvent::PlanProposed {
+            plan_md: "# plan".into(),
+            path: None,
+        });
+        let sent = app.take_notifications();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, NotificationKind::PermissionPrompt);
+        assert!(sent[0].body.contains("plan review"), "{:?}", sent[0]);
+    }
+
+    #[test]
+    fn turn_completion_notifies_with_a_duration() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = true;
+        app.terminal_focused = false;
+        app.mark_turn_started();
+        app.mark_turn_idle();
+        let sent = app.take_notifications();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, NotificationKind::TaskComplete);
+        // The service applies `min_duration_secs` against this value, so it
+        // must be present (0 for a turn that finished instantly).
+        assert_eq!(sent[0].duration_secs, Some(0));
+    }
+
+    #[test]
+    fn turn_completion_with_a_pending_modal_does_not_double_notify() {
+        // The modal already raised its own "attention required" popup.
+        let mut app = App::new("m", "/tmp", "s");
+        app.notifier_enabled = true;
+        app.terminal_focused = false;
+        app.mark_turn_started();
+        app.apply_engine(permission_ask());
+        let _ = app.take_notifications();
+        app.mark_turn_idle();
+        assert!(app.take_notifications().is_empty());
     }
 
     #[test]
