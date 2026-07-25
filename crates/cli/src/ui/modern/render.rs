@@ -672,7 +672,9 @@ fn draw_permission_modal(
         frame,
         area,
         lines,
-        &format!(" permission · {} ", pending.name),
+        // The name can come from a plugin manifest or executable filename,
+        // so it is untrusted like the rest of the modal text.
+        &format!(" permission · {} ", escape_deceptive(&pending.name)),
         accent,
         // Keep ≤ ~40 cols so min-width modals still show every binding
         // (digits 1/2/3 work the same as y/a/n; listed in /help).
@@ -1226,6 +1228,38 @@ mod tests {
             "a bidi override reached the screen:\n{s}"
         );
         assert!(s.contains("<U+202E>"), "override not surfaced:\n{s}");
+    }
+
+    /// The modal title names the tool being approved. A plugin manifest or
+    /// executable filename can carry a bidi override into that name, which
+    /// would misrender the identity of the tool on the authorization screen.
+    #[test]
+    fn permission_modal_reveals_a_bidi_override_in_the_tool_name() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "deploy\u{202e}hsilbup\u{202c}".into(),
+                    description: "run plugin".into(),
+                    origin: None,
+                    input_preview: None,
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            !s.contains('\u{202e}'),
+            "a bidi override in the tool name reached the screen:\n{s}"
+        );
+        assert!(
+            s.contains("deploy<U+202E>hsilbup<U+202C>"),
+            "override in the title not surfaced:\n{s}"
+        );
     }
 
     #[test]
