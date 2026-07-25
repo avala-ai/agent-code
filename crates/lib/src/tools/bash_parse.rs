@@ -202,11 +202,16 @@ pub fn unquote_token(raw: &str) -> String {
             }
             Some('"') => match c {
                 '"' => quote = None,
-                '\\' => {
-                    if let Some(next) = chars.next() {
+                // Inside double quotes bash strips a backslash only
+                // before these; before anything else it is preserved
+                // (`"\_x"` stays `\_x` — it does not become `_x`).
+                '\\' => match chars.peek() {
+                    Some(&next @ ('$' | '`' | '"' | '\\')) => {
+                        chars.next();
                         out.push(next);
                     }
-                }
+                    _ => out.push('\\'),
+                },
                 _ => out.push(c),
             },
             Some(_) => unreachable!("only ' and \" open a quote"),
@@ -733,6 +738,12 @@ mod tests {
     fn test_unquote_token() {
         assert_eq!(unquote_token("-'delete'"), "-delete");
         assert_eq!(unquote_token("-dele\\te"), "-delete");
+        // Bash keeps a backslash inside double quotes unless it
+        // precedes $, `, " or \.
+        assert_eq!(unquote_token("\"a\\_b\""), "a\\_b");
+        assert_eq!(unquote_token("\"a\\\"b\""), "a\"b");
+        assert_eq!(unquote_token("\"a\\\\b\""), "a\\b");
+        assert_eq!(unquote_token("\"a\\$b\""), "a$b");
         assert_eq!(unquote_token("\"git\""), "git");
         assert_eq!(unquote_token("plain"), "plain");
         // A backslash inside single quotes stays literal, as in a shell.
@@ -901,6 +912,9 @@ mod tests {
             // `-S` splitting honors quotes and escapes.
             ("env -S \"'git' status\" && touch marker", "git status"),
             ("env -S 'git\\_status'", "git status"),
+            // Bash preserves `\_` inside double quotes; env then
+            // treats it as a word separator.
+            ("env -S \"\\_git status\"", "git status"),
         ];
         for (cmd, expected) in cases {
             let parsed = parse_bash(cmd).unwrap();
@@ -946,6 +960,8 @@ mod tests {
             "env -P /bin rm victim",
             // Quotes inside a split-string must not hide the command.
             "env -S \"'rm' -rf /tmp/x\"",
+            // Bash-preserved backslash: `\_` separates env -S words.
+            "env -S \"\\_rm -f /tmp/victim\"",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             let violations = check_parsed_security(&parsed);
