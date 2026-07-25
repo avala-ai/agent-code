@@ -255,6 +255,52 @@ const ENV_OPERAND_SHORTS: &[char] = &['u', 'C', 'a', 'S'];
 /// `env` short options that never take an operand.
 const ENV_PLAIN_SHORTS: &[char] = &['i', '0', 'v'];
 
+#[derive(Clone, Copy)]
+enum EnvLong {
+    /// No separate operand. Covers `--block/default/ignore-signal`,
+    /// whose optional argument only attaches in the `=SIG` form.
+    Plain,
+    /// Takes an operand, attached with `=` or as the next token.
+    Operand,
+    /// `--split-string`: the operand holds the wrapped command itself.
+    SplitString,
+}
+
+/// GNU env's long options, for resolving abbreviations.
+const ENV_LONGS: &[(&str, EnvLong)] = &[
+    ("argv0", EnvLong::Operand),
+    ("block-signal", EnvLong::Plain),
+    ("chdir", EnvLong::Operand),
+    ("debug", EnvLong::Plain),
+    ("default-signal", EnvLong::Plain),
+    ("help", EnvLong::Plain),
+    ("ignore-environment", EnvLong::Plain),
+    ("ignore-signal", EnvLong::Plain),
+    ("list-signal-handling", EnvLong::Plain),
+    ("null", EnvLong::Plain),
+    ("split-string", EnvLong::SplitString),
+    ("unset", EnvLong::Operand),
+    ("version", EnvLong::Plain),
+];
+
+/// Resolve an env long option the way coreutils does: exact name, or
+/// any unambiguous prefix (`--deb` means `--debug`). `None` for
+/// unknown or ambiguous names — env rejects those at runtime, so no
+/// command executes behind them and aborting the unwrap hides nothing.
+fn resolve_env_long(name: &str) -> Option<EnvLong> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some((_, kind)) = ENV_LONGS.iter().find(|(n, _)| *n == name) {
+        return Some(*kind);
+    }
+    let mut candidates = ENV_LONGS.iter().filter(|(n, _)| n.starts_with(name));
+    match (candidates.next(), candidates.next()) {
+        (Some((_, kind)), None) => Some(*kind),
+        _ => None,
+    }
+}
+
 /// Tokens of the command a wrapper invocation runs (`tokens[0]` is the
 /// wrapper), with the wrapper's options and their operands consumed.
 /// `None` when the wrapped command cannot be identified — including any
@@ -283,35 +329,22 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
             };
-            match name {
-                // `--block/default/ignore-signal` take an optional
-                // argument, but only in the attached `=SIG` form.
-                "ignore-environment"
-                | "null"
-                | "debug"
-                | "list-signal-handling"
-                | "block-signal"
-                | "default-signal"
-                | "ignore-signal"
-                | "help"
-                | "version" => {
-                    i += 1;
-                }
-                "unset" | "chdir" | "argv0" => match inline {
+            match resolve_env_long(name)? {
+                EnvLong::Plain => i += 1,
+                EnvLong::Operand => match inline {
                     Some(_) => i += 1,
                     None => {
                         rest.get(i + 1)?;
                         i += 2;
                     }
                 },
-                "split-string" => {
+                EnvLong::SplitString => {
                     let (operand, next) = match inline {
                         Some(v) => (v, i + 1),
                         None => (rest.get(i + 1)?.clone(), i + 2),
                     };
                     return split_string_tokens(&operand, &rest[next..]);
                 }
-                _ => return None,
             }
             continue;
         }
@@ -768,6 +801,10 @@ mod tests {
             ),
             ("env -- git status", "git status"),
             ("command -p git status", "git status"),
+            // Coreutils accepts unambiguous long-option abbreviations.
+            ("env --deb git status", "git status"),
+            ("env --uns PATH git status", "git status"),
+            ("env --c /tmp git status", "git status"),
         ];
         for (cmd, expected) in cases {
             let parsed = parse_bash(cmd).unwrap();
@@ -781,10 +818,16 @@ mod tests {
 
     #[test]
     fn test_unwrap_bails_on_unknown_env_option() {
-        // An unrecognized option means the wrapped command cannot be
-        // located; a wrong guess would feed restrictive rules text
-        // that fails to match.
-        for cmd in ["env -Q git status", "env --frobnicate git status"] {
+        // An option env itself would reject means no command executes
+        // behind it; a wrong guess at the wrapped command would feed
+        // restrictive rules text that fails to match. `--i` and `--de`
+        // are ambiguous abbreviations, which coreutils also rejects.
+        for cmd in [
+            "env -Q git status",
+            "env --frobnicate git status",
+            "env --i git status",
+            "env --de git status",
+        ] {
             let parsed = parse_bash(cmd).unwrap();
             assert!(
                 unwrapped_invocation_texts(&parsed).is_empty(),
@@ -795,7 +838,12 @@ mod tests {
 
     #[test]
     fn test_env_option_operand_does_not_hide_dangerous_command() {
-        for cmd in ["env -u PATH rm -rf /tmp/x", "env -a sh rm -rf /tmp/x"] {
+        for cmd in [
+            "env -u PATH rm -rf /tmp/x",
+            "env -a sh rm -rf /tmp/x",
+            // Abbreviated long option plus a quote-split command name.
+            "env --deb r'm' /tmp/victim",
+        ] {
             let parsed = parse_bash(cmd).unwrap();
             let violations = check_parsed_security(&parsed);
             assert!(
