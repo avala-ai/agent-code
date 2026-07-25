@@ -486,10 +486,20 @@ fn normalized_forms(raw: &str) -> Vec<String> {
 /// Joining components rather than substituting characters keeps a
 /// backslash that is part of a Unix filename inside its own component.
 fn join_components(path: &std::path::Path) -> String {
+    use std::path::Component;
     let mut out = String::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::RootDir => out.push('/'),
+            // A Windows prefix (`C:`, or a UNC share from a `//host/x`
+            // spelling) is emitted verbatim. It is not a traversal — on
+            // Windows `//etc/passwd` denotes a network share, not the
+            // local `/etc`, so it must not be rewritten into one.
+            Component::Prefix(p) => out.push_str(&p.as_os_str().to_string_lossy()),
+            Component::RootDir => {
+                if !out.ends_with('/') {
+                    out.push('/');
+                }
+            }
             other => {
                 if !out.is_empty() && !out.ends_with('/') {
                     out.push('/');
@@ -663,11 +673,15 @@ mod tests {
     /// Windows runner.
     #[test]
     fn normalized_paths_use_forward_slashes_on_every_platform() {
+        // `//etc/passwd` is deliberately absent: on Windows that is a
+        // UNC share (`\\etc\\passwd`), not the local `/etc`, so
+        // normalizing it to `/etc/passwd` would be wrong rather than
+        // safer. It is covered as a traversal case on unix only.
         for (input, expected) in [
             ("/tmp/../etc/passwd", "/etc/passwd"),
-            ("//etc/passwd", "/etc/passwd"),
             ("/etc/./passwd", "/etc/passwd"),
             ("/usr/local/../../etc/passwd", "/etc/passwd"),
+            ("/var/tmp/../../etc/passwd", "/etc/passwd"),
         ] {
             let forms = normalized_forms(input);
             assert!(
@@ -687,9 +701,15 @@ mod tests {
     /// straight past it.
     #[test]
     fn traversal_cannot_reach_a_protected_directory() {
+        // `//etc/passwd` is unix-only: see the note in the
+        // forward-slash test — on Windows it is a UNC share.
+        #[cfg(unix)]
+        assert!(
+            check("echo x > //etc/passwd").is_err(),
+            "traversal reached a protected path: //etc/passwd"
+        );
         for cmd in [
             "echo x > /tmp/../etc/passwd",
-            "echo x > //etc/passwd",
             "echo x > /etc/./passwd",
             "cp evil /tmp/../etc/passwd",
             "tee /var/../etc/passwd",
