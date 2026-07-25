@@ -73,6 +73,15 @@ struct CreatedLink {
     name_forms: Vec<String>,
     /// The link target as written.
     target: String,
+    /// Directory the link itself lives in — the parent of the link
+    /// name. A *symbolic* link's relative target is resolved from
+    /// here, not from the shell cwd: after `ln -s ../etc /tmp/e`,
+    /// `/tmp/e` points at `/etc` regardless of where bash was run.
+    name_dir: String,
+    /// True for symbolic links (`ln -s`, `cp -s`). A hard link's
+    /// target is resolved against the cwd at creation time, so it
+    /// keeps the ordinary anchoring.
+    symbolic: bool,
     /// False when the target contains shell expansion (`$`, backtick)
     /// and therefore cannot be audited before execution.
     auditable: bool,
@@ -100,6 +109,27 @@ impl CreatedLink {
             }
         }
         None
+    }
+
+    /// The path this link resolves to once `remainder` is appended,
+    /// spelled so that [`normalized_forms`] can anchor it correctly.
+    ///
+    /// A symbolic link's relative target hangs off the link's own
+    /// directory; a hard link's target was resolved against the cwd
+    /// when it was created, so it is returned as written.
+    fn substituted(&self, remainder: &str) -> String {
+        let base =
+            if self.symbolic && !Path::new(&self.target).is_absolute() && !self.name_dir.is_empty()
+            {
+                format!("{}/{}", self.name_dir.trim_end_matches('/'), self.target)
+            } else {
+                self.target.clone()
+            };
+        if remainder.is_empty() {
+            base
+        } else {
+            format!("{}/{}", base.trim_end_matches('/'), remainder)
+        }
     }
 }
 
@@ -187,6 +217,17 @@ fn check_segment(
         return Ok(());
     }
 
+    // Subshells / groups / command substitutions. `shell_segments`
+    // keeps `( … )` intact on purpose, which left the whole group as
+    // one segment whose head is `(ln` — so a link created inside it was
+    // never recorded and a later write through it inside the same group
+    // was checked against a path that did not exist yet. Scan the inner
+    // command list first (it runs first) with the same `state`, so its
+    // link creations and its writes are ordered against each other.
+    for inner in nested_command_lists(trimmed) {
+        check_with_depth(&inner, depth + 1, state)?;
+    }
+
     // Redirections (`>`, `>>`, `|& tee FILE`, heredoc-to-file). These
     // are checked first because they apply regardless of the underlying
     // command name.
@@ -271,8 +312,37 @@ fn ensure_not_protected(
     // Writes through a link created earlier in this command: the path
     // does not exist at validation time, so canonicalization cannot see
     // it. Check the link *target* with the remainder substituted in.
+    follow_created_links(&forms, path, source, state, 0)
+}
+
+/// Longest chain of same-command links followed before giving up.
+/// Chains this long are not a legitimate construction; refusing is the
+/// fail-closed answer and it also bounds link cycles
+/// (`ln -s a b && ln -s b a`).
+const MAX_LINK_CHAIN: u8 = 8;
+
+/// Resolve `forms` through every link this command creates before the
+/// write, transitively: `ln -s "$PWD/.git" /tmp/a && ln -s /tmp/a /tmp/b`
+/// means a write to `/tmp/b/config` lands in `.git/config`, so the
+/// substituted path must itself be re-checked against the link table.
+fn follow_created_links(
+    forms: &[String],
+    path: &str,
+    source: &str,
+    state: &ScanState,
+    depth: u8,
+) -> Result<(), ProtectedPathViolation> {
+    if depth >= MAX_LINK_CHAIN {
+        return Err(ProtectedPathViolation {
+            reason: format!(
+                "{source} writes to {path} through a chain of more than \
+                 {MAX_LINK_CHAIN} links created by this same command; \
+                 refusing because such a chain cannot be safely audited"
+            ),
+        });
+    }
     for link in &state.links {
-        let Some(remainder) = link.match_remainder(&forms) else {
+        let Some(remainder) = link.match_remainder(forms) else {
             continue;
         };
         if !link.auditable {
@@ -285,16 +355,13 @@ fn ensure_not_protected(
                 ),
             });
         }
-        let substituted = if remainder.is_empty() {
-            link.target.clone()
-        } else {
-            format!("{}/{}", link.target.trim_end_matches('/'), remainder)
-        };
-        for form in normalized_forms(&substituted, &state.anchor) {
-            ensure_form_not_protected(&form, path, source)?;
+        let substituted = link.substituted(&remainder);
+        let sub_forms = normalized_forms(&substituted, &state.anchor);
+        for form in &sub_forms {
+            ensure_form_not_protected(form, path, source)?;
         }
+        follow_created_links(&sub_forms, path, source, state, depth + 1)?;
     }
-
     Ok(())
 }
 
@@ -304,19 +371,113 @@ fn is_literal_path(s: &str) -> bool {
     !s.contains('$') && !s.contains('`')
 }
 
+/// Extract command lists nested inside a segment: subshells and groups
+/// `( … )`, command substitutions `$( … )`, and backquotes. Each is a
+/// command list in its own right and executes as part of this segment,
+/// so it must go through the same checks.
+///
+/// Only the outermost level is returned; deeper nesting is reached by
+/// the recursive call on each result. Quoted runs are skipped so a
+/// literal paren inside `'…'` is not mistaken for a group.
+fn nested_command_lists(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = segment.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let bytes = segment.as_bytes();
+
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            // A `$( … )` inside double quotes still runs; single quotes
+            // are literal.
+            if c == q {
+                quote = None;
+            } else if q == '"'
+                && c == '$'
+                && bytes.get(i + 1) == Some(&b'(')
+                && let Some((inner, end)) = span_to_matching_paren(segment, i + 1)
+            {
+                out.push(inner);
+                while chars.peek().is_some_and(|(j, _)| *j <= end) {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '\\' => {
+                chars.next();
+            }
+            '`' => {
+                if let Some(end) = segment[i + 1..].find('`').map(|off| i + 1 + off) {
+                    out.push(segment[i + 1..end].to_string());
+                    while chars.peek().is_some_and(|(j, _)| *j <= end) {
+                        chars.next();
+                    }
+                }
+            }
+            '(' => {
+                if let Some((inner, end)) = span_to_matching_paren(segment, i) {
+                    out.push(inner);
+                    while chars.peek().is_some_and(|(j, _)| *j <= end) {
+                        chars.next();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Given the index of an opening `(`, return the text between it and
+/// its matching `)` plus the index of that `)`.
+fn span_to_matching_paren(s: &str, open: usize) -> Option<(String, usize)> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip_while(|(i, _)| *i < open) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' | '\'' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[open + 1..i].to_string(), i));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// If this segment creates filesystem links (`ln`, hard or symbolic,
 /// or `cp --link`/`--symbolic-link`), record the (target, link name)
 /// pairs so later write destinations can be checked against them.
 fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
+    let has_short = |c: char| {
+        args.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c))
+    };
+    let symbolic = has_short('s')
+        || args
+            .iter()
+            .any(|a| a == "--symbolic" || a == "--symbolic-link");
     let creates_links = match head {
         "ln" => true,
-        "cp" => args.iter().any(|a| {
-            a == "--link"
-                || a == "--symbolic-link"
-                || (a.starts_with('-')
-                    && !a.starts_with("--")
-                    && a[1..].chars().any(|c| c == 's' || c == 'l'))
-        }),
+        "cp" => symbolic || has_short('l') || args.iter().any(|a| a == "--link"),
         _ => false,
     };
     if !creates_links {
@@ -350,8 +511,21 @@ fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
             state.opaque_link = true;
             continue;
         }
+        let name_forms = normalized_forms(&name, &state.anchor);
+        // Prefer an absolute spelling of the link's directory when the
+        // anchor produced one, so a relative symbolic target resolves
+        // from where the link actually lives.
+        let name_dir = name_forms
+            .iter()
+            .find(|f| Path::new(f).is_absolute())
+            .map_or_else(
+                || parent_dir(&name).to_string(),
+                |f| parent_dir(f).to_string(),
+            );
         state.links.push(CreatedLink {
-            name_forms: normalized_forms(&name, &state.anchor),
+            name_forms,
+            name_dir,
+            symbolic,
             auditable: is_literal_path(&target),
             target,
         });
@@ -360,6 +534,17 @@ fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
 
 fn last_path_component(p: &str) -> &str {
     p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
+/// The directory part of a path as written — `""` when the path has no
+/// separator (a bare name in the cwd).
+fn parent_dir(p: &str) -> &str {
+    let trimmed = p.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &trimmed[..i],
+        None => "",
+    }
 }
 
 fn ensure_form_not_protected(
@@ -1283,6 +1468,79 @@ mod tests {
         // infrastructure, not a write into it — only writing *through*
         // it later is.
         allow("ln -s .git/hooks /tmp/agent-code-hooks-view");
+    }
+
+    /// A symbolic link's relative target is resolved from the link's
+    /// own directory, not from the shell cwd: after
+    /// `ln -s ../etc /tmp/e`, `/tmp/e` is `/etc` no matter where bash
+    /// was run. Anchoring the substituted target to the cwd checked
+    /// `<cwd>/../etc/passwd` and let the write through.
+    #[test]
+    fn relative_symlink_target_resolves_from_the_link_directory() {
+        refuse("ln -s ../etc /tmp/e && echo x > /tmp/e/passwd");
+        refuse("ln -s ../../etc /tmp/sub/e && echo x > /tmp/sub/e/passwd");
+        refuse("ln -s ../.git build/out && printf x > build/out/config");
+        // Anchored to a cwd far away from the link — the link's own
+        // directory is what decides.
+        let td = tempfile::tempdir().unwrap();
+        assert!(
+            check_at("ln -s ../etc /tmp/e && echo x > /tmp/e/passwd", td.path()).is_err(),
+            "relative symlink target was resolved from the cwd, not the link dir"
+        );
+    }
+
+    /// A relative target that stays clear of protected paths must not
+    /// be dragged into one by the resolution rule.
+    #[test]
+    fn relative_symlink_target_outside_protected_dirs_allowed() {
+        allow("ln -s ../shared /tmp/e && echo x > /tmp/e/out.txt");
+        allow("ln -s ../data build/link && cp a.csv build/link/a.csv");
+    }
+
+    /// Links chain: the substituted path must itself be re-checked
+    /// against the links this command already created.
+    #[test]
+    fn chained_links_are_followed_transitively() {
+        refuse(r#"ln -s "$PWD/.git" /tmp/a && ln -s /tmp/a /tmp/b && echo x > /tmp/b/config"#);
+        refuse(
+            "ln -s /etc /tmp/a && ln -s /tmp/a /tmp/b && ln -s /tmp/b /tmp/c && echo x > /tmp/c/passwd",
+        );
+        // A cycle must terminate (and fail closed) rather than spin.
+        let cyclic = "ln -s /tmp/b /tmp/a && ln -s /tmp/a /tmp/b && echo x > /tmp/a/f";
+        assert!(check(cyclic).is_err(), "link cycle should fail closed");
+    }
+
+    /// Chains that never reach a protected directory stay allowed.
+    #[test]
+    fn chained_links_outside_protected_dirs_allowed() {
+        allow("ln -s /tmp/data /tmp/a && ln -s /tmp/a /tmp/b && echo x > /tmp/b/out.txt");
+    }
+
+    /// `shell_segments` keeps `( … )` intact, so a group's head is
+    /// `(ln` and the link inside it was never recorded — the write
+    /// later in the same group went unchecked.
+    #[test]
+    fn links_created_inside_grouped_commands_are_recorded() {
+        refuse("(ln -s /etc /tmp/e && printf x > /tmp/e/passwd)");
+        refuse(r#"(ln -s "$PWD/.git" /tmp/e; printf x > /tmp/e/config)"#);
+        // Group creates the link, write happens after the group.
+        refuse("(ln -s /etc /tmp/e) && printf x > /tmp/e/passwd");
+        // Nested one level deeper.
+        refuse("((ln -s /etc /tmp/e && printf x > /tmp/e/passwd))");
+        // Command substitution runs too.
+        refuse(r#"echo $(ln -s /etc /tmp/e) && printf x > /tmp/e/passwd"#);
+        // A plain write inside a group is still caught directly.
+        refuse("(printf x > .git/config)");
+    }
+
+    /// Groups that write nowhere protected keep working.
+    #[test]
+    fn innocent_grouped_commands_allowed() {
+        allow("(cd src && cargo build)");
+        allow("(ln -s /tmp/a /tmp/b && echo hi > /tmp/c)");
+        allow("(mkdir -p build && echo x > build/out)");
+        allow("echo $(date) > /tmp/stamp.txt");
+        allow("(echo one; echo two) > /tmp/both.txt");
     }
 
     /// Flag arity is per-command. The old shared value-flag list let
