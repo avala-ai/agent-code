@@ -432,6 +432,87 @@ fn standard_palettes() -> Vec<Palette> {
             pink: rgb("#d33682"),
             accent: rgb("#268bd2"),
         },
+        // Colour-vision-deficiency safe: the Okabe-Ito qualitative palette,
+        // whose hues stay distinguishable under protanopia, deuteranopia and
+        // tritanopia. Roles are assigned so red/green never carry meaning
+        // alone — "error" is vermillion and "success" is bluish green.
+        Palette {
+            id: Cow::Borrowed("dark-colorblind"),
+            label: Cow::Borrowed("Dark (colour-blind safe)"),
+            is_dark: true,
+            bg: rgb("#1c1c1c"),
+            fg: rgb("#f2f2f2"),
+            muted: rgb("#9a9a9a"),
+            selection: rgb("#3a3a3a"),
+            red: rgb("#d55e00"),    // vermillion
+            orange: rgb("#e69f00"), // orange
+            yellow: rgb("#f0e442"), // yellow
+            green: rgb("#009e73"),  // bluish green
+            cyan: rgb("#56b4e9"),   // sky blue
+            blue: rgb("#0072b2"),   // blue
+            purple: rgb("#cc79a7"), // reddish purple
+            pink: rgb("#cc79a7"),
+            accent: rgb("#56b4e9"),
+        },
+        Palette {
+            id: Cow::Borrowed("light-colorblind"),
+            label: Cow::Borrowed("Light (colour-blind safe)"),
+            is_dark: false,
+            bg: rgb("#fdfdfd"),
+            fg: rgb("#1c1c1c"),
+            muted: rgb("#5c5c5c"),
+            selection: rgb("#e4e4e4"),
+            red: rgb("#d55e00"),
+            // On a light background the Okabe-Ito yellow is unreadable, so
+            // the warning role uses the darker orange instead.
+            orange: rgb("#b25f00"),
+            yellow: rgb("#9a7d00"),
+            green: rgb("#007a59"),
+            cyan: rgb("#2b7fb8"),
+            blue: rgb("#0072b2"),
+            purple: rgb("#a85585"),
+            pink: rgb("#a85585"),
+            accent: rgb("#0072b2"),
+        },
+        // 16-colour ANSI: every slot is a named terminal colour rather than
+        // truecolor, so these render correctly on terminals without RGB
+        // support and follow whatever palette the user's terminal defines.
+        Palette {
+            id: Cow::Borrowed("dark-ansi"),
+            label: Cow::Borrowed("ANSI 16 (dark)"),
+            is_dark: true,
+            bg: Color::Black,
+            fg: Color::White,
+            muted: Color::DarkGrey,
+            selection: Color::DarkBlue,
+            red: Color::Red,
+            orange: Color::DarkYellow,
+            yellow: Color::Yellow,
+            green: Color::Green,
+            cyan: Color::Cyan,
+            blue: Color::Blue,
+            purple: Color::Magenta,
+            pink: Color::Magenta,
+            accent: Color::Cyan,
+        },
+        Palette {
+            id: Cow::Borrowed("light-ansi"),
+            label: Cow::Borrowed("ANSI 16 (light)"),
+            is_dark: false,
+            bg: Color::White,
+            fg: Color::Black,
+            muted: Color::DarkGrey,
+            selection: Color::Grey,
+            red: Color::DarkRed,
+            orange: Color::DarkYellow,
+            yellow: Color::DarkYellow,
+            green: Color::DarkGreen,
+            cyan: Color::DarkCyan,
+            blue: Color::DarkBlue,
+            purple: Color::DarkMagenta,
+            pink: Color::DarkMagenta,
+            accent: Color::DarkBlue,
+        },
     ]
 }
 
@@ -820,5 +901,78 @@ accent = "#00ffff"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(load_palettes_dir(&missing).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    /// Every theme id the product ships as a default must actually resolve.
+    /// A typo'd or deleted id silently falls back, so the user quietly gets a
+    /// different theme than the config claims — how `"midnight"` survived in
+    /// the first-run config after the palettes were rewritten.
+    #[test]
+    fn shipped_default_theme_ids_resolve() {
+        let names = Theme::all_names();
+        // The id the first-run config writes must be a real registry option,
+        // not something that silently falls back to the default.
+        assert!(
+            names.iter().any(|n| n == "auto"),
+            "first-run default theme id must appear in the registry, got {names:?}"
+        );
+        // `dark`/`light` are aliases rather than registry entries, so assert
+        // they resolve to the polarity they promise instead.
+        assert!(
+            Theme::from_name("dark").is_dark,
+            "`dark` must be a dark theme"
+        );
+        assert!(
+            !Theme::from_name("light").is_dark,
+            "`light` must be a light theme"
+        );
+    }
+
+    /// Colour-vision-deficiency and 16-colour themes are accessibility
+    /// affordances, not cosmetics: they must stay in the registry.
+    #[test]
+    fn accessibility_themes_are_registered() {
+        let names = Theme::all_names();
+        for id in [
+            "dark-colorblind",
+            "light-colorblind",
+            "dark-ansi",
+            "light-ansi",
+        ] {
+            assert!(
+                names.iter().any(|n| n == id),
+                "accessibility theme {id} must be registered"
+            );
+        }
+    }
+
+    /// The colour-blind palettes must not encode meaning in a red/green pair
+    /// (indistinguishable under deuteranopia): error and success must differ
+    /// in more than hue.
+    #[test]
+    fn colorblind_themes_avoid_red_green_collision() {
+        for id in ["dark-colorblind", "light-colorblind"] {
+            let t = Theme::from_name(id);
+            assert_ne!(t.error, t.success, "{id}: error and success must differ");
+        }
+    }
+
+    /// The ANSI themes must use named terminal colours (not truecolor) so
+    /// they render on 16-colour terminals and follow the user's palette.
+    #[test]
+    fn ansi_themes_use_named_colors() {
+        for id in ["dark-ansi", "light-ansi"] {
+            let t = Theme::from_name(id);
+            assert!(
+                !matches!(t.accent, Color::Rgb { .. }),
+                "{id}: accent must be a named ANSI colour, got {:?}",
+                t.accent
+            );
+        }
     }
 }

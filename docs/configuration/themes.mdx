@@ -3,20 +3,20 @@ title: "Themes"
 description: "Terminal color themes and the semantic palette agent-code paints with"
 ---
 
-`agent-code` ships nine built-in themes plus an `auto` option that follows
-the terminal's background colour. Each theme is a fixed semantic palette —
-UI elements bind to slot names like `error` or `subagent_red` rather than
-to hard-coded hex codes, so a single theme switch repaints the whole
-session.
+`agent-code` ships eleven built-in themes plus an `auto` option that follows
+the terminal's background colour. Themes are *data-driven*: each one is a
+compact palette of base colours from which every semantic slot (`error`,
+`subagent_red`, the diff tints, …) is derived, so a single theme switch
+repaints the whole session — and adding a theme means adding a palette, not
+hand-writing fifty slots.
 
 ## Choosing a theme
 
-Run `/theme` to open the picker, or set the slot directly in
-`~/.config/agent-code/config.toml`:
+Set the slot in `~/.config/agent-code/config.toml`:
 
 ```toml
 [ui]
-theme = "midnight"
+theme = "auto"
 ```
 
 The valid identifiers are:
@@ -24,15 +24,47 @@ The valid identifiers are:
 | Name                | Description                                       |
 | ------------------- | ------------------------------------------------- |
 | `auto`              | Match the terminal background via OSC 11.         |
-| `midnight`          | Default dark palette with violet accents.         |
-| `daybreak`          | Default light palette with violet accents.        |
-| `midnight-muted`    | Softer dark palette.                              |
-| `daybreak-muted`    | Softer light palette.                             |
-| `terminal`          | Standard 16 ANSI colours, inherits terminal text. |
+| `dark` / `light`    | Aliases for the default dark / light themes.      |
+| `monokai`           | Warm dark palette (the classic editor scheme).    |
+| `dracula`           | Cool dark palette with violet accents.            |
+| `nord`              | Muted arctic blue dark palette.                   |
+| `gruvbox`           | Warm retro dark palette.                          |
+| `one-dark`          | Balanced dark palette (default dark).             |
+| `solarized-dark`    | Solarized, dark background.                       |
+| `solarized-light`   | Solarized, light background (default light).      |
 | `dark-colorblind`   | Okabe-Ito palette on a dark background.           |
 | `light-colorblind`  | Okabe-Ito palette on a light background.          |
 | `dark-ansi`         | 16-colour ANSI dark palette (no truecolor).       |
 | `light-ansi`        | 16-colour ANSI light palette (no truecolor).      |
+
+## Custom themes
+
+Drop a TOML palette into `<config dir>/agent-code/themes/<id>.toml` and it
+appears alongside the built-ins — the file stem is the theme id. Only the
+base colours are specified; the semantic slots are derived from them:
+
+```toml
+label = "My Theme"
+dark = true
+
+bg = "#1a1b26"
+fg = "#c0caf5"
+muted = "#565f89"
+selection = "#283457"
+
+red = "#f7768e"
+orange = "#ff9e64"
+yellow = "#e0af68"
+green = "#9ece6a"
+cyan = "#7dcfff"
+blue = "#7aa2f7"
+purple = "#bb9af7"
+pink = "#bb9af7"
+
+accent = "#7aa2f7"
+```
+
+A malformed file is skipped with a warning rather than failing startup.
 
 ## Semantic slots
 

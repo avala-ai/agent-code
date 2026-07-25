@@ -37,7 +37,7 @@ pub fn default_setup_result() -> SetupResult {
         provider: "xai".into(),
         base_url: Some("https://api.x.ai/v1".into()),
         model: Some("grok-build-0.1".into()),
-        theme: "midnight".into(),
+        theme: "auto".into(),
         permission_mode: "accept_edits".into(),
     }
 }
@@ -187,7 +187,7 @@ fn try_env_credentials() -> Option<SetupResult> {
                 provider: (*provider).into(),
                 base_url: Some((*url).into()),
                 model: Some((*model).into()),
-                theme: "midnight".into(),
+                theme: "auto".into(),
                 permission_mode: "accept_edits".into(),
             });
         }
@@ -248,7 +248,7 @@ pub fn run_setup() -> Option<SetupResult> {
                 provider: "xai".into(),
                 base_url: Some("https://api.x.ai/v1".into()),
                 model: Some("grok-build-0.1".into()),
-                theme: "midnight".into(),
+                theme: "auto".into(),
                 permission_mode: "accept_edits".into(),
             };
             write_config(&result);
@@ -1129,7 +1129,7 @@ mod tests {
             provider: "custom".to_string(),
             base_url: Some("https://api.openai.com/v1".to_string()),
             model: Some("gpt-5.4".to_string()),
-            theme: "midnight".to_string(),
+            theme: "nord".to_string(),
             permission_mode: "ask".to_string(),
         }
     }
@@ -1156,7 +1156,7 @@ mod tests {
             provider: "openai".into(),
             base_url: Some("https://chatgpt.com/backend-api/codex".into()),
             model: Some("gpt-5.5".into()),
-            theme: "midnight".into(),
+            theme: "auto".into(),
             permission_mode: "ask".into(),
         };
         let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
@@ -1173,7 +1173,7 @@ mod tests {
             provider: "xai".into(),
             base_url: Some("https://api.x.ai/v1".into()),
             model: Some("grok-build-0.1".into()),
-            theme: "midnight".into(),
+            theme: "auto".into(),
             permission_mode: "ask".into(),
         };
         let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
@@ -1233,7 +1233,7 @@ mod tests {
         );
         assert_eq!(doc["api"]["model"].as_str(), Some("gpt-5.4"));
         assert_eq!(doc["permissions"]["default_mode"].as_str(), Some("ask"));
-        assert_eq!(doc["ui"]["theme"].as_str(), Some("midnight"));
+        assert_eq!(doc["ui"]["theme"].as_str(), Some("nord"));
         assert!(
             doc["ui"].get("tui").is_none(),
             "tui kind is no longer configurable — modern is the only interactive surface"
