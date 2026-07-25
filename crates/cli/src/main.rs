@@ -270,6 +270,19 @@ fn run_setup_wizard() {
     }
 }
 
+/// Open (append) the interactive-session tracing log, creating
+/// `<config>/logs/` as needed. `None` falls back to stderr — better a
+/// corrupted frame than silently dropped diagnostics.
+fn open_tui_log_file() -> Option<std::fs::File> {
+    let dir = agent_code_lib::config::agent_config_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("agent.log"))
+        .ok()
+}
+
 fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
     match value.trim().replace('-', "_").as_str() {
         "api_key" => Ok(ApiAuthMode::ApiKey),
@@ -311,12 +324,28 @@ async fn async_main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
     // Logs go to stderr so stdout stays clean for machine-readable output
-    // (`--output-format json`, `security-scan --format json`) and never
-    // corrupts the interactive TUI.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .init();
+    // (`--output-format json`, `security-scan --format json`). The
+    // interactive fullscreen TUI owns the whole terminal, though —
+    // stderr writes land on the alt screen and get drawn over the UI
+    // (tracing WARN lines rendered inside the composer box) — so
+    // interactive sessions append tracing output to
+    // `<config>/logs/agent.log` instead. Headless modes keep stderr.
+    let interactive_tui = cli.prompt.is_none()
+        && !cli.dump_system_prompt
+        && !cli.serve
+        && !cli.acp
+        && cli.command.is_none();
+    match interactive_tui.then(open_tui_log_file).flatten() {
+        Some(log_file) => tracing_subscriber::fmt()
+            .with_writer(std::sync::Arc::new(log_file))
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init(),
+    }
 
     // Validate output format early — fail fast on bad values before
     // touching config, API keys, or the setup wizard.

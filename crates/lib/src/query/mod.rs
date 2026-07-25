@@ -103,7 +103,12 @@ pub trait StreamSink: Send + Sync {
     fn on_tool_start(&self, tool_name: &str, input: &serde_json::Value);
     fn on_tool_result(&self, tool_name: &str, result: &crate::tools::ToolResult);
     fn on_thinking(&self, _text: &str) {}
-    /// Called at the start of each agent turn (1-indexed).
+    /// Called at the start of each agent-loop iteration. `turn` is the
+    /// session-cumulative iteration number (1-indexed) — the same value
+    /// as `state.turn_count`, so UI surfaces that also read the engine
+    /// state (footer, /cost) never disagree with streamed events. In
+    /// one-shot runs the session has a single exchange, so this equals
+    /// the per-exchange iteration number.
     fn on_turn_start(&self, _turn: usize) {}
     fn on_turn_complete(&self, _turn: usize) {}
     fn on_error(&self, error: &str);
@@ -137,6 +142,7 @@ pub trait StreamSink: Send + Sync {
     fn on_subagent_update(&self, _agent_id: &str, _state: &str, _headline: &str) {}
 
     /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
+    /// `turn` is session-cumulative, matching [`Self::on_turn_start`].
     fn on_turn_outcome(&self, _turn: usize, _outcome: &str) {}
 
     /// Plan ready for user approval (ExitPlanMode completed with content).
@@ -787,7 +793,7 @@ impl QueryEngine {
         'turn: for turn in 0..max_turns {
             self.state.turn_count = base_turns + turn + 1;
             self.state.is_query_active = true;
-            sink.on_turn_start(turn + 1);
+            sink.on_turn_start(self.state.turn_count);
 
             // Steering: drain any input submitted mid-turn and inject it
             // as a user message before this iteration's LLM call. This is
@@ -1069,7 +1075,7 @@ impl QueryEngine {
                                     _ = self.cancel.cancelled() => {
                                         warn!("Turn cancelled during retry backoff");
                                         sink.on_warning("Cancelled");
-                                        sink.on_turn_outcome(turn + 1, "cancelled");
+                                        sink.on_turn_outcome(self.state.turn_count, "cancelled");
                                         self.state.is_query_active = false;
                                         return Ok(());
                                     }
@@ -1110,7 +1116,7 @@ impl QueryEngine {
                                         _ = self.cancel.cancelled() => {
                                             warn!("Turn cancelled during capacity wait");
                                             sink.on_warning("Cancelled");
-                                            sink.on_turn_outcome(turn + 1, "cancelled");
+                                            sink.on_turn_outcome(self.state.turn_count, "cancelled");
                                             self.state.is_query_active = false;
                                             return Ok(());
                                         }
@@ -1165,7 +1171,7 @@ impl QueryEngine {
                                 // a UI listening on on_turn_outcome never
                                 // learns the turn died (only on_error fires,
                                 // which mid-turn recovery also uses).
-                                sink.on_turn_outcome(turn + 1, "error");
+                                sink.on_turn_outcome(self.state.turn_count, "error");
                                 return Err(crate::error::Error::Other(e.to_string()));
                             }
                         }
@@ -1369,7 +1375,7 @@ impl QueryEngine {
                     forward_tool_event(sink, evt);
                 }
                 sink.on_warning("Cancelled");
-                sink.on_turn_outcome(turn + 1, "cancelled");
+                sink.on_turn_outcome(self.state.turn_count, "cancelled");
                 self.state.is_query_active = false;
                 return Ok(());
             }
@@ -1483,7 +1489,7 @@ impl QueryEngine {
                 // No tools requested — turn is complete.
                 info!("Turn complete (no tool calls)");
                 sink.on_turn_complete(turn + 1);
-                sink.on_turn_outcome(turn + 1, "done");
+                sink.on_turn_outcome(self.state.turn_count, "done");
                 self.state.is_query_active = false;
 
                 // PostTurn hooks fire on successful completion. Not fired
@@ -1820,7 +1826,7 @@ impl QueryEngine {
 
         warn!("Max turns ({max_turns}) reached");
         sink.on_warning(&format!("Agent stopped after {max_turns} turns"));
-        sink.on_turn_outcome(max_turns, "max_turns");
+        sink.on_turn_outcome(self.state.turn_count, "max_turns");
         self.state.is_query_active = false;
         Ok(())
     }
