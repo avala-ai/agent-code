@@ -1347,6 +1347,32 @@ mod tests {
         );
     }
 
+    /// Wrapper options that take an operand must be consumed, or the
+    /// operand is mistaken for the wrapped command: `env -u PATH git
+    /// status` once produced `PATH git status`, un-matching
+    /// `Auto("git status*")` and falling through to `Allow("*")`.
+    #[test]
+    fn wrapper_option_operands_do_not_unmatch_restrictive_rule() {
+        let c = checker(vec![
+            rule("Bash", "git status*", PermissionMode::Auto),
+            rule("Bash", "*", PermissionMode::Allow),
+        ]);
+        for cmd in [
+            "env -u PATH git status && touch marker",
+            "env -C /tmp git status && touch marker",
+            "env --unset PATH git status && touch marker",
+            "env -S 'git status' && touch marker",
+        ] {
+            assert!(
+                matches!(
+                    c.check("Bash", &bash_input(cmd)),
+                    PermissionDecision::Ask(_)
+                ),
+                "an option operand must not un-match the restrictive rule: {cmd}"
+            );
+        }
+    }
+
     #[test]
     fn decision_severity_orders_deny_ask_allow() {
         let deny = PermissionDecision::Deny("d".into());

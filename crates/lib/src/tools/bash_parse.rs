@@ -247,57 +247,161 @@ pub fn is_env_assignment(tok: &str) -> bool {
     }
 }
 
-/// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
-/// return the base name of the command it would run. `None` when the
-/// head is not a wrapper or no wrapped command can be identified.
-fn unwrapped_head(argv: &[String]) -> Option<String> {
+/// `env` short options that take an operand, attached (`-uPATH`) or as
+/// the next token (`-u PATH`). The operand must be consumed, or it gets
+/// mistaken for the wrapped command.
+const ENV_OPERAND_SHORTS: &[char] = &['u', 'C', 'a', 'S'];
+
+/// `env` short options that never take an operand.
+const ENV_PLAIN_SHORTS: &[char] = &['i', '0', 'v'];
+
+/// Tokens of the command a wrapper invocation runs (`tokens[0]` is the
+/// wrapper), with the wrapper's options and their operands consumed.
+/// `None` when the wrapped command cannot be identified — including any
+/// option this parser does not know, because mislocating the command
+/// would hand restrictive rules the wrong text to match.
+fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
+    let is_env = base_name(tokens.first()?) == "env";
+    let rest = &tokens[1..];
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok == "--" {
+            i += 1;
+            break;
+        }
+        if is_env_assignment(tok) {
+            i += 1;
+            continue;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            if !is_env {
+                i += 1;
+                continue;
+            }
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            match name {
+                // `--block/default/ignore-signal` take an optional
+                // argument, but only in the attached `=SIG` form.
+                "ignore-environment"
+                | "null"
+                | "debug"
+                | "list-signal-handling"
+                | "block-signal"
+                | "default-signal"
+                | "ignore-signal"
+                | "help"
+                | "version" => {
+                    i += 1;
+                }
+                "unset" | "chdir" | "argv0" => match inline {
+                    Some(_) => i += 1,
+                    None => {
+                        rest.get(i + 1)?;
+                        i += 2;
+                    }
+                },
+                "split-string" => {
+                    let (operand, next) = match inline {
+                        Some(v) => (v, i + 1),
+                        None => (rest.get(i + 1)?.clone(), i + 2),
+                    };
+                    return split_string_tokens(&operand, &rest[next..]);
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        if let Some(cluster) = tok.strip_prefix('-') {
+            if !is_env || cluster.is_empty() {
+                // Bare `-` is env's shorthand for `-i`; non-env
+                // wrappers have no operand-taking options to consume.
+                i += 1;
+                continue;
+            }
+            let mut consumed_next = false;
+            let mut split_operand: Option<String> = None;
+            for (pos, c) in cluster.char_indices() {
+                if ENV_PLAIN_SHORTS.contains(&c) {
+                    continue;
+                }
+                if !ENV_OPERAND_SHORTS.contains(&c) {
+                    return None;
+                }
+                let attached = &cluster[pos + c.len_utf8()..];
+                let operand = if attached.is_empty() {
+                    consumed_next = true;
+                    rest.get(i + 1)?.clone()
+                } else {
+                    attached.to_string()
+                };
+                if c == 'S' {
+                    split_operand = Some(operand);
+                }
+                break;
+            }
+            let next = i + 1 + usize::from(consumed_next);
+            if let Some(operand) = split_operand {
+                return split_string_tokens(&operand, &rest[next..]);
+            }
+            i = next;
+            continue;
+        }
+        break;
+    }
+    let out = rest[i..].to_vec();
+    (!out.is_empty()).then_some(out)
+}
+
+/// `env -S STRING` splits STRING into the leading words of the wrapped
+/// command; the remaining argv tokens follow it.
+fn split_string_tokens(operand: &str, remainder: &[String]) -> Option<Vec<String>> {
+    let mut out: Vec<String> = operand.split_whitespace().map(str::to_string).collect();
+    out.extend_from_slice(remainder);
+    (!out.is_empty()).then_some(out)
+}
+
+/// The invocation's tokens with any leading wrapper chain stripped.
+/// `None` when there was no wrapper or the wrapped command cannot be
+/// confidently identified.
+fn unwrapped_tokens(argv: &[String]) -> Option<Vec<String>> {
     let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
     let mut unwrapped = false;
     for _ in 0..8 {
         let head = base_name(tokens.first()?);
         if !COMMAND_WRAPPERS.contains(&head.as_str()) {
-            return unwrapped.then_some(head);
+            return unwrapped.then_some(tokens);
         }
-        let idx = tokens[1..]
-            .iter()
-            .position(|tok| !tok.starts_with('-') && !is_env_assignment(tok))?;
-        tokens = tokens.split_off(1 + idx);
+        tokens = strip_wrapper(&tokens)?;
         unwrapped = true;
     }
     None
 }
 
+/// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
+/// return the base name of the command it would run. `None` when the
+/// head is not a wrapper or no wrapped command can be identified.
+fn unwrapped_head(argv: &[String]) -> Option<String> {
+    unwrapped_tokens(argv).map(|tokens| base_name(&tokens[0]))
+}
+
 /// For each invocation, the text with any leading wrapper chain
-/// (`env`, `command`, `nohup`, `setsid` — plus their flags and
-/// VAR=value assignments) stripped: `env -i git status` yields
-/// `git status`. Only invocations that actually had a wrapper are
-/// returned. Lets restrictive permission rules keep matching a
+/// (`env`, `command`, `nohup`, `setsid` — plus their flags, operands
+/// and VAR=value assignments) stripped: `env -u PATH git status`
+/// yields `git status`. Only invocations that actually had a wrapper
+/// are returned. Lets restrictive permission rules keep matching a
 /// command that has been wrapped — the widening side never uses
 /// this, so unwrapping can only remove permissions, never grant.
 pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
-    let mut out = Vec::new();
-    for argv in &parsed.invocations {
-        let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
-        let mut unwrapped = false;
-        for _ in 0..8 {
-            let Some(first) = tokens.first() else { break };
-            if !COMMAND_WRAPPERS.contains(&base_name(first).as_str()) {
-                break;
-            }
-            let Some(idx) = tokens[1..]
-                .iter()
-                .position(|tok| !tok.starts_with('-') && !is_env_assignment(tok))
-            else {
-                break;
-            };
-            tokens = tokens.split_off(1 + idx);
-            unwrapped = true;
-        }
-        if unwrapped && !tokens.is_empty() {
-            out.push(tokens.join(" "));
-        }
-    }
-    out
+    parsed
+        .invocations
+        .iter()
+        .filter_map(|argv| unwrapped_tokens(argv))
+        .map(|tokens| tokens.join(" "))
+        .collect()
 }
 
 /// Check a parsed command against security rules.
@@ -647,5 +751,57 @@ mod tests {
         let parsed = parse_bash("LD_PRELOAD=/tmp/evil.so ls").unwrap();
         let violations = check_parsed_security(&parsed);
         assert!(violations.iter().any(|v| v.contains("LD_PRELOAD")));
+    }
+
+    #[test]
+    fn test_unwrap_consumes_wrapper_option_operands() {
+        let cases = [
+            ("env -u PATH git status && touch marker", "git status"),
+            ("env -uPATH git status", "git status"),
+            ("env -iv -u PATH git status", "git status"),
+            ("env --unset=PATH --chdir /tmp git status", "git status"),
+            ("env -C /tmp -a zero git status", "git status"),
+            ("env -S 'git status' && touch marker", "git status"),
+            (
+                "env --split-string='git -C /repo status'",
+                "git -C /repo status",
+            ),
+            ("env -- git status", "git status"),
+            ("command -p git status", "git status"),
+        ];
+        for (cmd, expected) in cases {
+            let parsed = parse_bash(cmd).unwrap();
+            let texts = unwrapped_invocation_texts(&parsed);
+            assert!(
+                texts.iter().any(|t| t == expected),
+                "expected {expected:?} among unwrapped texts {texts:?} for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unwrap_bails_on_unknown_env_option() {
+        // An unrecognized option means the wrapped command cannot be
+        // located; a wrong guess would feed restrictive rules text
+        // that fails to match.
+        for cmd in ["env -Q git status", "env --frobnicate git status"] {
+            let parsed = parse_bash(cmd).unwrap();
+            assert!(
+                unwrapped_invocation_texts(&parsed).is_empty(),
+                "no unwrapped text expected for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_option_operand_does_not_hide_dangerous_command() {
+        for cmd in ["env -u PATH rm -rf /tmp/x", "env -a sh rm -rf /tmp/x"] {
+            let parsed = parse_bash(cmd).unwrap();
+            let violations = check_parsed_security(&parsed);
+            assert!(
+                violations.iter().any(|v| v.contains("'rm'")),
+                "expected 'rm' to be detected in: {cmd}"
+            );
+        }
     }
 }
