@@ -189,14 +189,30 @@ impl Tool for BashTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("'command' is required".into()))?;
 
-        // Route any `sed -i` invocations through the FileEdit permission
-        // path so protected directories stay protected from both surfaces.
         let parsed = super::bash_parse::parse_bash(command).unwrap_or_else(|| {
             super::bash_parse::ParsedCommand {
                 raw: command.to_string(),
                 ..super::bash_parse::ParsedCommand::default()
             }
         });
+
+        // Plan mode is documented as read-only, so the effect classifier
+        // gets the final say on the command even when an explicit
+        // permission rule would otherwise allow Bash through. Without
+        // this the invariant depends on the executor's tool-level gate
+        // alone, which a `Bash` allow rule can outrank.
+        if ctx.plan_mode_now()
+            && let Err(violation) =
+                read_only_validation::validate_read_only(&parsed, &PermissionProfile::ReadOnly)
+        {
+            return Err(ToolError::PermissionDenied(format!(
+                "Plan mode allows read-only commands only. {}",
+                violation.message
+            )));
+        }
+
+        // Route any `sed -i` invocations through the FileEdit permission
+        // path so protected directories stay protected from both surfaces.
         if let Err(violation) =
             sed_validation::validate_sed_edits(&parsed, &ctx.cwd, ctx.permission_checker.as_ref())
         {
@@ -426,6 +442,53 @@ mod stream_emit_tests {
         }
         assert!(!chunks.is_empty());
         assert_eq!(chunks.concat(), "hello world from bash\n");
+    }
+}
+
+#[cfg(test)]
+mod plan_mode_tests {
+    use super::*;
+
+    fn plan_ctx() -> ToolContext {
+        let mut ctx = ToolContext::for_tests();
+        // Permissions allow everything: plan mode must still hold.
+        ctx.plan_mode = true;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn plan_mode_refuses_mutating_commands_the_permissions_would_allow() {
+        let tool = BashTool;
+        for cmd in [
+            "env rm -rf /tmp/agent-code-plan-probe",
+            "git push",
+            "sort -o /tmp/agent-code-plan-probe /etc/hostname",
+            "awk 'BEGIN{system(\"id\")}'",
+            "find . -delete",
+            "dig example.com",
+        ] {
+            let err = tool
+                .call(json!({"command": cmd}), &plan_ctx())
+                .await
+                .expect_err(&format!("plan mode must refuse: {cmd}"));
+            assert!(
+                matches!(err, ToolError::PermissionDenied(_)),
+                "{cmd}: expected PermissionDenied, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_still_runs_read_only_commands() {
+        let tool = BashTool;
+        for cmd in ["echo hi", "git status", "ls"] {
+            assert!(
+                tool.call(json!({"command": cmd}), &plan_ctx())
+                    .await
+                    .is_ok(),
+                "plan mode must allow: {cmd}"
+            );
+        }
     }
 }
 

@@ -23,7 +23,7 @@
 //! [`PermissionMode::Auto`]: crate::config::PermissionMode::Auto
 
 use crate::tools::bash::bash_security::{DestructivenessLevel, classify_destructive};
-use crate::tools::bash::command_semantics::{Effect, classify, classify_single};
+use crate::tools::bash::command_semantics::{Effect, classify};
 use crate::tools::bash_parse::{ParsedCommand, check_parsed_security, parse_bash};
 
 /// Binaries Auto mode may run without asking.
@@ -213,9 +213,18 @@ fn segment_is_safe(segment: &str) -> bool {
         return false;
     }
     // Belt and braces: the shared classifier must independently agree that
-    // this binary is read-only.
-    if classify_single(base) != vec![Effect::ReadOnly] {
-        return false;
+    // this *invocation* is read-only. It is classified per segment rather
+    // than by binary name, because for several binaries the arguments decide
+    // — `git status` reads, `git push` does not; `find -name` reads,
+    // `find -delete` does not. A name-only check would clear both.
+    match parse_bash(segment) {
+        Some(parsed) => {
+            let effects = classify(&parsed);
+            if effects.is_empty() || effects.iter().any(|e| *e != Effect::ReadOnly) {
+                return false;
+            }
+        }
+        None => return false,
     }
 
     if let Some((_, unsafe_opts)) = UNSAFE_OPTIONS.iter().find(|(name, _)| *name == base)
@@ -277,14 +286,65 @@ fn base_name(raw: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// The safety invariant: nothing Auto approves may be anything other than
+    /// read-only according to the shared classifier.
+    ///
+    /// This used to compare `classify_single(name)` against the allowlist,
+    /// which only held while the classifier judged by binary name. It is now
+    /// argument-aware — `git` is read-only or not depending on the
+    /// subcommand — so the invariant is asserted over whole invocations,
+    /// which is what Auto actually approves.
     #[test]
-    fn allowlist_is_a_subset_of_the_classifier_read_only_set() {
-        for cmd in AUTO_SAFE_COMMANDS {
-            assert_eq!(
-                classify_single(cmd),
-                vec![Effect::ReadOnly],
-                "{cmd} is on the auto allowlist but the classifier does not \
-                 consider it read-only"
+    fn nothing_auto_approves_is_non_read_only() {
+        for cmd in [
+            "ls -la",
+            "cat foo.rs",
+            "git status",
+            "git diff",
+            "git log --oneline -20",
+            "grep -r foo src/",
+            "rg pattern",
+            "find . -name '*.rs'",
+            "wc -l file",
+            "head -n 20 file",
+            "sort file",
+            "uniq file",
+            "echo hi",
+            "pwd",
+            "cat a.txt | grep foo | wc -l",
+            "git status && git diff",
+        ] {
+            if !is_auto_safe_shell_command(cmd) {
+                continue; // not approved; the invariant says nothing about it
+            }
+            let parsed = parse_bash(cmd).expect("approved command must parse");
+            let effects = classify(&parsed);
+            assert!(
+                !effects.is_empty() && effects.iter().all(|e| *e == Effect::ReadOnly),
+                "auto approved {cmd} but the classifier reports {effects:?}"
+            );
+        }
+    }
+
+    /// Every binary on the allowlist must have at least one invocation the
+    /// classifier agrees is read-only — otherwise the entry is dead weight
+    /// that can never be approved, which usually means a stale name.
+    #[test]
+    fn every_allowlisted_binary_has_a_read_only_invocation() {
+        for name in AUTO_SAFE_COMMANDS {
+            let probe = match *name {
+                "git" => "git status".to_string(),
+                "find" => "find . -name x".to_string(),
+                other => format!("{other} --help"),
+            };
+            let Some(parsed) = parse_bash(&probe) else {
+                panic!("{name}: probe {probe:?} did not parse");
+            };
+            let effects = classify(&parsed);
+            assert!(
+                effects.iter().all(|e| *e == Effect::ReadOnly),
+                "{name} is on the auto allowlist but no read-only invocation \
+                 exists — probe {probe:?} classified {effects:?}"
             );
         }
     }

@@ -14,6 +14,16 @@ pub struct ParsedCommand {
     pub raw: String,
     /// Top-level command names (the actual binaries being run).
     pub commands: Vec<String>,
+    /// Full argument vector for each command, in source order: the
+    /// command name followed by its arguments, with prefix variable
+    /// assignments and redirections removed.
+    ///
+    /// Effect classification is argument-dependent for several binaries
+    /// (`git push` vs `git status`, `find -delete` vs `find -name`), so
+    /// the name alone is not enough to decide whether an invocation is
+    /// read-only. Parallel to [`Self::commands`]: entry `i` of this list
+    /// starts with entry `i` of that one.
+    pub invocations: Vec<Vec<String>>,
     /// Variable assignments (FOO=bar).
     pub assignments: Vec<(String, String)>,
     /// Command substitutions ($(...) or `...`).
@@ -77,6 +87,10 @@ fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
                         break;
                     }
                 }
+            }
+            let argv = command_argv(node, source);
+            if !argv.is_empty() {
+                parsed.invocations.push(argv);
             }
         }
         "variable_assignment" => {
@@ -142,6 +156,117 @@ fn node_text(node: Node, source: &[u8]) -> String {
     node.utf8_text(source).unwrap_or("").to_string()
 }
 
+/// Collect the argument vector of a `command` node: the command name
+/// plus every argument, skipping prefix variable assignments and
+/// redirections (which are analysed separately).
+fn command_argv(node: Node, source: &[u8]) -> Vec<String> {
+    let mut argv = Vec::new();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "variable_assignment"
+            | "file_redirect"
+            | "heredoc_redirect"
+            | "herestring_redirect" => {}
+            _ => {
+                let text = node_text(child, source);
+                if !text.is_empty() {
+                    argv.push(text);
+                }
+            }
+        }
+    }
+    argv
+}
+
+/// Strip one layer of shell quoting/escaping from a single token so
+/// option matching cannot be defeated by writing `-'delete'` or
+/// `-dele\te`.
+///
+/// Follows shell rules closely enough for matching: inside single
+/// quotes a backslash is literal; elsewhere `\x` yields `x`.
+pub fn unquote_token(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    out.push(c);
+                }
+            }
+            Some('"') => match c {
+                '"' => quote = None,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                _ => out.push(c),
+            },
+            Some(_) => unreachable!("only ' and \" open a quote"),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+    out
+}
+
+/// Strip a leading path from an already-unquoted command name.
+pub fn base_name(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).to_string()
+}
+
+/// Commands whose job is to run the command that follows them, so the
+/// wrapper name says nothing about what actually executes.
+const COMMAND_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid"];
+
+/// True when `tok` is a `NAME=value` environment assignment.
+pub fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        }
+        None => false,
+    }
+}
+
+/// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
+/// return the base name of the command it would run. `None` when the
+/// head is not a wrapper or no wrapped command can be identified.
+fn unwrapped_head(argv: &[String]) -> Option<String> {
+    let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
+    let mut unwrapped = false;
+    for _ in 0..8 {
+        let head = base_name(tokens.first()?);
+        if !COMMAND_WRAPPERS.contains(&head.as_str()) {
+            return unwrapped.then_some(head);
+        }
+        let idx = tokens[1..]
+            .iter()
+            .position(|tok| !tok.starts_with('-') && !is_env_assignment(tok))?;
+        tokens = tokens.split_off(1 + idx);
+        unwrapped = true;
+    }
+    None
+}
+
 /// Check a parsed command against security rules.
 /// Returns a list of security violations found.
 pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {
@@ -153,9 +278,21 @@ pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {
         "killall", "pkill",
     ];
 
-    for cmd in &parsed.commands {
-        let base = cmd.rsplit('/').next().unwrap_or(cmd);
-        if DANGEROUS_COMMANDS.contains(&base) {
+    // Command names, plus the command each `env`-style wrapper runs —
+    // `env rm x` must be seen as `rm`, not as `env`.
+    let mut heads: Vec<String> = parsed
+        .commands
+        .iter()
+        .map(|c| base_name(&unquote_token(c)))
+        .collect();
+    for argv in &parsed.invocations {
+        if let Some(inner) = unwrapped_head(argv) {
+            heads.push(inner);
+        }
+    }
+
+    for base in &heads {
+        if DANGEROUS_COMMANDS.contains(&base.as_str()) {
             violations.push(format!(
                 "Dangerous command '{base}' detected in AST (not bypassable with quoting tricks)"
             ));
@@ -277,12 +414,69 @@ mod tests {
 
     #[test]
     fn test_detect_quoted_dangerous_command() {
-        // Tree-sitter sees through quotes to the actual command.
+        // Tree-sitter sees through quotes to the actual command, and the
+        // name is unquoted before it is matched, so the quoting trick
+        // does not hide `rm`.
         let parsed = parse_bash("'rm' -rf /").unwrap();
-        let _violations = check_parsed_security(&parsed);
-        // The command name includes quotes, but check_parsed_security
-        // strips path components. Let's verify the parse at least works.
+        let violations = check_parsed_security(&parsed);
         assert!(!parsed.commands.is_empty());
+        assert!(violations.iter().any(|v| v.contains("rm")));
+    }
+
+    #[test]
+    fn test_invocations_capture_arguments() {
+        let parsed = parse_bash("git push origin main").unwrap();
+        assert_eq!(
+            parsed.invocations,
+            vec![vec![
+                "git".to_string(),
+                "push".to_string(),
+                "origin".to_string(),
+                "main".to_string()
+            ]]
+        );
+
+        // Prefix assignments and redirections are not arguments.
+        let parsed = parse_bash("FOO=bar ls -la > out").unwrap();
+        assert_eq!(
+            parsed.invocations,
+            vec![vec!["ls".to_string(), "-la".to_string()]]
+        );
+
+        // Each pipeline segment and each substitution gets its own argv.
+        let parsed = parse_bash("cat f | grep x").unwrap();
+        assert_eq!(parsed.invocations.len(), 2);
+        let parsed = parse_bash("echo $(rm -rf /tmp/x)").unwrap();
+        assert!(
+            parsed
+                .invocations
+                .iter()
+                .any(|argv| argv.first().is_some_and(|c| c == "rm"))
+        );
+    }
+
+    #[test]
+    fn test_env_wrapper_does_not_hide_dangerous_command() {
+        // `env <cmd>` runs `<cmd>`; the wrapper name must not be the
+        // only thing the AST check sees.
+        for cmd in ["env rm somefile", "env FOO=bar rm somefile", "nohup rm f"] {
+            let parsed = parse_bash(cmd).unwrap();
+            let violations = check_parsed_security(&parsed);
+            assert!(
+                violations.iter().any(|v| v.contains("rm")),
+                "expected 'rm' to be detected in: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unquote_token() {
+        assert_eq!(unquote_token("-'delete'"), "-delete");
+        assert_eq!(unquote_token("-dele\\te"), "-delete");
+        assert_eq!(unquote_token("\"git\""), "git");
+        assert_eq!(unquote_token("plain"), "plain");
+        // A backslash inside single quotes stays literal, as in a shell.
+        assert_eq!(unquote_token("'-dele\\te'"), "-dele\\te");
     }
 
     #[test]

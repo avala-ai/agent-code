@@ -61,19 +61,14 @@ pub fn validate_read_only(
         return Ok(());
     }
 
-    let mut effects: Vec<Effect> = classify(cmd)
+    // `classify` is argument-aware and already accounts for output
+    // redirection, `env`-wrapped commands, mutating `git` subcommands
+    // and the rest, so the read-only decision is exactly "no effect
+    // other than ReadOnly survives".
+    let effects: Vec<Effect> = classify(cmd)
         .into_iter()
         .filter(|e| !matches!(e, Effect::ReadOnly))
         .collect();
-
-    // Any output redirection or process substitution is mutating
-    // regardless of the underlying command name. Without this
-    // adjustment `echo foo > file` and `awk '{}' > out` would be
-    // classified as read-only because `echo` and `awk` are on the
-    // read-only list.
-    if has_output_redirection(cmd) && !effects.contains(&Effect::Mutating) {
-        effects.push(Effect::Mutating);
-    }
 
     if effects.is_empty() {
         return Ok(());
@@ -88,62 +83,6 @@ pub fn validate_read_only(
             names.join(", ")
         ),
     })
-}
-
-/// Detect any output redirection (`>`, `>>`, `&>`, `2>`, heredoc-to-file
-/// from `<<<`, or process substitution `>(…)`) in the parsed command.
-///
-/// File-descriptor duplications such as `2>&1` are NOT output
-/// redirections to a path and must not be flagged here.
-fn has_output_redirection(cmd: &ParsedCommand) -> bool {
-    if cmd.has_process_substitution {
-        return true;
-    }
-    contains_unquoted_output_redirect(&cmd.raw)
-}
-
-/// True if `raw` contains a `>` outside of single/double quotes that
-/// is acting as an output redirection (i.e. not part of `2>&1`,
-/// arrows, comparison operators, etc.).
-fn contains_unquoted_output_redirect(raw: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut prev: Option<char> = None;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            prev = Some(c);
-            continue;
-        }
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '>' => {
-                // Skip `2>&1`-style merges: `>` followed by `&` and a
-                // digit is a duplication, not a file write.
-                if prev == Some('-') {
-                    // Heredoc bodies, arrows in conditionals (`->`),
-                    // etc. — not a redirect.
-                    prev = Some(c);
-                    continue;
-                }
-                if let Some(&next) = chars.peek()
-                    && next == '&'
-                {
-                    // `>&` (file descriptor duplication, e.g. `2>&1`).
-                    // Not a write to a path.
-                    chars.next();
-                    prev = Some('&');
-                    continue;
-                }
-                return true;
-            }
-            _ => {}
-        }
-        prev = Some(c);
-    }
-    false
 }
 
 #[cfg(test)]
@@ -269,5 +208,170 @@ mod tests {
         // `2>&1` is a file-descriptor duplication, not a path write.
         let cmd = parse("ls 2>&1");
         assert!(validate_read_only(&cmd, &PermissionProfile::ReadOnly).is_ok());
+    }
+
+    /// Every command here escaped the read-only profile before the
+    /// classifier became argument-aware: the binary name alone
+    /// (`git`, `env`, `awk`, `less`, `sort`, `ip`, `dig`, `find`, …)
+    /// was enough to be judged read-only.
+    #[test]
+    fn read_only_profile_refuses_known_escapes() {
+        for cmd in [
+            // Arbitrary execution through a wrapper or a program-text
+            // escape hatch.
+            "env rm -rf /tmp/x",
+            "env -S 'rm -rf /tmp/x'",
+            "awk 'BEGIN{system(\"rm -rf /tmp/x\")}'",
+            "awk '{print > \"/tmp/pwned\"}' /etc/hostname",
+            "awk -f /tmp/prog.awk /etc/hostname",
+            "less /etc/passwd",
+            "more /etc/passwd",
+            "top",
+            // Arbitrary file writes.
+            "sort -o /tmp/pwned /etc/hostname",
+            "sort --output=/tmp/pwned /etc/hostname",
+            "uniq /etc/hostname /tmp/pwned",
+            "find . -delete",
+            "find . -name '*.rs' -exec rm {} ;",
+            "find . -fprintf /tmp/pwned %p",
+            // System / network configuration.
+            "ip link set eth0 down",
+            "ip addr add 10.0.0.1/24 dev eth0",
+            "ifconfig eth0 down",
+            "hostname pwned",
+            "date -s 12:00",
+            "ss -K dst 1.2.3.4",
+            // Network egress.
+            "dig example.com",
+            "host example.com",
+            "nslookup example.com",
+            // Destructive or remote-mutating git.
+            "git push",
+            "git push origin main",
+            "git commit -m x",
+            "git reset --hard",
+            "git clean -fd",
+            "git checkout main",
+            "git fetch",
+            "git pull",
+            "git config user.email x@example.com",
+            "git stash",
+            "git branch -D main",
+            "git tag -d v1",
+            "git -c core.pager=sh status",
+            "git -C /tmp status",
+            "git --git-dir=/tmp/.git status",
+            "git diff --ext-diff",
+            "git log --textconv",
+        ] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_err(),
+                "read-only profile must refuse: {cmd}"
+            );
+        }
+    }
+
+    /// Plan mode has to stay useful: these must keep working.
+    #[test]
+    fn read_only_profile_still_allows_inspection_commands() {
+        for cmd in [
+            "git status",
+            "git diff",
+            "git log --oneline -5",
+            "git show HEAD",
+            "git branch",
+            "git remote -v",
+            "ls -la",
+            "cat f",
+            "grep -r x src/",
+            "rg pat",
+            "find . -name '*.rs'",
+            "awk '{print $1}' f",
+            "sort f",
+            "uniq f",
+            "head -20 f",
+            "tail -f f",
+            "wc -l f",
+            "hostname",
+            "pwd",
+            "echo hi",
+            "stat f",
+            "du -sh .",
+            "diff a b",
+            "cat a | grep b | wc -l",
+        ] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_ok(),
+                "read-only profile must allow: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_profile_sees_through_quote_and_backslash_evasion() {
+        for cmd in [
+            "find . -'delete'",
+            "find . -dele\\te",
+            "find . '-delete'",
+            "sort --'output'=/tmp/pwned f",
+            "sort --outp\\ut=/tmp/pwned f",
+        ] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_err(),
+                "quoting must not defeat option matching: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_wrapping_is_classified_by_the_wrapped_command() {
+        // Refused: `env` runs whatever follows it.
+        for cmd in [
+            "env rm -rf x",
+            "env git push",
+            "env curl https://example.com",
+        ] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_err(),
+                "env must be classified by the wrapped command: {cmd}"
+            );
+        }
+        // Allowed by design: recursion resolves to a read-only command.
+        for cmd in [
+            "env ls",
+            "env FOO=bar ls -la",
+            "env -i ls",
+            "env -u HOME ls",
+        ] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_ok(),
+                "env wrapping a read-only command should stay allowed: {cmd}"
+            );
+        }
+        // `env` with no command prints the environment; it must not panic.
+        let parsed = parse("env");
+        assert!(validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_ok());
+        let parsed = parse("env FOO=bar");
+        assert!(validate_read_only(&parsed, &PermissionProfile::ReadOnly).is_ok());
+    }
+
+    #[test]
+    fn deny_mode_profile_refuses_the_same_escapes() {
+        // `PermissionMode::Deny` maps to the same ReadOnly profile as
+        // plan mode, so the fix has to cover it too.
+        let profile = PermissionProfile::from(PermissionMode::Deny);
+        assert_eq!(profile, PermissionProfile::ReadOnly);
+        for cmd in ["git push", "env rm -rf /tmp/x", "sort -o /tmp/pwned f"] {
+            let parsed = parse(cmd);
+            assert!(
+                validate_read_only(&parsed, &profile).is_err(),
+                "deny mode must refuse: {cmd}"
+            );
+        }
     }
 }
