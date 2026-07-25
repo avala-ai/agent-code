@@ -176,7 +176,7 @@ where
     }
 
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, RawHandle};
 
     // Create a temp file to receive stdout.
     let mut tmp = match tempfile::NamedTempFile::new() {
@@ -190,49 +190,20 @@ where
     unsafe extern "system" {
         fn GetStdHandle(n_std_handle: u32) -> RawHandle;
         fn SetStdHandle(n_std_handle: u32, h: RawHandle) -> i32;
-        fn DuplicateHandle(
-            h_source_process: RawHandle,
-            h_source: RawHandle,
-            h_target_process: RawHandle,
-            lp_target: *mut RawHandle,
-            dw_desired_access: u32,
-            b_inherit: i32,
-            dw_options: u32,
-        ) -> i32;
-        fn GetCurrentProcess() -> RawHandle;
     }
     const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5; // (DWORD)-11
-    const DUPLICATE_SAME_ACCESS: u32 = 0x00000002;
 
-    // SAFETY: fetch current stdout handle.
+    // SAFETY: fetch current stdout handle. GetStdHandle returns the raw
+    // slot value without transferring ownership — nothing below closes
+    // it, so it stays valid to restore after the capture.
     let original = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     if original.is_null() || original == (-1isize as RawHandle) {
-        return (f(), String::new());
-    }
-
-    // Duplicate original so we can restore after SetStdHandle.
-    let mut saved: RawHandle = std::ptr::null_mut();
-    let process = unsafe { GetCurrentProcess() };
-    let dup_ok = unsafe {
-        DuplicateHandle(
-            process,
-            original,
-            process,
-            &mut saved,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    };
-    if dup_ok == 0 || saved.is_null() {
         return (f(), String::new());
     }
 
     // Redirect process stdout to the temp file handle.
     let set_ok = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, tmp_handle) };
     if set_ok == 0 {
-        // SAFETY: close the duplicated handle we no longer need.
-        drop(unsafe { OwnedHandle::from_raw_handle(saved) });
         return (f(), String::new());
     }
 
@@ -243,11 +214,16 @@ where
 
     let _ = std::io::stdout().flush();
 
-    // Restore original stdout handle.
+    // Restore the original stdout handle. Unlike POSIX dup2, SetStdHandle
+    // stores the raw value without duplicating it, so the slot must get
+    // back a handle that stays open. An earlier version installed a
+    // duplicate and then closed it, leaving stdout pointing at a dead —
+    // and reusable — handle value: every later stdout write in the
+    // process failed with ERROR_ACCESS_DENIED (or landed in whatever
+    // object reused the value), which intermittently killed the whole
+    // test harness on Windows CI.
     unsafe {
-        let _ = SetStdHandle(STD_OUTPUT_HANDLE, saved);
-        // Drop duplicate (OwnedHandle closes it).
-        drop(OwnedHandle::from_raw_handle(saved));
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, original);
     }
 
     // Read what was written.
