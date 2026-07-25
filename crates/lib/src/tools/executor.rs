@@ -124,6 +124,8 @@ pub async fn execute_tool_calls(
                         let perm_checker = ctx.permission_checker.clone();
 
                         let ctx_plan_mode = ctx.plan_mode;
+                        let ctx_live_plan = ctx.live_plan_mode.clone();
+                        let ctx_session_id = ctx.session_id.clone();
                         let ctx_file_cache = ctx.file_cache.clone();
                         // Read-only tools still go through permission checks —
                         // with the SAME prompter/allow-store/denial-tracker as
@@ -161,6 +163,8 @@ pub async fn execute_tool_calls(
                                     tool_events: ctx_events,
                                     active_call_id: None,
                                     subagent_api_defaults: None,
+                                    live_plan_mode: ctx_live_plan,
+                                    session_id: ctx_session_id,
                                 },
                                 &perm_checker,
                             )
@@ -204,7 +208,7 @@ async fn execute_single_tool(
     let ctx = ctx.with_call_id(&call.id);
 
     // Block non-read-only tools in plan mode.
-    if ctx.plan_mode && !tool.is_read_only() {
+    if ctx.plan_mode_now() && !tool.is_read_only() {
         return ToolCallResult {
             tool_use_id: call.id.clone(),
             tool_name: call.name.clone(),
@@ -540,5 +544,89 @@ mod parallel_batch_tests {
         for r in &results {
             assert!(r.result.is_error, "denied call returns an error result");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_plan_gate_tests {
+    use super::*;
+    use crate::permissions::{PermissionChecker, PermissionDecision};
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct WriteTool;
+
+    #[async_trait]
+    impl Tool for WriteTool {
+        fn name(&self) -> &'static str {
+            "TestWrite"
+        }
+        fn description(&self) -> &'static str {
+            "test write tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        async fn check_permissions(
+            &self,
+            _input: &serde_json::Value,
+            _checker: &PermissionChecker,
+        ) -> PermissionDecision {
+            PermissionDecision::Allow
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            Ok(ToolResult::success("wrote".to_string()))
+        }
+    }
+
+    fn call() -> PendingToolCall {
+        PendingToolCall {
+            id: "c1".into(),
+            name: "TestWrite".into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    /// A Plan toggle that lands mid-batch must gate the very next call:
+    /// the context snapshot says "not plan mode" (taken at iteration
+    /// start), but the live flag flipped while an earlier tool in the
+    /// batch was still running.
+    #[tokio::test]
+    async fn live_plan_flip_gates_next_call_despite_stale_snapshot() {
+        let live = Arc::new(AtomicBool::new(false));
+        let mut ctx = ToolContext::for_tests();
+        ctx.plan_mode = false;
+        ctx.live_plan_mode = Some(live.clone());
+        let checker = PermissionChecker::allow_all();
+
+        // Flip to Plan "mid-batch".
+        live.store(true, Ordering::SeqCst);
+        let blocked = execute_single_tool(&call(), &WriteTool, &ctx, &checker).await;
+        assert!(blocked.result.is_error, "write must be blocked live");
+        assert!(blocked.result.content.contains("Plan mode active"));
+
+        // Flip back out of Plan: the same context allows again.
+        live.store(false, Ordering::SeqCst);
+        let allowed = execute_single_tool(&call(), &WriteTool, &ctx, &checker).await;
+        assert!(!allowed.result.is_error, "write allowed after live exit");
+    }
+
+    /// Without a live handle the snapshot still gates (test contexts).
+    #[tokio::test]
+    async fn snapshot_gates_when_no_live_handle() {
+        let mut ctx = ToolContext::for_tests();
+        ctx.plan_mode = true;
+        let checker = PermissionChecker::allow_all();
+        let blocked = execute_single_tool(&call(), &WriteTool, &ctx, &checker).await;
+        assert!(blocked.result.is_error);
     }
 }
