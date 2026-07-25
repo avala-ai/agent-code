@@ -7,43 +7,98 @@
 
 use super::message::*;
 
-/// Ensure every tool_use block has a matching tool_result in the
-/// subsequent user message. Orphaned tool_use blocks cause API errors.
+/// Repair tool_use / tool_result pairing so strict providers accept
+/// the history.
+///
+/// Malformed histories (crash mid-turn, imported sessions, permissive
+/// upstream models) show up three ways, all rejected with a 400 by
+/// strict OpenAI-compatible and local backends:
+///
+/// - a `tool_use` with no answering `tool_result` → a synthetic error
+///   result is appended (long-standing behavior);
+/// - a `tool_result` with no preceding `tool_use` for its id
+///   (out-of-order or truly orphaned) → the block is dropped;
+/// - several `tool_result`s for the same id → the first is kept, the
+///   rest are dropped (the first is the one the model actually
+///   continued from).
+///
+/// Blocks emptied by the drops are cleaned up by the
+/// `remove_empty_messages` step that follows in the pipeline.
 pub fn ensure_tool_result_pairing(messages: &mut Vec<Message>) {
+    use std::collections::HashSet;
+
+    // IDs of tool_use blocks seen so far in the walk (a result is only
+    // valid when its call precedes it), and IDs already answered.
+    let mut seen_use_ids: HashSet<String> = HashSet::new();
+    let mut answered_ids: HashSet<String> = HashSet::new();
+    // Preserves emission order for the synthetic results appended below.
     let mut pending_tool_ids: Vec<String> = Vec::new();
 
-    let mut i = 0;
-    while i < messages.len() {
-        match &messages[i] {
+    for msg in messages.iter_mut() {
+        match msg {
             Message::Assistant(a) => {
-                // Collect tool_use IDs from this message.
                 for block in &a.content {
-                    if let ContentBlock::ToolUse { id, .. } = block {
+                    if let ContentBlock::ToolUse { id, .. } = block
+                        && seen_use_ids.insert(id.clone())
+                    {
                         pending_tool_ids.push(id.clone());
                     }
                 }
             }
             Message::User(u) => {
-                // Remove tool_result IDs that are satisfied.
-                for block in &u.content {
-                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                        pending_tool_ids.retain(|id| id != tool_use_id);
+                u.content.retain(|block| {
+                    let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                        return true;
+                    };
+                    if !seen_use_ids.contains(tool_use_id) {
+                        // Out-of-order or orphaned result — no call to
+                        // pair with; keeping it guarantees a 400.
+                        return false;
                     }
-                }
+                    // Keep only the first result per id.
+                    answered_ids.insert(tool_use_id.clone())
+                });
             }
             _ => {}
         }
-        i += 1;
     }
 
-    // Any remaining pending IDs need synthetic error results.
-    if !pending_tool_ids.is_empty() {
-        for id in pending_tool_ids {
-            messages.push(tool_result_message(
-                &id,
-                "(tool execution was interrupted)",
-                true,
-            ));
+    // Any calls still unanswered get synthetic error results.
+    pending_tool_ids.retain(|id| !answered_ids.contains(id));
+    for id in pending_tool_ids {
+        messages.push(tool_result_message(
+            &id,
+            "(tool execution was interrupted)",
+            true,
+        ));
+    }
+}
+
+/// Replace `tool_use` inputs that are not JSON objects.
+///
+/// Providers require tool-call arguments to be an object; some models
+/// emit `null` or the arguments as a JSON-encoded *string*. A string
+/// that parses to an object is adopted (the arguments were merely
+/// double-encoded); anything else non-object becomes `{}` so the
+/// request is not rejected outright.
+pub fn sanitize_tool_use_input(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        let Message::Assistant(a) = msg else { continue };
+        for block in a.content.iter_mut() {
+            let ContentBlock::ToolUse { input, .. } = block else {
+                continue;
+            };
+            if input.is_object() {
+                continue;
+            }
+            if let serde_json::Value::String(s) = &input
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                && parsed.is_object()
+            {
+                *input = parsed;
+                continue;
+            }
+            *input = serde_json::json!({});
         }
     }
 }
@@ -388,6 +443,199 @@ mod tests {
                 panic!("Expected user message with tool result");
             }
         }
+    }
+
+    fn assistant_with_use(id: &str, input: serde_json::Value) -> Message {
+        Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "Bash".into(),
+                input,
+            }],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })
+    }
+
+    fn result_content(msg: &Message) -> Vec<(&str, &str)> {
+        match msg {
+            Message::User(u) => u
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => Some((tool_use_id.as_str(), content.as_str())),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn orphan_result_with_no_preceding_use_is_dropped() {
+        let mut messages = vec![
+            user_message("hi"),
+            // Result arrives before any tool_use with this id exists.
+            tool_result_message("never_called", "stale", false),
+            assistant_with_use("call_1", serde_json::json!({})),
+            tool_result_message("call_1", "ok", false),
+        ];
+        ensure_tool_result_pairing(&mut messages);
+        let all_results: Vec<_> = messages.iter().flat_map(result_content).collect();
+        assert_eq!(
+            all_results,
+            vec![("call_1", "ok")],
+            "orphan result must be dropped, valid pair preserved"
+        );
+    }
+
+    #[test]
+    fn out_of_order_result_before_its_use_is_dropped_then_synthesized() {
+        let mut messages = vec![
+            // Result precedes its own tool_use — invalid ordering.
+            tool_result_message("call_1", "too early", false),
+            assistant_with_use("call_1", serde_json::json!({})),
+        ];
+        ensure_tool_result_pairing(&mut messages);
+        let all_results: Vec<_> = messages.iter().flat_map(result_content).collect();
+        // The early result is dropped; the now-unanswered call gets a
+        // synthetic error result appended.
+        assert_eq!(all_results.len(), 1);
+        assert_eq!(all_results[0].0, "call_1");
+        assert_ne!(all_results[0].1, "too early");
+    }
+
+    #[test]
+    fn duplicate_results_keep_only_the_first() {
+        let mut messages = vec![
+            assistant_with_use("call_1", serde_json::json!({})),
+            tool_result_message("call_1", "first", false),
+            tool_result_message("call_1", "second", false),
+            tool_result_message("call_1", "third", false),
+        ];
+        ensure_tool_result_pairing(&mut messages);
+        let all_results: Vec<_> = messages.iter().flat_map(result_content).collect();
+        assert_eq!(
+            all_results,
+            vec![("call_1", "first")],
+            "only the first result per id survives"
+        );
+    }
+
+    #[test]
+    fn duplicate_result_inside_one_message_is_deduplicated() {
+        let mut messages = vec![
+            assistant_with_use("call_1", serde_json::json!({})),
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "first".into(),
+                        is_error: false,
+                        extra_content: vec![],
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "second".into(),
+                        is_error: false,
+                        extra_content: vec![],
+                    },
+                ],
+                is_meta: true,
+                is_compact_summary: false,
+            }),
+        ];
+        ensure_tool_result_pairing(&mut messages);
+        let all_results: Vec<_> = messages.iter().flat_map(result_content).collect();
+        assert_eq!(all_results, vec![("call_1", "first")]);
+    }
+
+    #[test]
+    fn sanitize_null_input_becomes_empty_object() {
+        let mut messages = vec![assistant_with_use("call_1", serde_json::Value::Null)];
+        sanitize_tool_use_input(&mut messages);
+        let Message::Assistant(a) = &messages[0] else {
+            panic!("expected assistant");
+        };
+        let ContentBlock::ToolUse { input, .. } = &a.content[0] else {
+            panic!("expected tool_use");
+        };
+        assert_eq!(input, &serde_json::json!({}));
+    }
+
+    #[test]
+    fn sanitize_stringified_object_is_recovered() {
+        let mut messages = vec![assistant_with_use(
+            "call_1",
+            serde_json::Value::String(r#"{"command":"ls"}"#.into()),
+        )];
+        sanitize_tool_use_input(&mut messages);
+        let Message::Assistant(a) = &messages[0] else {
+            panic!("expected assistant");
+        };
+        let ContentBlock::ToolUse { input, .. } = &a.content[0] else {
+            panic!("expected tool_use");
+        };
+        assert_eq!(input, &serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn sanitize_non_object_values_become_empty_object() {
+        for bad in [
+            serde_json::json!("not json at all"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(42),
+            serde_json::json!("[1,2]"), // parses, but not to an object
+        ] {
+            let mut messages = vec![assistant_with_use("call_1", bad)];
+            sanitize_tool_use_input(&mut messages);
+            let Message::Assistant(a) = &messages[0] else {
+                panic!("expected assistant");
+            };
+            let ContentBlock::ToolUse { input, .. } = &a.content[0] else {
+                panic!("expected tool_use");
+            };
+            assert_eq!(input, &serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn well_formed_history_passes_through_unchanged() {
+        let original = vec![
+            user_message("run ls"),
+            assistant_with_use("call_1", serde_json::json!({"command": "ls"})),
+            tool_result_message("call_1", "file.txt", false),
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+        ];
+        let mut messages = original.clone();
+        sanitize_tool_use_input(&mut messages);
+        ensure_tool_result_pairing(&mut messages);
+        assert_eq!(messages.len(), original.len());
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            serde_json::to_string(&original).unwrap(),
+            "valid history must not be altered"
+        );
     }
 
     #[test]
