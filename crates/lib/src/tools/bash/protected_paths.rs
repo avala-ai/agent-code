@@ -19,8 +19,16 @@
 //! `/sbin/`, `/boot/`, `/sys/`, `/proc/`) so that the historical
 //! `mv …` / `> …` / `tee …` checks in `bash::mod` no longer leave
 //! `cp …`, `dd of=…`, `install …`, etc. as bypasses.
+//!
+//! Destinations are checked in several spellings (see
+//! [`normalized_forms`]): lexical, raw, anchored to the execution cwd
+//! for relative paths ([`check_at`]), and symlink-resolved. Links
+//! created by an earlier segment of the *same* command (`ln`,
+//! `cp -s`/`-l`) are tracked in scan order, so a later write through a
+//! path that does not exist at validation time is checked against the
+//! link's target instead of being waved through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::permissions::{PROTECTED_DIRS, is_team_memory_write_target};
 use crate::tools::bash::BLOCKED_WRITE_PATHS;
@@ -39,17 +47,116 @@ pub struct ProtectedPathViolation {
     pub reason: String,
 }
 
+/// How relative write destinations are anchored during a check.
+enum Anchor {
+    /// No execution directory is known (pre-execution screening from
+    /// `validate_input`). Relative paths are checked lexically only —
+    /// the anchored pass in [`check_at`] runs before dispatch.
+    None,
+    /// The canonicalized directory the command will execute in.
+    Dir(PathBuf),
+    /// A cwd was claimed but could not be canonicalized. Relative
+    /// write destinations cannot be verified, so they are refused
+    /// (fail closed).
+    Unavailable,
+}
+
+/// A link (`ln`, `ln -s`, `cp -s`, `cp -l`) that an earlier segment of
+/// the command under scan will create before a later segment runs.
+///
+/// Canonicalization sees only the pre-execution filesystem, so a write
+/// "through" such a link must be checked against the link's *target*,
+/// not against the not-yet-existing path.
+struct CreatedLink {
+    /// Normalized spellings of the link name, for prefix-matching
+    /// later write destinations.
+    name_forms: Vec<String>,
+    /// The link target as written.
+    target: String,
+    /// False when the target contains shell expansion (`$`, backtick)
+    /// and therefore cannot be audited before execution.
+    auditable: bool,
+}
+
+impl CreatedLink {
+    /// If any form of a write destination is the link itself or lies
+    /// below it, return the path remainder under the link ("" for the
+    /// link itself).
+    fn match_remainder(&self, dest_forms: &[String]) -> Option<String> {
+        for name in &self.name_forms {
+            let name = name.trim_end_matches('/');
+            if name.is_empty() || name == "." {
+                continue;
+            }
+            for dest in dest_forms {
+                if dest == name {
+                    return Some(String::new());
+                }
+                if let Some(rest) = dest.strip_prefix(name)
+                    && let Some(rest) = rest.strip_prefix('/')
+                {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// State threaded through every segment (and recursive shell payload)
+/// of one command, in execution order.
+struct ScanState {
+    anchor: Anchor,
+    /// Links created by segments already scanned.
+    links: Vec<CreatedLink>,
+    /// True once a segment creates a link whose *name* cannot be
+    /// determined before execution — after that, no later write
+    /// destination can be audited at all.
+    opaque_link: bool,
+}
+
+impl ScanState {
+    fn new(anchor: Anchor) -> Self {
+        Self {
+            anchor,
+            links: Vec::new(),
+            opaque_link: false,
+        }
+    }
+}
+
 /// Run every protected-path check against `command`. Returns the first
 /// violation found, or `Ok(())` when the command is safe.
 ///
 /// `command` is the full original shell string. We re-parse pieces of
 /// it (subshells, `bash -c` payloads, etc.) to apply the same checks
 /// recursively.
+///
+/// This entry point has no execution directory, so relative
+/// destinations are checked lexically only. The bash tool additionally
+/// runs [`check_at`] with the real cwd before dispatch; both must pass.
 pub fn check(command: &str) -> Result<(), ProtectedPathViolation> {
-    check_with_depth(command, 0)
+    check_with_depth(command, 0, &mut ScanState::new(Anchor::None))
 }
 
-fn check_with_depth(command: &str, depth: u8) -> Result<(), ProtectedPathViolation> {
+/// Like [`check`], but anchored to `cwd` — the directory the command
+/// will actually execute in. Relative destinations are resolved against
+/// it before symlink canonicalization, so `out -> .git` in the cwd is
+/// seen for what it is. When `cwd` cannot be canonicalized the check
+/// fails closed: relative write destinations are refused.
+pub fn check_at(command: &str, cwd: &Path) -> Result<(), ProtectedPathViolation> {
+    let anchor = match cwd.canonicalize() {
+        Ok(dir) => Anchor::Dir(dir),
+        Err(_) => Anchor::Unavailable,
+    };
+    check_with_depth(command, 0, &mut ScanState::new(anchor))
+}
+
+fn check_with_depth(
+    command: &str,
+    depth: u8,
+    state: &mut ScanState,
+) -> Result<(), ProtectedPathViolation> {
     if depth > MAX_INTERPRETER_DEPTH {
         return Err(ProtectedPathViolation {
             reason: format!(
@@ -60,12 +167,16 @@ fn check_with_depth(command: &str, depth: u8) -> Result<(), ProtectedPathViolati
     }
 
     for segment in shell_segments(command) {
-        check_segment(&segment, depth)?;
+        check_segment(&segment, depth, state)?;
     }
     Ok(())
 }
 
-fn check_segment(segment: &str, depth: u8) -> Result<(), ProtectedPathViolation> {
+fn check_segment(
+    segment: &str,
+    depth: u8,
+    state: &mut ScanState,
+) -> Result<(), ProtectedPathViolation> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -80,7 +191,7 @@ fn check_segment(segment: &str, depth: u8) -> Result<(), ProtectedPathViolation>
     // are checked first because they apply regardless of the underlying
     // command name.
     for dest in extract_redirection_destinations(&tokens) {
-        ensure_not_protected(&dest, "redirection")?;
+        ensure_not_protected(&dest, "redirection", state)?;
     }
 
     // Skip leading `VAR=value` assignments to find the actual command.
@@ -97,12 +208,20 @@ fn check_segment(segment: &str, depth: u8) -> Result<(), ProtectedPathViolation>
 
     // Writer commands: extract the destination operand and check it.
     for dest in extract_writer_destinations(head, args) {
-        ensure_not_protected(&dest, head)?;
+        ensure_not_protected(&dest, head, state)?;
     }
 
-    // Interpreter recursion / heuristic scan.
+    // Record links this segment creates AFTER its own destinations were
+    // checked (creating a link that merely points at a protected path
+    // is not a write into it), so only later writes are matched against
+    // the link.
+    record_link_creations(head, args, state);
+
+    // Interpreter recursion / heuristic scan. Recursion shares `state`
+    // so a link created inside `bash -c '…'` is visible to segments
+    // after it, and vice versa.
     if let Some(payload) = extract_recursive_shell_payload(head, args) {
-        check_with_depth(&payload, depth + 1)?;
+        check_with_depth(&payload, depth + 1, state)?;
     } else if let Some(payload) = extract_interpreter_payload(head, args) {
         ensure_no_protected_substring(&payload, head)?;
     }
@@ -112,13 +231,135 @@ fn check_segment(segment: &str, depth: u8) -> Result<(), ProtectedPathViolation>
 
 /// Refuse `path` if it resolves into any protected directory or
 /// blocked system path.
-fn ensure_not_protected(path: &str, source: &str) -> Result<(), ProtectedPathViolation> {
+fn ensure_not_protected(
+    path: &str,
+    source: &str,
+    state: &ScanState,
+) -> Result<(), ProtectedPathViolation> {
+    let trimmed = path.trim_matches(|c: char| c == '"' || c == '\'');
+    if matches!(state.anchor, Anchor::Unavailable) && !Path::new(trimmed).is_absolute() {
+        return Err(ProtectedPathViolation {
+            reason: format!(
+                "{source} writes to relative path {path}, but the command's \
+                 working directory is unavailable so the destination cannot \
+                 be verified; failing closed"
+            ),
+        });
+    }
+
     // Check every spelling the token can denote — see `normalized_forms`.
     // A path is refused if *any* of them lands somewhere protected.
-    for normalized in normalized_forms(path) {
-        ensure_form_not_protected(&normalized, path, source)?;
+    let forms = normalized_forms(path, &state.anchor);
+    for normalized in &forms {
+        ensure_form_not_protected(normalized, path, source)?;
     }
+
+    // A previous segment created a link whose name we could not
+    // determine — any destination might be (or pass through) that
+    // link, and `ln -f` can even replace an existing file with it.
+    if state.opaque_link {
+        return Err(ProtectedPathViolation {
+            reason: format!(
+                "{source} writes to {path} after this command creates a link \
+                 whose name cannot be determined before execution; failing \
+                 closed — run the link creation and the write as separate \
+                 commands"
+            ),
+        });
+    }
+
+    // Writes through a link created earlier in this command: the path
+    // does not exist at validation time, so canonicalization cannot see
+    // it. Check the link *target* with the remainder substituted in.
+    for link in &state.links {
+        let Some(remainder) = link.match_remainder(&forms) else {
+            continue;
+        };
+        if !link.auditable {
+            return Err(ProtectedPathViolation {
+                reason: format!(
+                    "{source} would write through {path}, a link created \
+                     earlier in this command whose target cannot be \
+                     determined before execution; failing closed — run the \
+                     link creation and the write as separate commands"
+                ),
+            });
+        }
+        let substituted = if remainder.is_empty() {
+            link.target.clone()
+        } else {
+            format!("{}/{}", link.target.trim_end_matches('/'), remainder)
+        };
+        for form in normalized_forms(&substituted, &state.anchor) {
+            ensure_form_not_protected(&form, path, source)?;
+        }
+    }
+
     Ok(())
+}
+
+/// True when a token contains no shell expansion syntax, i.e. the path
+/// it denotes at execution time is the token itself.
+fn is_literal_path(s: &str) -> bool {
+    !s.contains('$') && !s.contains('`')
+}
+
+/// If this segment creates filesystem links (`ln`, hard or symbolic,
+/// or `cp --link`/`--symbolic-link`), record the (target, link name)
+/// pairs so later write destinations can be checked against them.
+fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
+    let creates_links = match head {
+        "ln" => true,
+        "cp" => args.iter().any(|a| {
+            a == "--link"
+                || a == "--symbolic-link"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a[1..].chars().any(|c| c == 's' || c == 'l'))
+        }),
+        _ => false,
+    };
+    if !creates_links {
+        return;
+    }
+
+    let positional = positional_args(head, args);
+    let mut pairs: Vec<(String, String)> = Vec::new(); // (target, link name)
+    if let Some(dir) = find_flag_value(args, &["-t", "--target-directory"]) {
+        for p in &positional {
+            let name = format!("{}/{}", dir.trim_end_matches('/'), last_path_component(p));
+            pairs.push((p.clone(), name));
+        }
+    } else if positional.len() == 2 {
+        pairs.push((positional[0].clone(), positional[1].clone()));
+    } else if positional.len() > 2 {
+        // `ln TARGET... DIR` creates DIR/<basename> for every target.
+        let dir = positional.last().expect("len checked above");
+        for p in &positional[..positional.len() - 1] {
+            let name = format!("{}/{}", dir.trim_end_matches('/'), last_path_component(p));
+            pairs.push((p.clone(), name));
+        }
+    } else if positional.len() == 1 && head == "ln" {
+        // `ln TARGET` creates ./<basename> in the cwd.
+        let p = &positional[0];
+        pairs.push((p.clone(), last_path_component(p).to_string()));
+    }
+
+    for (target, name) in pairs {
+        if !is_literal_path(&name) {
+            state.opaque_link = true;
+            continue;
+        }
+        state.links.push(CreatedLink {
+            name_forms: normalized_forms(&name, &state.anchor),
+            auditable: is_literal_path(&target),
+            target,
+        });
+    }
+}
+
+fn last_path_component(p: &str) -> &str {
+    p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
 }
 
 fn ensure_form_not_protected(
@@ -248,7 +489,7 @@ fn strip_redirect_prefix(tok: &str) -> Option<&str> {
 
 /// Identify the destination operand for a known writer command.
 fn extract_writer_destinations(head: &str, args: &[String]) -> Vec<String> {
-    let positional = positional_args(args);
+    let positional = positional_args(head, args);
     match head {
         "cp" | "mv" | "rsync" | "scp" => {
             // Last positional is the destination. Earlier positionals
@@ -358,26 +599,40 @@ fn extract_interpreter_payload(head: &str, args: &[String]) -> Option<String> {
     None
 }
 
-/// Return positional (non-flag) arguments. Skips long-form flag
-/// values (`--target=DIR` is consumed in one token already) and the
-/// argument that follows known short flags taking a value.
-fn positional_args(args: &[String]) -> Vec<String> {
-    const FLAGS_WITH_VALUE: &[&str] = &[
-        "-t",
-        "--target-directory",
-        "-s",
-        "--size",
-        "-m",
-        "--mode",
-        "-o",
-        "--owner",
-        "-g",
-        "--group",
-        "-T",
-        "--no-target-directory",
-        "-S",
-        "--suffix",
-    ];
+/// Flags of `head` that consume the following token as their value.
+///
+/// Flag arity is per-command: `truncate -s SIZE` takes a value while
+/// `ln -s` does not. A single shared list made `ln -s TARGET LINK`
+/// swallow its own target, so `ln -s evil .git/config` sailed past the
+/// destination check. `-T`/`--no-target-directory` take no value
+/// anywhere and are deliberately absent. Misclassifying a value-taking
+/// flag as valueless only adds phantom positionals *before* the final
+/// operand, which over-checks rather than under-checks.
+fn value_flags(head: &str) -> &'static [&'static str] {
+    match head {
+        "ln" | "cp" | "mv" => &["-t", "--target-directory", "-S", "--suffix"],
+        "install" => &[
+            "-t",
+            "--target-directory",
+            "-m",
+            "--mode",
+            "-o",
+            "--owner",
+            "-g",
+            "--group",
+            "-S",
+            "--suffix",
+        ],
+        "truncate" => &["-s", "--size", "-r", "--reference"],
+        _ => &[],
+    }
+}
+
+/// Return positional (non-flag) arguments of `head`. Skips long-form
+/// flag values (`--target=DIR` is consumed in one token already) and
+/// the argument that follows short flags of `head` that take a value.
+fn positional_args(head: &str, args: &[String]) -> Vec<String> {
+    let with_value = value_flags(head);
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -389,7 +644,7 @@ fn positional_args(args: &[String]) -> Vec<String> {
             }
             break;
         }
-        if FLAGS_WITH_VALUE.contains(&a.as_str()) {
+        if with_value.contains(&a.as_str()) {
             i += 2;
             continue;
         }
@@ -448,19 +703,21 @@ fn path_targets_dir(path: &str, dir: &str) -> bool {
 ///   separators collapsed. Without this `/tmp/../etc/passwd` and
 ///   `//etc/passwd` both reached `/etc` while plain `/etc/passwd` was
 ///   refused.
+/// * **anchored** — a relative path joined onto the directory the
+///   command will execute in ([`Anchor::Dir`]). Bash resolves relative
+///   destinations against its cwd, so the check must too.
 /// * **symlink-resolved** — the deepest existing ancestor canonicalized
 ///   and the remainder re-appended, so `ln -s /etc /tmp/e` followed by a
-///   write to `/tmp/e/passwd` is seen for what it is.
+///   write to `/tmp/e/passwd` — or `out -> .git` in the cwd followed by
+///   a write to `out/config` — is seen for what it is.
 ///
 /// The caller checks every form and refuses if any one of them lands in
 /// a protected location. Resolution is best-effort: the write target
 /// usually does not exist yet, so a failure to canonicalize falls back
 /// to the lexical form rather than skipping the check.
-fn normalized_forms(raw: &str) -> Vec<String> {
+fn normalized_forms(raw: &str, anchor: &Anchor) -> Vec<String> {
     let trimmed = raw.trim_matches(|c: char| c == '"' || c == '\'');
-    let lexical = join_components(&crate::permissions::lexical_normalize(
-        std::path::Path::new(trimmed),
-    ));
+    let lexical = join_components(&crate::permissions::lexical_normalize(Path::new(trimmed)));
 
     let mut forms = vec![lexical.clone()];
     // Keep the raw spelling too: `lexical_normalize` pops `..` past the
@@ -470,7 +727,23 @@ fn normalized_forms(raw: &str) -> Vec<String> {
     if trimmed != lexical {
         forms.push(trimmed.to_string());
     }
-    if let Some(resolved) = resolve_symlinked_ancestor(&lexical)
+
+    // The absolute spelling to resolve symlinks against: the path
+    // itself when absolute, or the anchored join when the execution
+    // directory is known.
+    let absolute = if Path::new(trimmed).is_absolute() {
+        Some(lexical)
+    } else if let Anchor::Dir(dir) = anchor {
+        let anchored = join_components(&crate::permissions::lexical_normalize(&dir.join(trimmed)));
+        if !forms.contains(&anchored) {
+            forms.push(anchored.clone());
+        }
+        Some(anchored)
+    } else {
+        None
+    };
+    if let Some(abs) = absolute
+        && let Some(resolved) = resolve_symlinked_ancestor(&abs)
         && !forms.contains(&resolved)
     {
         forms.push(resolved);
@@ -683,7 +956,7 @@ mod tests {
             ("/usr/local/../../etc/passwd", "/etc/passwd"),
             ("/var/tmp/../../etc/passwd", "/etc/passwd"),
         ] {
-            let forms = normalized_forms(input);
+            let forms = normalized_forms(input, &Anchor::None);
             assert!(
                 forms.iter().any(|f| f == expected),
                 "{input} did not normalize to {expected}: {forms:?}"
@@ -907,5 +1180,121 @@ mod tests {
         // `ln target` (one positional) should not be flagged because we
         // don't know the destination — but it must not panic either.
         allow("ln target");
+    }
+
+    /// A relative destination is executed relative to the bash cwd, so
+    /// the symlink resolution must be too: with `out -> .git` in the
+    /// cwd, `printf x > out/config` overwrites `.git/config`.
+    #[cfg(unix)]
+    #[test]
+    fn relative_destination_resolves_symlinks_against_the_commands_cwd() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join(".git")).unwrap();
+        if std::os::unix::fs::symlink(".git", td.path().join("out")).is_err() {
+            return; // no permission to symlink here; nothing to assert
+        }
+        for cmd in [
+            "printf x > out/config",
+            "echo x >> out/config",
+            "cp evil out/config",
+            "tee out/config",
+        ] {
+            assert!(
+                check_at(cmd, td.path()).is_err(),
+                "relative symlink hid the destination: {cmd}"
+            );
+        }
+    }
+
+    /// Anchoring must not over-block: relative writes in a cwd without
+    /// hostile symlinks stay allowed.
+    #[test]
+    fn relative_destination_in_a_clean_cwd_still_allowed() {
+        let td = tempfile::tempdir().unwrap();
+        for cmd in [
+            "printf x > out/config",
+            "echo ok > notes.md",
+            "mkdir -p build && echo x > build/out",
+            "cp a.txt b.txt",
+        ] {
+            assert!(
+                check_at(cmd, td.path()).is_ok(),
+                "false positive on: {cmd}, got {:?}",
+                check_at(cmd, td.path())
+            );
+        }
+    }
+
+    /// When the claimed cwd cannot be canonicalized, relative write
+    /// destinations cannot be verified at all — fail closed.
+    #[test]
+    fn unavailable_cwd_fails_closed_for_relative_destinations() {
+        let missing = Path::new("/nonexistent-agent-code-test/dir");
+        assert!(check_at("echo x > relative.txt", missing).is_err());
+        assert!(check_at("cp a b", missing).is_err());
+        // Commands without write destinations are unaffected.
+        assert!(check_at("ls -la", missing).is_ok());
+        // Absolute destinations do not depend on the cwd.
+        #[cfg(unix)]
+        assert!(check_at("echo x > /tmp/fine.txt", missing).is_ok());
+    }
+
+    /// A symlink created by an earlier segment of the same command does
+    /// not exist when the check runs, so canonicalization alone cannot
+    /// see it. The link target must be checked instead.
+    #[test]
+    fn symlink_created_in_the_same_command_cannot_reach_a_protected_dir() {
+        // The exact reported bypass: the link target names `.git` via
+        // `$PWD`, the write goes through the not-yet-existing link.
+        refuse(r#"ln -s "$PWD/.git" /tmp/e && printf x > /tmp/e/config"#);
+        // Literal target into a blocked system path.
+        refuse("ln -s /etc /tmp/agent-code-e2 && echo x > /tmp/agent-code-e2/passwd");
+        // Relative link name, relative target.
+        refuse("ln -s ../.git out && printf x > out/config");
+        // `;` and `|` sequencing are the same hazard as `&&`.
+        refuse(r#"ln -s "$PWD/.git" /tmp/e; printf x > /tmp/e/config"#);
+        refuse(r#"ln -s "$PWD/.git" /tmp/e | printf x > /tmp/e/config"#);
+        // Writing to the link itself (hard link to a protected file).
+        refuse("ln .git/config /tmp/agent-code-x && printf y > /tmp/agent-code-x");
+        // `cp` can create links too.
+        refuse("cp -s /etc /tmp/agent-code-e3 && echo x > /tmp/agent-code-e3/passwd");
+        // Link creation hidden inside a recursive shell payload.
+        refuse(r#"bash -c 'ln -s "$PWD/.git" /tmp/e' && printf x > /tmp/e/config"#);
+    }
+
+    /// A link whose name is only known at execution time makes every
+    /// later write unauditable — fail closed.
+    #[test]
+    fn link_with_unauditable_name_blocks_later_writes() {
+        refuse(r#"ln -s /etc/passwd "$D" && printf x > /tmp/out"#);
+        refuse("ln -sf .git/config $LINK; echo x > notes.txt");
+    }
+
+    /// The same-command link tracking must not flag innocent compound
+    /// commands: links not written through, writes not through links,
+    /// and non-link commands creating fresh directories.
+    #[test]
+    fn innocent_compound_commands_with_links_still_allowed() {
+        allow("ln -s /tmp/a /tmp/b && echo hi > /tmp/c");
+        allow("ln -s /var/data d && cp report.csv d/out.csv");
+        allow("ln -s ../shared/config.toml conf.toml && cat conf.toml");
+        allow("mkdir -p build && echo x > build/out");
+        // Creating a link that points AT a protected path is reading
+        // infrastructure, not a write into it — only writing *through*
+        // it later is.
+        allow("ln -s .git/hooks /tmp/agent-code-hooks-view");
+    }
+
+    /// Flag arity is per-command. The old shared value-flag list let
+    /// `ln -s` (no value) swallow its own target because `truncate -s
+    /// SIZE` takes one, and treated the valueless `-T` as value-taking
+    /// — both made the destination operand disappear from the check.
+    #[test]
+    fn flag_parsing_does_not_hide_the_destination() {
+        refuse("ln -s evil .git/config");
+        refuse("ln -s -T evil .git/config");
+        refuse("cp -T src .git/config");
+        refuse("mv --no-target-directory x .git/config");
+        refuse("truncate -s 0 .git/config");
     }
 }
