@@ -482,6 +482,11 @@ fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
     let Some(parsed) = parsed else {
         return false;
     };
+    // `env -S '${CMD} -rf x'` runs whatever CMD expands to; there is
+    // no text to vouch for.
+    if crate::tools::bash_parse::has_dynamic_wrapper(&parsed) {
+        return false;
+    }
     if parsed.has_parse_error
         || !parsed.substitutions.is_empty()
         || parsed.has_subshell
@@ -1376,6 +1381,21 @@ mod tests {
                 "an option operand must not un-match the restrictive rule: {cmd}"
             );
         }
+    }
+
+    /// A command whose identity only expansion decides cannot satisfy
+    /// a widening rule: `env -S '${CMD} -rf /tmp/x'` must not be
+    /// executed by an `Allow("env *")`.
+    #[test]
+    fn dynamic_split_string_fails_closed_against_widening_rule() {
+        let c = checker(vec![rule("Bash", "env *", PermissionMode::Allow)]);
+        assert!(
+            !matches!(
+                c.check("Bash", &bash_input("env -S '${CMD} -rf /tmp/x'")),
+                PermissionDecision::Allow
+            ),
+            "an unknowable wrapped command must not be auto-allowed"
+        );
     }
 
     #[test]

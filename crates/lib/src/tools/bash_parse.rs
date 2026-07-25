@@ -315,11 +315,21 @@ fn resolve_env_long(name: &str) -> Option<EnvLong> {
 
 /// Tokens of the command a wrapper invocation runs (`tokens[0]` is the
 /// wrapper), with the wrapper's options and their operands consumed.
-/// `None` when the wrapped command cannot be identified — including any
-/// option this parser does not know, because mislocating the command
-/// would hand restrictive rules the wrong text to match.
-fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
-    let is_env = base_name(tokens.first()?) == "env";
+/// [`Unwrap::None`] when no command executes behind the arguments —
+/// including options this parser does not know, which env rejects.
+/// [`Unwrap::Dynamic`] when a command runs but only expansion decides
+/// which; mislocating it would hand restrictive rules text that
+/// silently fails to match.
+fn strip_wrapper(tokens: &[String]) -> Unwrap {
+    macro_rules! reject_unless {
+        ($opt:expr) => {
+            match $opt {
+                Some(v) => v,
+                None => return Unwrap::None,
+            }
+        };
+    }
+    let is_env = base_name(reject_unless!(tokens.first())) == "env";
     let rest = &tokens[1..];
     let mut i = 0;
     while i < rest.len() {
@@ -341,19 +351,19 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
             };
-            match resolve_env_long(name)? {
+            match reject_unless!(resolve_env_long(name)) {
                 EnvLong::Plain => i += 1,
                 EnvLong::Operand => match inline {
                     Some(_) => i += 1,
                     None => {
-                        rest.get(i + 1)?;
+                        reject_unless!(rest.get(i + 1));
                         i += 2;
                     }
                 },
                 EnvLong::SplitString => {
                     let (operand, next) = match inline {
                         Some(v) => (v, i + 1),
-                        None => (rest.get(i + 1)?.clone(), i + 2),
+                        None => (reject_unless!(rest.get(i + 1)).clone(), i + 2),
                     };
                     return split_string_tokens(&tokens[0], &operand, &rest[next..]);
                 }
@@ -374,12 +384,12 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
                     continue;
                 }
                 if !ENV_OPERAND_SHORTS.contains(&c) {
-                    return None;
+                    return Unwrap::None;
                 }
                 let attached = &cluster[pos + c.len_utf8()..];
                 let operand = if attached.is_empty() {
                     consumed_next = true;
-                    rest.get(i + 1)?.clone()
+                    reject_unless!(rest.get(i + 1)).clone()
                 } else {
                     attached.to_string()
                 };
@@ -398,31 +408,62 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
         break;
     }
     let out = rest[i..].to_vec();
-    (!out.is_empty()).then_some(out)
+    if out.is_empty() {
+        Unwrap::None
+    } else {
+        Unwrap::Tokens(out)
+    }
 }
 
 /// `env -S STRING` splits STRING into further `env` arguments — not
 /// straight into the command. `env -S '-u DUMMY rm -f x'` still has
 /// options to process, so the split words are handed back with an
 /// `env` head and re-enter option parsing on the next pass.
-fn split_string_tokens(wrapper: &str, operand: &str, remainder: &[String]) -> Option<Vec<String>> {
+fn split_string_tokens(wrapper: &str, operand: &str, remainder: &[String]) -> Unwrap {
     let mut out = vec![wrapper.to_string()];
-    out.extend(split_env_s(operand)?);
+    match split_env_s(operand) {
+        Unwrap::Tokens(words) => out.extend(words),
+        other => return other,
+    }
     out.extend_from_slice(remainder);
-    Some(out)
+    Unwrap::Tokens(out)
+}
+
+/// Outcome of locating the command a wrapper runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unwrap {
+    /// The wrapped command's tokens.
+    Tokens(Vec<String>),
+    /// A command runs but its identity cannot be known at gate time:
+    /// `env -S` expands `${VAR}` itself, so `CMD=rm env -S '${CMD} -rf
+    /// x'` executes `rm`. Gates must treat this as unknown, not as
+    /// "nothing wrapped" — a silent drop lets a broad allow through.
+    Dynamic,
+    /// Nothing was unwrapped: the head is not a wrapper, or the
+    /// arguments are ones env itself rejects, so no command executes
+    /// behind them.
+    None,
 }
 
 /// Split an `env -S` string the way GNU env does: whitespace-separated
 /// words, single and double quotes, backslash escapes, `#` comments
-/// and the `\c` terminator. `None` when the executed words cannot be
-/// known at gate time — `${VAR}` expansion — or for sequences env
-/// rejects at runtime, behind which nothing executes anyway.
-fn split_env_s(s: &str) -> Option<Vec<String>> {
+/// and the `\c` terminator. [`Unwrap::Dynamic`] when `$` expansion
+/// decides the command; [`Unwrap::None`] for sequences env rejects at
+/// runtime, behind which nothing executes anyway.
+fn split_env_s(s: &str) -> Unwrap {
     fn end_word(cur: &mut String, in_word: &mut bool, words: &mut Vec<String>) {
         if *in_word {
             words.push(std::mem::take(cur));
             *in_word = false;
         }
+    }
+    macro_rules! next_or_reject {
+        ($chars:expr) => {
+            match $chars.next() {
+                Some(c) => c,
+                None => return Unwrap::None,
+            }
+        };
     }
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -432,15 +473,15 @@ fn split_env_s(s: &str) -> Option<Vec<String>> {
         match c {
             c if c.is_whitespace() => end_word(&mut cur, &mut in_word, &mut words),
             '#' if !in_word => break,
-            '$' => return None,
+            '$' => return Unwrap::Dynamic,
             '\'' => {
                 in_word = true;
                 loop {
-                    match chars.next()? {
+                    match next_or_reject!(chars) {
                         '\'' => break,
-                        '\\' => match chars.next()? {
+                        '\\' => match next_or_reject!(chars) {
                             esc @ ('\'' | '\\') => cur.push(esc),
-                            _ => return None,
+                            _ => return Unwrap::None,
                         },
                         ch => cur.push(ch),
                     }
@@ -449,28 +490,34 @@ fn split_env_s(s: &str) -> Option<Vec<String>> {
             '"' => {
                 in_word = true;
                 loop {
-                    match chars.next()? {
+                    match next_or_reject!(chars) {
                         '"' => break,
-                        '$' => return None,
+                        '$' => return Unwrap::Dynamic,
                         '\\' => {
-                            let esc = chars.next()?;
+                            let esc = next_or_reject!(chars);
                             if esc == '_' {
                                 cur.push(' ');
                             } else {
-                                cur.push(env_s_escape(esc)?);
+                                match env_s_escape(esc) {
+                                    Some(ch) => cur.push(ch),
+                                    None => return Unwrap::None,
+                                }
                             }
                         }
                         ch => cur.push(ch),
                     }
                 }
             }
-            '\\' => match chars.next()? {
+            '\\' => match next_or_reject!(chars) {
                 'c' => break 'outer,
                 // Outside quotes `\_` separates words.
                 '_' => end_word(&mut cur, &mut in_word, &mut words),
                 esc => {
                     in_word = true;
-                    cur.push(env_s_escape(esc)?);
+                    match env_s_escape(esc) {
+                        Some(ch) => cur.push(ch),
+                        None => return Unwrap::None,
+                    }
                 }
             },
             ch => {
@@ -482,7 +529,11 @@ fn split_env_s(s: &str) -> Option<Vec<String>> {
     if in_word {
         words.push(cur);
     }
-    (!words.is_empty()).then_some(words)
+    if words.is_empty() {
+        Unwrap::None
+    } else {
+        Unwrap::Tokens(words)
+    }
 }
 
 /// One `env -S` backslash escape; `None` for sequences GNU env
@@ -500,27 +551,37 @@ fn env_s_escape(c: char) -> Option<char> {
 }
 
 /// The invocation's tokens with any leading wrapper chain stripped.
-/// `None` when there was no wrapper or the wrapped command cannot be
-/// confidently identified.
-fn unwrapped_tokens(argv: &[String]) -> Option<Vec<String>> {
+fn unwrapped_tokens(argv: &[String]) -> Unwrap {
     let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
     let mut unwrapped = false;
     for _ in 0..8 {
-        let head = base_name(tokens.first()?);
-        if !COMMAND_WRAPPERS.contains(&head.as_str()) {
-            return unwrapped.then_some(tokens);
+        let Some(first) = tokens.first() else {
+            return Unwrap::None;
+        };
+        if !COMMAND_WRAPPERS.contains(&base_name(first).as_str()) {
+            return if unwrapped {
+                Unwrap::Tokens(tokens)
+            } else {
+                Unwrap::None
+            };
         }
-        tokens = strip_wrapper(&tokens)?;
+        match strip_wrapper(&tokens) {
+            Unwrap::Tokens(next) => tokens = next,
+            other => return other,
+        }
         unwrapped = true;
     }
-    None
+    Unwrap::None
 }
 
 /// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
 /// return the base name of the command it would run. `None` when the
 /// head is not a wrapper or no wrapped command can be identified.
 fn unwrapped_head(argv: &[String]) -> Option<String> {
-    unwrapped_tokens(argv).map(|tokens| base_name(&tokens[0]))
+    match unwrapped_tokens(argv) {
+        Unwrap::Tokens(tokens) => Some(base_name(&tokens[0])),
+        _ => None,
+    }
 }
 
 /// For each invocation, the text with any leading wrapper chain
@@ -534,9 +595,22 @@ pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
     parsed
         .invocations
         .iter()
-        .filter_map(|argv| unwrapped_tokens(argv))
-        .map(|tokens| tokens.join(" "))
+        .filter_map(|argv| match unwrapped_tokens(argv) {
+            Unwrap::Tokens(tokens) => Some(tokens.join(" ")),
+            _ => None,
+        })
         .collect()
+}
+
+/// True when some invocation runs a command whose identity only
+/// run-time expansion decides (`env -S '${CMD} -rf x'`). The command
+/// text a gate would match is unknowable, so widening rules must fail
+/// closed rather than treat the invocation as "nothing wrapped".
+pub fn has_dynamic_wrapper(parsed: &ParsedCommand) -> bool {
+    parsed
+        .invocations
+        .iter()
+        .any(|argv| unwrapped_tokens(argv) == Unwrap::Dynamic)
 }
 
 /// Check a parsed command against security rules.
@@ -561,6 +635,14 @@ pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {
         if let Some(inner) = unwrapped_head(argv) {
             heads.push(inner);
         }
+    }
+
+    if has_dynamic_wrapper(parsed) {
+        violations.push(
+            "Wrapped command is chosen by run-time expansion (env -S with $), so what executes \
+             cannot be determined"
+                .to_string(),
+        );
     }
 
     for base in &heads {
@@ -952,9 +1034,6 @@ mod tests {
             "env --frobnicate git status",
             "env --i git status",
             "env --de git status",
-            // `${VAR}` in a split-string expands at run time; the
-            // executed command cannot be known at gate time.
-            "env -S 'echo ${X}' git status",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             assert!(
@@ -962,6 +1041,25 @@ mod tests {
                 "no unwrapped text expected for: {cmd}"
             );
         }
+    }
+
+    /// `env -S` expands `${VAR}` itself, so the command that runs is
+    /// unknowable at gate time. That must surface as an explicit
+    /// unknown — a silent drop would let a broad allow execute it.
+    #[test]
+    fn test_dynamic_split_string_is_reported_not_dropped() {
+        let parsed = parse_bash("env -S '${CMD} -rf /tmp/x'").unwrap();
+        assert!(has_dynamic_wrapper(&parsed));
+        assert!(unwrapped_invocation_texts(&parsed).is_empty());
+        assert!(
+            check_parsed_security(&parsed)
+                .iter()
+                .any(|v| v.contains("run-time expansion")),
+            "dynamic wrapper must be flagged to the destructive-command gate"
+        );
+        // An option env itself rejects is not dynamic: nothing runs.
+        let rejected = parse_bash("env --frobnicate git status").unwrap();
+        assert!(!has_dynamic_wrapper(&rejected));
     }
 
     #[test]
