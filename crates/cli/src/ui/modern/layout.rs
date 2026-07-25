@@ -507,10 +507,14 @@ fn render_tool_card(
 /// Render a folded read-only group as a single summary line (plan §M4):
 /// `▸ read N (first, second, …)`.
 fn render_group(items: &[TranscriptItem], idxs: &[usize], selected: bool) -> Vec<Line<'static>> {
+    // Folded groups bypass render_item, so the deceptive-character
+    // scrub must run here too: a FileRead/Grep/WebFetch detail carrying
+    // bidi or zero-width controls would otherwise reach the terminal
+    // unescaped whenever three reads folded.
     let details: Vec<String> = idxs
         .iter()
         .filter_map(|&i| match &items[i] {
-            TranscriptItem::Tool { detail, .. } => Some(detail.clone()),
+            TranscriptItem::Tool { detail, .. } => Some(escape_deceptive(detail).into_owned()),
             _ => None,
         })
         .collect();
@@ -611,6 +615,39 @@ mod tests {
         assert!(
             !text.contains('\u{202e}'),
             "override reached the transcript: {text:?}"
+        );
+    }
+
+    /// Folded read groups render through `render_group`, not
+    /// `render_item` — the scrub must hold on that path too (a Grep
+    /// query or WebFetch URL with a bidi override, folded with two
+    /// clean reads, previously reached the terminal unescaped).
+    #[test]
+    fn a_folded_read_group_cannot_smuggle_a_bidi_override() {
+        let read = |detail: &str| TranscriptItem::Tool {
+            call_id: "c".into(),
+            name: "FileRead".into(),
+            detail: detail.into(),
+            result: Some("ok".into()),
+            is_error: false,
+            live: None,
+        };
+        let items = vec![
+            read("src/a.rs"),
+            read("evil\u{202e}sr.nigol\u{202c}.rs"),
+            read("src/b.rs"),
+        ];
+        let text: String = render_group(&items, &[0, 1, 2], false)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(
+            !text.contains('\u{202e}'),
+            "override reached the folded group line: {text:?}"
+        );
+        assert!(
+            text.contains("src/a.rs"),
+            "clean details still render: {text:?}"
         );
     }
 
