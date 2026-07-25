@@ -385,6 +385,11 @@ pub fn build_subagent_command(
     if let Some(mode) = endpoint.auth_mode {
         cmd.env("AGENT_CODE_AUTH_MODE", mode.as_str());
     }
+    for var in scoped_out_key_vars(endpoint, |v| {
+        std::env::var(v).is_ok_and(|s| !s.trim().is_empty())
+    }) {
+        cmd.env_remove(var);
+    }
 
     // Mark the child as a subagent and propagate its id/color so the
     // child renderer and output-style filtering behave correctly.
@@ -401,6 +406,68 @@ pub fn build_subagent_command(
     }
 
     cmd
+}
+
+/// Provider-key env vars to strip from a child whose endpoint override
+/// pins a specific provider.
+///
+/// A child resolves its API key from the environment by a fixed
+/// priority list (`config::API_KEY_ENV_VARS`), not by which provider
+/// its base URL points at — so with several provider keys exported, a
+/// child pointed at provider B could pick up provider A's key and send
+/// it to B's endpoint. When the override names a dedicated provider
+/// and the parent holds that provider's key, every other key var is
+/// stripped so the child can only resolve the right credential.
+///
+/// Returns an empty list (child inherits everything — the behavior
+/// when no override exists) unless all of the following hold:
+///
+/// - the endpoint override sets an explicit `base_url` (no override →
+///   the child talks to the parent's provider and the parent's key
+///   resolution is correct for it);
+/// - the effective auth mode is `api_key` (subscription auth reads
+///   session files, not key env vars);
+/// - the base URL maps to a known dedicated provider — custom /
+///   OpenAI-compatible / cloud endpoints (Bedrock, Vertex, Azure) may
+///   legitimately pair with any key or use their own auth env;
+/// - the parent actually holds the target provider's key var,
+///   otherwise stripping would strand setups that run on the generic
+///   `AGENT_CODE_API_KEY` against an alternate endpoint.
+fn scoped_out_key_vars(
+    endpoint: &SubagentEndpoint,
+    parent_has_key: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    use crate::llm::provider::{ProviderKind, detect_provider};
+
+    if endpoint
+        .auth_mode
+        .unwrap_or(crate::config::ApiAuthMode::ApiKey)
+        != crate::config::ApiAuthMode::ApiKey
+    {
+        return Vec::new();
+    }
+    let Some(url) = endpoint.base_url.as_deref() else {
+        return Vec::new();
+    };
+    let kind = detect_provider(endpoint.model.as_deref().unwrap_or(""), url);
+    if matches!(
+        kind,
+        ProviderKind::OpenAiCompatible
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::AzureOpenAi
+    ) {
+        return Vec::new();
+    }
+    let target = kind.env_var_name();
+    if !parent_has_key(target) {
+        return Vec::new();
+    }
+    crate::config::API_KEY_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| *var != target)
+        .collect()
 }
 
 /// Spawn a subagent as a tracked background task and return its id.
@@ -579,6 +646,115 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    fn deepseek_endpoint() -> SubagentEndpoint {
+        SubagentEndpoint {
+            model: None,
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            auth_mode: None,
+        }
+    }
+
+    #[test]
+    fn key_scoping_strips_other_providers_when_target_key_exists() {
+        let removed = scoped_out_key_vars(&deepseek_endpoint(), |v| {
+            // Parent exports the target key plus two others and the
+            // generic key that would outrank it in the child.
+            matches!(
+                v,
+                "DEEPSEEK_API_KEY" | "ANTHROPIC_API_KEY" | "AGENT_CODE_API_KEY"
+            )
+        });
+        assert!(removed.contains(&"ANTHROPIC_API_KEY"));
+        assert!(
+            removed.contains(&"AGENT_CODE_API_KEY"),
+            "the generic key outranks provider keys in the child's \
+             resolution and must be stripped too"
+        );
+        assert!(!removed.contains(&"DEEPSEEK_API_KEY"));
+        assert_eq!(
+            removed.len(),
+            crate::config::API_KEY_ENV_VARS.len() - 1,
+            "everything except the target is stripped"
+        );
+    }
+
+    #[test]
+    fn key_scoping_skips_when_parent_lacks_target_key() {
+        // Generic-key setups pointed at an alternate endpoint must keep
+        // inheriting everything rather than being stranded keyless.
+        let removed = scoped_out_key_vars(&deepseek_endpoint(), |v| v == "AGENT_CODE_API_KEY");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn key_scoping_skips_without_base_url_override() {
+        let endpoint = endpoint_with_model("gpt-5.4");
+        let removed = scoped_out_key_vars(&endpoint, |_| true);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn key_scoping_skips_for_subscription_auth() {
+        let endpoint = SubagentEndpoint {
+            model: None,
+            base_url: Some("https://api.x.ai/v1".into()),
+            auth_mode: Some(crate::config::ApiAuthMode::XaiOauth),
+        };
+        let removed = scoped_out_key_vars(&endpoint, |_| true);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn key_scoping_skips_for_custom_and_cloud_endpoints() {
+        for url in [
+            "http://localhost:11434/v1",
+            "https://myco.openai.azure.com/openai/deployments/x",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        ] {
+            let endpoint = SubagentEndpoint {
+                model: None,
+                base_url: Some(url.into()),
+                auth_mode: None,
+            };
+            let removed = scoped_out_key_vars(&endpoint, |_| true);
+            assert!(removed.is_empty(), "no scoping for {url}");
+        }
+    }
+
+    #[test]
+    fn build_subagent_command_removes_scoped_out_keys_from_child_env() {
+        // env_remove entries surface from std::process::Command as
+        // (key, None) pairs — assert the child actually blocks
+        // inheritance of foreign provider keys. The target var only
+        // appears when the parent exports it, which this test cannot
+        // assume, but the removals are unconditional once scoping is
+        // active... so drive scoping through an env var the test
+        // controls: skip when the target key is absent in the parent.
+        if std::env::var("DEEPSEEK_API_KEY").is_err() {
+            // Scoping (correctly) disarms without the target key —
+            // nothing to assert in this environment. The pure-fn tests
+            // above cover the decision table.
+            return;
+        }
+        let cmd = build_subagent_command(
+            "p",
+            std::path::Path::new("/tmp"),
+            "sid",
+            None,
+            None,
+            None,
+            &deepseek_endpoint(),
+        );
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(!removed.contains(&"DEEPSEEK_API_KEY".to_string()));
     }
 
     #[test]
