@@ -48,6 +48,7 @@ pub struct ProtectedPathViolation {
 }
 
 /// How relative write destinations are anchored during a check.
+#[derive(Clone)]
 enum Anchor {
     /// No execution directory is known (pre-execution screening from
     /// `validate_input`). Relative paths are checked lexically only —
@@ -224,8 +225,18 @@ fn check_segment(
     // was checked against a path that did not exist yet. Scan the inner
     // command list first (it runs first) with the same `state`, so its
     // link creations and its writes are ordered against each other.
-    for inner in nested_command_lists(trimmed) {
-        check_with_depth(&inner, depth + 1, state)?;
+    //
+    // Every construct reached here — `( … )`, `$( … )`, backquotes —
+    // runs in a subshell, so a `cd` inside it does not move the parent
+    // shell: the anchor is restored afterwards. Links are filesystem
+    // effects and do persist, so `state.links` is not restored.
+    let nested = nested_command_lists(trimmed);
+    if !nested.is_empty() {
+        let saved = state.anchor.clone();
+        for inner in nested {
+            check_with_depth(&inner, depth + 1, state)?;
+        }
+        state.anchor = saved;
     }
 
     // Redirections (`>`, `>>`, `|& tee FILE`, heredoc-to-file). These
@@ -235,9 +246,15 @@ fn check_segment(
         ensure_not_protected(&dest, "redirection", state)?;
     }
 
-    // Skip leading `VAR=value` assignments to find the actual command.
+    // Skip leading `VAR=value` assignments and brace-group punctuation
+    // to find the actual command. `shell_segments` splits on `;`, so
+    // `{ ln -s … ; write ; }` already arrives as ordered segments —
+    // but the first one's head parsed as `{`, which hid the `ln`.
+    // A brace group runs in the *current* shell, so its `cd` and its
+    // links both persist; nothing is saved or restored here.
     let mut idx = 0;
-    while idx < tokens.len() && is_assignment(&tokens[idx]) {
+    while idx < tokens.len() && (is_assignment(&tokens[idx]) || is_group_punctuation(&tokens[idx]))
+    {
         idx += 1;
     }
     if idx >= tokens.len() {
@@ -257,6 +274,9 @@ fn check_segment(
     // is not a write into it), so only later writes are matched against
     // the link.
     record_link_creations(head, args, state);
+
+    // A `cd` moves every later relative destination in this command.
+    apply_directory_change(head, args, state);
 
     // Interpreter recursion / heuristic scan. Recursion shares `state`
     // so a link created inside `bash -c '…'` is visible to segments
@@ -371,6 +391,74 @@ fn is_literal_path(s: &str) -> bool {
     !s.contains('$') && !s.contains('`')
 }
 
+/// Brace-group punctuation (`{` / `}`) occupying a token of its own.
+/// Bash requires these to be separate tokens, so a literal `{}` (as in
+/// `find -exec … {} \;`) or a `${VAR}` never matches.
+fn is_group_punctuation(tok: &str) -> bool {
+    tok == "{" || tok == "}"
+}
+
+/// Update the anchor when a segment changes the working directory.
+///
+/// Every later relative destination in the command resolves against
+/// the new directory: `cd / && printf x > etc/passwd` writes
+/// `/etc/passwd`. A destination we cannot follow statically (`cd $D`,
+/// bare `cd` to `$HOME`, `cd -`, `popd`) makes the directory unknown,
+/// which refuses later relative writes rather than checking them
+/// against a cwd the command has already left.
+fn apply_directory_change(head: &str, args: &[String], state: &mut ScanState) {
+    match head {
+        "cd" | "pushd" => {}
+        "popd" => {
+            // The stack is not tracked, so the resulting directory is
+            // unknown — but only downgrade a known directory.
+            if matches!(state.anchor, Anchor::Dir(_)) {
+                state.anchor = Anchor::Unavailable;
+            }
+            return;
+        }
+        _ => return,
+    }
+
+    let target = positional_args(head, args).into_iter().next();
+    let Some(target) = target else {
+        // Bare `cd` goes to `$HOME`, which is not knowable here.
+        if matches!(state.anchor, Anchor::Dir(_)) {
+            state.anchor = Anchor::Unavailable;
+        }
+        return;
+    };
+    if target == "-" || !is_literal_path(&target) {
+        if matches!(state.anchor, Anchor::Dir(_)) {
+            state.anchor = Anchor::Unavailable;
+        }
+        return;
+    }
+
+    let path = Path::new(&target);
+    if path.is_absolute() {
+        // An absolute `cd` pins the directory regardless of where the
+        // command started — worth following even from `Anchor::None`.
+        let resolved = path
+            .canonicalize()
+            .unwrap_or_else(|_| crate::permissions::lexical_normalize(path));
+        state.anchor = Anchor::Dir(resolved);
+        return;
+    }
+    match &state.anchor {
+        Anchor::Dir(dir) => {
+            let joined = dir.join(path);
+            let resolved = joined
+                .canonicalize()
+                .unwrap_or_else(|_| crate::permissions::lexical_normalize(&joined));
+            state.anchor = Anchor::Dir(resolved);
+        }
+        // Without a starting directory a relative `cd` teaches us
+        // nothing; the anchored pass in `check_at` is what resolves it.
+        Anchor::None | Anchor::Unavailable => {}
+    }
+}
+
 /// Extract command lists nested inside a segment: subshells and groups
 /// `( … )`, command substitutions `$( … )`, and backquotes. Each is a
 /// command list in its own right and executes as part of this segment,
@@ -387,8 +475,8 @@ fn nested_command_lists(segment: &str) -> Vec<String> {
 
     while let Some((i, c)) = chars.next() {
         if let Some(q) = quote {
-            // A `$( … )` inside double quotes still runs; single quotes
-            // are literal.
+            // `$( … )` and backquotes both still run inside double
+            // quotes; single quotes are literal.
             if c == q {
                 quote = None;
             } else if q == '"'
@@ -397,6 +485,14 @@ fn nested_command_lists(segment: &str) -> Vec<String> {
                 && let Some((inner, end)) = span_to_matching_paren(segment, i + 1)
             {
                 out.push(inner);
+                while chars.peek().is_some_and(|(j, _)| *j <= end) {
+                    chars.next();
+                }
+            } else if q == '"'
+                && c == '`'
+                && let Some(end) = segment[i + 1..].find('`').map(|off| i + 1 + off)
+            {
+                out.push(segment[i + 1..end].to_string());
                 while chars.peek().is_some_and(|(j, _)| *j <= end) {
                     chars.next();
                 }
@@ -1541,6 +1637,115 @@ mod tests {
         allow("(mkdir -p build && echo x > build/out)");
         allow("echo $(date) > /tmp/stamp.txt");
         allow("(echo one; echo two) > /tmp/both.txt");
+    }
+
+    /// A `cd` moves every later relative destination in the command:
+    /// `cd / && printf x > etc/passwd` writes `/etc/passwd`, but the
+    /// check anchored `etc/passwd` under the original cwd.
+    #[test]
+    fn directory_changes_move_later_relative_destinations() {
+        let td = tempfile::tempdir().unwrap();
+        for cmd in [
+            "cd / && printf x > etc/passwd",
+            "cd /; printf x > etc/passwd",
+            "cd / && cp evil etc/passwd",
+            "cd /etc && printf x > passwd",
+            "{ cd /; printf x > etc/passwd; }",
+        ] {
+            assert!(
+                check_at(cmd, td.path()).is_err(),
+                "cd was not tracked: {cmd}"
+            );
+        }
+        // An absolute `cd` is knowable even without a starting cwd.
+        refuse("cd / && printf x > etc/passwd");
+    }
+
+    /// A `cd` whose destination cannot be resolved before execution
+    /// leaves the directory unknown, so later relative writes fail
+    /// closed rather than being checked against a stale cwd.
+    #[test]
+    fn unresolvable_cd_fails_closed_for_later_relative_writes() {
+        let td = tempfile::tempdir().unwrap();
+        for cmd in [
+            "cd $TARGET && printf x > out.txt",
+            "cd && printf x > out.txt",
+            "cd - && printf x > out.txt",
+            "pushd /tmp >/dev/null; popd >/dev/null; printf x > out.txt",
+        ] {
+            assert!(
+                check_at(cmd, td.path()).is_err(),
+                "unresolvable cd did not fail closed: {cmd}"
+            );
+        }
+        // Absolute destinations remain checkable after any `cd`.
+        assert!(check_at("cd $TARGET && printf x > /tmp/fine.txt", td.path()).is_ok());
+        // A `cd` with no later write is unaffected.
+        assert!(check_at("cd $TARGET && ls -la", td.path()).is_ok());
+    }
+
+    /// Ordinary `cd`-then-write must keep working, and a `cd` inside a
+    /// subshell must not leak into the parent shell.
+    #[test]
+    fn ordinary_directory_changes_do_not_over_block() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join("build")).unwrap();
+        for cmd in [
+            "cd build && echo x > out.txt",
+            "cd build; printf ok > log",
+            "(cd / && ls) && echo ok > notes.md",
+            "(cd src && cargo build)",
+        ] {
+            assert!(
+                check_at(cmd, td.path()).is_ok(),
+                "false positive on: {cmd}, got {:?}",
+                check_at(cmd, td.path())
+            );
+        }
+    }
+
+    /// A brace group runs in the current shell and `shell_segments`
+    /// splits it on `;`, but the first segment's head parsed as `{`,
+    /// so the link inside it was never recorded.
+    #[test]
+    fn links_created_inside_brace_groups_are_recorded() {
+        refuse("{ ln -s /etc /tmp/agent-brace-link; printf x > /tmp/agent-brace-link/passwd; }");
+        refuse(
+            r#"{ ln -s "$PWD/.git" /tmp/agent-brace-g; printf x > /tmp/agent-brace-g/config; }"#,
+        );
+        refuse("{ printf x > .git/config; }");
+        // The group's own writer command is still found behind `{`.
+        refuse("{ cp src .git/config; }");
+    }
+
+    /// Brace punctuation must not swallow real commands or flag
+    /// ordinary uses of `{}`.
+    #[test]
+    fn innocent_brace_groups_allowed() {
+        allow("{ echo one; echo two; } > /tmp/both.txt");
+        allow("{ cd /tmp && ls; }");
+        allow("find . -name '*.tmp' -exec rm {} \\;");
+        allow("echo ${HOME}/notes.md");
+    }
+
+    /// Backquotes execute inside double quotes too, so a link created
+    /// there must be recorded before later writes are checked.
+    #[test]
+    fn backquotes_inside_double_quotes_are_scanned() {
+        refuse(
+            "echo \"`ln -s /etc /tmp/agent-backtick-link`\" \
+             && printf x > /tmp/agent-backtick-link/passwd",
+        );
+        refuse("echo \"`printf x > .git/config`\"");
+        // Unquoted backquotes were already covered; keep them pinned.
+        refuse("echo `ln -s /etc /tmp/agent-bt2` && printf x > /tmp/agent-bt2/passwd");
+    }
+
+    /// Backquoted commands that touch nothing protected stay allowed.
+    #[test]
+    fn innocent_backquotes_allowed() {
+        allow("echo \"`date`\" > /tmp/stamp.txt");
+        allow("echo \"`ls /tmp`\"");
     }
 
     /// Flag arity is per-command. The old shared value-flag list let
