@@ -75,57 +75,30 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn midnight() -> Self {
-        legacy::Theme::midnight().into()
-    }
-
-    pub fn daybreak() -> Self {
-        legacy::Theme::daybreak().into()
-    }
-
-    pub fn midnight_muted() -> Self {
-        legacy::Theme::midnight_muted().into()
-    }
-
-    pub fn daybreak_muted() -> Self {
-        legacy::Theme::daybreak_muted().into()
-    }
-
-    pub fn terminal() -> Self {
-        legacy::Theme::terminal().into()
-    }
-
-    pub fn dark_colorblind() -> Self {
-        legacy::Theme::dark_colorblind().into()
-    }
-
-    pub fn light_colorblind() -> Self {
-        legacy::Theme::light_colorblind().into()
-    }
-
-    pub fn dark_ansi() -> Self {
-        legacy::Theme::dark_ansi().into()
-    }
-
-    pub fn light_ansi() -> Self {
-        legacy::Theme::light_ansi().into()
-    }
-
+    /// Resolve a theme name to a runtime [`Theme`]. `auto` is resolved
+    /// here (rather than delegated) so it uses the richer terminal
+    /// background detection from [`detect_system_theme`]; every other
+    /// name — including the `dark`/`light` aliases and user palette ids
+    /// — is resolved by the data-driven [`legacy::Theme::from_name`].
     pub fn from_name(name: &str) -> Self {
-        match name {
-            "auto" => {
-                if detect_system_theme() == "light" {
-                    Self::daybreak()
-                } else {
-                    Self::midnight()
-                }
-            }
-            _ => legacy::Theme::from_name(name).into(),
+        if name == "auto" {
+            let id = if detect_system_theme() == "light" {
+                "solarized-light"
+            } else {
+                "one-dark"
+            };
+            return legacy::Theme::from_name(id).into();
         }
+        legacy::Theme::from_name(name).into()
     }
 
-    pub fn all_names() -> &'static [&'static str] {
+    pub fn all_names() -> Vec<String> {
         legacy::Theme::all_names()
+    }
+
+    /// `(id, label)` pairs in display order — for the theme picker.
+    pub fn all_options() -> Vec<(String, String)> {
+        legacy::Theme::all_options()
     }
 
     pub fn agent_color(&self, index: usize) -> Color {
@@ -233,9 +206,9 @@ pub fn detect_system_theme() -> &'static str {
 pub fn resolve_theme(configured: &str) -> String {
     if configured == "auto" {
         if detect_system_theme() == "light" {
-            "daybreak".to_string()
+            "solarized-light".to_string()
         } else {
-            "midnight".to_string()
+            "one-dark".to_string()
         }
     } else {
         configured.to_string()
@@ -306,7 +279,7 @@ pub fn current() -> Theme {
         .read()
         .ok()
         .and_then(|g| g.clone())
-        .unwrap_or_else(Theme::midnight);
+        .unwrap_or_else(|| Theme::from_name("dark"));
     let options = ACTIVE_OPTIONS.read().map(|g| *g).unwrap_or_default();
     adapt_for_emit(apply_inherit_fg(raw, options))
 }
@@ -402,14 +375,14 @@ mod tests {
 
     #[test]
     fn resolve_non_auto_preserves_configured_name() {
-        assert_eq!(resolve_theme("midnight"), "midnight");
-        assert_eq!(resolve_theme("daybreak"), "daybreak");
+        assert_eq!(resolve_theme("dracula"), "dracula");
+        assert_eq!(resolve_theme("solarized-light"), "solarized-light");
     }
 
     #[test]
     fn every_advertised_theme_resolves_through_facade() {
         for name in Theme::all_names() {
-            let theme = Theme::from_name(name);
+            let theme = Theme::from_name(&name);
             assert_eq!(theme.agent_colors.len(), 8, "theme {name}");
         }
     }
@@ -423,7 +396,7 @@ mod tests {
     fn inherit_fg_overrides_text_when_detection_succeeds() {
         // Auto + inherit_fg + cached foreground → text slot becomes
         // the detected RGB, every other slot is left alone.
-        let mut theme = Theme::midnight();
+        let mut theme = Theme::from_name("dark");
         let original_accent = theme.accent;
         apply_inherit_fg_with(&mut theme, opts(true, true), Some((0x12, 0x34, 0x56)));
         assert_eq!(
@@ -443,7 +416,7 @@ mod tests {
         // Auto + inherit_fg but no cached foreground → keep the
         // theme's own text colour. This is the "we didn't get an OSC
         // 10 reply" branch.
-        let mut theme = Theme::midnight();
+        let mut theme = Theme::from_name("dark");
         let default_text = theme.text;
         apply_inherit_fg_with(&mut theme, opts(true, true), None);
         assert_eq!(theme.text, default_text);
@@ -454,7 +427,7 @@ mod tests {
         // Auto theme but inherit_fg = false → ignore the cache. This
         // is the default behaviour and protects users who explicitly
         // chose Auto without opting into the override.
-        let mut theme = Theme::midnight();
+        let mut theme = Theme::from_name("dark");
         let default_text = theme.text;
         apply_inherit_fg_with(&mut theme, opts(true, false), Some((0xAA, 0xBB, 0xCC)));
         assert_eq!(theme.text, default_text);
@@ -465,7 +438,7 @@ mod tests {
         // Explicit theme + inherit_fg = true → still ignore the
         // cache. The override is Auto-only because users who picked
         // Midnight (etc.) intentionally signed up for that palette.
-        let mut theme = Theme::midnight();
+        let mut theme = Theme::from_name("dark");
         let default_text = theme.text;
         apply_inherit_fg_with(&mut theme, opts(false, true), Some((0xAA, 0xBB, 0xCC)));
         assert_eq!(theme.text, default_text);
@@ -478,7 +451,7 @@ mod tests {
     fn subagent_theme_color_maps_to_each_named_slot() {
         use agent_code_lib::services::subagent_colors::SubagentColor;
         for name in Theme::all_names() {
-            let theme = Theme::from_name(name);
+            let theme = Theme::from_name(&name);
             assert_eq!(
                 subagent_theme_color(SubagentColor::Red, &theme),
                 theme.subagent_red,

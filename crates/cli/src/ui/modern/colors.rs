@@ -47,32 +47,28 @@ mod tests {
     use crossterm::style::Color as CtColor;
 
     #[test]
-    fn midnight_accent_is_restrained_steel_blue() {
-        let classic = theme::Theme::midnight();
+    fn palette_reflects_active_theme_accent() {
+        // one-dark's accent is #61afef (97, 175, 239).
+        let classic = theme::Theme::from_name("one-dark");
         assert!(
             matches!(
                 classic.accent,
                 CtColor::Rgb {
-                    r: 130,
-                    g: 165,
-                    b: 195
+                    r: 97,
+                    g: 175,
+                    b: 239
                 }
             ),
-            "midnight accent drifted: {:?}",
+            "one-dark accent drifted: {:?}",
             classic.accent
         );
-        crate::ui::theme::init("midnight");
+        crate::ui::theme::init("one-dark");
         let p = palette();
         // Must not fall back to loud Magenta/Cyan brand hardcodes.
         assert_ne!(p.accent, Color::Cyan);
         assert_ne!(p.accent, Color::Magenta);
         if let Color::Rgb(r, g, b) = p.accent {
-            assert_eq!((r, g, b), (130, 165, 195));
-            // Calm: not a high-chroma purple (red channel should not dominate).
-            assert!(
-                r <= g && g <= b + 40,
-                "accent should stay cool/neutral, got rgb({r},{g},{b})"
-            );
+            assert_eq!((r, g, b), (97, 175, 239));
         }
     }
 }

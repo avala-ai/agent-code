@@ -610,16 +610,12 @@ fn format_input_prefixes_help() -> String {
     out
 }
 
-/// Theme names accepted by the `/color` command. Shared with the REPL
-/// tab-completer so suggestions match exactly what the command accepts.
-pub(crate) const COLOR_THEME_NAMES: &[&str] = &[
-    "midnight",
-    "daybreak",
-    "midnight-muted",
-    "daybreak-muted",
-    "terminal",
-    "auto",
-];
+/// Theme names accepted by the `/color` command. Resolved at runtime
+/// from the theme registry so standard *and* user-defined themes are
+/// accepted (and offered in the "Available:" hint).
+pub(crate) fn color_theme_names() -> Vec<String> {
+    crate::ui::theme::Theme::all_names()
+}
 
 /// True if `name` (without `/`) is a built-in command or alias.
 pub fn is_builtin_command(name: &str) -> bool {
@@ -1793,9 +1789,9 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             CommandResult::Handled
         }
         Some("color") => {
-            let themes = COLOR_THEME_NAMES;
+            let themes = color_theme_names();
             if let Some(name) = args {
-                if themes.contains(&name) {
+                if themes.iter().any(|t| t == name) {
                     engine.state_mut().config.ui.theme = name.to_string();
                     println!("Theme set to: {name}");
                 } else {

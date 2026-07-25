@@ -2,7 +2,16 @@
 //!
 //! Provides a semantic color system where UI elements reference
 //! named colors (error, warning, accent, etc.) rather than
-//! hardcoded ANSI codes. Supports dark, light, and ANSI-only themes.
+//! hardcoded ANSI codes.
+//!
+//! Themes are *data-driven*: a compact [`Palette`] names a handful of
+//! base colours and [`theme_from_palette`] derives the full runtime
+//! [`Theme`] (every semantic slot) from it. Standard palettes live in
+//! [`standard_palettes`]; users can drop their own TOML palettes into
+//! `<config_dir>/agent-code/themes/*.toml`.
+
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 use crossterm::style::{Attribute, Color, StyledContent, Stylize};
 
@@ -122,1289 +131,441 @@ pub struct Theme {
     pub is_dark: bool,
 }
 
+/// Compact, author-facing definition of a theme. A handful of base
+/// colours; [`theme_from_palette`] derives every runtime [`Theme`] slot
+/// from these. `id`/`label` are `Cow` so both the built-in (`'static`)
+/// palettes and user palettes loaded from disk share one type.
+#[derive(Debug, Clone)]
+pub struct Palette {
+    /// Stable identifier, e.g. `"dracula"` (also the TOML file stem).
+    pub id: Cow<'static, str>,
+    /// Human-facing name shown in pickers, e.g. `"Dracula"`.
+    pub label: Cow<'static, str>,
+    /// Whether this is a dark theme.
+    pub is_dark: bool,
+
+    /// Background.
+    pub bg: Color,
+    /// Foreground / primary text.
+    pub fg: Color,
+    /// Muted / secondary text.
+    pub muted: Color,
+    /// Selection background.
+    pub selection: Color,
+
+    /// Base red.
+    pub red: Color,
+    /// Base orange.
+    pub orange: Color,
+    /// Base yellow.
+    pub yellow: Color,
+    /// Base green.
+    pub green: Color,
+    /// Base cyan.
+    pub cyan: Color,
+    /// Base blue.
+    pub blue: Color,
+    /// Base purple.
+    pub purple: Color,
+    /// Base pink.
+    pub pink: Color,
+
+    /// Brand accent.
+    pub accent: Color,
+}
+
+// ---- Color helpers ----
+
+/// Per-channel linear blend `a*(1-t) + b*t`, with `t` clamped to
+/// `[0, 1]`. Non-`Rgb` colours pass through unchanged (the blend is
+/// undefined for named ANSI codes).
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (
+            Color::Rgb {
+                r: ar,
+                g: ag,
+                b: ab,
+            },
+            Color::Rgb {
+                r: br,
+                g: bg,
+                b: bb,
+            },
+        ) => {
+            let t = t.clamp(0.0, 1.0);
+            let blend = |x: u8, y: u8| (f32::from(x) * (1.0 - t) + f32::from(y) * t).round() as u8;
+            Color::Rgb {
+                r: blend(ar, br),
+                g: blend(ag, bg),
+                b: blend(ab, bb),
+            }
+        }
+        _ => a,
+    }
+}
+
+/// Add `amt` to each channel, saturating at 255. Non-`Rgb` colours
+/// pass through unchanged.
+fn brighten(c: Color, amt: u8) -> Color {
+    match c {
+        Color::Rgb { r, g, b } => Color::Rgb {
+            r: r.saturating_add(amt),
+            g: g.saturating_add(amt),
+            b: b.saturating_add(amt),
+        },
+        _ => c,
+    }
+}
+
+/// Parse a `"#rrggbb"` (or `"rrggbb"`) hex string into a [`Color::Rgb`].
+/// Returns `None` for anything that isn't exactly six hex digits.
+fn parse_hex(s: &str) -> Option<Color> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color::Rgb { r, g, b })
+}
+
+/// Parse a built-in palette hex literal. Panics on a malformed literal
+/// — the argument is always a controlled constant, so a bad value is a
+/// programming error we want to surface immediately in tests.
+fn rgb(hex: &str) -> Color {
+    parse_hex(hex).expect("built-in palette hex literal must be valid")
+}
+
+/// Derive the full runtime [`Theme`] from a compact [`Palette`]. Every
+/// [`Theme`] field is filled here — semantic roles map onto the base
+/// colours, and derived tints/shades come from [`mix`]/[`brighten`].
+fn theme_from_palette(p: &Palette) -> Theme {
+    Theme {
+        accent: p.accent,
+        error: p.red,
+        warning: p.yellow,
+        success: p.green,
+        muted: p.muted,
+        inactive: mix(p.muted, p.fg, 0.4),
+        tool: p.cyan,
+        plan: p.purple,
+        text: p.fg,
+        diff_add: p.green,
+        diff_remove: p.red,
+        agent_colors: [
+            p.blue, p.green, p.yellow, p.purple, p.red, p.cyan, p.orange, p.pink,
+        ],
+        success_shimmer: brighten(p.green, 40),
+        error_shimmer: brighten(p.red, 40),
+        warning_shimmer: brighten(p.yellow, 40),
+        accent_shimmer: brighten(p.accent, 40),
+        muted_shimmer: brighten(p.muted, 40),
+        diff_added_dimmed: mix(p.green, p.bg, 0.82),
+        diff_removed_dimmed: mix(p.red, p.bg, 0.82),
+        diff_added_word: mix(p.green, p.bg, 0.6),
+        diff_removed_word: mix(p.red, p.bg, 0.6),
+        subagent_red: p.red,
+        subagent_blue: p.blue,
+        subagent_green: p.green,
+        subagent_yellow: p.yellow,
+        subagent_purple: p.purple,
+        subagent_orange: p.orange,
+        subagent_pink: p.pink,
+        subagent_cyan: p.cyan,
+        rate_limit_fill: p.green,
+        rate_limit_empty: mix(p.muted, p.bg, 0.5),
+        selection_bg: p.selection,
+        message_action_bg: mix(p.accent, p.bg, 0.85),
+        user_message_bg: mix(p.blue, p.bg, 0.88),
+        bash_message_bg: mix(p.green, p.bg, 0.9),
+        memory_message_bg: mix(p.purple, p.bg, 0.9),
+        rainbow_red: p.red,
+        rainbow_orange: p.orange,
+        rainbow_yellow: p.yellow,
+        rainbow_green: p.green,
+        rainbow_blue: p.blue,
+        rainbow_indigo: mix(p.blue, p.purple, 0.5),
+        rainbow_violet: p.purple,
+        plan_mode: p.purple,
+        brief_mode: p.cyan,
+        fast_mode: p.orange,
+        fast_mode_shimmer: brighten(p.orange, 40),
+        is_dark: p.is_dark,
+    }
+}
+
+// ---- Standard palettes ----
+
+/// Default dark theme id used when a name can't be resolved.
+const DEFAULT_DARK: &str = "one-dark";
+/// Default light theme id (the "light" alias, and Auto in light terminals).
+const DEFAULT_LIGHT: &str = "solarized-light";
+
+/// The built-in palettes, in display order.
+fn standard_palettes() -> Vec<Palette> {
+    vec![
+        Palette {
+            id: Cow::Borrowed("monokai"),
+            label: Cow::Borrowed("Monokai"),
+            is_dark: true,
+            bg: rgb("#272822"),
+            fg: rgb("#f8f8f2"),
+            muted: rgb("#75715e"),
+            selection: rgb("#49483e"),
+            red: rgb("#f92672"),
+            orange: rgb("#fd971f"),
+            yellow: rgb("#e6db74"),
+            green: rgb("#a6e22e"),
+            cyan: rgb("#66d9ef"),
+            blue: rgb("#66d9ef"),
+            purple: rgb("#ae81ff"),
+            pink: rgb("#f92672"),
+            accent: rgb("#66d9ef"),
+        },
+        Palette {
+            id: Cow::Borrowed("dracula"),
+            label: Cow::Borrowed("Dracula"),
+            is_dark: true,
+            bg: rgb("#282a36"),
+            fg: rgb("#f8f8f2"),
+            muted: rgb("#6272a4"),
+            selection: rgb("#44475a"),
+            red: rgb("#ff5555"),
+            orange: rgb("#ffb86c"),
+            yellow: rgb("#f1fa8c"),
+            green: rgb("#50fa7b"),
+            cyan: rgb("#8be9fd"),
+            blue: rgb("#8be9fd"),
+            purple: rgb("#bd93f9"),
+            pink: rgb("#ff79c6"),
+            accent: rgb("#bd93f9"),
+        },
+        Palette {
+            id: Cow::Borrowed("nord"),
+            label: Cow::Borrowed("Nord"),
+            is_dark: true,
+            bg: rgb("#2e3440"),
+            fg: rgb("#d8dee9"),
+            muted: rgb("#4c566a"),
+            selection: rgb("#434c5e"),
+            red: rgb("#bf616a"),
+            orange: rgb("#d08770"),
+            yellow: rgb("#ebcb8b"),
+            green: rgb("#a3be8c"),
+            cyan: rgb("#88c0d0"),
+            blue: rgb("#81a1c1"),
+            purple: rgb("#b48ead"),
+            pink: rgb("#b48ead"),
+            accent: rgb("#88c0d0"),
+        },
+        Palette {
+            id: Cow::Borrowed("gruvbox"),
+            label: Cow::Borrowed("Gruvbox"),
+            is_dark: true,
+            bg: rgb("#282828"),
+            fg: rgb("#ebdbb2"),
+            muted: rgb("#928374"),
+            selection: rgb("#504945"),
+            red: rgb("#fb4934"),
+            orange: rgb("#fe8019"),
+            yellow: rgb("#fabd2f"),
+            green: rgb("#b8bb26"),
+            cyan: rgb("#8ec07c"),
+            blue: rgb("#83a598"),
+            purple: rgb("#d3869b"),
+            pink: rgb("#d3869b"),
+            accent: rgb("#fabd2f"),
+        },
+        Palette {
+            id: Cow::Borrowed("one-dark"),
+            label: Cow::Borrowed("One Dark"),
+            is_dark: true,
+            bg: rgb("#282c34"),
+            fg: rgb("#abb2bf"),
+            muted: rgb("#5c6370"),
+            selection: rgb("#3e4451"),
+            red: rgb("#e06c75"),
+            orange: rgb("#d19a66"),
+            yellow: rgb("#e5c07b"),
+            green: rgb("#98c379"),
+            cyan: rgb("#56b6c2"),
+            blue: rgb("#61afef"),
+            purple: rgb("#c678dd"),
+            pink: rgb("#c678dd"),
+            accent: rgb("#61afef"),
+        },
+        Palette {
+            id: Cow::Borrowed("solarized-dark"),
+            label: Cow::Borrowed("Solarized Dark"),
+            is_dark: true,
+            bg: rgb("#002b36"),
+            fg: rgb("#839496"),
+            muted: rgb("#586e75"),
+            selection: rgb("#073642"),
+            red: rgb("#dc322f"),
+            orange: rgb("#cb4b16"),
+            yellow: rgb("#b58900"),
+            green: rgb("#859900"),
+            cyan: rgb("#2aa198"),
+            blue: rgb("#268bd2"),
+            purple: rgb("#6c71c4"),
+            pink: rgb("#d33682"),
+            accent: rgb("#268bd2"),
+        },
+        Palette {
+            id: Cow::Borrowed("solarized-light"),
+            label: Cow::Borrowed("Solarized Light"),
+            is_dark: false,
+            bg: rgb("#fdf6e3"),
+            fg: rgb("#657b83"),
+            muted: rgb("#93a1a1"),
+            selection: rgb("#eee8d5"),
+            red: rgb("#dc322f"),
+            orange: rgb("#cb4b16"),
+            yellow: rgb("#b58900"),
+            green: rgb("#859900"),
+            cyan: rgb("#2aa198"),
+            blue: rgb("#268bd2"),
+            purple: rgb("#6c71c4"),
+            pink: rgb("#d33682"),
+            accent: rgb("#268bd2"),
+        },
+    ]
+}
+
+// ---- User themes (TOML) ----
+
+/// Directory user palettes are loaded from: `<config_dir>/themes/`.
+/// `None` when no config directory can be resolved.
+fn user_themes_dir() -> Option<PathBuf> {
+    agent_code_lib::config::agent_config_dir().map(|d| d.join("themes"))
+}
+
+/// Load every user palette from disk. Best-effort: a missing directory
+/// yields no themes; malformed files are logged and skipped.
+fn user_palettes() -> Vec<Palette> {
+    user_themes_dir()
+        .map(|d| load_palettes_dir(&d))
+        .unwrap_or_default()
+}
+
+/// Load all `*.toml` palettes from `dir`. Pure over the directory path
+/// so tests can point it at a temporary directory. Palettes are sorted
+/// by id for a stable display order.
+fn load_palettes_dir(dir: &Path) -> Vec<Palette> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match load_palette_file(&path, stem) {
+            Some(p) => out.push(p),
+            None => tracing::warn!("skipping malformed theme file: {}", path.display()),
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Parse a single palette TOML file. `id` is the file stem. Returns
+/// `None` (never panics) on any parse error or missing colour.
+fn load_palette_file(path: &Path, id: &str) -> Option<Palette> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&raw).ok()?;
+    let tbl = value.as_table()?;
+    let color =
+        |key: &str| -> Option<Color> { tbl.get(key).and_then(|v| v.as_str()).and_then(parse_hex) };
+    let label = tbl
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id)
+        .to_string();
+    let is_dark = tbl.get("dark").and_then(|v| v.as_bool()).unwrap_or(true);
+    Some(Palette {
+        id: Cow::Owned(id.to_string()),
+        label: Cow::Owned(label),
+        is_dark,
+        bg: color("bg")?,
+        fg: color("fg")?,
+        muted: color("muted")?,
+        selection: color("selection")?,
+        red: color("red")?,
+        orange: color("orange")?,
+        yellow: color("yellow")?,
+        green: color("green")?,
+        cyan: color("cyan")?,
+        blue: color("blue")?,
+        purple: color("purple")?,
+        pink: color("pink")?,
+        accent: color("accent")?,
+    })
+}
+
+/// Find a palette by exact id across standard then user themes.
+fn lookup_palette(id: &str) -> Option<Palette> {
+    standard_palettes()
+        .into_iter()
+        .find(|p| p.id.as_ref() == id)
+        .or_else(|| user_palettes().into_iter().find(|p| p.id.as_ref() == id))
+}
+
 impl Theme {
-    /// Midnight — dark theme with a restrained steel-blue accent.
+    /// Resolve a theme name to a [`Theme`].
     ///
-    /// Kept intentionally desaturated so chrome (borders, badges, selection)
-    /// stays calm; semantic colors (error/warning/success) carry the weight.
-    pub fn midnight() -> Self {
-        Self {
-            // Soft steel blue — elegant default, not a loud brand purple.
-            accent: Color::Rgb {
-                r: 130,
-                g: 165,
-                b: 195,
-            },
-            error: Color::Rgb {
-                r: 220,
-                g: 115,
-                b: 125,
-            },
-            warning: Color::Rgb {
-                r: 210,
-                g: 175,
-                b: 90,
-            },
-            success: Color::Rgb {
-                r: 95,
-                g: 175,
-                b: 125,
-            },
-            muted: Color::Rgb {
-                r: 110,
-                g: 112,
-                b: 118,
-            },
-            inactive: Color::Rgb {
-                r: 140,
-                g: 142,
-                b: 148,
-            },
-            // Cool gray-blue for tools — less “pastel purple”.
-            tool: Color::Rgb {
-                r: 145,
-                g: 160,
-                b: 175,
-            },
-            plan: Color::Rgb {
-                r: 95,
-                g: 155,
-                b: 150,
-            },
-            text: Color::Rgb {
-                r: 230,
-                g: 232,
-                b: 236,
-            },
-            diff_add: Color::Rgb {
-                r: 56,
-                g: 166,
-                b: 96,
-            },
-            diff_remove: Color::Rgb {
-                r: 179,
-                g: 89,
-                b: 107,
-            },
-            agent_colors: [
-                Color::Rgb {
-                    r: 220,
-                    g: 38,
-                    b: 38,
-                },
-                Color::Rgb {
-                    r: 37,
-                    g: 99,
-                    b: 235,
-                },
-                Color::Rgb {
-                    r: 22,
-                    g: 163,
-                    b: 74,
-                },
-                Color::Rgb {
-                    r: 202,
-                    g: 138,
-                    b: 4,
-                },
-                Color::Rgb {
-                    r: 147,
-                    g: 51,
-                    b: 234,
-                },
-                Color::Rgb {
-                    r: 234,
-                    g: 88,
-                    b: 12,
-                },
-                Color::Rgb {
-                    r: 219,
-                    g: 39,
-                    b: 119,
-                },
-                Color::Rgb {
-                    r: 8,
-                    g: 145,
-                    b: 178,
-                },
-            ],
-            success_shimmer: Color::Rgb {
-                r: 130,
-                g: 220,
-                b: 150,
-            },
-            error_shimmer: Color::Rgb {
-                r: 255,
-                g: 160,
-                b: 175,
-            },
-            warning_shimmer: Color::Rgb {
-                r: 255,
-                g: 220,
-                b: 100,
-            },
-            accent_shimmer: Color::Rgb {
-                r: 165,
-                g: 195,
-                b: 220,
-            },
-            muted_shimmer: Color::Rgb {
-                r: 160,
-                g: 162,
-                b: 168,
-            },
-            diff_added_dimmed: Color::Rgb {
-                r: 30,
-                g: 70,
-                b: 45,
-            },
-            diff_removed_dimmed: Color::Rgb {
-                r: 80,
-                g: 40,
-                b: 50,
-            },
-            diff_added_word: Color::Rgb {
-                r: 90,
-                g: 200,
-                b: 130,
-            },
-            diff_removed_word: Color::Rgb {
-                r: 220,
-                g: 130,
-                b: 145,
-            },
-            subagent_red: Color::Rgb {
-                r: 210,
-                g: 100,
-                b: 95,
-            },
-            subagent_blue: Color::Rgb {
-                r: 100,
-                g: 145,
-                b: 210,
-            },
-            subagent_green: Color::Rgb {
-                r: 95,
-                g: 180,
-                b: 130,
-            },
-            subagent_yellow: Color::Rgb {
-                r: 200,
-                g: 175,
-                b: 90,
-            },
-            // Subagent id color only — not the product brand.
-            subagent_purple: Color::Rgb {
-                r: 155,
-                g: 130,
-                b: 185,
-            },
-            subagent_orange: Color::Rgb {
-                r: 210,
-                g: 145,
-                b: 90,
-            },
-            subagent_pink: Color::Rgb {
-                r: 200,
-                g: 130,
-                b: 160,
-            },
-            subagent_cyan: Color::Rgb {
-                r: 100,
-                g: 175,
-                b: 190,
-            },
-            rate_limit_fill: Color::Rgb {
-                r: 95,
-                g: 175,
-                b: 125,
-            },
-            rate_limit_empty: Color::Rgb {
-                r: 48,
-                g: 50,
-                b: 56,
-            },
-            // Neutral slate selection — no purple wash.
-            selection_bg: Color::Rgb {
-                r: 48,
-                g: 54,
-                b: 64,
-            },
-            message_action_bg: Color::Rgb {
-                r: 36,
-                g: 38,
-                b: 44,
-            },
-            user_message_bg: Color::Rgb {
-                r: 32,
-                g: 34,
-                b: 40,
-            },
-            bash_message_bg: Color::Rgb {
-                r: 30,
-                g: 36,
-                b: 32,
-            },
-            memory_message_bg: Color::Rgb {
-                r: 40,
-                g: 38,
-                b: 30,
-            },
-            rainbow_red: Color::Rgb {
-                r: 232,
-                g: 75,
-                b: 70,
-            },
-            rainbow_orange: Color::Rgb {
-                r: 240,
-                g: 140,
-                b: 60,
-            },
-            rainbow_yellow: Color::Rgb {
-                r: 240,
-                g: 220,
-                b: 80,
-            },
-            rainbow_green: Color::Rgb {
-                r: 80,
-                g: 200,
-                b: 120,
-            },
-            rainbow_blue: Color::Rgb {
-                r: 80,
-                g: 140,
-                b: 240,
-            },
-            rainbow_indigo: Color::Rgb {
-                r: 120,
-                g: 130,
-                b: 190,
-            },
-            rainbow_violet: Color::Rgb {
-                r: 150,
-                g: 135,
-                b: 180,
-            },
-            // Plan mode badge: same family as accent, slightly cooler.
-            plan_mode: Color::Rgb {
-                r: 120,
-                g: 155,
-                b: 185,
-            },
-            brief_mode: Color::Rgb {
-                r: 200,
-                g: 150,
-                b: 95,
-            },
-            fast_mode: Color::Rgb {
-                r: 95,
-                g: 175,
-                b: 125,
-            },
-            fast_mode_shimmer: Color::Rgb {
-                r: 130,
-                g: 200,
-                b: 155,
-            },
-            is_dark: true,
-        }
-    }
-
-    /// Daybreak — light theme with soft blue accents.
-    pub fn daybreak() -> Self {
-        Self {
-            accent: Color::Rgb {
-                r: 70,
-                g: 115,
-                b: 160,
-            },
-            error: Color::Rgb {
-                r: 171,
-                g: 43,
-                b: 63,
-            },
-            warning: Color::Rgb {
-                r: 150,
-                g: 108,
-                b: 30,
-            },
-            success: Color::Rgb {
-                r: 44,
-                g: 122,
-                b: 57,
-            },
-            muted: Color::Rgb {
-                r: 140,
-                g: 140,
-                b: 140,
-            },
-            inactive: Color::Rgb {
-                r: 102,
-                g: 102,
-                b: 102,
-            },
-            tool: Color::Rgb {
-                r: 87,
-                g: 105,
-                b: 247,
-            },
-            plan: Color::Rgb {
-                r: 50,
-                g: 120,
-                b: 110,
-            },
-            text: Color::Black,
-            diff_add: Color::Rgb {
-                r: 47,
-                g: 157,
-                b: 68,
-            },
-            diff_remove: Color::Rgb {
-                r: 209,
-                g: 69,
-                b: 75,
-            },
-            agent_colors: [
-                Color::Rgb {
-                    r: 185,
-                    g: 28,
-                    b: 28,
-                },
-                Color::Rgb {
-                    r: 29,
-                    g: 78,
-                    b: 216,
-                },
-                Color::Rgb {
-                    r: 21,
-                    g: 128,
-                    b: 61,
-                },
-                Color::Rgb {
-                    r: 161,
-                    g: 98,
-                    b: 7,
-                },
-                Color::Rgb {
-                    r: 126,
-                    g: 34,
-                    b: 206,
-                },
-                Color::Rgb {
-                    r: 194,
-                    g: 65,
-                    b: 12,
-                },
-                Color::Rgb {
-                    r: 190,
-                    g: 24,
-                    b: 93,
-                },
-                Color::Rgb {
-                    r: 14,
-                    g: 116,
-                    b: 144,
-                },
-            ],
-            success_shimmer: Color::Rgb {
-                r: 28,
-                g: 95,
-                b: 40,
-            },
-            error_shimmer: Color::Rgb {
-                r: 135,
-                g: 30,
-                b: 45,
-            },
-            warning_shimmer: Color::Rgb {
-                r: 115,
-                g: 80,
-                b: 20,
-            },
-            accent_shimmer: Color::Rgb {
-                r: 90,
-                g: 130,
-                b: 170,
-            },
-            muted_shimmer: Color::Rgb {
-                r: 100,
-                g: 100,
-                b: 100,
-            },
-            diff_added_dimmed: Color::Rgb {
-                r: 215,
-                g: 240,
-                b: 220,
-            },
-            diff_removed_dimmed: Color::Rgb {
-                r: 245,
-                g: 215,
-                b: 220,
-            },
-            diff_added_word: Color::Rgb {
-                r: 30,
-                g: 130,
-                b: 55,
-            },
-            diff_removed_word: Color::Rgb {
-                r: 175,
-                g: 40,
-                b: 55,
-            },
-            subagent_red: Color::Rgb {
-                r: 185,
-                g: 28,
-                b: 28,
-            },
-            subagent_blue: Color::Rgb {
-                r: 29,
-                g: 78,
-                b: 216,
-            },
-            subagent_green: Color::Rgb {
-                r: 21,
-                g: 128,
-                b: 61,
-            },
-            subagent_yellow: Color::Rgb {
-                r: 161,
-                g: 98,
-                b: 7,
-            },
-            subagent_purple: Color::Rgb {
-                r: 126,
-                g: 34,
-                b: 206,
-            },
-            subagent_orange: Color::Rgb {
-                r: 194,
-                g: 65,
-                b: 12,
-            },
-            subagent_pink: Color::Rgb {
-                r: 190,
-                g: 24,
-                b: 93,
-            },
-            subagent_cyan: Color::Rgb {
-                r: 14,
-                g: 116,
-                b: 144,
-            },
-            rate_limit_fill: Color::Rgb {
-                r: 44,
-                g: 122,
-                b: 57,
-            },
-            rate_limit_empty: Color::Rgb {
-                r: 215,
-                g: 215,
-                b: 220,
-            },
-            selection_bg: Color::Rgb {
-                r: 200,
-                g: 215,
-                b: 245,
-            },
-            message_action_bg: Color::Rgb {
-                r: 230,
-                g: 230,
-                b: 240,
-            },
-            user_message_bg: Color::Rgb {
-                r: 235,
-                g: 235,
-                b: 245,
-            },
-            bash_message_bg: Color::Rgb {
-                r: 230,
-                g: 240,
-                b: 230,
-            },
-            memory_message_bg: Color::Rgb {
-                r: 245,
-                g: 235,
-                b: 225,
-            },
-            rainbow_red: Color::Rgb {
-                r: 185,
-                g: 28,
-                b: 28,
-            },
-            rainbow_orange: Color::Rgb {
-                r: 194,
-                g: 65,
-                b: 12,
-            },
-            rainbow_yellow: Color::Rgb {
-                r: 161,
-                g: 98,
-                b: 7,
-            },
-            rainbow_green: Color::Rgb {
-                r: 21,
-                g: 128,
-                b: 61,
-            },
-            rainbow_blue: Color::Rgb {
-                r: 29,
-                g: 78,
-                b: 216,
-            },
-            rainbow_indigo: Color::Rgb {
-                r: 80,
-                g: 95,
-                b: 160,
-            },
-            rainbow_violet: Color::Rgb {
-                r: 110,
-                g: 100,
-                b: 150,
-            },
-            plan_mode: Color::Rgb {
-                r: 70,
-                g: 115,
-                b: 160,
-            },
-            brief_mode: Color::Rgb {
-                r: 175,
-                g: 105,
-                b: 55,
-            },
-            fast_mode: Color::Rgb {
-                r: 40,
-                g: 130,
-                b: 80,
-            },
-            fast_mode_shimmer: Color::Rgb {
-                r: 30,
-                g: 100,
-                b: 50,
-            },
-            is_dark: false,
-        }
-    }
-
-    /// Midnight Muted — softer dark theme (lower-contrast steel accent).
-    pub fn midnight_muted() -> Self {
-        let mut t = Self::midnight();
-        t.accent = Color::Rgb {
-            r: 115,
-            g: 140,
-            b: 160,
-        };
-        t.error = Color::Rgb {
-            r: 195,
-            g: 115,
-            b: 120,
-        };
-        t.warning = Color::Rgb {
-            r: 190,
-            g: 160,
-            b: 85,
-        };
-        t.success = Color::Rgb {
-            r: 90,
-            g: 155,
-            b: 115,
-        };
-        t.tool = Color::Rgb {
-            r: 130,
-            g: 142,
-            b: 155,
-        };
-        t.success_shimmer = Color::Rgb {
-            r: 120,
-            g: 175,
-            b: 140,
-        };
-        t.error_shimmer = Color::Rgb {
-            r: 210,
-            g: 140,
-            b: 145,
-        };
-        t.warning_shimmer = Color::Rgb {
-            r: 210,
-            g: 185,
-            b: 110,
-        };
-        t.accent_shimmer = Color::Rgb {
-            r: 145,
-            g: 170,
-            b: 190,
-        };
-        t.diff_added_word = Color::Rgb {
-            r: 110,
-            g: 200,
-            b: 130,
-        };
-        t.diff_removed_word = Color::Rgb {
-            r: 220,
-            g: 130,
-            b: 145,
-        };
-        t.subagent_red = Color::Rgb {
-            r: 200,
-            g: 100,
-            b: 100,
-        };
-        t.subagent_blue = Color::Rgb {
-            r: 110,
-            g: 150,
-            b: 220,
-        };
-        t.subagent_green = Color::Rgb {
-            r: 100,
-            g: 180,
-            b: 130,
-        };
-        t.subagent_yellow = Color::Rgb {
-            r: 210,
-            g: 190,
-            b: 100,
-        };
-        t.subagent_purple = Color::Rgb {
-            r: 170,
-            g: 120,
-            b: 220,
-        };
-        t.subagent_orange = Color::Rgb {
-            r: 220,
-            g: 150,
-            b: 90,
-        };
-        t.subagent_pink = Color::Rgb {
-            r: 220,
-            g: 130,
-            b: 175,
-        };
-        t.subagent_cyan = Color::Rgb {
-            r: 110,
-            g: 190,
-            b: 210,
-        };
-        t.rainbow_red = t.subagent_red;
-        t.rainbow_orange = t.subagent_orange;
-        t.rainbow_yellow = t.subagent_yellow;
-        t.rainbow_green = t.subagent_green;
-        t.rainbow_blue = t.subagent_blue;
-        t.rainbow_indigo = Color::Rgb {
-            r: 120,
-            g: 110,
-            b: 200,
-        };
-        t.rainbow_violet = t.subagent_purple;
-        t.plan_mode = t.subagent_purple;
-        t.brief_mode = t.subagent_orange;
-        t.fast_mode = t.subagent_green;
-        t.fast_mode_shimmer = Color::Rgb {
-            r: 130,
-            g: 210,
-            b: 150,
-        };
-        t
-    }
-
-    /// Daybreak Muted — softer light theme.
-    pub fn daybreak_muted() -> Self {
-        let mut t = Self::daybreak();
-        t.accent = Color::Rgb {
-            r: 110,
-            g: 30,
-            b: 150,
-        };
-        t.error = Color::Rgb {
-            r: 150,
-            g: 50,
-            b: 60,
-        };
-        t.warning = Color::Rgb {
-            r: 130,
-            g: 100,
-            b: 40,
-        };
-        t.success = Color::Rgb {
-            r: 50,
-            g: 110,
-            b: 55,
-        };
-        t.tool = Color::Rgb {
-            r: 70,
-            g: 85,
-            b: 190,
-        };
-        t.success_shimmer = Color::Rgb {
-            r: 35,
-            g: 90,
-            b: 45,
-        };
-        t.error_shimmer = Color::Rgb {
-            r: 125,
-            g: 40,
-            b: 50,
-        };
-        t.warning_shimmer = Color::Rgb {
-            r: 105,
-            g: 80,
-            b: 30,
-        };
-        t.accent_shimmer = Color::Rgb {
-            r: 90,
-            g: 25,
-            b: 130,
-        };
-        t.diff_added_word = Color::Rgb {
-            r: 35,
-            g: 120,
-            b: 55,
-        };
-        t.diff_removed_word = Color::Rgb {
-            r: 160,
-            g: 50,
-            b: 60,
-        };
-        t.subagent_red = Color::Rgb {
-            r: 165,
-            g: 50,
-            b: 50,
-        };
-        t.subagent_blue = Color::Rgb {
-            r: 50,
-            g: 90,
-            b: 190,
-        };
-        t.subagent_green = Color::Rgb {
-            r: 40,
-            g: 120,
-            b: 70,
-        };
-        t.subagent_yellow = Color::Rgb {
-            r: 145,
-            g: 105,
-            b: 25,
-        };
-        t.subagent_purple = Color::Rgb {
-            r: 115,
-            g: 50,
-            b: 180,
-        };
-        t.subagent_orange = Color::Rgb {
-            r: 175,
-            g: 75,
-            b: 30,
-        };
-        t.subagent_pink = Color::Rgb {
-            r: 170,
-            g: 40,
-            b: 100,
-        };
-        t.subagent_cyan = Color::Rgb {
-            r: 35,
-            g: 110,
-            b: 135,
-        };
-        t.rainbow_red = t.subagent_red;
-        t.rainbow_orange = t.subagent_orange;
-        t.rainbow_yellow = t.subagent_yellow;
-        t.rainbow_green = t.subagent_green;
-        t.rainbow_blue = t.subagent_blue;
-        t.rainbow_indigo = Color::Rgb {
-            r: 75,
-            g: 65,
-            b: 175,
-        };
-        t.rainbow_violet = t.subagent_purple;
-        t.plan_mode = t.subagent_purple;
-        t.brief_mode = t.subagent_orange;
-        t.fast_mode = t.subagent_green;
-        t.fast_mode_shimmer = Color::Rgb {
-            r: 35,
-            g: 95,
-            b: 50,
-        };
-        t
-    }
-
-    /// Terminal — uses standard 16 ANSI colors only.
-    pub fn terminal() -> Self {
-        // Bright ANSI variants do not have dedicated `Color::Bright*`
-        // names in `crossterm`; use the regular variants for "bright"
-        // shimmer roles and the `Dark*` variants for "base" roles where
-        // the terminal renders the brighter version on top.
-        Self {
-            accent: Color::Magenta,
-            error: Color::Red,
-            warning: Color::Yellow,
-            success: Color::Green,
-            muted: Color::DarkGrey,
-            inactive: Color::Grey,
-            tool: Color::Cyan,
-            plan: Color::DarkGreen,
-            text: Color::Reset,
-            diff_add: Color::Green,
-            diff_remove: Color::Red,
-            agent_colors: [
-                Color::Red,
-                Color::Blue,
-                Color::Green,
-                Color::Yellow,
-                Color::Magenta,
-                Color::DarkYellow,
-                Color::DarkMagenta,
-                Color::Cyan,
-            ],
-            success_shimmer: Color::Green,
-            error_shimmer: Color::Red,
-            warning_shimmer: Color::Yellow,
-            accent_shimmer: Color::Magenta,
-            muted_shimmer: Color::Grey,
-            diff_added_dimmed: Color::DarkGreen,
-            diff_removed_dimmed: Color::DarkRed,
-            diff_added_word: Color::Green,
-            diff_removed_word: Color::Red,
-            subagent_red: Color::Red,
-            subagent_blue: Color::Blue,
-            subagent_green: Color::Green,
-            subagent_yellow: Color::Yellow,
-            subagent_purple: Color::Magenta,
-            subagent_orange: Color::DarkYellow,
-            subagent_pink: Color::DarkMagenta,
-            subagent_cyan: Color::Cyan,
-            rate_limit_fill: Color::Green,
-            rate_limit_empty: Color::DarkGrey,
-            selection_bg: Color::DarkGrey,
-            message_action_bg: Color::DarkGrey,
-            user_message_bg: Color::DarkGrey,
-            bash_message_bg: Color::DarkGrey,
-            memory_message_bg: Color::DarkGrey,
-            rainbow_red: Color::Red,
-            rainbow_orange: Color::DarkYellow,
-            rainbow_yellow: Color::Yellow,
-            rainbow_green: Color::Green,
-            rainbow_blue: Color::Blue,
-            rainbow_indigo: Color::DarkBlue,
-            rainbow_violet: Color::Magenta,
-            plan_mode: Color::Magenta,
-            brief_mode: Color::DarkYellow,
-            fast_mode: Color::Green,
-            fast_mode_shimmer: Color::Green,
-            is_dark: true,
-        }
-    }
-
-    /// Dark theme using the Okabe-Ito palette — chosen for protanopia,
-    /// deuteranopia, and tritanopia distinguishability. The eight
-    /// canonical hex values are mapped to semantic slots so diffs and
-    /// status indicators stay separable for users with common forms of
-    /// colour-vision deficiency.
-    pub fn dark_colorblind() -> Self {
-        // Okabe-Ito palette (canonical hex):
-        //   black       #000000
-        //   orange      #E69F00
-        //   sky-blue    #56B4E9
-        //   bluish-green#009E73
-        //   yellow      #F0E442
-        //   blue        #0072B2
-        //   vermillion  #D55E00
-        //   reddish-purple #CC79A7
-        let orange = Color::Rgb {
-            r: 0xE6,
-            g: 0x9F,
-            b: 0x00,
-        };
-        let sky_blue = Color::Rgb {
-            r: 0x56,
-            g: 0xB4,
-            b: 0xE9,
-        };
-        let bluish_green = Color::Rgb {
-            r: 0x00,
-            g: 0x9E,
-            b: 0x73,
-        };
-        let yellow = Color::Rgb {
-            r: 0xF0,
-            g: 0xE4,
-            b: 0x42,
-        };
-        let blue = Color::Rgb {
-            r: 0x00,
-            g: 0x72,
-            b: 0xB2,
-        };
-        let vermillion = Color::Rgb {
-            r: 0xD5,
-            g: 0x5E,
-            b: 0x00,
-        };
-        let reddish_purple = Color::Rgb {
-            r: 0xCC,
-            g: 0x79,
-            b: 0xA7,
-        };
-
-        Self {
-            accent: sky_blue,
-            error: vermillion,
-            warning: orange,
-            success: bluish_green,
-            muted: Color::Rgb {
-                r: 130,
-                g: 130,
-                b: 130,
-            },
-            inactive: Color::Rgb {
-                r: 170,
-                g: 170,
-                b: 170,
-            },
-            tool: reddish_purple,
-            plan: blue,
-            text: Color::White,
-            diff_add: bluish_green,
-            diff_remove: vermillion,
-            agent_colors: [
-                vermillion,
-                blue,
-                bluish_green,
-                yellow,
-                sky_blue,
-                orange,
-                reddish_purple,
-                Color::White,
-            ],
-            // The Okabe-Ito palette has only seven chromatic hues plus
-            // black/white; nine subagent + rainbow slots can't all be
-            // unique, so some intentional repetition appears below.
-            success_shimmer: bluish_green,
-            error_shimmer: vermillion,
-            warning_shimmer: yellow,
-            accent_shimmer: sky_blue,
-            muted_shimmer: Color::White,
-            diff_added_dimmed: bluish_green,
-            diff_removed_dimmed: vermillion,
-            diff_added_word: bluish_green,
-            diff_removed_word: vermillion,
-            subagent_red: vermillion,
-            subagent_blue: blue,
-            subagent_green: bluish_green,
-            subagent_yellow: yellow,
-            subagent_purple: reddish_purple,
-            subagent_orange: orange,
-            // Repeats reddish_purple — Okabe-Ito has no separate pink.
-            subagent_pink: reddish_purple,
-            subagent_cyan: sky_blue,
-            rate_limit_fill: bluish_green,
-            rate_limit_empty: Color::Black,
-            selection_bg: blue,
-            message_action_bg: Color::Black,
-            user_message_bg: Color::Black,
-            bash_message_bg: Color::Black,
-            memory_message_bg: Color::Black,
-            rainbow_red: vermillion,
-            rainbow_orange: orange,
-            rainbow_yellow: yellow,
-            rainbow_green: bluish_green,
-            rainbow_blue: blue,
-            // Repeats blue — Okabe-Ito has no separate indigo.
-            rainbow_indigo: blue,
-            rainbow_violet: reddish_purple,
-            plan_mode: reddish_purple,
-            brief_mode: orange,
-            fast_mode: bluish_green,
-            fast_mode_shimmer: bluish_green,
-            is_dark: true,
-        }
-    }
-
-    /// Light counterpart of [`Theme::dark_colorblind`] using the same
-    /// Okabe-Ito palette. The semantic slots are re-mapped to keep
-    /// contrast against a pale background; the eight canonical hex
-    /// values are still exclusively used.
-    pub fn light_colorblind() -> Self {
-        let orange = Color::Rgb {
-            r: 0xE6,
-            g: 0x9F,
-            b: 0x00,
-        };
-        let sky_blue = Color::Rgb {
-            r: 0x56,
-            g: 0xB4,
-            b: 0xE9,
-        };
-        let bluish_green = Color::Rgb {
-            r: 0x00,
-            g: 0x9E,
-            b: 0x73,
-        };
-        let yellow = Color::Rgb {
-            r: 0xF0,
-            g: 0xE4,
-            b: 0x42,
-        };
-        let blue = Color::Rgb {
-            r: 0x00,
-            g: 0x72,
-            b: 0xB2,
-        };
-        let vermillion = Color::Rgb {
-            r: 0xD5,
-            g: 0x5E,
-            b: 0x00,
-        };
-        let reddish_purple = Color::Rgb {
-            r: 0xCC,
-            g: 0x79,
-            b: 0xA7,
-        };
-
-        Self {
-            accent: blue,
-            error: vermillion,
-            warning: orange,
-            success: bluish_green,
-            muted: Color::Rgb {
-                r: 110,
-                g: 110,
-                b: 110,
-            },
-            inactive: Color::Rgb {
-                r: 90,
-                g: 90,
-                b: 90,
-            },
-            tool: reddish_purple,
-            plan: bluish_green,
-            text: Color::Black,
-            diff_add: bluish_green,
-            diff_remove: vermillion,
-            agent_colors: [
-                vermillion,
-                blue,
-                bluish_green,
-                yellow,
-                sky_blue,
-                orange,
-                reddish_purple,
-                Color::Black,
-            ],
-            // The Okabe-Ito palette has only seven chromatic hues plus
-            // black/white; nine subagent + rainbow slots can't all be
-            // unique, so some intentional repetition appears below.
-            success_shimmer: bluish_green,
-            error_shimmer: vermillion,
-            warning_shimmer: orange,
-            accent_shimmer: blue,
-            muted_shimmer: Color::Black,
-            diff_added_dimmed: bluish_green,
-            diff_removed_dimmed: vermillion,
-            diff_added_word: bluish_green,
-            diff_removed_word: vermillion,
-            subagent_red: vermillion,
-            subagent_blue: blue,
-            subagent_green: bluish_green,
-            subagent_yellow: yellow,
-            subagent_purple: reddish_purple,
-            subagent_orange: orange,
-            // Repeats reddish_purple — Okabe-Ito has no separate pink.
-            subagent_pink: reddish_purple,
-            subagent_cyan: sky_blue,
-            rate_limit_fill: bluish_green,
-            rate_limit_empty: Color::White,
-            selection_bg: sky_blue,
-            message_action_bg: Color::White,
-            user_message_bg: Color::White,
-            bash_message_bg: Color::White,
-            memory_message_bg: Color::White,
-            rainbow_red: vermillion,
-            rainbow_orange: orange,
-            rainbow_yellow: yellow,
-            rainbow_green: bluish_green,
-            rainbow_blue: blue,
-            // Repeats blue — Okabe-Ito has no separate indigo.
-            rainbow_indigo: blue,
-            rainbow_violet: reddish_purple,
-            plan_mode: reddish_purple,
-            brief_mode: orange,
-            fast_mode: bluish_green,
-            fast_mode_shimmer: bluish_green,
-            is_dark: false,
-        }
-    }
-
-    /// Dark theme restricted to the 16 standard ANSI colour codes —
-    /// for terminals without truecolor support. Every slot is one of
-    /// the named [`Color`] variants the standard ANSI palette knows
-    /// (no `Color::Rgb`, no 256-colour indices).
-    pub fn dark_ansi() -> Self {
-        // The 16-colour ANSI palette has 16 distinct slots; many of
-        // the new visual slots have to share with semantic ones. The
-        // mapping below picks the closest hue from the 16 standard
-        // codes, with the bright `Color::Red/Green/...` set used for
-        // shimmer roles and the `Color::Dark*` set for "base" hues.
-        Self {
-            accent: Color::Cyan,
-            error: Color::Red,
-            warning: Color::Yellow,
-            success: Color::Green,
-            muted: Color::DarkGrey,
-            inactive: Color::Grey,
-            tool: Color::Magenta,
-            plan: Color::Blue,
-            text: Color::White,
-            diff_add: Color::Green,
-            diff_remove: Color::Red,
-            agent_colors: [
-                Color::Red,
-                Color::Blue,
-                Color::Green,
-                Color::Yellow,
-                Color::Magenta,
-                Color::Cyan,
-                Color::DarkYellow,
-                Color::DarkMagenta,
-            ],
-            success_shimmer: Color::Green,
-            error_shimmer: Color::Red,
-            warning_shimmer: Color::Yellow,
-            accent_shimmer: Color::Cyan,
-            muted_shimmer: Color::Grey,
-            diff_added_dimmed: Color::DarkGreen,
-            diff_removed_dimmed: Color::DarkRed,
-            diff_added_word: Color::Green,
-            diff_removed_word: Color::Red,
-            subagent_red: Color::Red,
-            subagent_blue: Color::Blue,
-            subagent_green: Color::Green,
-            subagent_yellow: Color::Yellow,
-            subagent_purple: Color::Magenta,
-            subagent_orange: Color::DarkYellow,
-            subagent_pink: Color::DarkMagenta,
-            subagent_cyan: Color::Cyan,
-            rate_limit_fill: Color::Green,
-            rate_limit_empty: Color::DarkGrey,
-            selection_bg: Color::DarkGrey,
-            message_action_bg: Color::DarkGrey,
-            user_message_bg: Color::DarkGrey,
-            bash_message_bg: Color::DarkGrey,
-            memory_message_bg: Color::DarkGrey,
-            rainbow_red: Color::Red,
-            rainbow_orange: Color::DarkYellow,
-            rainbow_yellow: Color::Yellow,
-            rainbow_green: Color::Green,
-            rainbow_blue: Color::Blue,
-            rainbow_indigo: Color::DarkBlue,
-            rainbow_violet: Color::Magenta,
-            plan_mode: Color::Magenta,
-            brief_mode: Color::DarkYellow,
-            fast_mode: Color::Green,
-            fast_mode_shimmer: Color::Green,
-            is_dark: true,
-        }
-    }
-
-    /// Light counterpart of [`Theme::dark_ansi`]. Uses the dark ANSI
-    /// variants where contrast on a pale background matters.
-    pub fn light_ansi() -> Self {
-        Self {
-            accent: Color::DarkBlue,
-            error: Color::DarkRed,
-            warning: Color::DarkYellow,
-            success: Color::DarkGreen,
-            muted: Color::DarkGrey,
-            inactive: Color::Grey,
-            tool: Color::DarkMagenta,
-            plan: Color::DarkCyan,
-            text: Color::Black,
-            diff_add: Color::DarkGreen,
-            diff_remove: Color::DarkRed,
-            agent_colors: [
-                Color::DarkRed,
-                Color::DarkBlue,
-                Color::DarkGreen,
-                Color::DarkYellow,
-                Color::DarkMagenta,
-                Color::DarkCyan,
-                Color::Red,
-                Color::Blue,
-            ],
-            success_shimmer: Color::DarkGreen,
-            error_shimmer: Color::DarkRed,
-            warning_shimmer: Color::DarkYellow,
-            accent_shimmer: Color::DarkBlue,
-            muted_shimmer: Color::DarkGrey,
-            diff_added_dimmed: Color::Green,
-            diff_removed_dimmed: Color::Red,
-            diff_added_word: Color::DarkGreen,
-            diff_removed_word: Color::DarkRed,
-            subagent_red: Color::DarkRed,
-            subagent_blue: Color::DarkBlue,
-            subagent_green: Color::DarkGreen,
-            subagent_yellow: Color::DarkYellow,
-            subagent_purple: Color::DarkMagenta,
-            // No "dark orange" in the 16-ANSI set; reuse DarkYellow.
-            subagent_orange: Color::DarkYellow,
-            // No "dark pink" in the 16-ANSI set; reuse DarkMagenta.
-            subagent_pink: Color::DarkMagenta,
-            subagent_cyan: Color::DarkCyan,
-            rate_limit_fill: Color::DarkGreen,
-            rate_limit_empty: Color::Grey,
-            selection_bg: Color::Grey,
-            message_action_bg: Color::Grey,
-            user_message_bg: Color::Grey,
-            bash_message_bg: Color::Grey,
-            memory_message_bg: Color::Grey,
-            rainbow_red: Color::DarkRed,
-            rainbow_orange: Color::DarkYellow,
-            rainbow_yellow: Color::DarkYellow,
-            rainbow_green: Color::DarkGreen,
-            rainbow_blue: Color::DarkBlue,
-            rainbow_indigo: Color::Blue,
-            rainbow_violet: Color::DarkMagenta,
-            plan_mode: Color::DarkMagenta,
-            brief_mode: Color::DarkYellow,
-            fast_mode: Color::DarkGreen,
-            fast_mode_shimmer: Color::DarkGreen,
-            is_dark: false,
-        }
-    }
-
-    /// Resolve a theme name to a Theme instance.
+    /// Resolution order: exact palette id (standard, then user), then
+    /// the aliases `auto` (OS-detected), `dark`, `light`. Anything
+    /// unknown falls back to the default dark theme (`one-dark`).
     pub fn from_name(name: &str) -> Self {
-        match name {
-            "midnight" | "dark" => Self::midnight(),
-            "daybreak" | "light" => Self::daybreak(),
-            "midnight-muted" => Self::midnight_muted(),
-            "daybreak-muted" => Self::daybreak_muted(),
-            "terminal" => Self::terminal(),
-            "dark-colorblind" => Self::dark_colorblind(),
-            "light-colorblind" => Self::light_colorblind(),
-            "dark-ansi" => Self::dark_ansi(),
-            "light-ansi" => Self::light_ansi(),
+        if let Some(p) = lookup_palette(name) {
+            return theme_from_palette(&p);
+        }
+        let fallback = match name {
             "auto" => {
-                let detected = detect_system_theme();
-                if detected == "light" {
-                    Self::daybreak()
+                if detect_system_theme() == "light" {
+                    DEFAULT_LIGHT
                 } else {
-                    Self::midnight()
+                    DEFAULT_DARK
                 }
             }
-            _ => Self::midnight(),
-        }
+            "light" => DEFAULT_LIGHT,
+            "dark" => DEFAULT_DARK,
+            _ => DEFAULT_DARK,
+        };
+        let p = lookup_palette(fallback).expect("built-in default palette must exist");
+        theme_from_palette(&p)
     }
 
-    /// All known theme identifiers in display order. Drives the
-    /// onboarding picker and the `/theme` slash command.
-    pub fn all_names() -> &'static [&'static str] {
-        &[
-            "auto",
-            "midnight",
-            "daybreak",
-            "dark-colorblind",
-            "light-colorblind",
-            "dark-ansi",
-            "light-ansi",
-        ]
+    /// All known theme identifiers in display order: `auto`, then the
+    /// standard palette ids, then any user palette ids. Drives the
+    /// onboarding picker and the `/color` slash command.
+    pub fn all_names() -> Vec<String> {
+        let mut names = vec!["auto".to_string()];
+        names.extend(standard_palettes().into_iter().map(|p| p.id.into_owned()));
+        names.extend(user_palettes().into_iter().map(|p| p.id.into_owned()));
+        names
+    }
+
+    /// `(id, label)` pairs in display order, for pickers that show a
+    /// human-facing name. Mirrors [`Self::all_names`].
+    pub fn all_options() -> Vec<(String, String)> {
+        let mut opts = vec![("auto".to_string(), "Auto (match terminal)".to_string())];
+        for p in standard_palettes() {
+            opts.push((p.id.into_owned(), p.label.into_owned()));
+        }
+        for p in user_palettes() {
+            opts.push((p.id.into_owned(), p.label.into_owned()));
+        }
+        opts
     }
 
     /// Get a subagent color by index (wraps around).
@@ -1455,95 +616,152 @@ pub fn detect_system_theme() -> &'static str {
     "dark"
 }
 
-/// Resolve a config theme name, handling "auto".
-pub fn resolve_theme(configured: &str) -> String {
-    if configured == "auto" {
-        let detected = detect_system_theme();
-        if detected == "light" {
-            "daybreak".to_string()
-        } else {
-            "midnight".to_string()
-        }
-    } else {
-        configured.to_string()
-    }
-}
-
-// ---- Global theme access ----
-//
-// The active theme is held behind a `RwLock` rather than a `OnceLock`
-// so the `/theme` slash command can re-paint the running session
-// without requiring a restart. Writes happen at most once per user
-// command; reads are cheap because `Theme` is `Clone` and the lock
-// hold time is microseconds.
-
-use std::sync::RwLock;
-
-static ACTIVE_THEME: RwLock<Option<Theme>> = RwLock::new(None);
-
-/// Initialize (or re-set) the global theme. Safe to call from the
-/// startup path *and* from the `/theme` slash command — the latter
-/// overrides any previously installed theme.
-pub fn init(theme_name: &str) {
-    let theme = Theme::from_name(theme_name);
-    if let Ok(mut guard) = ACTIVE_THEME.write() {
-        *guard = Some(theme);
-    }
-}
-
-/// Get a snapshot of the active theme. Falls back to midnight if not
-/// initialized. Returns by value (cheap clone) so callers don't need
-/// to hold the lock across rendering.
-pub fn current() -> Theme {
-    ACTIVE_THEME
-        .read()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(Theme::midnight)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_resolve_non_auto() {
-        assert_eq!(resolve_theme("midnight"), "midnight");
-        assert_eq!(resolve_theme("daybreak"), "daybreak");
+    fn as_rgb(c: Color) -> Option<(u8, u8, u8)> {
+        match c {
+            Color::Rgb { r, g, b } => Some((r, g, b)),
+            _ => None,
+        }
     }
 
     #[test]
-    fn test_resolve_auto_returns_valid_theme() {
-        let result = resolve_theme("auto");
-        assert!(result == "midnight" || result == "daybreak");
+    fn mix_blends_endpoints() {
+        let a = Color::Rgb { r: 0, g: 0, b: 0 };
+        let b = Color::Rgb {
+            r: 100,
+            g: 200,
+            b: 50,
+        };
+        assert_eq!(as_rgb(mix(a, b, 0.0)), Some((0, 0, 0)));
+        assert_eq!(as_rgb(mix(a, b, 1.0)), Some((100, 200, 50)));
+        assert_eq!(as_rgb(mix(a, b, 0.5)), Some((50, 100, 25)));
+        // Non-Rgb passes through as `a`.
+        assert!(matches!(mix(Color::Red, b, 0.5), Color::Red));
     }
 
     #[test]
-    fn test_theme_from_name() {
-        let t = Theme::from_name("midnight");
+    fn brighten_saturates() {
+        let c = Color::Rgb {
+            r: 250,
+            g: 10,
+            b: 100,
+        };
+        assert_eq!(as_rgb(brighten(c, 40)), Some((255, 50, 140)));
+        assert!(matches!(brighten(Color::Red, 40), Color::Red));
+    }
+
+    #[test]
+    fn parse_hex_valid_and_invalid() {
+        assert_eq!(
+            parse_hex("#ff5555"),
+            Some(Color::Rgb {
+                r: 0xff,
+                g: 0x55,
+                b: 0x55
+            })
+        );
+        // Accepts the un-prefixed form too.
+        assert_eq!(
+            parse_hex("50fa7b"),
+            Some(Color::Rgb {
+                r: 0x50,
+                g: 0xfa,
+                b: 0x7b
+            })
+        );
+        assert_eq!(parse_hex("#fff"), None);
+        assert_eq!(parse_hex("#gggggg"), None);
+        assert_eq!(parse_hex("not a color"), None);
+        assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn theme_from_palette_maps_every_role() {
+        let dracula = lookup_palette("dracula").expect("dracula palette exists");
+        let t = theme_from_palette(&dracula);
+        // error == red hex (#ff5555).
+        assert_eq!(
+            as_rgb(t.error),
+            Some((0xff, 0x55, 0x55)),
+            "error should map to the palette's red"
+        );
+        // success/diff_add == green (#50fa7b).
+        assert_eq!(as_rgb(t.success), Some((0x50, 0xfa, 0x7b)));
+        assert_eq!(as_rgb(t.diff_add), as_rgb(t.success));
+        // tool == cyan; plan/plan_mode == purple.
+        assert_eq!(as_rgb(t.tool), as_rgb(dracula.cyan));
+        assert_eq!(as_rgb(t.plan), as_rgb(dracula.purple));
+        assert_eq!(as_rgb(t.plan_mode), as_rgb(dracula.purple));
+        // text == fg; accent == accent.
+        assert_eq!(as_rgb(t.text), as_rgb(dracula.fg));
+        assert_eq!(as_rgb(t.accent), as_rgb(dracula.accent));
+        // agent_colors[0] == blue.
+        assert_eq!(as_rgb(t.agent_colors[0]), as_rgb(dracula.blue));
         assert!(t.is_dark);
-        let t = Theme::from_name("daybreak");
-        assert!(!t.is_dark);
+        // Derived slots stay populated (no accidental Reset).
+        assert!(!matches!(t.diff_added_dimmed, Color::Reset));
+        assert!(!matches!(t.rate_limit_empty, Color::Reset));
     }
 
     #[test]
-    fn test_agent_color_wraps() {
-        let t = Theme::midnight();
-        let c0 = t.agent_color(0);
-        let c8 = t.agent_color(8);
-        assert!(matches!(c0, Color::Rgb { .. }));
-        assert!(matches!(c8, Color::Rgb { .. }));
+    fn from_name_standard_ids_are_distinct() {
+        let monokai = Theme::from_name("monokai");
+        let dracula = Theme::from_name("dracula");
+        let nord = Theme::from_name("nord");
+        assert_ne!(as_rgb(monokai.accent), as_rgb(dracula.accent));
+        assert_ne!(as_rgb(dracula.accent), as_rgb(nord.accent));
+        assert_ne!(as_rgb(monokai.accent), as_rgb(nord.accent));
     }
 
     #[test]
-    fn every_named_theme_resolves() {
-        // Tripwire: every name advertised by `all_names` must produce a
-        // theme whose every slot is populated. `Color` has no Default
-        // impl so a missing field is a compile error already; this
-        // covers semantic completeness too — matching `Color::Reset`
-        // on a non-text slot is the "I forgot to set this" footgun.
+    fn from_name_unknown_falls_back_to_default_dark() {
+        let unknown = Theme::from_name("does-not-exist");
+        let default = Theme::from_name(DEFAULT_DARK);
+        assert!(unknown.is_dark);
+        assert_eq!(as_rgb(unknown.accent), as_rgb(default.accent));
+    }
+
+    #[test]
+    fn light_alias_resolves_to_light_theme() {
+        let light = Theme::from_name("light");
+        assert!(!light.is_dark, "'light' alias must be a light theme");
+        let solarized = Theme::from_name("solarized-light");
+        assert!(!solarized.is_dark);
+        assert_eq!(as_rgb(light.accent), as_rgb(solarized.accent));
+    }
+
+    #[test]
+    fn dark_alias_resolves_to_default_dark() {
+        let dark = Theme::from_name("dark");
+        let one_dark = Theme::from_name("one-dark");
+        assert!(dark.is_dark);
+        assert_eq!(as_rgb(dark.accent), as_rgb(one_dark.accent));
+    }
+
+    #[test]
+    fn all_names_starts_with_auto_and_lists_standard_ids() {
+        let names = Theme::all_names();
+        assert_eq!(names.first().map(String::as_str), Some("auto"));
+        for id in [
+            "monokai",
+            "dracula",
+            "nord",
+            "gruvbox",
+            "one-dark",
+            "solarized-dark",
+            "solarized-light",
+        ] {
+            assert!(names.iter().any(|n| n == id), "missing standard id {id}");
+        }
+    }
+
+    #[test]
+    fn every_named_theme_resolves_with_populated_slots() {
         for name in Theme::all_names() {
-            let t = Theme::from_name(name);
+            let t = Theme::from_name(&name);
             assert!(
                 !matches!(t.accent, Color::Reset),
                 "theme {name} has unset accent"
@@ -1551,14 +769,6 @@ mod tests {
             assert!(
                 !matches!(t.error, Color::Reset),
                 "theme {name} has unset error"
-            );
-            assert!(
-                !matches!(t.diff_add, Color::Reset),
-                "theme {name} has unset diff_add"
-            );
-            assert!(
-                !matches!(t.diff_remove, Color::Reset),
-                "theme {name} has unset diff_remove"
             );
             assert_eq!(
                 t.agent_colors.len(),
@@ -1569,243 +779,46 @@ mod tests {
     }
 
     #[test]
-    fn colorblind_palette_uses_okabe_ito_hex_values() {
-        // Spec: every Okabe-Ito canonical hex value must show up in
-        // either dark-colorblind or light-colorblind. The two themes
-        // share the same palette and only re-map semantic slots, so a
-        // single union suffices.
-        let okabe_ito: &[(u8, u8, u8)] = &[
-            (0xE6, 0x9F, 0x00), // orange
-            (0x56, 0xB4, 0xE9), // sky-blue
-            (0x00, 0x9E, 0x73), // bluish-green
-            (0xF0, 0xE4, 0x42), // yellow
-            (0x00, 0x72, 0xB2), // blue
-            (0xD5, 0x5E, 0x00), // vermillion
-            (0xCC, 0x79, 0xA7), // reddish-purple
-        ];
+    fn user_palette_loads_from_toml_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r##"
+label = "My Theme"
+dark = false
+bg = "#101010"
+fg = "#fafafa"
+muted = "#808080"
+selection = "#303030"
+red = "#ff0000"
+orange = "#ff8800"
+yellow = "#ffff00"
+green = "#00ff00"
+cyan = "#00ffff"
+blue = "#0000ff"
+purple = "#8800ff"
+pink = "#ff00ff"
+accent = "#00ffff"
+"##;
+        std::fs::write(dir.path().join("mytheme.toml"), toml).unwrap();
+        // A malformed file must be skipped, not panic.
+        std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
 
-        let collect = |t: &Theme| -> Vec<(u8, u8, u8)> {
-            let mut all = vec![
-                t.accent,
-                t.error,
-                t.warning,
-                t.success,
-                t.tool,
-                t.plan,
-                t.diff_add,
-                t.diff_remove,
-            ];
-            all.extend_from_slice(&t.agent_colors);
-            all.into_iter()
-                .filter_map(|c| match c {
-                    Color::Rgb { r, g, b } => Some((r, g, b)),
-                    _ => None,
-                })
-                .collect()
-        };
+        let palettes = load_palettes_dir(dir.path());
+        assert_eq!(palettes.len(), 1, "only the valid palette should load");
+        let p = &palettes[0];
+        assert_eq!(p.id.as_ref(), "mytheme", "id is the file stem");
+        assert_eq!(p.label.as_ref(), "My Theme");
+        assert!(!p.is_dark);
 
-        let dark = Theme::dark_colorblind();
-        let light = Theme::light_colorblind();
-        let mut union: Vec<(u8, u8, u8)> = collect(&dark);
-        union.extend(collect(&light));
-        union.sort_unstable();
-        union.dedup();
-
-        for triple in okabe_ito {
-            assert!(
-                union.contains(triple),
-                "Okabe-Ito colour {:02X}{:02X}{:02X} missing from colourblind themes",
-                triple.0,
-                triple.1,
-                triple.2,
-            );
-        }
-        // Black (the eighth Okabe-Ito colour) should appear as text in
-        // at least the light variant — assert separately so the union
-        // check stays focused on the chromatic seven.
-        assert!(matches!(light.text, Color::Black));
+        let t = theme_from_palette(p);
+        assert!(!t.is_dark);
+        assert_eq!(as_rgb(t.error), Some((0xff, 0x00, 0x00)));
+        assert_eq!(as_rgb(t.accent), Some((0x00, 0xff, 0xff)));
     }
 
     #[test]
-    fn ansi_only_themes_use_no_truecolor() {
-        // For every slot in the ANSI-only themes, the colour must be
-        // one of the 16 standard ANSI variants — no `Rgb`, no
-        // `AnsiValue`. The latter would still resolve in 256-colour
-        // terminals but doesn't degrade in 16-colour ones.
-        fn is_ansi_16(c: Color) -> bool {
-            matches!(
-                c,
-                Color::Reset
-                    | Color::Black
-                    | Color::Red
-                    | Color::Green
-                    | Color::Yellow
-                    | Color::Blue
-                    | Color::Magenta
-                    | Color::Cyan
-                    | Color::Grey
-                    | Color::White
-                    | Color::DarkGrey
-                    | Color::DarkRed
-                    | Color::DarkGreen
-                    | Color::DarkYellow
-                    | Color::DarkBlue
-                    | Color::DarkMagenta
-                    | Color::DarkCyan
-            )
-        }
-        for theme in [Theme::dark_ansi(), Theme::light_ansi()] {
-            for c in [
-                theme.accent,
-                theme.error,
-                theme.warning,
-                theme.success,
-                theme.muted,
-                theme.inactive,
-                theme.tool,
-                theme.plan,
-                theme.text,
-                theme.diff_add,
-                theme.diff_remove,
-            ] {
-                assert!(is_ansi_16(c), "ANSI theme leaked non-ANSI colour {c:?}");
-            }
-            for c in theme.agent_colors {
-                assert!(is_ansi_16(c), "ANSI theme agent colour {c:?} is non-ANSI");
-            }
-            for (label, c) in new_slots(&theme) {
-                assert!(
-                    is_ansi_16(c),
-                    "ANSI theme slot {label} leaked non-ANSI colour {c:?}"
-                );
-            }
-        }
-    }
-
-    /// Every non-array slot added in the palette expansion, paired with
-    /// its name for diagnostic messages. Tests iterate over this to
-    /// avoid drifting when slots are added.
-    fn new_slots(t: &Theme) -> [(&'static str, Color); 35] {
-        [
-            ("success_shimmer", t.success_shimmer),
-            ("error_shimmer", t.error_shimmer),
-            ("warning_shimmer", t.warning_shimmer),
-            ("accent_shimmer", t.accent_shimmer),
-            ("muted_shimmer", t.muted_shimmer),
-            ("diff_added_dimmed", t.diff_added_dimmed),
-            ("diff_removed_dimmed", t.diff_removed_dimmed),
-            ("diff_added_word", t.diff_added_word),
-            ("diff_removed_word", t.diff_removed_word),
-            ("subagent_red", t.subagent_red),
-            ("subagent_blue", t.subagent_blue),
-            ("subagent_green", t.subagent_green),
-            ("subagent_yellow", t.subagent_yellow),
-            ("subagent_purple", t.subagent_purple),
-            ("subagent_orange", t.subagent_orange),
-            ("subagent_pink", t.subagent_pink),
-            ("subagent_cyan", t.subagent_cyan),
-            ("rate_limit_fill", t.rate_limit_fill),
-            ("rate_limit_empty", t.rate_limit_empty),
-            ("selection_bg", t.selection_bg),
-            ("message_action_bg", t.message_action_bg),
-            ("user_message_bg", t.user_message_bg),
-            ("bash_message_bg", t.bash_message_bg),
-            ("memory_message_bg", t.memory_message_bg),
-            ("rainbow_red", t.rainbow_red),
-            ("rainbow_orange", t.rainbow_orange),
-            ("rainbow_yellow", t.rainbow_yellow),
-            ("rainbow_green", t.rainbow_green),
-            ("rainbow_blue", t.rainbow_blue),
-            ("rainbow_indigo", t.rainbow_indigo),
-            ("rainbow_violet", t.rainbow_violet),
-            ("plan_mode", t.plan_mode),
-            ("brief_mode", t.brief_mode),
-            ("fast_mode", t.fast_mode),
-            ("fast_mode_shimmer", t.fast_mode_shimmer),
-        ]
-    }
-
-    /// Every constructor (named themes plus the ones omitted from the
-    /// onboarding list) must produce a struct without panicking. This
-    /// guards against a stray bad `Color::Rgb` triple slipping in.
-    #[test]
-    fn every_constructor_returns_successfully() {
-        let _ = Theme::midnight();
-        let _ = Theme::daybreak();
-        let _ = Theme::midnight_muted();
-        let _ = Theme::daybreak_muted();
-        let _ = Theme::terminal();
-        let _ = Theme::dark_colorblind();
-        let _ = Theme::light_colorblind();
-        let _ = Theme::dark_ansi();
-        let _ = Theme::light_ansi();
-    }
-
-    type ThemeCtor = fn() -> Theme;
-
-    fn all_constructors() -> &'static [(&'static str, ThemeCtor)] {
-        &[
-            ("midnight", Theme::midnight),
-            ("daybreak", Theme::daybreak),
-            ("midnight_muted", Theme::midnight_muted),
-            ("daybreak_muted", Theme::daybreak_muted),
-            ("terminal", Theme::terminal),
-            ("dark_colorblind", Theme::dark_colorblind),
-            ("light_colorblind", Theme::light_colorblind),
-            ("dark_ansi", Theme::dark_ansi),
-            ("light_ansi", Theme::light_ansi),
-        ]
-    }
-
-    #[test]
-    fn every_new_slot_is_populated_in_every_theme() {
-        // `Color::Reset` is the "I forgot to set this" footgun for any
-        // emphasis slot — none of the new slots want to inherit. (The
-        // existing `text` slot is allowed to be `Reset`; the new slots
-        // are visual emphasis, where "inherit" produces no emphasis.)
-        for (name, ctor) in all_constructors() {
-            let t = ctor();
-            for (label, c) in new_slots(&t) {
-                assert!(
-                    !matches!(c, Color::Reset),
-                    "theme {name} has unset {label} slot"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn colorblind_themes_only_use_okabe_ito_palette_for_new_slots() {
-        // Allowlist: the seven canonical Okabe-Ito hex values plus
-        // black and white. Every new slot in either colourblind theme
-        // must resolve to one of these.
-        fn is_allowed(c: Color) -> bool {
-            const ALLOWED: &[(u8, u8, u8)] = &[
-                (0xE6, 0x9F, 0x00), // orange
-                (0x56, 0xB4, 0xE9), // sky-blue
-                (0x00, 0x9E, 0x73), // bluish-green
-                (0xF0, 0xE4, 0x42), // yellow
-                (0x00, 0x72, 0xB2), // blue
-                (0xD5, 0x5E, 0x00), // vermillion
-                (0xCC, 0x79, 0xA7), // reddish-purple
-            ];
-            match c {
-                Color::Rgb { r, g, b } => ALLOWED.contains(&(r, g, b)),
-                Color::Black | Color::White => true,
-                _ => false,
-            }
-        }
-
-        for (name, theme) in [
-            ("dark_colorblind", Theme::dark_colorblind()),
-            ("light_colorblind", Theme::light_colorblind()),
-        ] {
-            for (label, c) in new_slots(&theme) {
-                assert!(
-                    is_allowed(c),
-                    "{name} slot {label} uses non-Okabe-Ito colour {c:?}"
-                );
-            }
-        }
+    fn missing_user_dir_yields_no_palettes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(load_palettes_dir(&missing).is_empty());
     }
 }

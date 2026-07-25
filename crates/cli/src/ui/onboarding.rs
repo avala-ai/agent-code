@@ -199,11 +199,12 @@ fn print_welcome() {
 // Theme picker
 // ---------------------------------------------------------------------------
 
-/// One row in the picker: display label, theme name persisted to
-/// settings, and which short hint to show beneath the option list.
+/// One row in the picker: display label and the theme id persisted to
+/// settings. Built at runtime from [`Theme::all_options`] so standard
+/// and user-defined themes both appear.
 struct PickerOption {
-    label: &'static str,
-    value: &'static str,
+    label: String,
+    value: String,
 }
 
 // TODO(8.15.5): expose `[ui].inherit_fg` here once the picker grows
@@ -213,38 +214,15 @@ struct PickerOption {
 // `~/.config/agent-code/config.toml` directly. See
 // `docs/configuration/settings.mdx` for the option description.
 
-/// Order shown to the user. `auto` first because it is the safest
-/// default — it follows the terminal's own background detection.
-const THEME_OPTIONS: &[PickerOption] = &[
-    PickerOption {
-        label: "Auto (match terminal)",
-        value: "auto",
-    },
-    PickerOption {
-        label: "Dark mode",
-        value: "midnight",
-    },
-    PickerOption {
-        label: "Light mode",
-        value: "daybreak",
-    },
-    PickerOption {
-        label: "Dark mode (colorblind-friendly)",
-        value: "dark-colorblind",
-    },
-    PickerOption {
-        label: "Light mode (colorblind-friendly)",
-        value: "light-colorblind",
-    },
-    PickerOption {
-        label: "Dark mode (ANSI colors only)",
-        value: "dark-ansi",
-    },
-    PickerOption {
-        label: "Light mode (ANSI colors only)",
-        value: "light-ansi",
-    },
-];
+/// Build the picker rows. `auto` is first (safest default — follows
+/// the terminal's own background detection), then every standard and
+/// user theme, in display order.
+fn theme_options() -> Vec<PickerOption> {
+    Theme::all_options()
+        .into_iter()
+        .map(|(value, label)| PickerOption { label, value })
+        .collect()
+}
 
 /// Tiny canned diff used in the live preview. Designed to be
 /// language-agnostic, short enough to fit in five rendered rows, and
@@ -255,16 +233,17 @@ const PREVIEW_AFTER: &str = "fn render(view: &View) {\n    let title = view.head
 
 /// Show the picker. Returns `None` on Escape or other cancel.
 fn pick_theme(initial: String) -> Option<String> {
-    let mut selected = THEME_OPTIONS
+    let options = theme_options();
+    let mut selected = options
         .iter()
         .position(|o| o.value == initial)
-        .unwrap_or(1);
+        .unwrap_or(1.min(options.len().saturating_sub(1)));
     let confirmed_initial = selected;
 
     if terminal::enable_raw_mode().is_err() {
         // Without raw mode we can't track arrow keys. Fall back to a
         // non-interactive default so we never hang.
-        return Some(THEME_OPTIONS[selected].value.to_string());
+        return Some(options[selected].value.clone());
     }
 
     let stdout = io::stdout();
@@ -280,7 +259,7 @@ fn pick_theme(initial: String) -> Option<String> {
         out.flush().ok();
     }
 
-    render_picker(selected, confirmed_initial);
+    render_picker(&options, selected, confirmed_initial);
 
     let mut cancelled = false;
     loop {
@@ -307,17 +286,17 @@ fn pick_theme(initial: String) -> Option<String> {
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     selected = if selected == 0 {
-                        THEME_OPTIONS.len() - 1
+                        options.len() - 1
                     } else {
                         selected - 1
                     };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % THEME_OPTIONS.len();
+                    selected = (selected + 1) % options.len();
                 }
                 KeyCode::Char(c) if ('1'..='9').contains(&c) => {
                     let idx = (c as usize) - ('1' as usize);
-                    if idx < THEME_OPTIONS.len() {
+                    if idx < options.len() {
                         selected = idx;
                     }
                 }
@@ -332,13 +311,13 @@ fn pick_theme(initial: String) -> Option<String> {
                 }
                 _ => {}
             }
-            clear_picker();
-            render_picker(selected, confirmed_initial);
+            clear_picker(&options);
+            render_picker(&options, selected, confirmed_initial);
         }
     }
 
     let _ = terminal::disable_raw_mode();
-    clear_picker();
+    clear_picker(&options);
 
     if cancelled {
         // Confirm in the visible scrollback so the user knows they
@@ -351,7 +330,7 @@ fn pick_theme(initial: String) -> Option<String> {
         return None;
     }
 
-    let chosen = THEME_OPTIONS[selected].value.to_string();
+    let chosen = options[selected].value.clone();
     println!(
         "  {} {}",
         "→".with(super::theme::current().accent),
@@ -360,28 +339,29 @@ fn pick_theme(initial: String) -> Option<String> {
     Some(chosen)
 }
 
-/// Total number of terminal rows the picker occupies. Constant so
-/// `clear_picker` can reverse it without remembering per-call state.
-fn picker_height() -> usize {
-    // Options + blank + 5 preview rows + footer = constant.
-    THEME_OPTIONS.len() + 1 + 5 + 1
+/// Total number of terminal rows the picker occupies. Depends on the
+/// option count so `clear_picker` can reverse exactly what
+/// `render_picker` drew.
+fn picker_height(options: &[PickerOption]) -> usize {
+    // Options + blank + 5 preview rows + footer.
+    options.len() + 1 + 5 + 1
 }
 
-fn clear_picker() {
+fn clear_picker(options: &[PickerOption]) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    for _ in 0..picker_height() {
+    for _ in 0..picker_height(options) {
         let _ = write!(out, "\x1b[A\x1b[2K");
     }
     out.flush().ok();
 }
 
-fn render_picker(selected: usize, confirmed_initial: usize) {
+fn render_picker(options: &[PickerOption], selected: usize, confirmed_initial: usize) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let theme = Theme::from_name(THEME_OPTIONS[selected].value);
+    let theme = Theme::from_name(&options[selected].value);
 
-    for (i, opt) in THEME_OPTIONS.iter().enumerate() {
+    for (i, opt) in options.iter().enumerate() {
         let is_cursor = i == selected;
         let is_initial = i == confirmed_initial;
         let cursor_marker = if is_cursor { "❯" } else { " " };
@@ -393,7 +373,7 @@ fn render_picker(selected: usize, confirmed_initial: usize) {
                 "   {} {} {}{}\r",
                 cursor_marker.with(theme.accent).bold(),
                 number.with(theme.accent),
-                opt.label.with(theme.text).bold(),
+                opt.label.as_str().with(theme.text).bold(),
                 check.with(theme.success),
             );
         } else {
@@ -402,7 +382,7 @@ fn render_picker(selected: usize, confirmed_initial: usize) {
                 "   {} {} {}{}\r",
                 cursor_marker,
                 number,
-                opt.label.with(theme.muted),
+                opt.label.as_str().with(theme.muted),
                 check.with(theme.success),
             );
         }
@@ -428,7 +408,7 @@ fn render_picker(selected: usize, confirmed_initial: usize) {
     let _ = writeln!(
         out,
         "  {}\r",
-        "↑/↓ move · 1-7 jump · Enter confirm · Esc skip".with(theme.muted),
+        "↑/↓ move · 1-9 jump · Enter confirm · Esc skip".with(theme.muted),
     );
 
     out.flush().ok();
@@ -680,7 +660,7 @@ mod tests {
         // Picker layout depends on this constant. If it ever changes
         // we'd misalign clear_picker → confirm visually here.
         for name in Theme::all_names() {
-            let theme = Theme::from_name(name);
+            let theme = Theme::from_name(&name);
             let body = render_preview(&theme);
             // 5 lines of body + the trailing newline = 5 line breaks.
             let line_count = body.matches('\n').count();
@@ -695,11 +675,11 @@ mod tests {
     fn picker_options_match_supported_theme_names() {
         // Every option the picker advertises must be a name the
         // resolver knows about. Cheap structural check that catches
-        // typos in either list.
-        let known: std::collections::HashSet<&str> = Theme::all_names().iter().copied().collect();
-        for opt in THEME_OPTIONS {
+        // drift between `all_options` and `all_names`.
+        let known: std::collections::HashSet<String> = Theme::all_names().into_iter().collect();
+        for opt in theme_options() {
             assert!(
-                known.contains(opt.value),
+                known.contains(&opt.value),
                 "picker option {:?} is not in Theme::all_names()",
                 opt.value
             );
