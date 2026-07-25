@@ -590,23 +590,23 @@ mod tests {
         assert!(!out.prompt.contains("<file"));
     }
 
+    // Unix-only: creating a symlink on Windows needs developer mode or
+    // SeCreateSymbolicLinkPrivilege, neither of which CI runners grant.
+    // Gating the whole test keeps `dir` used on every target.
+    #[cfg(unix)]
     #[test]
     fn expand_rejects_symlink_escaping_the_workspace() {
         let dir = fixture();
         let outside = tempfile::tempdir().expect("outside");
         fs::write(outside.path().join("secret.env"), "TOKEN=1\n").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(
             outside.path().join("secret.env"),
             dir.path().join("link.env"),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            let out = expand_mentions("see @link.env", dir.path()).expect("expanded");
-            assert_eq!(out.notes, vec!["@link.env — outside the workspace"]);
-            assert!(!out.prompt.contains("TOKEN=1"));
-        }
+        let out = expand_mentions("see @link.env", dir.path()).expect("expanded");
+        assert_eq!(out.notes, vec!["@link.env — outside the workspace"]);
+        assert!(!out.prompt.contains("TOKEN=1"));
     }
 
     #[test]
