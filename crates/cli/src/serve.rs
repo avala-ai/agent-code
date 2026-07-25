@@ -63,11 +63,22 @@ pub enum SseEvent {
 
     /// A tool execution has started.
     #[serde(rename = "tool_start")]
-    ToolStart { name: String },
+    ToolStart {
+        name: String,
+        /// The tool's input arguments, so the client can render a detail
+        /// preview (e.g. the bash command or the edited file path).
+        input: serde_json::Value,
+    },
 
     /// A tool has produced a result.
     #[serde(rename = "tool_result")]
-    ToolResult { name: String, is_error: bool },
+    ToolResult {
+        name: String,
+        is_error: bool,
+        /// The tool's output, so the client can render it (e.g. a unified
+        /// diff for edits, or command output for shell tools).
+        content: String,
+    },
 
     /// Model is thinking (extended thinking / chain-of-thought).
     #[serde(rename = "thinking")]
@@ -104,6 +115,30 @@ pub enum SseEvent {
         tools_used: Vec<String>,
         cost_usd: f64,
     },
+}
+
+/// Cap on tool output carried in a stream event. Events are broadcast to
+/// every subscriber (and cloned per subscriber), so an unbounded result —
+/// a large `FileRead`, a chatty shell command — would be copied wholesale
+/// into the channel. 64 KiB is far more than any diff or command output a
+/// client renders; longer content is cut with a marker.
+const MAX_TOOL_CONTENT_BYTES: usize = 64 * 1024;
+
+/// Truncate `s` to [`MAX_TOOL_CONTENT_BYTES`] on a char boundary, appending
+/// a marker when anything was dropped.
+fn truncate_for_stream(s: &str) -> String {
+    if s.len() <= MAX_TOOL_CONTENT_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_TOOL_CONTENT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… [truncated {} bytes]",
+        &s[..end],
+        s.len().saturating_sub(end)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +244,7 @@ impl StreamSink for SseBroadcastSink {
         });
     }
 
-    fn on_tool_start(&self, name: &str, _input: &serde_json::Value) {
+    fn on_tool_start(&self, name: &str, input: &serde_json::Value) {
         if let Ok(mut tools) = self.tools.lock()
             && !tools.contains(&name.to_string())
         {
@@ -217,6 +252,7 @@ impl StreamSink for SseBroadcastSink {
         }
         self.send(SseEvent::ToolStart {
             name: name.to_string(),
+            input: input.clone(),
         });
     }
 
@@ -224,6 +260,7 @@ impl StreamSink for SseBroadcastSink {
         self.send(SseEvent::ToolResult {
             name: name.to_string(),
             is_error: result.is_error,
+            content: truncate_for_stream(&result.content),
         });
     }
 
@@ -773,4 +810,60 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl+c");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream contract: clients render tool cards from these fields, so
+    /// `tool_start` must carry the input and `tool_result` the output.
+    #[test]
+    fn tool_events_serialize_with_input_and_content() {
+        let start = serde_json::to_value(SseEvent::ToolStart {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "ls -la"}),
+        })
+        .unwrap();
+        assert_eq!(start["type"], "tool_start");
+        assert_eq!(start["name"], "Bash");
+        assert_eq!(start["input"]["command"], "ls -la");
+
+        let result = serde_json::to_value(SseEvent::ToolResult {
+            name: "FileEdit".into(),
+            is_error: false,
+            content: "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n".into(),
+        })
+        .unwrap();
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["is_error"], false);
+        assert!(
+            result["content"].as_str().unwrap().contains("@@"),
+            "diff content must survive serialization"
+        );
+    }
+
+    #[test]
+    fn short_content_is_not_truncated() {
+        let s = "hello world";
+        assert_eq!(truncate_for_stream(s), s);
+    }
+
+    #[test]
+    fn long_content_is_truncated_with_marker() {
+        let s = "a".repeat(MAX_TOOL_CONTENT_BYTES + 500);
+        let out = truncate_for_stream(&s);
+        assert!(out.len() < s.len(), "output should be shorter");
+        assert!(out.contains("truncated"), "expected a truncation marker");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // Multi-byte chars straddling the cap must not panic or split.
+        let s = "é".repeat(MAX_TOOL_CONTENT_BYTES);
+        let out = truncate_for_stream(&s);
+        assert!(out.contains("truncated"));
+        // Valid UTF-8 by construction (String), and the kept prefix is whole.
+        assert!(out.starts_with('é'));
+    }
 }
