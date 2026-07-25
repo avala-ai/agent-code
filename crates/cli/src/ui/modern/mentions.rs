@@ -302,10 +302,21 @@ fn contained_in(cwd: &Path, path: &Path) -> bool {
 }
 
 /// Label a resolved path for the model: workspace-relative when possible.
+///
+/// Joined with forward slashes on every platform: the tag is
+/// model-facing text, so the same mention must serialize identically
+/// regardless of host OS — `to_string_lossy` on the relative path
+/// produced `src\main.rs` on Windows.
 fn display_path(cwd: &Path, path: &Path, raw: &str) -> String {
     let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     path.strip_prefix(&cwd_canon)
-        .map(|rel| rel.to_string_lossy().replace('"', "'"))
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+                .replace('"', "'")
+        })
         .unwrap_or_else(|_| raw.replace('"', "'"))
 }
 
