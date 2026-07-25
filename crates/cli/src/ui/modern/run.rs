@@ -461,6 +461,11 @@ pub(super) async fn event_loop(
                     // Keep TUI header/path and `!` shell in sync with engine
                     // after `/cd` (and any other cwd-changing command).
                     app.cwd = eng.state().cwd.clone();
+                    // Same for `/color`: the arm re-inits the palette and
+                    // updates the config, but only the app knows what the
+                    // theme picker should treat as current.
+                    let configured = eng.state().config.ui.theme.clone();
+                    app.sync_theme_from_config(&configured);
                     if interactive {
                         app.force_full_redraw = true;
                     }
