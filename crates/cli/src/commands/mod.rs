@@ -1728,6 +1728,42 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             if engine.state().plan_mode {
                 println!("Plan mode: ACTIVE (read-only tools only)");
             }
+            // Persisted "always allow" grants. Listed here rather than
+            // hidden in a file, because an approval the user cannot see
+            // is one they cannot revoke.
+            if let Some(store) = engine.persistent_grants_handle() {
+                let rt = tokio::runtime::Handle::current();
+                let clearing = args == Some("clear");
+                // Scratch thread for the same reason `/tasks` uses one:
+                // `execute` runs inside the REPL runtime, where a nested
+                // `block_on` would panic.
+                let report = std::thread::spawn(move || {
+                    rt.block_on(async move {
+                        let mut guard = store.lock().await;
+                        if clearing {
+                            let n = guard.len();
+                            match guard.clear() {
+                                Ok(()) => format!("Cleared {n} saved grant(s)."),
+                                Err(e) => format!("Could not clear saved grants: {e}"),
+                            }
+                        } else if guard.is_empty() {
+                            "Saved grants: none".to_string()
+                        } else {
+                            let mut out = format!(
+                                "Saved grants: {} — `/permissions clear` to forget them",
+                                guard.len()
+                            );
+                            for label in guard.labels() {
+                                out.push_str(&format!("\n  {label}"));
+                            }
+                            out
+                        }
+                    })
+                })
+                .join()
+                .unwrap_or_else(|_| "grant worker thread panicked".to_string());
+                println!("{report}");
+            }
             CommandResult::Handled
         }
         Some("theme") => {

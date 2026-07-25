@@ -74,6 +74,10 @@ pub struct QueryEngine {
     last_seen_denial_total: usize,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Grants that persist across sessions. `None` until a host opts in
+    /// via [`Self::set_persistent_grants`] — library embedders get the
+    /// previous behaviour (session-scoped only) unless they ask for it.
+    persistent_grants: Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
     question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
@@ -219,6 +223,7 @@ impl QueryEngine {
                 crate::memory::extraction::ExtractionState::new(),
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
             cached_system_prompt: None,
@@ -278,6 +283,25 @@ impl QueryEngine {
     /// interactive path only; one-shot/non-interactive runs leave it unset.
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
+    }
+
+    /// Enable grants that persist across sessions, loading whatever this
+    /// project already has recorded.
+    ///
+    /// Opt-in: without this call the engine behaves as before and an
+    /// "always" answer degrades to session scope. Hosts that never call
+    /// it cannot accumulate approvals on disk.
+    pub fn enable_persistent_grants(&mut self, project_root: &std::path::Path) {
+        let store = crate::permissions::grants::GrantStore::load(project_root);
+        self.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(store)));
+    }
+
+    /// Handle to the grant store, so a caller outside the async context
+    /// (a slash command) can inspect or clear it on its own thread.
+    pub fn persistent_grants_handle(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>> {
+        self.persistent_grants.clone()
     }
 
     /// Install the multi-choice question asker (modern TUI modal).
@@ -1304,6 +1328,7 @@ impl QueryEngine {
                                                                 task_manager: None,
                                                                 subagent_colors: None,
                                                                 session_allows: None,
+                                                                persistent_grants: None,
                                                                 permission_prompter: None,
                                                                 question_asker: None,
                                                                 agent_origin: None,
@@ -1566,6 +1591,7 @@ impl QueryEngine {
                 task_manager: Some(self.state.task_manager.clone()),
                 subagent_colors: Some(self.state.subagent_colors.clone()),
                 session_allows: Some(self.session_allows.clone()),
+                persistent_grants: self.persistent_grants.clone(),
                 permission_prompter: self.permission_prompter.clone(),
                 question_asker: self.question_asker.clone(),
                 agent_origin: None,

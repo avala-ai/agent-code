@@ -68,6 +68,10 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     // default), which must never happen in an interactive surface.
     let (eng_tx, eng_rx) = mpsc::unbounded_channel::<EngineEvent>();
     engine.set_permission_prompter(ModernPrompter::new(eng_tx.clone()));
+    // Load this project's "always allow" grants. Interactive only: a
+    // non-interactive run has nobody to answer the prompt that would
+    // create one, and should not silently consume grants either.
+    engine.enable_persistent_grants(std::path::Path::new(&cwd));
     // Route AskUserQuestion through a UI modal instead of stdin (which would
     // hang under the alt-screen raw mode).
     engine.set_question_asker(ModernQuestionAsker::new(eng_tx.clone()));
@@ -954,6 +958,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             Some(Modal::Permission(_)) => match (key.modifiers, key.code) {
                 (_, KeyCode::Char('y')) | (_, KeyCode::Char('1')) => {
                     app.resolve_permission(PermissionResponse::AllowOnce);
+                }
+                // Uppercase `A` for the durable grant: it outlives the
+                // session, so it should take a deliberate keypress rather
+                // than sit one typo away from "allow for session".
+                (_, KeyCode::Char('A')) | (_, KeyCode::Char('4')) => {
+                    app.resolve_permission(PermissionResponse::AllowAlways);
                 }
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);

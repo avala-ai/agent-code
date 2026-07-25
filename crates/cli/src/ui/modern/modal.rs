@@ -112,6 +112,9 @@ impl App {
         let note = match resp {
             PermissionResponse::AllowOnce => format!("allowed {} once", p.name),
             PermissionResponse::AllowSession => format!("allowed {} for this session", p.name),
+            PermissionResponse::AllowAlways => {
+                format!("always allowing this exact {} call (saved)", p.name)
+            }
             PermissionResponse::Deny => format!("denied {}", p.name),
         };
         let _ = p.respond.send(resp);

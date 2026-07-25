@@ -144,6 +144,7 @@ impl TaskExecutor for LocalAgentExecutor {
             task_manager: ctx.task_manager.clone(),
             subagent_colors: ctx.subagent_colors.clone(),
             session_allows: None,
+            persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
             agent_origin: None,

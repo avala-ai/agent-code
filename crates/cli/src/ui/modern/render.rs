@@ -671,7 +671,9 @@ fn draw_permission_modal(
         accent,
         // Keep ≤ ~40 cols so min-width modals still show every binding
         // (digits 1/2/3 work the same as y/a/n; listed in /help).
-        Some(key_hint_line("[y] once   [a] session   [n]/[Esc] deny")),
+        Some(key_hint_line(
+            "[y] once   [a] session   [A] always   [n]/[Esc] deny",
+        )),
     );
 }
 

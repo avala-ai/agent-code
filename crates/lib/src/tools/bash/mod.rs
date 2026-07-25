@@ -411,6 +411,7 @@ mod stream_emit_tests {
             task_manager: None,
             subagent_colors: None,
             session_allows: None,
+            persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
             agent_origin: None,
