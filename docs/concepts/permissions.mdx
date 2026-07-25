@@ -104,11 +104,13 @@ action = "allow"
 Rules resolve by **severity, not by position**: `deny` beats `ask`, which beats
 `allow`. If no rule matches, the default mode applies.
 
-Severity ordering matters because config layers *replace* the `rules` array
-rather than merging it, so which rule comes first is not something you can
-reliably control across `~/.config`, `.agent/settings.toml` and
-`.agent/settings.local.toml`. A `deny` you wrote is never silently outranked by
-a broader `allow` from another layer.
+Severity ordering matters because config layers *concatenate* their `rules`
+arrays (every layer's rules stay active), so which rule comes first is not
+something you can reliably control across `~/.config`, `.agent/settings.toml`
+and `.agent/settings.local.toml`. A `deny` you wrote is never silently
+outranked by a broader `allow` from another layer, and a stricter mode from
+one layer (for example a project-level `auto`) outranks a looser one (a
+user-level `allow`) even when the looser rule appears first.
 
 ### Shell commands are matched per invocation
 

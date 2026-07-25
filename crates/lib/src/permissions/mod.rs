@@ -216,7 +216,7 @@ impl PermissionChecker {
                 continue;
             }
             if let Some(ref pattern) = rule.pattern
-                && !matches_input_pattern(pattern, input, rule.action)
+                && !matches_input_pattern(pattern, input, rule.action, tool_name)
             {
                 continue;
             }
@@ -254,7 +254,7 @@ impl PermissionChecker {
                 continue;
             }
             if let Some(ref pattern) = rule.pattern
-                && !matches_input_pattern(pattern, input, rule.action)
+                && !matches_input_pattern(pattern, input, rule.action, tool_name)
             {
                 continue;
             }
@@ -370,27 +370,58 @@ fn matches_tool(rule_tool: &str, tool_name: &str) -> bool {
 }
 
 /// Ranking used to resolve several matching rules. Higher wins.
-const DENY_RANK: u8 = 3;
+const DENY_RANK: u8 = 5;
 
 fn restrictiveness(action: PermissionMode) -> u8 {
     match action {
         PermissionMode::Deny => DENY_RANK,
         // Plan refuses every non-read-only tool, so it sits just under
         // an outright deny.
-        PermissionMode::Plan => 2,
-        PermissionMode::Ask => 1,
-        // Allow / AcceptEdits / Auto all widen what may run without a
-        // prompt, so they are the weakest claim a rule can make.
-        PermissionMode::Allow | PermissionMode::AcceptEdits | PermissionMode::Auto => 0,
+        PermissionMode::Plan => 4,
+        PermissionMode::Ask => 3,
+        // The three widening modes are NOT equally permissive, so they
+        // get distinct ranks — with equal ranks the first matching rule
+        // wins, and config layers concatenate, so an earlier user-level
+        // `allow` would silently override a later project-level `auto`.
+        // Auto still prompts for anything not provably harmless;
+        // AcceptEdits auto-approves every edit but prompts for exec;
+        // Allow runs everything without asking.
+        PermissionMode::Auto => 2,
+        PermissionMode::AcceptEdits => 1,
+        PermissionMode::Allow => 0,
     }
 }
 
-fn matches_input_pattern(pattern: &str, input: &serde_json::Value, action: PermissionMode) -> bool {
+/// Whether a rule action grants execution without a prompt for at
+/// least part of the tool surface. Drives the asymmetric shell
+/// matching below — deliberately independent of the restrictiveness
+/// *ranking*, which now distinguishes the widening modes from each
+/// other.
+fn is_widening(action: PermissionMode) -> bool {
+    matches!(
+        action,
+        PermissionMode::Allow | PermissionMode::AcceptEdits | PermissionMode::Auto
+    )
+}
+
+fn matches_input_pattern(
+    pattern: &str,
+    input: &serde_json::Value,
+    action: PermissionMode,
+    tool_name: &str,
+) -> bool {
     // A shell command is not one string to match — it is a list of
     // invocations. Matching the raw text let `git status && rm -rf /`
-    // satisfy an `allow` rule written as `git status*`.
+    // satisfy an `allow` rule written as `git status*`. Only Bash input
+    // is parsed with the Bash grammar: other tools carry a `command`
+    // field too (PowerShell), and running their syntax through the
+    // wrong parser made valid invocations fail closed past a
+    // configured allow.
     if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-        return matches_shell_command(pattern, command, action);
+        if tool_name.eq_ignore_ascii_case("Bash") {
+            return matches_shell_command(pattern, command, action);
+        }
+        return glob_match(pattern, command);
     }
 
     // Match against common input fields: file_path, pattern.
@@ -416,7 +447,7 @@ fn matches_input_pattern(pattern: &str, input: &serde_json::Value, action: Permi
 /// The asymmetry is the safety property: a wrapper or an extra segment
 /// can only ever cost you permissions, never grant them.
 fn matches_shell_command(pattern: &str, command: &str, action: PermissionMode) -> bool {
-    let widening = restrictiveness(action) == 0;
+    let widening = is_widening(action);
     let parsed = crate::tools::bash_parse::parse_bash(command);
 
     if !widening {
@@ -1222,6 +1253,77 @@ mod tests {
     /// A blanket `*` allow is an explicit opt-out of prompting, so it is
     /// not second-guessed — there is no specificity for an extra segment
     /// to widen it into.
+    /// The widening modes get distinct ranks: with equal ranks the
+    /// first matching rule won, so an earlier user-layer `allow` beat a
+    /// later project-layer `auto` and silently ran what the project
+    /// wanted gated (concatenated layers put user rules first).
+    #[test]
+    fn later_auto_outranks_earlier_allow() {
+        let c = checker(vec![
+            rule("Bash", "git *", PermissionMode::Allow),
+            rule("Bash", "git *", PermissionMode::Auto),
+        ]);
+        // Auto wins the rank contest; `git push` is not provably
+        // harmless, so the decision must not be an unconditional Allow.
+        assert!(
+            !matches!(
+                c.check("Bash", &bash_input("git push origin main")),
+                PermissionDecision::Allow
+            ),
+            "earlier allow must not outrank later auto"
+        );
+    }
+
+    #[test]
+    fn widening_ranks_are_distinct_and_ordered() {
+        assert!(
+            restrictiveness(PermissionMode::Auto) > restrictiveness(PermissionMode::AcceptEdits)
+        );
+        assert!(
+            restrictiveness(PermissionMode::AcceptEdits) > restrictiveness(PermissionMode::Allow)
+        );
+        assert!(restrictiveness(PermissionMode::Ask) > restrictiveness(PermissionMode::Auto));
+        for m in [
+            PermissionMode::Allow,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+        ] {
+            assert!(is_widening(m), "{m:?}");
+        }
+        for m in [
+            PermissionMode::Ask,
+            PermissionMode::Plan,
+            PermissionMode::Deny,
+        ] {
+            assert!(!is_widening(m), "{m:?}");
+        }
+    }
+
+    /// Only Bash input goes through the Bash grammar. PowerShell inputs
+    /// also carry a `command` field, and parsing their syntax with the
+    /// Bash parser (parens read as subshells) made valid invocations
+    /// fail closed straight past a configured allow.
+    #[test]
+    fn powershell_rules_are_not_parsed_as_bash() {
+        let input = serde_json::json!({
+            "command": "Get-ChildItem -Path (Join-Path $env:TEMP '*')"
+        });
+        assert!(matches_input_pattern(
+            "Get-ChildItem*",
+            &input,
+            PermissionMode::Allow,
+            "PowerShell"
+        ));
+        // The same text under the Bash tool still fails closed for a
+        // widening rule (subshell + variable — unanalysable).
+        assert!(!matches_input_pattern(
+            "Get-ChildItem*",
+            &input,
+            PermissionMode::Allow,
+            "Bash"
+        ));
+    }
+
     #[test]
     fn a_universal_allow_still_allows_everything() {
         let c = checker(vec![rule("Bash", "*", PermissionMode::Allow)]);
@@ -1259,9 +1361,12 @@ mod tests {
     fn test_matches_input_pattern_with_file_path() {
         let input = serde_json::json!({"file_path": "src/main.rs"});
         for action in BOTH_DIRECTIONS {
-            assert!(matches_input_pattern("src/*", &input, action), "{action:?}");
             assert!(
-                !matches_input_pattern("test/*", &input, action),
+                matches_input_pattern("src/*", &input, action, "FileEdit"),
+                "{action:?}"
+            );
+            assert!(
+                !matches_input_pattern("test/*", &input, action, "FileEdit"),
                 "{action:?}"
             );
         }
@@ -1271,9 +1376,12 @@ mod tests {
     fn test_matches_input_pattern_with_pattern_field() {
         let input = serde_json::json!({"pattern": "TODO"});
         for action in BOTH_DIRECTIONS {
-            assert!(matches_input_pattern("TODO", &input, action), "{action:?}");
             assert!(
-                !matches_input_pattern("FIXME", &input, action),
+                matches_input_pattern("TODO", &input, action, "Grep"),
+                "{action:?}"
+            );
+            assert!(
+                !matches_input_pattern("FIXME", &input, action, "Grep"),
                 "{action:?}"
             );
         }
