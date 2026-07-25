@@ -8,7 +8,7 @@ Interactive sessions use the **fullscreen TUI**.
 | **Esc** | **Never cancels a turn.** Clears draft, dismisses modals, or double-press quit when idle |
 | **Ctrl+C** (Ctrl+Shift+C / Cmd+C) | Cancels a running turn (clears mid-turn draft first if non-empty) |
 | **Enter** | Submit · queue while streaming · send next queued when idle + empty |
-| **Shift+Tab** | Cycle mode: Manual → Normal → AcceptEdits → Plan (mid-turn) |
+| **Shift+Tab** | Cycle mode: Manual → Normal → AcceptEdits → Auto → Plan (mid-turn) |
 
 Full tables (modals, scroll, queue, mouse):
 

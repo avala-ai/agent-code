@@ -1323,7 +1323,7 @@ impl App {
         }
         if text == "/permissions" {
             self.transcript.push(TranscriptItem::System(format!(
-                "permissions: mode={} · Shift+Tab cycles Manual/Normal/AcceptEdits/Plan · \
+                "permissions: mode={} · Shift+Tab cycles Manual/Normal/AcceptEdits/Auto/Plan · \
                  modal: y once / a session / n deny",
                 self.mode.label()
             )));

@@ -124,7 +124,7 @@ fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Ctrl+Enter/I    interject (cancel + send now)"),
         Line::from("  Esc             never cancels · clear draft / dismiss modal"),
         Line::from("  Ctrl+C          cancel turn · double-press quit"),
-        Line::from("  Shift+Tab       cycle mode Manual → Normal → AcceptEdits → Plan"),
+        Line::from("  Shift+Tab       cycle mode Manual → Normal → AcceptEdits → Auto → Plan"),
         Line::from("  Ctrl+P / ?      command palette"),
         Line::from("  Ctrl+; / '      queue pane"),
         Line::from("  Ctrl+T          tasks pane"),
@@ -1114,6 +1114,7 @@ fn mode_style(mode: SessionMode) -> Style {
         SessionMode::Manual => p.warning,
         SessionMode::Normal => p.success,
         SessionMode::AcceptEdits => p.tool,
+        SessionMode::Auto => p.accent,
         SessionMode::Plan => p.plan,
     };
     Style::default().fg(fg).add_modifier(Modifier::BOLD)

@@ -318,7 +318,7 @@ fn parse_list_literal(value: &str) -> Vec<String> {
 }
 
 /// Parse a permission mode keyword (`ask`, `allow`, `deny`, `plan`,
-/// `accept_edits`). Returns `None` for unrecognised values.
+/// `accept_edits`, `auto`). Returns `None` for unrecognised values.
 fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
     match value.trim().trim_matches(|c| c == '"' || c == '\'') {
         "allow" => Some(PermissionMode::Allow),
@@ -326,6 +326,7 @@ fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
         "ask" => Some(PermissionMode::Ask),
         "plan" => Some(PermissionMode::Plan),
         "accept_edits" => Some(PermissionMode::AcceptEdits),
+        "auto" => Some(PermissionMode::Auto),
         _ => None,
     }
 }

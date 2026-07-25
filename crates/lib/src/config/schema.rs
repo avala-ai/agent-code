@@ -471,6 +471,19 @@ pub enum PermissionMode {
     Ask,
     /// Accept file edits automatically, ask for other mutations.
     AcceptEdits,
+    /// Accept file edits automatically *and* run shell commands that are
+    /// provably read-only (`ls`, `git status`, `grep`, …) without asking.
+    ///
+    /// This is not a bypass mode. It relaxes only the *default* decision,
+    /// never a configured rule, and it fails closed: a shell command is
+    /// auto-approved only when the parser, the destructive-pattern scanner
+    /// and the effect classifier all agree that every segment of the
+    /// command is read-only. Anything that mutates state outside the edit
+    /// tools, touches the network, escalates privilege, redirects output,
+    /// substitutes or expands, or that simply is not recognised, still
+    /// prompts. Non-shell, non-edit tools (MCP, subagents, web fetch, cron)
+    /// always prompt.
+    Auto,
     /// Plan mode: read-only tools only.
     Plan,
 }

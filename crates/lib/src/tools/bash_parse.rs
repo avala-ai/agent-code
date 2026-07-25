@@ -30,6 +30,15 @@ pub struct ParsedCommand {
     pub has_process_substitution: bool,
     /// Raw command strings from each pipeline segment.
     pub pipeline_segments: Vec<String>,
+    /// Source text of every `command` node, in AST order — one entry per
+    /// invocation including the ones inside chains, pipes and subshells.
+    /// Unlike [`Self::commands`] (bare binary names) this keeps the
+    /// arguments, which argument-sensitive gates need.
+    pub command_texts: Vec<String>,
+    /// Whether tree-sitter reported a syntax error or a missing node
+    /// anywhere in the tree. A command that did not parse cleanly cannot
+    /// be analysed, so safety gates must treat it as unknown.
+    pub has_parse_error: bool,
 }
 
 /// Parse a bash command string into a structured representation.
@@ -43,6 +52,7 @@ pub fn parse_bash(command: &str) -> Option<ParsedCommand> {
 
     let mut parsed = ParsedCommand {
         raw: command.to_string(),
+        has_parse_error: root.has_error(),
         ..ParsedCommand::default()
     };
     extract_from_node(root, command.as_bytes(), &mut parsed);
@@ -53,6 +63,7 @@ pub fn parse_bash(command: &str) -> Option<ParsedCommand> {
 fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
     match node.kind() {
         "command" => {
+            parsed.command_texts.push(node_text(node, source));
             // Extract the command name (first child that's a "command_name" or "word").
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, source);
@@ -381,6 +392,27 @@ mod tests {
         let parsed = parse_bash("echo payload > /etc/passwd").unwrap();
         let violations = check_parsed_security(&parsed);
         assert!(violations.iter().any(|v| v.contains("/etc/")));
+    }
+
+    #[test]
+    fn test_command_texts_keep_arguments_per_invocation() {
+        let parsed = parse_bash("ls -la && git diff --stat | wc -l").unwrap();
+        assert_eq!(
+            parsed.command_texts,
+            vec!["ls -la", "git diff --stat", "wc -l"]
+        );
+        // One text per name, so an argument-aware gate can pair them up.
+        assert_eq!(parsed.command_texts.len(), parsed.commands.len());
+    }
+
+    #[test]
+    fn test_parse_error_is_reported() {
+        assert!(!parse_bash("ls -la").unwrap().has_parse_error);
+        assert!(
+            parse_bash("ls |&& ((( \"unterminated")
+                .unwrap()
+                .has_parse_error
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ Set the mode via CLI flag or config:
 | `deny` | Block all mutations |
 | `plan` | Read-only tools only (strictest) |
 | `accept_edits` | Auto-approve file edits, ask for shell commands |
+| `auto` | Auto-approve file edits **and** provably read-only shell commands; ask for everything else |
 
 ```bash
 # CLI
@@ -20,6 +21,52 @@ agent --permission-mode plan
 # Skip all checks (CI/scripting only)
 agent --dangerously-skip-permissions
 ```
+
+### `auto` mode
+
+`auto` is the middle ground between "ask for everything" and "approve
+everything". It removes the prompt for the shell commands that cannot change
+anything, and keeps it for the ones that can.
+
+**Approved without asking**
+
+- File edits, exactly as under `accept_edits` — and still subject to the
+  protected-directory (`.git/`, `.husky/`, `node_modules/`) and team-memory
+  guards, which run before any mode is consulted.
+- Shell commands that are *provably* read-only: `ls`, `cat`, `head`, `tail`,
+  `wc`, `grep`/`rg`, `find` (without `-exec`/`-delete`), `diff`, `stat`,
+  `echo`, `pwd`, `git status`/`diff`/`log`/`show`/`blame`, and the rest of a
+  fixed allowlist of inspection tools.
+
+**Still asks**
+
+- Anything that writes: `rm`, `mv`, `cp`, `chmod`, `chown`, `dd`, `mkfs`, …
+- Anything that reaches the network: `curl`, `wget`, `ssh`, `nc`, `git push`,
+  `git fetch`, `npm install`, `pip install`, …
+- Anything that escalates privilege: `sudo`, `doas`, `su`, `pkexec`.
+- Process and service control: `kill`, `pkill`, `systemctl`, `docker run`.
+- Output redirection (`echo x > file`), pipes into a shell (`cat f | sh`),
+  `eval`, command substitution (`$(…)`, backticks), subshells, process
+  substitution, variable expansion and inline variable assignments — the gate
+  cannot see what those actually run.
+- Any chain in which *any* segment is not provably safe. `ls && rm -rf /`
+  asks; the decision is a conjunction over every segment, never a verdict on
+  the first one.
+- Any command that fails to parse, and any binary not on the allowlist.
+- Every non-shell, non-edit tool: MCP tools, subagents, web fetch/search,
+  cron. There is no allowlist of "probably fine" tools.
+
+**`auto` is not a bypass mode.** It relaxes only the *default* decision. An
+explicit `deny` rule still denies and an explicit `ask` rule still prompts,
+even for a command `auto` would otherwise approve. If you want everything
+approved, that is `allow` — a separate, deliberate choice. The interactive
+Shift+Tab cycle (`manual → normal → accept-edits → auto → plan`) has no
+always-approve entry by design.
+
+The gate fails closed: a command is auto-approved only when the parser, the
+destructive-pattern scanner and the effect classifier all agree that every
+segment is read-only. A command that cannot be positively classified is
+asked about.
 
 ## Permission rules
 

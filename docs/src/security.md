@@ -12,6 +12,7 @@ Every tool call passes through a permission check:
 | `deny` | Blocks all mutations |
 | `plan` | Read-only tools only |
 | `accept_edits` | Auto-approves file edits, asks for shell commands |
+| `auto` | Auto-approves file edits and provably read-only shell commands; asks for anything that mutates outside the workspace, touches the network, or escalates privilege. Not a bypass mode — explicit `deny`/`ask` rules still win |
 
 Configure per-tool rules:
 

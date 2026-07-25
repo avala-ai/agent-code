@@ -478,7 +478,7 @@ mod tests {
     }
 
     /// Shift+Tab mid-turn reaches the engine immediately: cycling
-    /// Normal → AcceptEdits → Plan flips the live plan atomic and the
+    /// Normal → AcceptEdits → Auto → Plan flips the live plan atomic and the
     /// checker's default mode while the turn still holds the engine lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shift_tab_mid_turn_applies_live_mode() {
@@ -497,10 +497,11 @@ mod tests {
 
         let mut script = type_str("go", ms(1));
         script.push((ms(2), key(KeyCode::Enter)));
-        // Mid-turn (turn runs 5 virtual seconds): two BackTabs from the
-        // default Normal → AcceptEdits → Plan.
+        // Mid-turn (turn runs 5 virtual seconds): three BackTabs from the
+        // default Normal → AcceptEdits → Auto → Plan.
         script.push((ms(100), shift_backtab()));
         script.push((ms(110), shift_backtab()));
+        script.push((ms(120), shift_backtab()));
         // Probe point: give the loop a beat to apply the mode, then quit
         // while the turn is STILL streaming (mid-turn is the whole point).
         script.push((ms(200), key(KeyCode::Char(' '))));

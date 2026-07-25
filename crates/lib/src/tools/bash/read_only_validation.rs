@@ -15,8 +15,9 @@ use crate::tools::bash_parse::ParsedCommand;
 /// Wraps [`PermissionMode`] so callers do not have to reason about the
 /// individual config-level variants. `Allow` and `AcceptEdits` map to
 /// [`PermissionProfile::Permissive`]; `Plan` and `Deny` map to
-/// [`PermissionProfile::ReadOnly`]; `Ask` maps to
-/// [`PermissionProfile::Prompted`].
+/// [`PermissionProfile::ReadOnly`]; `Ask` and `Auto` map to
+/// [`PermissionProfile::Prompted`] — under `Auto` a mutating command is
+/// not refused outright, it is put in front of the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionProfile {
     /// Anything goes (subject to the regular destructive-pattern checks).
@@ -32,7 +33,7 @@ impl From<PermissionMode> for PermissionProfile {
     fn from(mode: PermissionMode) -> Self {
         match mode {
             PermissionMode::Allow | PermissionMode::AcceptEdits => PermissionProfile::Permissive,
-            PermissionMode::Ask => PermissionProfile::Prompted,
+            PermissionMode::Ask | PermissionMode::Auto => PermissionProfile::Prompted,
             PermissionMode::Deny | PermissionMode::Plan => PermissionProfile::ReadOnly,
         }
     }

@@ -57,7 +57,7 @@ Agent:
 - **30+ tools** — files, shell, search, worktrees, web, LSP, MCP, subagents, monitors, cron
 - **Multi-provider** — Anthropic, OpenAI, Azure, xAI, Google, OpenRouter, local OpenAI-compatible, and more
 - **Skills & plugins** — reusable workflows and project conventions (`AGENTS.md`)
-- **Permissions** — ask / allow / plan / accept_edits, protected dirs, bypass lock
+- **Permissions** — ask / allow / plan / accept_edits / auto, protected dirs, bypass lock
 - **Sessions** — save, resume, fork, rewind, compact
 - **Security-scan** — plan → shard → map → reduce vulnerability hunting
 - **Privacy default** — no product telemetry unless you opt in

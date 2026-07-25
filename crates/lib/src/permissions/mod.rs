@@ -10,6 +10,7 @@
 //! Rules can be configured per-tool and per-pattern (e.g., allow
 //! `Bash` for `git *` commands, deny `FileWrite` outside the project).
 
+pub mod auto;
 pub mod tracking;
 
 use std::path::{Path, PathBuf};
@@ -214,11 +215,11 @@ impl PermissionChecker {
                 continue;
             }
 
-            return mode_to_decision(rule.action, tool_name);
+            return decide(rule.action, tool_name, input);
         }
 
         // Fall back to default mode (may have been updated mid-turn).
-        mode_to_decision(self.default_mode(), tool_name)
+        decide(self.default_mode(), tool_name, input)
     }
 
     /// Check for read-only operations (always allowed).
@@ -457,6 +458,11 @@ fn is_write_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Tools that hand a string to a system shell.
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "PowerShell")
+}
+
 /// Check if the input targets a protected path. Returns the denial reason if so.
 fn check_protected_path(input: &serde_json::Value) -> Option<String> {
     let path = input
@@ -475,9 +481,52 @@ fn check_protected_path(input: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Resolve `mode` for a call whose input is available.
+///
+/// Only [`PermissionMode::Auto`] needs the input — it classifies the shell
+/// command itself — so everything else defers to [`mode_to_decision`].
+fn decide(mode: PermissionMode, tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
+    match mode {
+        PermissionMode::Auto => auto_decision(tool_name, input),
+        other => mode_to_decision(other, tool_name),
+    }
+}
+
+/// Auto mode: allow the edit tools (the protected-path and team-memory
+/// guards in [`PermissionChecker::check`] have already run), allow shell
+/// commands that are provably read-only, ask for everything else.
+///
+/// There is deliberately no allowlist of "probably fine" tools here. MCP
+/// tools, subagent spawns, web fetch/search, cron and anything unrecognised
+/// fall through to `Ask`.
+fn auto_decision(tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
+    if is_write_tool(tool_name) {
+        return PermissionDecision::Allow;
+    }
+    if is_shell_tool(tool_name) {
+        // Only Bash is analysable; the PowerShell tool has no classifier,
+        // so it prompts.
+        if tool_name == "Bash"
+            && let Some(command) = input.get("command").and_then(|v| v.as_str())
+            && auto::is_auto_safe_shell_command(command)
+        {
+            return PermissionDecision::Allow;
+        }
+        return PermissionDecision::Ask(format!("Allow {tool_name} to execute?"));
+    }
+    PermissionDecision::Ask(format!("Allow {tool_name} to execute?"))
+}
+
+/// Resolve a mode from the tool *name* alone.
+///
+/// [`PermissionMode::Auto`] cannot be decided from a name — it needs the
+/// command text — so this returns `Ask` for it. Callers that hold the input
+/// must go through [`decide`] instead, so that a name-only caller can never
+/// accidentally auto-approve a shell command.
 fn mode_to_decision(mode: PermissionMode, tool_name: &str) -> PermissionDecision {
     match mode {
         PermissionMode::Allow => PermissionDecision::Allow,
+        PermissionMode::Auto => PermissionDecision::Ask(format!("Allow {tool_name} to execute?")),
         // Auto-allow filesystem edits only; shell / agent / MCP / other
         // mutations still prompt (docs: "auto-approve file edits, ask for
         // shell commands"). Treating AcceptEdits as Allow for every tool
@@ -1083,6 +1132,329 @@ mod tests {
             &serde_json::json!({"file_path": ".agent/team-memory/foo.md"}),
         );
         assert!(matches!(dec, PermissionDecision::Allow));
+    }
+
+    // ---- Auto mode ----
+
+    fn auto_checker() -> PermissionChecker {
+        PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Auto,
+            rules: Vec::new(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        })
+    }
+
+    fn bash(command: &str) -> serde_json::Value {
+        serde_json::json!({ "command": command })
+    }
+
+    /// Commands Auto mode must run without a prompt.
+    const AUTO_ALLOW_COMMANDS: &[&str] = &[
+        "ls -la",
+        "cat foo.rs",
+        "git status",
+        "git diff",
+        "grep -r foo src/",
+        "rg pattern",
+        "wc -l file",
+        "head -n 5 file",
+        "tail -n 5 file",
+        "find . -name '*.rs'",
+        "echo hi",
+        "pwd",
+    ];
+
+    /// Commands Auto mode must put in front of the user. Each entry is a
+    /// distinct escape route, so they are asserted individually.
+    const AUTO_ASK_COMMANDS: &[&str] = &[
+        // Filesystem mutation.
+        "rm -rf /",
+        "rm file",
+        "mv a b",
+        "cp a b",
+        "chmod +x f",
+        "chown user file",
+        "dd if=/dev/zero of=/tmp/x",
+        "mkfs.ext4 /dev/sda1",
+        // Privilege escalation.
+        "sudo anything",
+        "doas x",
+        // Network.
+        "curl https://x",
+        "wget https://x",
+        "ssh host",
+        "nc host 1234",
+        // Repository / package mutation.
+        "git push",
+        "git reset --hard",
+        "npm install",
+        "pip install requests",
+        "cargo publish",
+        // Process and system control.
+        "kill 1234",
+        "pkill node",
+        "systemctl restart nginx",
+        "docker run alpine",
+        // Shell constructs that hide the effective command line.
+        "echo x > file",
+        "cat f | sh",
+        "eval \"$X\"",
+        "$(curl x)",
+        "`curl x`",
+        // A chain whose FIRST segment is safe must still ask.
+        "ls && rm -rf /",
+        "ls; rm x",
+        "ls || rm x",
+        // Garbage.
+        "ls |&& ((( \"unterminated",
+    ];
+
+    #[test]
+    fn auto_allows_provably_read_only_shell_commands() {
+        let checker = auto_checker();
+        for cmd in AUTO_ALLOW_COMMANDS {
+            assert!(
+                matches!(checker.check("Bash", &bash(cmd)), PermissionDecision::Allow),
+                "auto mode should allow `{cmd}` without asking"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_asks_for_every_non_read_only_shell_command() {
+        let checker = auto_checker();
+        for cmd in AUTO_ASK_COMMANDS {
+            assert!(
+                matches!(
+                    checker.check("Bash", &bash(cmd)),
+                    PermissionDecision::Ask(_)
+                ),
+                "auto mode must ask before running `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_asks_for_a_chain_whose_first_segment_is_safe() {
+        // The single most important case: the gate is a conjunction over
+        // every segment, not a verdict on the head of the command.
+        let checker = auto_checker();
+        for cmd in [
+            "ls && rm -rf /",
+            "ls; rm x",
+            "ls || rm x",
+            "git status && git push",
+            "cat a.txt | tee b.txt",
+        ] {
+            assert!(
+                matches!(
+                    checker.check("Bash", &bash(cmd)),
+                    PermissionDecision::Ask(_)
+                ),
+                "auto mode must ask before running `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_asks_for_missing_or_empty_bash_input() {
+        let checker = auto_checker();
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"command": ""}),
+            serde_json::json!({"command": "   "}),
+            serde_json::json!({"command": 42}),
+        ] {
+            assert!(
+                matches!(checker.check("Bash", &input), PermissionDecision::Ask(_)),
+                "auto mode must ask for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_asks_for_powershell() {
+        // No PowerShell classifier exists, so it cannot be proven safe.
+        let checker = auto_checker();
+        assert!(matches!(
+            checker.check(
+                "PowerShell",
+                &serde_json::json!({"command": "Get-ChildItem"})
+            ),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn auto_allows_write_tools_but_manual_asks() {
+        let auto = auto_checker();
+        let manual = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: Vec::new(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+        for tool in ["FileWrite", "FileEdit", "MultiEdit", "NotebookEdit"] {
+            let input = serde_json::json!({"file_path": "src/lib.rs"});
+            assert!(
+                matches!(auto.check(tool, &input), PermissionDecision::Allow),
+                "auto mode should allow {tool}"
+            );
+            assert!(
+                matches!(manual.check(tool, &input), PermissionDecision::Ask(_)),
+                "manual (ask) mode should prompt for {tool}"
+            );
+        }
+        assert!(matches!(
+            auto.check(
+                "ApplyPatch",
+                &serde_json::json!({"patch": "*** Begin Patch\n*** End Patch\n"})
+            ),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn auto_asks_for_non_shell_non_write_tools() {
+        // No allowlist of "probably fine" tools — everything unrecognised
+        // falls through to Ask.
+        let checker = auto_checker();
+        for (tool, input) in [
+            ("Agent", serde_json::json!({"prompt": "do work"})),
+            ("Task", serde_json::json!({"prompt": "do work"})),
+            (
+                "WebFetch",
+                serde_json::json!({"url": "https://example.com"}),
+            ),
+            ("WebSearch", serde_json::json!({"query": "rust"})),
+            ("CronCreate", serde_json::json!({"schedule": "* * * * *"})),
+            ("mcp__server__do_thing", serde_json::json!({"arg": 1})),
+            ("SomeToolAddedNextYear", serde_json::json!({})),
+        ] {
+            assert!(
+                matches!(checker.check(tool, &input), PermissionDecision::Ask(_)),
+                "auto mode must ask for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_still_denies_protected_path_writes() {
+        let checker = auto_checker();
+        for path in [
+            ".git/config",
+            "node_modules/pkg/index.js",
+            ".husky/pre-commit",
+        ] {
+            assert!(
+                matches!(
+                    checker.check("FileWrite", &serde_json::json!({"file_path": path})),
+                    PermissionDecision::Deny(_)
+                ),
+                "auto mode must not weaken the protected-path guard for {path}"
+            );
+        }
+        // The team-memory guard also runs before the mode is consulted.
+        assert!(matches!(
+            checker.check(
+                "FileWrite",
+                &serde_json::json!({"file_path": ".agent/team-memory/foo.md"})
+            ),
+            PermissionDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn auto_does_not_override_explicit_rules() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Auto,
+            rules: vec![
+                PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: Some("ls *".into()),
+                    action: PermissionMode::Deny,
+                },
+                PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: Some("git *".into()),
+                    action: PermissionMode::Ask,
+                },
+                PermissionRule {
+                    tool: "FileWrite".into(),
+                    pattern: Some("*.lock".into()),
+                    action: PermissionMode::Deny,
+                },
+            ],
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+
+        // An explicit Deny wins even though `ls -la` is provably read-only.
+        assert!(matches!(
+            checker.check("Bash", &bash("ls -la")),
+            PermissionDecision::Deny(_)
+        ));
+        // An explicit Ask still forces a prompt for a safe command.
+        assert!(matches!(
+            checker.check("Bash", &bash("git status")),
+            PermissionDecision::Ask(_)
+        ));
+        // Rules apply to write tools too.
+        assert!(matches!(
+            checker.check("FileWrite", &serde_json::json!({"file_path": "Cargo.lock"})),
+            PermissionDecision::Deny(_)
+        ));
+        // A command matching no rule still gets the Auto default.
+        assert!(matches!(
+            checker.check("Bash", &bash("cat foo.rs")),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn mode_to_decision_is_conservative_for_auto() {
+        // Name-only callers cannot classify a command, so Auto must not
+        // resolve to Allow there.
+        assert!(matches!(
+            mode_to_decision(PermissionMode::Auto, "Bash"),
+            PermissionDecision::Ask(_)
+        ));
+        assert!(matches!(
+            mode_to_decision(PermissionMode::Auto, "FileWrite"),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn auto_is_reachable_by_switching_the_default_mode_mid_turn() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: Vec::new(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+        assert!(matches!(
+            checker.check("Bash", &bash("ls -la")),
+            PermissionDecision::Ask(_)
+        ));
+        checker.set_default_mode(PermissionMode::Auto);
+        assert!(matches!(
+            checker.check("Bash", &bash("ls -la")),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            checker.check("Bash", &bash("rm -rf /")),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn is_shell_tool_classification() {
+        assert!(is_shell_tool("Bash"));
+        assert!(is_shell_tool("PowerShell"));
+        assert!(!is_shell_tool("FileRead"));
+        assert!(!is_shell_tool("Agent"));
     }
 
     #[test]

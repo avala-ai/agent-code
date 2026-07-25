@@ -56,7 +56,7 @@ Every tool call passes through `PermissionChecker::check()` before execution:
 
 1. **Protected directories**: write tools blocked from `.git/`, `.husky/`, `node_modules/` (hardcoded, not overridable)
 2. **Explicit rules**: user-configured per-tool/pattern rules evaluated in order, first match wins
-3. **Default mode**: `ask`, `allow`, `deny`, `plan`, or `accept_edits`
+3. **Default mode**: `ask`, `allow`, `deny`, `plan`, `accept_edits`, or `auto`
 
 Read-only tools use a relaxed check (`check_read()`) that only blocks explicit deny rules.
 

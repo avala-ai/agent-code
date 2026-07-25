@@ -8,7 +8,7 @@ Interactive sessions use the fullscreen TUI.
 |---|---|
 | `Enter` | Submit prompt · while a turn runs: queue it · on an empty prompt while idle: send next queued prompt |
 | `Ctrl+Enter` (alt: `Ctrl+I`) | **Send now / interject**: cancel the live turn and send the composer (or the head of the queue if empty) |
-| `Shift+Tab` | Cycle mode: Manual → Normal → AcceptEdits → Plan (applies mid-turn) |
+| `Shift+Tab` | Cycle mode: Manual → Normal → AcceptEdits → Auto → Plan (applies mid-turn) |
 | `Esc` | **Never cancels a turn.** Modal: deny/dismiss only · non-empty prompt: clear draft · idle empty: press twice within 1.5 s to quit · mid-turn empty: no-op (status hints Ctrl+C) |
 | `Ctrl+C` (also `Cmd+C` / Super+C) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit · **not** `Ctrl+Shift+C` (that is copy) |
 | `Ctrl+D` | Quit (empty prompt only) |
@@ -36,7 +36,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | `Alt+↑` | Pop newest queued prompt into editor | same |
 | `Alt+-` | Delete newest queued prompt | same |
 | `Tab` | Complete the `@path` mention under the cursor, else a partial `/command` | same |
-| `Shift+Tab` | Cycle permission mode (Manual → Normal → AcceptEdits → Plan) | same |
+| `Shift+Tab` | Cycle permission mode (Manual → Normal → AcceptEdits → Auto → Plan) | same |
 
 ## Transcript / scrollback
 
