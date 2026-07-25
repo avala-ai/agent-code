@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Provider-aware API-key resolution** — when several provider keys are exported, `Config::load` now prefers the key belonging to the effective provider (detected from `base_url`/`model`) instead of always taking the first hit in the fixed priority list, so a session pointed at provider B no longer sends provider A's key there. `AGENT_CODE_API_KEY` keeps its top rank as an explicit override; custom/OpenAI-compatible and cloud endpoints (Bedrock, Vertex, Azure) keep the old order; setups with a single key are unaffected.
 - **Calmer default theme** — midnight/daybreak accents move from loud purple to restrained steel-blue; selection and message backgrounds stay neutral slate; header brand is text accent instead of filled purple pill.
 
 ### Added

@@ -341,7 +341,7 @@ impl ProviderKind {
     }
 
     /// The environment variable name conventionally used for this provider's API key.
-    pub fn env_var_name(&self) -> &str {
+    pub fn env_var_name(&self) -> &'static str {
         match self {
             Self::Anthropic | Self::Bedrock | Self::Vertex => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
