@@ -209,32 +209,51 @@ impl PermissionChecker {
             }
         }
 
-        // Collect every matching rule, then take the most restrictive.
-        let mut winner: Option<PermissionMode> = None;
+        // Collect every matching rule, then keep the one whose EFFECTIVE
+        // decision for this input is most restrictive (Deny > Ask >
+        // Allow). Mode identity cannot be ranked statically: for a safe
+        // shell command AcceptEdits prompts while Auto allows, yet for a
+        // file edit both allow — restrictiveness only exists relative to
+        // the input, so rules are compared by what they would actually
+        // decide. The effective decision also picks the match semantics:
+        // a rule that would execute without a prompt is a widening claim
+        // and must vouch for every invocation, while a rule that would
+        // ask or deny matches on any invocation — so appending a segment
+        // to a command can remove permissions but never grant them (an
+        // Auto rule that would prompt must not stop matching just
+        // because a tacked-on `&& rm` broke its every-segment match,
+        // exposing a broader Allow behind it).
+        let mut winner: Option<PermissionDecision> = None;
         for rule in &self.rules {
             if !matches_tool(&rule.tool, tool_name) {
                 continue;
             }
+            let effective = decide(rule.action, tool_name, input);
             if let Some(ref pattern) = rule.pattern
-                && !matches_input_pattern(pattern, input, rule.action, tool_name)
+                && !matches_input_pattern(
+                    pattern,
+                    input,
+                    decision_is_widening(&effective),
+                    tool_name,
+                )
             {
                 continue;
             }
-            let more_restrictive = match winner {
+            let more_restrictive = match &winner {
                 None => true,
-                Some(current) => restrictiveness(rule.action) > restrictiveness(current),
+                Some(current) => decision_severity(&effective) > decision_severity(current),
             };
             if more_restrictive {
-                winner = Some(rule.action);
+                winner = Some(effective);
             }
             // `Deny` is the ceiling; nothing later can outrank it.
-            if restrictiveness(rule.action) == DENY_RANK {
+            if matches!(winner, Some(PermissionDecision::Deny(_))) {
                 break;
             }
         }
 
         match winner {
-            Some(action) => decide(action, tool_name, input),
+            Some(decision) => decision,
             // Fall back to default mode (may have been updated mid-turn).
             None => decide(self.default_mode(), tool_name, input),
         }
@@ -254,7 +273,7 @@ impl PermissionChecker {
                 continue;
             }
             if let Some(ref pattern) = rule.pattern
-                && !matches_input_pattern(pattern, input, rule.action, tool_name)
+                && !matches_input_pattern(pattern, input, false, tool_name)
             {
                 continue;
             }
@@ -369,45 +388,30 @@ fn matches_tool(rule_tool: &str, tool_name: &str) -> bool {
     rule_tool == "*" || rule_tool.eq_ignore_ascii_case(tool_name)
 }
 
-/// Ranking used to resolve several matching rules. Higher wins.
-const DENY_RANK: u8 = 5;
-
-fn restrictiveness(action: PermissionMode) -> u8 {
-    match action {
-        PermissionMode::Deny => DENY_RANK,
-        // Plan refuses every non-read-only tool, so it sits just under
-        // an outright deny.
-        PermissionMode::Plan => 4,
-        PermissionMode::Ask => 3,
-        // The three widening modes are NOT equally permissive, so they
-        // get distinct ranks — with equal ranks the first matching rule
-        // wins, and config layers concatenate, so an earlier user-level
-        // `allow` would silently override a later project-level `auto`.
-        // Auto still prompts for anything not provably harmless;
-        // AcceptEdits auto-approves every edit but prompts for exec;
-        // Allow runs everything without asking.
-        PermissionMode::Auto => 2,
-        PermissionMode::AcceptEdits => 1,
-        PermissionMode::Allow => 0,
+/// Severity of a rule's effective decision. Higher wins the contest
+/// between several matching rules.
+fn decision_severity(decision: &PermissionDecision) -> u8 {
+    match decision {
+        PermissionDecision::Deny(_) => 2,
+        PermissionDecision::Ask(_) => 1,
+        PermissionDecision::Allow => 0,
     }
 }
 
-/// Whether a rule action grants execution without a prompt for at
-/// least part of the tool surface. Drives the asymmetric shell
-/// matching below — deliberately independent of the restrictiveness
-/// *ranking*, which now distinguishes the widening modes from each
-/// other.
-fn is_widening(action: PermissionMode) -> bool {
-    matches!(
-        action,
-        PermissionMode::Allow | PermissionMode::AcceptEdits | PermissionMode::Auto
-    )
+/// A rule whose effective decision executes without a prompt makes a
+/// widening claim and gets the strict every-invocation shell matching;
+/// a rule that would ask or deny is restrictive and matches on any
+/// invocation. Derived from the decision (not the mode) because the
+/// same mode widens for one input and restricts for another — Auto
+/// allows a provably-safe command but prompts otherwise.
+fn decision_is_widening(decision: &PermissionDecision) -> bool {
+    matches!(decision, PermissionDecision::Allow)
 }
 
 fn matches_input_pattern(
     pattern: &str,
     input: &serde_json::Value,
-    action: PermissionMode,
+    widening: bool,
     tool_name: &str,
 ) -> bool {
     // A shell command is not one string to match — it is a list of
@@ -419,7 +423,7 @@ fn matches_input_pattern(
     // configured allow.
     if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
         if tool_name.eq_ignore_ascii_case("Bash") {
-            return matches_shell_command(pattern, command, action);
+            return matches_shell_command(pattern, command, widening);
         }
         return glob_match(pattern, command);
     }
@@ -446,8 +450,7 @@ fn matches_input_pattern(
 ///
 /// The asymmetry is the safety property: a wrapper or an extra segment
 /// can only ever cost you permissions, never grant them.
-fn matches_shell_command(pattern: &str, command: &str, action: PermissionMode) -> bool {
-    let widening = is_widening(action);
+fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
     let parsed = crate::tools::bash_parse::parse_bash(command);
 
     if !widening {
@@ -1274,29 +1277,58 @@ mod tests {
         );
     }
 
+    /// AcceptEdits prompts for shell commands while Auto runs the
+    /// provably-safe ones — for a safe command AcceptEdits is therefore
+    /// the more restrictive rule and must win, which no static
+    /// mode-identity ranking can express (for a file edit both allow).
     #[test]
-    fn widening_ranks_are_distinct_and_ordered() {
+    fn accept_edits_outranks_auto_for_safe_commands() {
+        let c = checker(vec![
+            rule("Bash", "git *", PermissionMode::Auto),
+            rule("Bash", "git *", PermissionMode::AcceptEdits),
+        ]);
         assert!(
-            restrictiveness(PermissionMode::Auto) > restrictiveness(PermissionMode::AcceptEdits)
+            matches!(
+                c.check("Bash", &bash_input("git status")),
+                PermissionDecision::Ask(_)
+            ),
+            "AcceptEdits' prompt must outrank Auto's allow for this input"
         );
+    }
+
+    /// An Auto rule that would PROMPT for this command is a restrictive
+    /// match: appending a segment must not un-match it and expose a
+    /// broader allow behind it (`git status && rm -rf x` once fell
+    /// through Auto's every-segment match onto `Allow("*")`).
+    #[test]
+    fn prompting_auto_rule_still_matches_appended_segments() {
+        let c = checker(vec![
+            rule("Bash", "git status*", PermissionMode::Auto),
+            rule("Bash", "*", PermissionMode::Allow),
+        ]);
         assert!(
-            restrictiveness(PermissionMode::AcceptEdits) > restrictiveness(PermissionMode::Allow)
+            matches!(
+                c.check("Bash", &bash_input("git status && rm -rf /tmp/x")),
+                PermissionDecision::Ask(_)
+            ),
+            "appending a segment must never grant permissions"
         );
-        assert!(restrictiveness(PermissionMode::Ask) > restrictiveness(PermissionMode::Auto));
-        for m in [
-            PermissionMode::Allow,
-            PermissionMode::AcceptEdits,
-            PermissionMode::Auto,
-        ] {
-            assert!(is_widening(m), "{m:?}");
-        }
-        for m in [
-            PermissionMode::Ask,
-            PermissionMode::Plan,
-            PermissionMode::Deny,
-        ] {
-            assert!(!is_widening(m), "{m:?}");
-        }
+        // The same Auto rule on its own safe command still auto-runs.
+        assert!(matches!(
+            c.check("Bash", &bash_input("git status")),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn decision_severity_orders_deny_ask_allow() {
+        let deny = PermissionDecision::Deny("d".into());
+        let ask = PermissionDecision::Ask("a".into());
+        assert!(decision_severity(&deny) > decision_severity(&ask));
+        assert!(decision_severity(&ask) > decision_severity(&PermissionDecision::Allow));
+        assert!(decision_is_widening(&PermissionDecision::Allow));
+        assert!(!decision_is_widening(&ask));
+        assert!(!decision_is_widening(&deny));
     }
 
     /// Only Bash input goes through the Bash grammar. PowerShell inputs
@@ -1311,7 +1343,7 @@ mod tests {
         assert!(matches_input_pattern(
             "Get-ChildItem*",
             &input,
-            PermissionMode::Allow,
+            true,
             "PowerShell"
         ));
         // The same text under the Bash tool still fails closed for a
@@ -1319,7 +1351,7 @@ mod tests {
         assert!(!matches_input_pattern(
             "Get-ChildItem*",
             &input,
-            PermissionMode::Allow,
+            true,
             "Bash"
         ));
     }
@@ -1355,19 +1387,19 @@ mod tests {
     /// Non-shell inputs have no segments to peel, so the allow/deny
     /// asymmetry must not change their result. Asserting over both
     /// directions keeps that from silently drifting.
-    const BOTH_DIRECTIONS: [PermissionMode; 2] = [PermissionMode::Allow, PermissionMode::Deny];
+    const BOTH_DIRECTIONS: [bool; 2] = [true, false];
 
     #[test]
     fn test_matches_input_pattern_with_file_path() {
         let input = serde_json::json!({"file_path": "src/main.rs"});
-        for action in BOTH_DIRECTIONS {
+        for widening in BOTH_DIRECTIONS {
             assert!(
-                matches_input_pattern("src/*", &input, action, "FileEdit"),
-                "{action:?}"
+                matches_input_pattern("src/*", &input, widening, "FileEdit"),
+                "widening={widening}"
             );
             assert!(
-                !matches_input_pattern("test/*", &input, action, "FileEdit"),
-                "{action:?}"
+                !matches_input_pattern("test/*", &input, widening, "FileEdit"),
+                "widening={widening}"
             );
         }
     }
@@ -1375,14 +1407,14 @@ mod tests {
     #[test]
     fn test_matches_input_pattern_with_pattern_field() {
         let input = serde_json::json!({"pattern": "TODO"});
-        for action in BOTH_DIRECTIONS {
+        for widening in BOTH_DIRECTIONS {
             assert!(
-                matches_input_pattern("TODO", &input, action, "Grep"),
-                "{action:?}"
+                matches_input_pattern("TODO", &input, widening, "Grep"),
+                "widening={widening}"
             );
             assert!(
-                !matches_input_pattern("FIXME", &input, action, "Grep"),
-                "{action:?}"
+                !matches_input_pattern("FIXME", &input, widening, "Grep"),
+                "widening={widening}"
             );
         }
     }
