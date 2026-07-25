@@ -68,10 +68,11 @@ pub(super) fn build_args(
 ) -> Vec<OsString> {
     let mut out: Vec<OsString> = Vec::new();
 
-    // Namespace isolation. We deliberately do NOT unshare the network by
-    // default — most coding-agent bash calls need outbound HTTPS for git,
-    // package managers, and network-aware tools. Users who need strict
-    // isolation set `allow_network = false` in config.
+    // Namespace isolation. The network namespace is unshared unless the
+    // policy opts into networking — network access is denied by default,
+    // so a compromised subprocess cannot exfiltrate over the network.
+    // Users who need outbound HTTPS (git, package managers) set
+    // `allow_network = true` in config.
     push_flag(&mut out, "--unshare-user");
     push_flag(&mut out, "--unshare-ipc");
     push_flag(&mut out, "--unshare-uts");

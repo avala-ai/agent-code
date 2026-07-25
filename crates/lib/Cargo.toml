@@ -59,6 +59,12 @@ tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
 pulldown-cmark = "0.13"
 
+# Linux OS-level sandbox: Landlock (filesystem confinement) + seccomp
+# (network kill). Linux-only so non-Linux targets still build.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = { version = "0.8", features = ["html_reports"] }

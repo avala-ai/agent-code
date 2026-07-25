@@ -567,6 +567,165 @@ async fn bwrap_dangerously_disable_sandbox_is_ignored_when_bypass_denied() {
     assert!(!std::path::Path::new(marker).exists());
 }
 
+// ──────────────────────────────────────────────────────────────────
+//  Linux Landlock + seccomp behavioral tests
+// ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod landlock_behavior {
+    use agent_code_lib::sandbox::SandboxPolicy;
+    use agent_code_lib::sandbox::SandboxStrategy;
+    use agent_code_lib::sandbox::landlock::{LandlockStrategy, landlock_available};
+    use std::path::Path;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    fn binary_on_path(name: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|d| d.join(name).is_file()))
+            .unwrap_or(false)
+    }
+
+    fn deny_net_policy(project_dir: &Path) -> SandboxPolicy {
+        SandboxPolicy {
+            project_dir: project_dir.to_path_buf(),
+            allowed_write_paths: vec![],
+            forbidden_paths: vec![],
+            allow_network: false,
+        }
+    }
+
+    /// Run `sh -c <script>` confined by LandlockStrategy under the given
+    /// network-denied policy, returning the completed process output.
+    async fn run_confined(project: &Path, script: &str) -> std::process::Output {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).current_dir(project);
+        let mut wrapped = LandlockStrategy.wrap_command(cmd, &deny_net_policy(project));
+        wrapped
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        wrapped
+            .spawn()
+            .expect("spawn confined sh")
+            .wait_with_output()
+            .await
+            .expect("await confined sh")
+    }
+
+    #[tokio::test]
+    async fn landlock_confines_writes_and_kills_network() {
+        if !landlock_available() {
+            eprintln!("skipping: Landlock not enforceable on this kernel");
+            return;
+        }
+        if !binary_on_path("sh") {
+            eprintln!("skipping: /bin/sh not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+
+        // (a) A write INSIDE the project directory must succeed.
+        let out = run_confined(project, "echo hi > inside.txt && cat inside.txt").await;
+        assert!(
+            out.status.success(),
+            "inside-project write should succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("hi"),
+            "expected file contents echoed back"
+        );
+        assert!(
+            project.join("inside.txt").exists(),
+            "inside.txt should have been created in the project dir"
+        );
+
+        // (b) A write OUTSIDE the writable set (/etc) must FAIL, and the file
+        // must not be created on the host.
+        let escape = "/etc/agent_sbx_escape";
+        // Best-effort clean any stale artifact from a previous aborted run.
+        let _ = std::fs::remove_file(escape);
+        let out = run_confined(
+            project,
+            "echo pwned > /etc/agent_sbx_escape 2>&1; echo exit=$?",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("exit=0"),
+            "write to /etc should have failed under Landlock, got: {text}"
+        );
+        assert!(
+            !Path::new(escape).exists(),
+            "escape file must NOT exist on the host at {escape}"
+        );
+
+        // (c) A network connection attempt must NOT succeed (seccomp makes
+        // socket(AF_INET) return EPERM). Uses bash's /dev/tcp; skip if bash
+        // is unavailable.
+        if binary_on_path("bash") {
+            let out = run_confined(
+                project,
+                "bash -c 'exec 3<>/dev/tcp/1.1.1.1/53 && echo CONNECTED_OK' 2>/dev/null; true",
+            )
+            .await;
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !text.contains("CONNECTED_OK"),
+                "network connect should have been blocked by seccomp, got: {text}"
+            );
+        } else {
+            eprintln!("note: bash unavailable, skipping /dev/tcp network sub-check");
+        }
+    }
+
+    /// Airtight control: writing to world-writable `/tmp` succeeds for an
+    /// UNCONFINED process but must FAIL under LandlockStrategy — proving the
+    /// sandbox itself (not ambient filesystem permissions) is what blocks the
+    /// escape. `/tmp` is not in the writable set (only project_dir +
+    /// allowed_write_paths + /dev/null,/dev/tty are).
+    #[tokio::test]
+    async fn landlock_blocks_world_writable_tmp_but_unconfined_can() {
+        if !landlock_available() || !binary_on_path("sh") {
+            eprintln!("skipping: landlock/sh unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let marker = format!("/tmp/agent_sbx_ctl_{}", std::process::id());
+        let _ = std::fs::remove_file(&marker);
+
+        // Baseline: an UNCONFINED write to /tmp succeeds.
+        let ctl = Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo x > {marker}"))
+            .status()
+            .await
+            .expect("run unconfined control");
+        assert!(
+            ctl.success() && Path::new(&marker).exists(),
+            "baseline: unconfined write to world-writable /tmp should succeed"
+        );
+        std::fs::remove_file(&marker).ok();
+
+        // The SAME write, CONFINED, must fail and leave no file behind.
+        let out = run_confined(project, &format!("echo x > {marker} 2>&1; echo exit=$?")).await;
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !Path::new(&marker).exists(),
+            "confined write to /tmp must be blocked by Landlock (file was created!)"
+        );
+        assert!(
+            !text.contains("exit=0"),
+            "confined /tmp write should have a nonzero exit, got: {text}"
+        );
+        std::fs::remove_file(&marker).ok();
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn sandboxed_bash_reads_remain_broadly_allowed() {

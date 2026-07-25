@@ -177,6 +177,12 @@ pub struct SandboxConfig {
     /// broad-read allow rule so credentials stay masked.
     pub forbidden_paths: Vec<String>,
     /// Whether subprocesses in the sandbox can open network sockets.
+    ///
+    /// Denied by default: a sandboxed subprocess cannot open `AF_INET` /
+    /// `AF_INET6` sockets unless this is set to `true`. Opt in with
+    /// `allow_network = true`. (`bwrap` enforces the denial via
+    /// `--unshare-net`; the Landlock strategy enforces it via a seccomp
+    /// filter on `socket(2)`.)
     pub allow_network: bool,
     /// Fail closed: when the sandbox is enabled but no working strategy is
     /// available on this platform (e.g. `bwrap` is not installed), refuse to
@@ -196,7 +202,7 @@ impl Default for SandboxConfig {
                 "~/.aws".to_string(),
                 "~/.gnupg".to_string(),
             ],
-            allow_network: true,
+            allow_network: false,
             fail_closed: true,
         }
     }
