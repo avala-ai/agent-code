@@ -9,7 +9,7 @@
 //! that lived in `bash.rs` so that a refactor does not change which
 //! invocations are blocked.
 
-use crate::tools::bash_parse::ParsedCommand;
+use crate::tools::bash_parse::{ParsedCommand, base_name, unquote_token};
 
 /// Severity of a destructive-command finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -136,11 +136,38 @@ pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
         }
     }
 
+    // Normalized scan. The raw text can be spelled to dodge a substring
+    // match while running exactly the same thing: `'git' push --force`
+    // and `ch\\mod 777 /etc` both reached the shell unflagged. Rebuild
+    // each invocation from its tokens with the shell quoting removed and
+    // scan that too. Additive — anything the raw scan catches is still
+    // caught.
+    for invocation in &cmd.invocations {
+        let normalized = invocation
+            .iter()
+            .map(|t| unquote_token(t))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for pattern in DESTRUCTIVE_PATTERNS {
+            if normalized.contains(pattern) {
+                findings.push(DestructiveFinding {
+                    level: DestructivenessLevel::Destructive,
+                    reason: format!("contains '{pattern}'"),
+                });
+            }
+        }
+    }
+
     // Pipeline scan: any segment whose head is intrinsically destructive
     // is flagged even if the whole-string pattern scan did not catch it.
+    // The head is unquoted and de-pathed first, so `/bin/rm` and `'rm'`
+    // are both recognised as `rm`.
     for segment in cmd.raw.split('|') {
         let trimmed = segment.trim();
-        let base = trimmed.split_whitespace().next().unwrap_or("");
+        let head = trimmed.split_whitespace().next().unwrap_or("");
+        let base_owned = base_name(&unquote_token(head)).to_lowercase();
+        let base = base_owned.as_str();
         if DESTRUCTIVE_PIPELINE_BASES.contains(&base) {
             findings.push(DestructiveFinding {
                 level: DestructivenessLevel::Destructive,
@@ -167,6 +194,72 @@ pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
 
 #[cfg(test)]
 mod tests {
+    /// The pattern scan ran over the raw text, so re-spelling a command
+    /// without changing what it runs walked past it. Both of these were
+    /// accepted by `BashTool::validate_input` in every mode.
+    #[test]
+    fn quoting_and_escaping_cannot_hide_a_destructive_command() {
+        for cmd in [
+            "'git' push --force",
+            "\"git\" push --force",
+            "ch\\mod 777 /etc",
+            "'chmod' 777 /etc",
+            "'rm' -rf /tmp/x",
+            "/bin/rm -rf /tmp/x",
+            "'shutdown' -h now",
+        ] {
+            let parsed = parse_bash(cmd).expect("parses");
+            assert_eq!(
+                classify_destructive(&parsed),
+                DestructivenessLevel::Destructive,
+                "re-spelling hid a destructive command: {cmd}"
+            );
+        }
+    }
+
+    /// Known limitation, pre-dating this change: the scan cannot tell a
+    /// command from a string that merely mentions one, so searching for a
+    /// dangerous pattern is refused. Pinned here so the behaviour is
+    /// documented rather than discovered, and so a later fix has a test
+    /// to flip. Over-blocking, i.e. failing in the safe direction.
+    #[test]
+    fn a_literal_argument_mentioning_a_pattern_is_still_flagged() {
+        for cmd in [
+            "grep -r 'rm -rf' docs/",
+            "grep 'shutdown' log.txt",
+            "echo 'rm -rf /'",
+        ] {
+            let parsed = parse_bash(cmd).expect("parses");
+            assert_eq!(
+                classify_destructive(&parsed),
+                DestructivenessLevel::Destructive,
+                "behaviour changed for: {cmd}"
+            );
+        }
+    }
+
+    /// The normalization must not start flagging ordinary work — a guard
+    /// that refuses everything is its own kind of failure.
+    #[test]
+    fn ordinary_commands_stay_safe() {
+        for cmd in [
+            "ls -la",
+            "git status",
+            "git push",
+            "git commit -m 'wip'",
+            "cargo build",
+            "chmod 644 file.txt",
+            "echo hi | grep h",
+        ] {
+            let parsed = parse_bash(cmd).expect("parses");
+            assert_eq!(
+                classify_destructive(&parsed),
+                DestructivenessLevel::Safe,
+                "false positive on: {cmd}"
+            );
+        }
+    }
+
     use super::*;
     use crate::tools::bash_parse::parse_bash;
 
