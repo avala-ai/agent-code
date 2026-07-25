@@ -66,22 +66,16 @@ impl Config {
         let mut config = merge_layer_contents(&layer_refs)?;
 
         // Layer 3: Environment variables override file-based config.
-        // API key from env always wins over config files, because users
-        // expect `OPENAI_API_KEY=x agent` to use key x, even if a
-        // stale key exists in config.toml.
-        let env_api_key = resolve_api_key_from_env();
-        if env_api_key.is_some() {
-            config.api.api_key = env_api_key;
-        }
-
-        // Base URL from env overrides file config.
+        // Base URL / model / auth mode apply first — the key chosen
+        // below prefers the provider they select.
         if let Ok(url) = std::env::var("AGENT_CODE_API_BASE_URL") {
             config.api.base_url = url;
         }
-
-        // Auth mode from env overrides file config.
         if let Ok(auth_mode) = std::env::var("AGENT_CODE_AUTH_MODE") {
             config.api.auth_mode = toml::Value::String(auth_mode).try_into()?;
+        }
+        if let Ok(model) = std::env::var("AGENT_CODE_MODEL") {
+            config.api.model = model;
         }
 
         // CODEX_HOME is honored by the auth loader when codex_home is unset;
@@ -90,9 +84,23 @@ impl Config {
             config.api.codex_home = Some(codex_home);
         }
 
-        // Model from env overrides file config.
-        if let Ok(model) = std::env::var("AGENT_CODE_MODEL") {
-            config.api.model = model;
+        // API key from env always wins over config files, because users
+        // expect `OPENAI_API_KEY=x agent` to use key x, even if a
+        // stale key exists in config.toml. When several provider keys
+        // are exported, the one belonging to the effective provider
+        // (from base_url/model) is preferred over the fixed priority
+        // order, so the session never sends provider A's key to
+        // provider B's endpoint.
+        let env_api_key = if let Some(var) =
+            choose_api_key_var(&config.api.base_url, &config.api.model, |v| {
+                std::env::var(v).is_ok_and(|s| !s.trim().is_empty())
+            }) {
+            std::env::var(var).ok()
+        } else {
+            resolve_api_key_from_env()
+        };
+        if env_api_key.is_some() {
+            config.api.api_key = env_api_key;
         }
 
         // Layer 4: Dynamic API key helper.
@@ -288,6 +296,44 @@ fn resolve_api_key_from_env() -> Option<String> {
     API_KEY_ENV_VARS
         .iter()
         .find_map(|var| std::env::var(var).ok())
+}
+
+/// Pick the env var the effective provider's key should come from, or
+/// `None` to fall back to the fixed priority order.
+///
+/// Pure — `has` reports whether a var is set non-empty — so the
+/// decision table is testable without touching process env. Rules:
+///
+/// 1. `AGENT_CODE_API_KEY` keeps its top rank: it is an explicit
+///    "use this key" override, relied on for OpenAI-compatible proxies
+///    where URL-based detection cannot identify the vendor.
+/// 2. When `base_url`/`model` map to a dedicated provider and that
+///    provider's key var is set, it wins over other providers' vars.
+/// 3. Otherwise (custom/cloud endpoints, or the matching var absent)
+///    the caller falls back to [`API_KEY_ENV_VARS`] order — exactly
+///    the pre-existing behavior, so single-key setups are unchanged.
+fn choose_api_key_var(
+    base_url: &str,
+    model: &str,
+    has: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    use crate::llm::provider::{ProviderKind, detect_provider};
+
+    if has("AGENT_CODE_API_KEY") {
+        return Some("AGENT_CODE_API_KEY");
+    }
+    let kind = detect_provider(model, base_url);
+    if matches!(
+        kind,
+        ProviderKind::OpenAiCompatible
+            | ProviderKind::Bedrock
+            | ProviderKind::Vertex
+            | ProviderKind::AzureOpenAi
+    ) {
+        return None;
+    }
+    let var = kind.env_var_name();
+    has(var).then_some(var)
 }
 
 /// Returns the user-level config file path.
@@ -1112,6 +1158,70 @@ action = "ask"
         // flag paths where the key could land in panic output.
         let key = resolve_api_key_from_helper("true").unwrap();
         assert_eq!(key.len(), 0);
+    }
+
+    fn has_vars(set_vars: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |v| set_vars.contains(&v)
+    }
+
+    #[test]
+    fn key_var_matches_effective_provider_over_priority_order() {
+        // ANTHROPIC outranks XAI in the fixed order, but the effective
+        // provider is xAI — its key must win.
+        let var = choose_api_key_var(
+            "https://api.x.ai/v1",
+            "grok-build-0.1",
+            has_vars(&["ANTHROPIC_API_KEY", "XAI_API_KEY"]),
+        );
+        assert_eq!(var, Some("XAI_API_KEY"));
+    }
+
+    #[test]
+    fn generic_key_keeps_top_rank() {
+        let var = choose_api_key_var(
+            "https://api.x.ai/v1",
+            "grok-build-0.1",
+            has_vars(&["AGENT_CODE_API_KEY", "XAI_API_KEY"]),
+        );
+        assert_eq!(var, Some("AGENT_CODE_API_KEY"));
+    }
+
+    #[test]
+    fn missing_provider_var_falls_back_to_priority_order() {
+        // Only a foreign key is exported: preserve the pre-existing
+        // fallback (the session may be intentionally cross-configured,
+        // e.g. a proxy that accepts any bearer token).
+        let var = choose_api_key_var(
+            "https://api.x.ai/v1",
+            "grok-build-0.1",
+            has_vars(&["ANTHROPIC_API_KEY"]),
+        );
+        assert_eq!(var, None);
+    }
+
+    #[test]
+    fn custom_and_cloud_endpoints_use_priority_order() {
+        for url in [
+            "http://localhost:11434/v1",
+            "https://myco.openai.azure.com/openai/deployments/x",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        ] {
+            let var = choose_api_key_var(url, "", has_vars(&["OPENAI_API_KEY"]));
+            assert_eq!(var, None, "no provider-pinning for {url}");
+        }
+    }
+
+    #[test]
+    fn model_based_detection_pins_the_key_too() {
+        // No recognizable URL, but the model names the vendor.
+        let var = choose_api_key_var(
+            "https://api.openai.com/v1",
+            "claude-sonnet-4-20250514",
+            has_vars(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]),
+        );
+        // URL detection runs first and says OpenAI — the URL is the
+        // stronger signal of where the request will actually be sent.
+        assert_eq!(var, Some("OPENAI_API_KEY"));
     }
 
     #[cfg(unix)]

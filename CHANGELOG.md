@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
-## [0.27.0] - 2026-07-16
+## [0.27.0] - 2026-07-24
 
 ### Removed
 
@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Subagent endpoint/auth overrides** (#475) — `[api] subagent_model` / `subagent_base_url` / `subagent_auth_mode` plus `base_url:` / `auth_mode:` in agent-definition frontmatter (resolution: per-call > definition > config > inherit), so one session can fan out across providers — e.g. main loop on an API key while agent types use a subscription session or a local endpoint. Per-call override stays model-only so tool input can never redirect credentials.
+- **Data-driven theme system** (#478) — built-in and user-defined themes.
 - **Modern TUI agent-screen parity** (#444, #445, #449) — multiline composer, prompt history, fold/expand, queue pane, interject (Ctrl+Enter), full slash-command bridge with Tab complete and stdout capture (including interactive slash suspend for pickers/`$EDITOR`), `!` shell passthrough, y/Y block copy, shared clipboard (native → tmux → OSC 52), and setup hero polish.
 - **Ctrl+P command palette** (#446) — filterable slash-command picker (Enter fills `/cmd `); Tab complete stays name-only so aliases do not pollute completions.
 - **Modern TUI visual polish** (#447) — braille spinner + blinking action-required status (focus-aware), OSC window-title spinner (control-char sanitized), fenced **code snippet cards** (language pill, line numbers, copy hint), mouse drag text selection with highlight, copy toast (no sticky status), `Ctrl+Shift+C` / `y` selection copy, `Ctrl+.` shortcuts overlay; Ctrl+C still cancels through the help overlay.
@@ -25,12 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Provider-aware API-key resolution** (#481) — with several provider keys exported, `Config::load` prefers the key belonging to the effective provider (from `base_url`/`model`) over the fixed priority order, so a session pointed at provider B never sends provider A's key there. `AGENT_CODE_API_KEY` keeps its top rank as an explicit override; custom/OpenAI-compatible and cloud endpoints keep the old order; single-key setups are unaffected.
 - **Calmer default theme** (#448) — midnight/daybreak accents move from loud purple to restrained steel-blue; selection and message backgrounds stay neutral slate; header brand is text accent instead of a filled purple pill; mode badges are text-only.
 - **Permissions overlay merge is deny-first** (#452 / #426) — host Deny, then overlay Deny, then non-Deny rules so a project-wide Allow cannot defeat a confined subagent's Deny.
 - **WebFetch uses full permission check** (#451 / #429) — network fetch is not treated as a pure filesystem read under AcceptEdits/Ask/Deny.
 
 ### Fixed
 
+- **First-run defaults no longer pin the xAI endpoint over existing credentials** (#459) — env/CLI keys pick the persisted provider section; the env-candidate table mirrors the loader's key priority (`config::API_KEY_ENV_VARS`).
+- **Selector Ctrl+C** (#473) — Ctrl+C (and Ctrl+D / Super+C) in arrow-key menus (`/session`, `/model` fallback, tutorial, setup wizard) aborts the menu instead of being read as the letter `c` hotkey or ignored; other Ctrl/Alt chords are no longer hotkeys.
+- **Windows stdout capture** (#472) — restoring stdout after slash-command capture no longer installs an already-closed handle; fixes the intermittent `Access is denied` failures that killed the whole Windows test harness.
+- **Compaction never splits a tool_use/tool_result pair** (#475) — the cut moves to a safe boundary, and request normalization drops orphan/out-of-order/duplicate tool_results and sanitizes non-object tool inputs, eliminating a class of 400s from strict OpenAI-compatible and local backends.
+- **TUI logging and turn numbering** (#477) — tracing output goes to `<config>/logs/agent.log` in interactive sessions instead of being drawn over the alt screen; turn events carry the session-cumulative number so the footer and status messages agree.
+- **Subagent provider-key scoping** (#479) — a child whose endpoint override pins a dedicated provider receives only that provider's key env var, so multiple exported keys cannot cross-wire.
 - **HITL answer-key grace** (#450 / #431) — y/a/n (and plan/question answers) wait until the modal is painted plus ~250 ms so mid-stream typing cannot auto-allow a permission ask.
 - **Streaming tool path validation and denial audit** (#451 / #429) — streaming read-only tools run `validate_input`; Deny records to the denial tracker; Ask defers to the serial executor (HITL prompter).
 - **Concurrent `Session::spawn_turn` rejected** (#453 / #425) — a second spawn while status is `Running` fails instead of hijacking cancel/status.
