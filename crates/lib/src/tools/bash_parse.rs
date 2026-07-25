@@ -206,6 +206,11 @@ pub fn unquote_token(raw: &str) -> String {
                 // before these; before anything else it is preserved
                 // (`"\_x"` stays `\_x` — it does not become `_x`).
                 '\\' => match chars.peek() {
+                    // A backslash-newline is a line continuation:
+                    // both characters disappear.
+                    Some('\n') => {
+                        chars.next();
+                    }
                     Some(&next @ ('$' | '`' | '"' | '\\')) => {
                         chars.next();
                         out.push(next);
@@ -217,11 +222,10 @@ pub fn unquote_token(raw: &str) -> String {
             Some(_) => unreachable!("only ' and \" open a quote"),
             None => match c {
                 '\'' | '"' => quote = Some(c),
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                }
+                '\\' => match chars.next() {
+                    Some('\n') | None => {}
+                    Some(next) => out.push(next),
+                },
                 _ => out.push(c),
             },
         }
@@ -351,7 +355,7 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
                         Some(v) => (v, i + 1),
                         None => (rest.get(i + 1)?.clone(), i + 2),
                     };
-                    return split_string_tokens(&operand, &rest[next..]);
+                    return split_string_tokens(&tokens[0], &operand, &rest[next..]);
                 }
             }
             continue;
@@ -386,7 +390,7 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
             }
             let next = i + 1 + usize::from(consumed_next);
             if let Some(operand) = split_operand {
-                return split_string_tokens(&operand, &rest[next..]);
+                return split_string_tokens(&tokens[0], &operand, &rest[next..]);
             }
             i = next;
             continue;
@@ -397,12 +401,15 @@ fn strip_wrapper(tokens: &[String]) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// `env -S STRING` splits STRING into the leading words of the wrapped
-/// command; the remaining argv tokens follow it.
-fn split_string_tokens(operand: &str, remainder: &[String]) -> Option<Vec<String>> {
-    let mut out = split_env_s(operand)?;
+/// `env -S STRING` splits STRING into further `env` arguments — not
+/// straight into the command. `env -S '-u DUMMY rm -f x'` still has
+/// options to process, so the split words are handed back with an
+/// `env` head and re-enter option parsing on the next pass.
+fn split_string_tokens(wrapper: &str, operand: &str, remainder: &[String]) -> Option<Vec<String>> {
+    let mut out = vec![wrapper.to_string()];
+    out.extend(split_env_s(operand)?);
     out.extend_from_slice(remainder);
-    (!out.is_empty()).then_some(out)
+    Some(out)
 }
 
 /// Split an `env -S` string the way GNU env does: whitespace-separated
@@ -423,7 +430,7 @@ fn split_env_s(s: &str) -> Option<Vec<String>> {
     let mut chars = s.chars();
     'outer: while let Some(c) = chars.next() {
         match c {
-            ' ' | '\t' => end_word(&mut cur, &mut in_word, &mut words),
+            c if c.is_whitespace() => end_word(&mut cur, &mut in_word, &mut words),
             '#' if !in_word => break,
             '$' => return None,
             '\'' => {
@@ -915,6 +922,14 @@ mod tests {
             // Bash preserves `\_` inside double quotes; env then
             // treats it as a word separator.
             ("env -S \"\\_git status\"", "git status"),
+            // `-S` yields further env arguments, options included.
+            ("env -S '-u DUMMY git status'", "git status"),
+            ("env -S '-i' git status", "git status"),
+            // Any whitespace separates `-S` words, newlines included.
+            ("env -S 'git\nstatus'", "git status"),
+            // Bash removes a backslash-newline continuation inside
+            // double quotes, so env sees `git status`.
+            ("env -S \"gi\\\nt status\"", "git status"),
         ];
         for (cmd, expected) in cases {
             let parsed = parse_bash(cmd).unwrap();
@@ -962,6 +977,12 @@ mod tests {
             "env -S \"'rm' -rf /tmp/x\"",
             // Bash-preserved backslash: `\_` separates env -S words.
             "env -S \"\\_rm -f /tmp/victim\"",
+            // `-S` output re-enters env option parsing.
+            "env -S '-u DUMMY rm -f /tmp/victim'",
+            // Newline separates `-S` words.
+            "env -S 'rm\n-f /tmp/victim'",
+            // Backslash-newline continuation inside double quotes.
+            "env -S \"r\\\nm -f /tmp/victim\"",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             let violations = check_parsed_security(&parsed);

@@ -1365,6 +1365,8 @@ mod tests {
             "env -S 'git status' && touch marker",
             "env -S \"'git' status\" && touch marker",
             "env -P /bin git status && touch marker",
+            "env -S '-u DUMMY git status' && touch marker",
+            "env -S 'git\nstatus' && touch marker",
         ] {
             assert!(
                 matches!(
