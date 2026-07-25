@@ -51,6 +51,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 toml = "1.1"
 tempfile = "3"
+# Gitignore-aware directory walk for `@path` completion in the TUI composer.
+ignore = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

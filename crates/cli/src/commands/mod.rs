@@ -5690,11 +5690,13 @@ pub fn collect_session_files(
     out
 }
 
-/// Extract `@path` references from a user text block. Matches the
-/// same rule as the @-mention expander in the REPL: `@` at start or
+/// Extract `@path` references from a user text block: `@` at start or
 /// after whitespace, followed by non-whitespace chars containing a
 /// `/` or `.` (so bare words like `@foo` aren't mistaken for paths).
-fn extract_at_mentions(text: &str) -> Vec<String> {
+///
+/// Shared by `/files` reporting and the TUI composer's mention expander —
+/// both surfaces must agree on what counts as a mention.
+pub(crate) fn extract_at_mentions(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;

@@ -35,6 +35,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | `Home` / `End` | Line start/end when drafting; transcript top/bottom if empty | same |
 | `Alt+↑` | Pop newest queued prompt into editor | same |
 | `Alt+-` | Delete newest queued prompt | same |
+| `Tab` | Complete the `@path` mention under the cursor, else a partial `/command` | same |
 | `Shift+Tab` | Cycle permission mode (Manual → Normal → AcceptEdits → Plan) | same |
 
 ## Transcript / scrollback
@@ -107,6 +108,32 @@ and `dir/SKILL.md`. Truly unknown `/names` are rejected with a hint.
 | Prefix | Action |
 |--------|--------|
 | `!cmd` | Run shell now; stream into transcript + inject into engine context |
+| `@path` | **File mention** — Tab completes, contents are inlined for the model |
 | (plain text) | Agent turn (queued mid-stream) |
+
+### `@` file mentions
+
+Type `@` followed by a path to reference a file or directory. A mention is
+recognised when `@` starts the line or follows whitespace and the token
+contains a `/` or a `.` — so `user@example.com` is never a mention.
+
+**Tab** completes the `@` token under the cursor against the session cwd:
+directories complete with a trailing `/` so the next Tab drills in, matching is
+case-insensitive, `.gitignore` is honoured, and `.git/` and dotfiles are hidden
+(type a leading `.` to see dotfiles). Several mentions on one line complete
+independently. With more than one match, Tab extends to the longest common
+prefix and lists the candidates in the transcript.
+
+On submit, each mention is resolved against the session cwd and its contents
+are appended to the message the model receives. The transcript keeps your line
+exactly as typed.
+
+| Case | Behaviour |
+|---|---|
+| Directory | Expanded to a one-level listing (gitignored entries and `.git/` excluded, capped at 100 entries) |
+| Missing, unreadable, or binary file | Skipped, noted under the prompt as `@mentions: …` |
+| Path outside the workspace (incl. via symlink) or inside `.git/` | Rejected, noted |
+| File over **64 KiB** | Truncated with a `… [truncated: …]` marker |
+| More than **256 KiB** across all mentions | Remaining mentions skipped, noted |
 
 `/copy` and `y`/`Y` use the clipboard cascade: native → tmux buffer → OSC 52.

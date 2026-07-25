@@ -136,6 +136,7 @@ fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  y / Y           copy block body / metadata"),
         Line::from("  Ctrl+Shift+C    copy selection or last reply"),
         Line::from("  drag mouse      select transcript text · release keeps selection"),
+        Line::from("  @path           mention a file · Tab completes · contents inlined"),
         Line::from("  !cmd            shell passthrough"),
         Line::from("  Ctrl+. / Ctrl+X this help"),
         Line::from(""),

@@ -1303,6 +1303,68 @@ impl App {
         self.enqueue_turn(text);
     }
 
+    /// Tab-complete the token under the cursor: an `@path` file mention when
+    /// the cursor sits in one, otherwise a partial slash command.
+    pub fn complete_tab(&mut self) {
+        if self.complete_at_tab() {
+            return;
+        }
+        self.complete_slash_tab();
+    }
+
+    /// Complete an `@path` mention against the session cwd. Returns `false`
+    /// when the cursor is not inside a mention so the caller falls through to
+    /// slash completion.
+    fn complete_at_tab(&mut self) -> bool {
+        let Some(tok) = super::mentions::at_token_at_cursor(&self.input, self.cursor) else {
+            return false;
+        };
+        let cands =
+            super::mentions::complete_at_path(std::path::Path::new(&self.cwd), &tok.partial);
+        match cands.as_slice() {
+            [] => {
+                self.status_message = "no matching paths".into();
+            }
+            [only] => {
+                let text = super::mentions::mention_text(only);
+                // A directory keeps the cursor tight against the `/` so the
+                // next Tab drills in; a file gets a separating space unless
+                // the line already has one after the token.
+                let already_spaced = self.input[tok.end..].starts_with(char::is_whitespace);
+                let trailing = if text.ends_with('/') || already_spaced {
+                    ""
+                } else {
+                    " "
+                };
+                self.replace_at_token(&tok, &format!("@{text}{trailing}"));
+                self.status_message = format!("@{text}");
+            }
+            many => {
+                let prefix = super::mentions::longest_common_prefix(many);
+                if prefix.len() > tok.partial.len() {
+                    self.replace_at_token(&tok, &format!("@{prefix}"));
+                }
+                let list = many.iter().take(12).cloned().collect::<Vec<_>>().join(" ");
+                let more = if many.len() > 12 {
+                    format!(" …+{}", many.len() - 12)
+                } else {
+                    String::new()
+                };
+                self.transcript
+                    .push(TranscriptItem::System(format!("paths: {list}{more}")));
+                self.status_message = format!("{} matches", many.len());
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn replace_at_token(&mut self, tok: &super::mentions::AtToken, replacement: &str) {
+        self.input.replace_range(tok.start..tok.end, replacement);
+        self.cursor = tok.start + replacement.len();
+        self.history_browse = None;
+    }
+
     /// Tab-complete a partial slash command in the composer.
     pub fn complete_slash_tab(&mut self) {
         let trimmed = self.input.trim();
@@ -1335,13 +1397,7 @@ impl App {
                 };
             }
             many => {
-                // Longest common prefix among candidates.
-                let mut prefix = many[0].to_string();
-                for c in &many[1..] {
-                    while !c.starts_with(&prefix) && !prefix.is_empty() {
-                        prefix.pop();
-                    }
-                }
+                let prefix = super::mentions::longest_common_prefix(many);
                 if prefix.len() > partial.len() {
                     self.input = format!("/{prefix}");
                     self.cursor = self.input.len();
@@ -1452,6 +1508,7 @@ impl App {
     /// Resolve user text into a turn: expand `/skill` invocations the same
     /// way slash dispatch does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
+        let mut mention_notes: Vec<String> = Vec::new();
         let (display, prompt) =
             match try_expand_skill_slash_full(&text, &self.cwd, self.disable_skill_shell) {
                 Some(expanded) => {
@@ -1491,11 +1548,29 @@ impl App {
                         self.dirty = true;
                         return;
                     }
-                    (text.clone(), text)
+                    // `@path` mentions are inlined for the model only — the
+                    // transcript keeps the line exactly as it was typed.
+                    let prompt = match super::mentions::expand_mentions(
+                        &text,
+                        std::path::Path::new(&self.cwd),
+                    ) {
+                        Some(expansion) => {
+                            mention_notes = expansion.notes;
+                            expansion.prompt
+                        }
+                        None => text.clone(),
+                    };
+                    (text, prompt)
                 }
             };
         self.push_prompt_history(&display);
         self.transcript.push(TranscriptItem::User(display));
+        if !mention_notes.is_empty() {
+            self.transcript.push(TranscriptItem::System(format!(
+                "@mentions: {}",
+                mention_notes.join(" · ")
+            )));
+        }
         self.input.clear();
         self.cursor = 0;
         self.history_browse = None;
@@ -3365,5 +3440,126 @@ mod tests {
         let before = app.transcript.len();
         app.resolve_permission(PermissionResponse::Deny);
         assert_eq!(app.transcript.len(), before);
+    }
+
+    // ---- `@` file mentions ----
+
+    /// Small workspace + an App rooted in it.
+    fn app_in_workspace() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "hidden.txt\n").unwrap();
+        std::fs::write(root.join("hidden.txt"), "nope\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let app = App::new("m", root.to_string_lossy().to_string(), "s");
+        (dir, app)
+    }
+
+    fn type_input(app: &mut App, text: &str) {
+        app.input = text.to_string();
+        app.cursor = app.input.len();
+    }
+
+    #[test]
+    fn tab_completes_an_at_mention_to_a_single_file() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "explain @src/ma");
+        app.complete_tab();
+        assert_eq!(app.input, "explain @src/main.rs ");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn tab_completes_a_directory_with_a_trailing_slash() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "@sr");
+        app.complete_tab();
+        assert_eq!(
+            app.input, "@src/",
+            "directory keeps the cursor on the slash"
+        );
+        // Drilling in again lists the directory's contents.
+        app.complete_tab();
+        assert!(app.input.starts_with("@src/"));
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(s) if s.starts_with("paths: "))),
+            "candidate list should be shown like slash completion"
+        );
+    }
+
+    #[test]
+    fn tab_completion_skips_gitignored_paths() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "@hidden");
+        app.complete_tab();
+        assert_eq!(app.input, "@hidden", "input unchanged");
+        assert_eq!(app.status_message, "no matching paths");
+    }
+
+    #[test]
+    fn tab_completes_the_mention_under_the_cursor_not_the_last_one() {
+        let (_dir, mut app) = app_in_workspace();
+        app.input = "@src/main.rs and @READ done".to_string();
+        app.cursor = "@src/main.rs and @READ".len();
+        app.complete_tab();
+        assert_eq!(app.input, "@src/main.rs and @README.md done");
+    }
+
+    #[test]
+    fn tab_still_completes_slash_commands() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "/hel");
+        app.complete_tab();
+        assert!(
+            app.input.starts_with("/help"),
+            "slash completion regressed: {}",
+            app.input
+        );
+    }
+
+    #[test]
+    fn submit_inlines_mentions_but_transcript_keeps_the_typed_text() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "explain @src/main.rs");
+        app.submit();
+        let prompt = app.pending_submit.clone().expect("turn started");
+        assert!(prompt.starts_with("explain @src/main.rs"));
+        assert!(prompt.contains("<file path=\"src/main.rs\">"));
+        assert!(prompt.contains("fn main() {}"));
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "explain @src/main.rs")),
+            "transcript must show the line as typed"
+        );
+    }
+
+    #[test]
+    fn submit_notes_a_missing_mention_without_failing_the_turn() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "read @src/nope.rs");
+        app.submit();
+        assert_eq!(app.pending_submit.as_deref(), Some("read @src/nope.rs"));
+        assert!(
+            app.transcript.iter().any(
+                |i| matches!(i, TranscriptItem::System(s) if s.contains("@mentions:")
+                    && s.contains("not found"))
+            ),
+            "expected a skipped-mention note"
+        );
+    }
+
+    #[test]
+    fn submit_without_mentions_is_unchanged() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "hello there");
+        app.submit();
+        assert_eq!(app.pending_submit.as_deref(), Some("hello there"));
     }
 }

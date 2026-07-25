@@ -10,6 +10,7 @@ mod diffview;
 mod fake_engine;
 mod layout;
 mod markdown;
+mod mentions;
 mod modal;
 mod mode;
 mod model_picker;

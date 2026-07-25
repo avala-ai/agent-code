@@ -1067,9 +1067,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         (_, KeyCode::Backspace) => app.backspace(),
-        // Tab completes slash commands when drafting `/…`.
+        // Tab completes `@path` mentions and slash commands.
         (_, KeyCode::Tab) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.complete_slash_tab();
+            app.complete_tab();
         }
         // Turn navigation (Shift+Left/Right) — before bare arrows.
         (m, KeyCode::Left) if m.contains(KeyModifiers::SHIFT) => {
