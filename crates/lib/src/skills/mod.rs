@@ -76,7 +76,11 @@ pub struct SkillMetadata {
     /// Optional reasoning-effort override when this skill runs.
     pub effort: Option<String>,
     /// When true, only slash invocation runs the skill (model cannot auto-call).
-    #[serde(alias = "disable-model-invocation", alias = "disableModelInvocation", default)]
+    #[serde(
+        alias = "disable-model-invocation",
+        alias = "disableModelInvocation",
+        default
+    )]
     pub disable_model_invocation: bool,
 }
 
@@ -907,7 +911,12 @@ const SKILL_SCAN_REL_PATHS: &[&str] = &[
 fn is_vendor_default_skill(name: &str) -> bool {
     matches!(
         name,
-        "shell" | "canvas" | "statusline" | "cursor-guide" | "create-rule" | "create-skill"
+        "shell"
+            | "canvas"
+            | "statusline"
+            | "cursor-guide"
+            | "create-rule"
+            | "create-skill"
             | "migrate-to-skills"
     )
 }
@@ -1082,7 +1091,10 @@ disable-model-invocation: true\n\
 ---\n\nDeploy {{arg}} carefully.";
         let (meta, body) = parse_frontmatter(content).unwrap();
         assert_eq!(meta.description.as_deref(), Some("Deploy the service"));
-        assert_eq!(meta.when_to_use.as_deref(), Some("When the user wants to deploy"));
+        assert_eq!(
+            meta.when_to_use.as_deref(),
+            Some("When the user wants to deploy")
+        );
         assert!(meta.user_invocable);
         assert_eq!(meta.argument_hint.as_deref(), Some("env name"));
         assert_eq!(meta.model.as_deref(), Some("grok-4"));

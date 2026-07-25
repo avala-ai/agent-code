@@ -44,11 +44,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let session_id = engine.state().session_id.clone();
     let base_permission_mode = engine.state().config.permissions.default_mode;
     let disable_skill_shell = engine.state().config.security.disable_skill_shell_execution;
-    let show_thinking_blocks = engine
-        .state()
-        .config
-        .ui
-        .show_thinking_blocks;
+    let show_thinking_blocks = engine.state().config.ui.show_thinking_blocks;
     let initial_effort = engine.state().config.api.effort.clone();
 
     // Apply theme so any shared color helpers still resolve.
@@ -1301,8 +1297,7 @@ fn update_terminal_title(app: &App) {
                 "{} agent · {} · {}",
                 super::anim::spinner_glyph(app.tick),
                 model,
-                app.waiting_on
-                    .label_with_elapsed(app.thinking_started_at)
+                app.waiting_on.label_with_elapsed(app.thinking_started_at)
             )
         }
         super::app::Phase::Permission => {

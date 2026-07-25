@@ -118,11 +118,7 @@ fn is_effort_level(s: &str) -> bool {
 
 fn normalize_effort(s: &str) -> String {
     let t = s.trim().to_ascii_lowercase();
-    if t == "max" {
-        "xhigh".into()
-    } else {
-        t
-    }
+    if t == "max" { "xhigh".into() } else { t }
 }
 
 /// Format `/model` catalog lines for the transcript (fallback when picker closed).
@@ -3185,16 +3181,13 @@ mod tests {
         assert_eq!(app.waiting_on, WaitingOn::Answering);
         app.flush_stream();
         // Thinking block should be finalized with a duration.
-        let thought = app
-            .transcript
-            .iter()
-            .find_map(|i| match i {
-                TranscriptItem::Thinking {
-                    duration_ms: Some(ms),
-                    ..
-                } => Some(*ms),
-                _ => None,
-            });
+        let thought = app.transcript.iter().find_map(|i| match i {
+            TranscriptItem::Thinking {
+                duration_ms: Some(ms),
+                ..
+            } => Some(*ms),
+            _ => None,
+        });
         assert!(thought.is_some(), "thinking duration should be stamped");
         assert_eq!(app.waiting_on.label(), "answering…");
     }

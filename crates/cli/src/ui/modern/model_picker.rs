@@ -33,8 +33,7 @@ impl ModelPicker {
                 if q.is_empty() {
                     return true;
                 }
-                id.to_ascii_lowercase().contains(&q)
-                    || desc.to_ascii_lowercase().contains(&q)
+                id.to_ascii_lowercase().contains(&q) || desc.to_ascii_lowercase().contains(&q)
             })
             .map(|(i, (id, desc))| (i, id.as_str(), desc.as_str()))
             .collect()
@@ -89,7 +88,8 @@ impl App {
         };
         if p.effort_phase {
             p.effort_phase = false;
-            self.status_message = "model picker · type to filter · Enter select · Tab effort".into();
+            self.status_message =
+                "model picker · type to filter · Enter select · Tab effort".into();
         } else {
             p.query.pop();
             p.selected = 0;
@@ -195,10 +195,7 @@ mod tests {
     #[test]
     fn effort_phase_sets_both() {
         let mut app = App::new("m", "/tmp", "s");
-        app.open_model_picker(
-            "o3",
-            vec![("o3".into(), "reason".into())],
-        );
+        app.open_model_picker("o3", vec![("o3".into(), "reason".into())]);
         app.model_picker_enter_effort();
         assert!(app.model_picker.as_ref().unwrap().effort_phase);
         // Select "high" (index of high in EFFORT_LEVELS)

@@ -266,9 +266,7 @@ fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines,
             " reasoning effort ",
             palette().accent,
-            Some(key_hint_line(
-                "[↑↓] move   [Enter] apply   [Esc/⌫] back",
-            )),
+            Some(key_hint_line("[↑↓] move   [Enter] apply   [Esc/⌫] back")),
         );
         return;
     }
@@ -884,8 +882,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spans.push(Span::styled(
                 format!(
                     "{} ",
-                    app.waiting_on
-                        .label_with_elapsed(app.thinking_started_at)
+                    app.waiting_on.label_with_elapsed(app.thinking_started_at)
                 ),
                 Style::default().fg(text_color),
             ));
