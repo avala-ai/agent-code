@@ -404,6 +404,8 @@ mod stream_emit_tests {
             tool_events: Some(tx),
             active_call_id: Some("call-1".into()),
             subagent_api_defaults: None,
+            live_plan_mode: None,
+            session_id: None,
         };
         let data = b"hello world from bash\n";
         let mut cursor = Cursor::new(&data[..]);

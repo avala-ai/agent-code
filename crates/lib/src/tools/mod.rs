@@ -290,6 +290,18 @@ pub struct ToolContext {
     /// per-definition overrides when resolving a child's endpoint.
     /// `None` → subagents inherit the parent's provider settings.
     pub subagent_api_defaults: Option<crate::services::coordinator::SubagentEndpoint>,
+    /// Live plan-mode flag shared with the engine (flipped by
+    /// EnterPlanMode/ExitPlanMode and the UI's mode toggle). When set,
+    /// [`Self::plan_mode_now`] reads it so a toggle that lands
+    /// mid-batch gates the very next tool call; the `plan_mode` bool
+    /// is only the snapshot taken when this context was built and lags
+    /// one agent-loop iteration.
+    pub live_plan_mode: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Session id of the owning engine, for session-scoped tool state
+    /// (e.g. the active-plan pointer, so a session resumed in a new
+    /// process finds its plan). `None` in minimal/test contexts falls
+    /// back to process-scoped state.
+    pub session_id: Option<String>,
 }
 
 impl ToolContext {
@@ -326,7 +338,21 @@ impl ToolContext {
             tool_events: None,
             active_call_id: None,
             subagent_api_defaults: None,
+            live_plan_mode: None,
+            session_id: None,
         }
+    }
+
+    /// Whether plan mode is active *right now*. Reads the live shared
+    /// flag when present, falling back to the per-iteration snapshot —
+    /// so a Plan toggle that lands mid-batch (while an earlier tool in
+    /// the same batch is still running) gates the next call instead of
+    /// lagging a full agent-loop iteration.
+    pub fn plan_mode_now(&self) -> bool {
+        self.live_plan_mode
+            .as_ref()
+            .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(self.plan_mode)
     }
 
     /// Emit progressive tool output when a live event channel is installed.
@@ -358,6 +384,8 @@ impl ToolContext {
             tool_events: self.tool_events.clone(),
             active_call_id: Some(call_id.into()),
             subagent_api_defaults: self.subagent_api_defaults.clone(),
+            live_plan_mode: self.live_plan_mode.clone(),
+            session_id: self.session_id.clone(),
         }
     }
 }

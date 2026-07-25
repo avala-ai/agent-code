@@ -35,6 +35,8 @@ fn make_ctx(cwd: std::path::PathBuf, sandbox: Option<Arc<SandboxExecutor>>) -> T
         tool_events: None,
         active_call_id: None,
         subagent_api_defaults: None,
+        live_plan_mode: None,
+        session_id: None,
     }
 }
 

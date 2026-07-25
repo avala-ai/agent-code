@@ -1285,6 +1285,10 @@ impl QueryEngine {
                                                 let active_call_id = Some(tool_id.clone());
                                                 let denial_tracker =
                                                     Some(self.denial_tracker.clone());
+                                                let live_plan_mode =
+                                                    Some(self.live_plan_mode.clone());
+                                                let session_id =
+                                                    Some(self.state.session_id.clone());
                                                 let handle = tokio::spawn(async move {
                                                     match tool
                                                         .call(
@@ -1309,6 +1313,8 @@ impl QueryEngine {
                                                                 tool_events,
                                                                 active_call_id,
                                                                 subagent_api_defaults: None,
+                                                                live_plan_mode,
+                                                                session_id,
                                                             },
                                                         )
                                                         .await
@@ -1579,6 +1585,8 @@ impl QueryEngine {
                         &self.state.config.api,
                     ),
                 ),
+                live_plan_mode: Some(self.live_plan_mode.clone()),
+                session_id: Some(self.state.session_id.clone()),
             };
 
             // Collect streaming tool results first.

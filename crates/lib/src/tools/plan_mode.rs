@@ -74,7 +74,7 @@ impl Tool for EnterPlanModeTool {
     async fn call(
         &self,
         _input: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let plan_dir = plan_dir();
         let _ = std::fs::create_dir_all(&plan_dir);
@@ -106,7 +106,7 @@ impl Tool for EnterPlanModeTool {
 
         // Session pointer so ExitPlanMode can find the active plan without
         // ToolContext plumbing. Overwritten on every EnterPlanMode call.
-        if let Err(e) = set_active_plan_path(&plan_path) {
+        if let Err(e) = set_active_plan_path(&plan_path, ctx.session_id.as_deref()) {
             return Err(ToolError::ExecutionFailed(format!(
                 "Failed to record active plan path: {e}"
             )));
@@ -186,7 +186,7 @@ impl Tool for ExitPlanModeTool {
         let mut plan_path = if let Some(p) = input.get("plan_path").and_then(|v| v.as_str()) {
             PathBuf::from(p)
         } else {
-            match active_plan_path() {
+            match active_plan_path(ctx.session_id.as_deref()) {
                 Some(p) => p,
                 None => {
                     return Ok(ToolResult::error(
@@ -217,7 +217,7 @@ impl Tool for ExitPlanModeTool {
                     plan_path.display()
                 ))
             })?;
-            let _ = set_active_plan_path(&plan_path);
+            let _ = set_active_plan_path(&plan_path, ctx.session_id.as_deref());
         }
 
         if !plan_path.exists() {
@@ -274,7 +274,7 @@ impl Tool for ExitPlanModeTool {
         }
 
         // Clear the active pointer so a stale plan is not reused later.
-        let _ = clear_active_plan_path();
+        let _ = clear_active_plan_path(ctx.session_id.as_deref());
 
         Ok(ToolResult::success(result))
     }
@@ -339,29 +339,47 @@ fn ensure_path_under_plan_dir(path: &Path) -> Result<PathBuf, ToolError> {
     Ok(checked)
 }
 
-fn active_plan_pointer() -> PathBuf {
-    // Keyed per-process so concurrent sessions (each its own `agent`
-    // process, incl. subagents) don't clobber each other's active plan —
-    // with the shared `.active-plan` name, session B's EnterPlanMode
-    // redirected session A's ExitPlanMode. Full session-id plumbing
-    // through ToolContext is the eventual fix; pid covers every
-    // process-per-session path today.
-    plan_dir().join(format!(".active-plan-{}", std::process::id()))
+/// Pointer file for the active plan, keyed by session when known.
+///
+/// Session keying makes the pointer survive a resume in a new process
+/// and keeps concurrent sessions (each its own `agent` process, incl.
+/// subagents) from clobbering each other. Without a session id (test
+/// or minimal contexts) the per-process pid key is used — the
+/// pre-session behavior.
+fn active_plan_pointer(session_id: Option<&str>) -> PathBuf {
+    let sanitized = session_id.map(|sid| {
+        sid.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect::<String>()
+    });
+    match sanitized.as_deref() {
+        // "s-" prefix keeps session keys disjoint from the numeric pid
+        // namespace below.
+        Some(sid) if !sid.is_empty() => plan_dir().join(format!(".active-plan-s-{sid}")),
+        _ => plan_dir().join(format!(".active-plan-{}", std::process::id())),
+    }
 }
 
 /// Legacy shared pointer name (pre-per-process); still read as a fallback
-/// so a session resumed in a new process can find its plan.
+/// so a session started under an older build can find its plan.
 fn legacy_plan_pointer() -> PathBuf {
     plan_dir().join(".active-plan")
 }
 
-fn set_active_plan_path(path: &Path) -> std::io::Result<()> {
+fn set_active_plan_path(path: &Path, session_id: Option<&str>) -> std::io::Result<()> {
     let _ = std::fs::create_dir_all(plan_dir());
-    std::fs::write(active_plan_pointer(), path.to_string_lossy().as_bytes())
+    std::fs::write(
+        active_plan_pointer(session_id),
+        path.to_string_lossy().as_bytes(),
+    )
 }
 
-fn active_plan_path() -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(active_plan_pointer())
+/// Read the active plan path: session pointer first, then the pid
+/// pointer (state written before session ids were threaded through, or
+/// by contexts without one), then the legacy shared name.
+fn active_plan_path(session_id: Option<&str>) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(active_plan_pointer(session_id))
+        .or_else(|_| std::fs::read_to_string(active_plan_pointer(None)))
         .or_else(|_| std::fs::read_to_string(legacy_plan_pointer()))
         .ok()?;
     let trimmed = raw.trim();
@@ -372,14 +390,18 @@ fn active_plan_path() -> Option<PathBuf> {
     }
 }
 
-fn clear_active_plan_path() -> std::io::Result<()> {
-    // Remove the legacy pointer too so a stale shared file can't shadow
-    // future fallback reads.
+fn clear_active_plan_path(session_id: Option<&str>) -> std::io::Result<()> {
+    // Remove the pid and legacy pointers too so a stale file can't
+    // shadow future fallback reads.
     let legacy = legacy_plan_pointer();
     if legacy.exists() {
         let _ = std::fs::remove_file(legacy);
     }
-    let ptr = active_plan_pointer();
+    let pid_ptr = active_plan_pointer(None);
+    if pid_ptr.exists() {
+        let _ = std::fs::remove_file(pid_ptr);
+    }
+    let ptr = active_plan_pointer(session_id);
     if ptr.exists() {
         std::fs::remove_file(ptr)?;
     }
@@ -436,6 +458,61 @@ mod tests {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn plan_pointer_is_session_scoped_when_id_present() {
+        let with_session = active_plan_pointer(Some("abc-123"));
+        let name = with_session.file_name().unwrap().to_string_lossy();
+        assert_eq!(name, ".active-plan-s-abc-123");
+        assert!(
+            !name.contains(&std::process::id().to_string()) || !name.starts_with(".active-plan-s"),
+            "session pointer must not depend on the pid, so a resumed \
+             session in a new process finds the same pointer"
+        );
+        // Without a session id: the pid-scoped pre-session behavior.
+        let without = active_plan_pointer(None);
+        assert_eq!(
+            without.file_name().unwrap().to_string_lossy(),
+            format!(".active-plan-{}", std::process::id())
+        );
+    }
+
+    #[test]
+    fn plan_pointer_sanitizes_hostile_session_ids() {
+        let ptr = active_plan_pointer(Some("../../etc/passwd"));
+        let name = ptr.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!name.contains(".."), "path metacharacters stripped: {name}");
+        assert!(ptr.parent().unwrap().ends_with("plans"));
+        // A fully-hostile id that sanitizes to empty falls back to pid.
+        let empty = active_plan_pointer(Some("/../"));
+        assert_eq!(
+            empty.file_name().unwrap().to_string_lossy(),
+            format!(".active-plan-{}", std::process::id())
+        );
+    }
+
+    #[test]
+    fn plan_pointer_roundtrip_and_pid_fallback() {
+        let sid = format!("test-sess-{}", std::process::id());
+        let plan = plan_dir().join("roundtrip-test.md");
+
+        // Session-scoped write is read back under the same session id.
+        set_active_plan_path(&plan, Some(&sid)).unwrap();
+        assert_eq!(active_plan_path(Some(&sid)), Some(plan.clone()));
+
+        // A different session must not see it via the session pointer;
+        // absent its own pointer it falls back to pid/legacy, so clear
+        // those first to assert isolation.
+        clear_active_plan_path(Some(&sid)).unwrap();
+        assert_eq!(active_plan_path(Some(&sid)), None);
+
+        // Pointer written without a session id (pid-scoped) is still
+        // found by a session-id read — the fallback chain covers state
+        // written by contexts that lack an id.
+        set_active_plan_path(&plan, None).unwrap();
+        assert_eq!(active_plan_path(Some(&sid)), Some(plan.clone()));
+        clear_active_plan_path(None).unwrap();
+    }
+
     fn test_ctx() -> ToolContext {
         ToolContext {
             cwd: PathBuf::from("/tmp"),
@@ -457,6 +534,8 @@ mod tests {
             tool_events: None,
             active_call_id: None,
             subagent_api_defaults: None,
+            live_plan_mode: None,
+            session_id: None,
         }
     }
 
