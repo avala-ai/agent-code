@@ -93,7 +93,7 @@ pub fn assert_snapshot(name: &str, actual: &str) {
         std::fs::write(&path, actual).expect("write snapshot");
         return;
     }
-    let Ok(expected) = std::fs::read_to_string(&path) else {
+    let Ok(expected) = std::fs::read_to_string(&path).map(|s| normalize_newlines(&s)) else {
         panic!(
             "missing snapshot {}\n\
              re-run with UPDATE_SNAPSHOTS=1 and review the result before committing.\n\
@@ -109,6 +109,13 @@ pub fn assert_snapshot(name: &str, actual: &str) {
             path.display()
         );
     }
+}
+
+/// Strip `\r` so a checkout that converted line endings still compares
+/// equal. `.gitattributes` marks these files as LF, but a test that
+/// fails because of the reader's git config is a bad test.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
 }
 
 fn snapshot_path(name: &str) -> std::path::PathBuf {
@@ -161,6 +168,15 @@ mod tests {
             crate::ui::modern::render::buffer_to_string(&recoloured),
             "precondition: the glyph-only view cannot see this change"
         );
+    }
+
+    #[test]
+    fn crlf_in_a_snapshot_file_still_compares_equal() {
+        // Git on Windows rewrites line endings on checkout, which made
+        // every file-based snapshot fail there while passing on Linux.
+        let lf = "== glyphs ==\nab\n";
+        assert_eq!(normalize_newlines("== glyphs ==\r\nab\r\n"), lf);
+        assert_eq!(normalize_newlines(lf), lf);
     }
 
     #[test]
