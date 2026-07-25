@@ -302,10 +302,26 @@ fn contained_in(cwd: &Path, path: &Path) -> bool {
 }
 
 /// Label a resolved path for the model: workspace-relative when possible.
+///
+/// Components are joined with `/` on every platform. The label is
+/// model-facing text that the model quotes back in later tool calls, and
+/// the mention it came from was written with `/`, so the two shapes have
+/// to agree. `to_string_lossy` on the relative path emitted `src\main.rs`
+/// on Windows.
+///
+/// Joining components rather than substituting characters is what makes
+/// this safe on Unix, where a backslash is a legal filename character: it
+/// stays inside a single component and is never mistaken for a separator.
 fn display_path(cwd: &Path, path: &Path, raw: &str) -> String {
     let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     path.strip_prefix(&cwd_canon)
-        .map(|rel| rel.to_string_lossy().replace('"', "'"))
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+                .replace('"', "'")
+        })
         .unwrap_or_else(|_| raw.replace('"', "'"))
 }
 
@@ -588,6 +604,32 @@ mod tests {
             out.notes
         );
         assert!(!out.prompt.contains("<file"));
+    }
+
+    #[test]
+    fn file_labels_use_forward_slashes_on_every_platform() {
+        let dir = fixture();
+        let out = expand_mentions("see @src/main.rs", dir.path()).expect("expanded");
+        assert!(
+            out.prompt.contains("<file path=\"src/main.rs\">"),
+            "label kept an OS separator: {}",
+            out.prompt
+        );
+    }
+
+    // A backslash is a legal filename character on Unix, so separator
+    // normalization must not rewrite one that is part of a name.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_inside_a_unix_filename_survives() {
+        let dir = fixture();
+        fs::write(dir.path().join("we\\ird.txt"), "hi\n").unwrap();
+        let out = expand_mentions("see @we\\ird.txt", dir.path()).expect("expanded");
+        assert!(
+            out.prompt.contains("we\\ird.txt"),
+            "mangled a real filename: {}",
+            out.prompt
+        );
     }
 
     // Unix-only: creating a symlink on Windows needs developer mode or
