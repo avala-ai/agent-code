@@ -1,0 +1,62 @@
+== glyphs ==
+agent-code 0.27.0  test-model   NORMAL   /w
+
+────────────────────────────────────────────────────────────────────────────────
+ ⠋ action required
+  · Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Ent
+er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
+
+   ┌ permission · Bash ─────────────────────────────────────────────────────┐
+   │Bash: run `cargo test`                                                  │
+   │                                                                        │
+   │{                                                                       │
+   │  "command": "cargo test"                                               │
+   │}                                                                       │
+   │                                                                        │
+   │[y] once   [a] session   [n]/[Esc] deny                                 │
+   └────────────────────────────────────────────────────────────────────────┘
+
+
+
+ turn 0 │ 0 tok │ $0.0000 │ ⠋  action required │ sid sess1234
+╭ composer ────────────────────────────────────────────────────────────────────╮
+│❯                                                                             │
+│Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+== styles ==
+aaaaaaaaaabccccccbbddddddddddbbeeeeeeeebbccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+fffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggbbb
+bbbghhhhhhhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgcbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgcccccccccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgcbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgfffffffffffffffffffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbfffiiiiiiiiiiiiiiiiibccccccccccccccbbbbbbbbbbbbbbbbbb
+gaaaaaaaaaaggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
+gaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbg
+gccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccg
+gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
+
+== legend ==
+a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
+b fg=Reset bg=Reset mods=NONE
+c fg=DarkGray bg=Reset mods=NONE
+d fg=Gray bg=Reset mods=NONE
+e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
+f fg=Rgb(229, 192, 123) bg=Reset mods=BOLD
+g fg=Rgb(97, 175, 239) bg=Reset mods=NONE
+h fg=White bg=Reset mods=NONE
+i fg=Black bg=Rgb(229, 192, 123) mods=BOLD
