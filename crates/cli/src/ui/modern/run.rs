@@ -2023,24 +2023,47 @@ mod tests {
         pop_keyboard_enhancement(&mut buf);
         assert!(buf.is_empty(), "must not pop what we never pushed");
 
-        // With the capability granted the push happens once and the pop
-        // is armed exactly once.
+        // With the capability granted the push is attempted. Whether the
+        // terminal layer accepts it is platform-dependent: the sequence is a
+        // Unix terminal concept, and the Windows console path rejects the
+        // command outright. So assert the *invariant* rather than success —
+        // we record a push exactly when bytes went out, and we only ever pop
+        // what we pushed. An unbalanced pop would eat an outer
+        // application's keyboard flags.
         KEYBOARD_ENHANCEMENT_WANTED.store(true, Ordering::Relaxed);
+        buf.clear();
         push_keyboard_enhancement(&mut buf);
-        assert!(KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed));
-        push_keyboard_enhancement(&mut buf);
+        let pushed = KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed);
         assert_eq!(
-            String::from_utf8_lossy(&buf).matches("\x1b[>").count(),
-            1,
-            "push must be idempotent"
+            pushed,
+            !buf.is_empty(),
+            "the pushed flag must track whether bytes were actually emitted"
         );
-        buf.clear();
-        pop_keyboard_enhancement(&mut buf);
-        assert_eq!(String::from_utf8_lossy(&buf), "\x1b[<1u");
-        assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed));
-        buf.clear();
-        pop_keyboard_enhancement(&mut buf);
-        assert!(buf.is_empty(), "double pop must be a no-op");
+
+        if pushed {
+            push_keyboard_enhancement(&mut buf);
+            assert_eq!(
+                String::from_utf8_lossy(&buf).matches("\x1b[>").count(),
+                1,
+                "push must be idempotent"
+            );
+            buf.clear();
+            pop_keyboard_enhancement(&mut buf);
+            assert_eq!(String::from_utf8_lossy(&buf), "\x1b[<1u");
+            assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::Relaxed));
+            buf.clear();
+            pop_keyboard_enhancement(&mut buf);
+            assert!(buf.is_empty(), "double pop must be a no-op");
+        } else {
+            // The platform refused the push; we must not claim it happened,
+            // and must not emit a pop we never earned.
+            buf.clear();
+            pop_keyboard_enhancement(&mut buf);
+            assert!(
+                buf.is_empty(),
+                "must not pop when the push was rejected by the platform"
+            );
+        }
         KEYBOARD_ENHANCEMENT_WANTED.store(false, Ordering::Relaxed);
     }
 
