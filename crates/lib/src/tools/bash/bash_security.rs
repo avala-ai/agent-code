@@ -142,10 +142,15 @@ pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
     // each invocation from its tokens with the shell quoting removed and
     // scan that too. Additive — anything the raw scan catches is still
     // caught.
+    //
+    // A space inside one token is data, not an argument boundary —
+    // `printf '%s\n' 'git push' --force` prints two strings, it does
+    // not push. Mask intra-token spaces so a pattern can only match
+    // across real argv boundaries.
     for invocation in &cmd.invocations {
         let normalized = invocation
             .iter()
-            .map(|t| unquote_token(t))
+            .map(|t| unquote_token(t).replace(' ', "\u{0}"))
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
@@ -337,6 +342,10 @@ mod tests {
             // the segment after it must not be unquoted into a head.
             "printf '%s\\n' 'keep|rm'",
             "grep 'foo|dd' notes.txt",
+            // A space inside a quoted argument is data, not an argument
+            // boundary: this prints two strings, it does not push.
+            "printf '%s\\n' 'git push' --force",
+            "printf '%s' 'git clean' -f",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
