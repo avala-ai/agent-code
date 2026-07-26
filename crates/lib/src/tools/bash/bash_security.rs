@@ -648,14 +648,18 @@ const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly"
 /// `FOO=bar` on its own, or `export FOO=bar` — outlives the statement.
 fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
+    // `command export FOO=bar` exports just as `export FOO=bar` does,
+    // so the builtin wrappers come off before the head is read.
     let exports_via_builtin = parsed.invocations.iter().any(|invocation| {
         invocation
-            .first()
-            .is_some_and(|t| EXPORTING_BUILTINS.contains(&base_name(&unquote_token(t)).as_str()))
+            .iter()
+            .map(|t| base_name(&unquote_token(t)))
+            .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()))
+            .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()))
     });
     if exports_via_builtin {
         for invocation in &parsed.invocations {
-            for token in invocation.iter().skip(1) {
+            for token in invocation {
                 push_assignment(&mut pairs, &unquote_token(token));
             }
         }
@@ -840,7 +844,14 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         }
         match name.strip_prefix("GIT_CONFIG_KEY_") {
             Some(index) if index.chars().all(|c| c.is_ascii_digit()) => {
-                dynamic_value || names_an_alias
+                // An include directive pulls in a file whose contents
+                // are not in the command either, and that file can
+                // define aliases just as a config file can.
+                let value = value.to_lowercase();
+                dynamic_value
+                    || names_an_alias
+                    || value.starts_with("include.")
+                    || value.starts_with("includeif.")
             }
             _ => false,
         }
@@ -1526,6 +1537,13 @@ mod tests {
             // Appending to an unset variable just sets it.
             "export GIT_CONFIG_GLOBAL+=/tmp/g; git p",
             "GIT_CONFIG_GLOBAL+=/tmp/g\ngit p",
+            // A builtin wrapper does not stop the export.
+            "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
+            // An include directive pulls in a file that can define
+            // aliases.
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path \
+             GIT_CONFIG_VALUE_0=/tmp/g git p",
             // An interpreter that can run a command does not make its
             // operands data.
             "awk 'BEGIN{system(ARGV[1] \" \" ARGV[2] \" \" ARGV[3]); exit}' git push -uf",
