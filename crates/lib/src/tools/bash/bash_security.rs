@@ -368,6 +368,11 @@ fn clustered_git_flag(invocation: &[String]) -> Option<String> {
 /// needs no option grammar at all, and an operand that happens to be
 /// spelled `push` only costs an over-block.
 fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
+    // `git --html-path push -uf` prints a path and exits — no
+    // subcommand is dispatched, so nothing after the global runs.
+    if dispatches_no_subcommand(after_git) {
+        return None;
+    }
     if let Some(reason) = scan_git_subcommands(after_git) {
         return Some(reason);
     }
@@ -458,6 +463,47 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
 
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// Index of the git command word — the first token that is neither a
+/// global option nor the operand of one. `None` when a global makes
+/// git print and exit, or when no command word follows.
+fn git_command_index(tokens: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if !token.starts_with('-') {
+            return Some(idx);
+        }
+        if GIT_REPORT_ONLY_GLOBALS.contains(&token.as_str()) {
+            return None;
+        }
+        idx += if GIT_GLOBAL_OPERAND_OPTIONS.contains(&token.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+/// True when a leading global stops git before it dispatches anything,
+/// so no later token is a command however it is spelled.
+fn dispatches_no_subcommand(tokens: &[String]) -> bool {
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if !token.starts_with('-') {
+            return false;
+        }
+        if GIT_REPORT_ONLY_GLOBALS.contains(&token.as_str()) {
+            return true;
+        }
+        idx += if GIT_GLOBAL_OPERAND_OPTIONS.contains(&token.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
 
 /// Outcome of resolving the git command token through inline aliases.
 enum AliasExpansion {
@@ -567,24 +613,7 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
             .map(|(_, expansion)| expansion.clone())
     };
 
-    // The command is the first token that is neither an option nor the
-    // operand of one.
-    let mut idx = 0;
-    while let Some(token) = tokens.get(idx) {
-        if !token.starts_with('-') {
-            break;
-        }
-        // `git --version p` prints a version and exits; nothing after
-        // it is a command at all.
-        if GIT_REPORT_ONLY_GLOBALS.contains(&token.as_str()) {
-            return None;
-        }
-        idx += if GIT_GLOBAL_OPERAND_OPTIONS.contains(&token.as_str()) {
-            2
-        } else {
-            1
-        };
-    }
+    let idx = git_command_index(tokens)?;
     let mut expansion = lookup(&tokens.get(idx)?.to_lowercase())?;
     // An alias can name another alias. Follow the chain, refusing to
     // revisit a name so a cycle cannot spin.
@@ -1053,9 +1082,12 @@ mod tests {
             // An alias name reused as an operand of another
             // subcommand is not the command token.
             "git -c 'alias.p=push --force' status p",
-            // A global that prints and exits dispatches no subcommand.
+            // A global that prints and exits dispatches no subcommand,
+            // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
             "git -c 'alias.p=push -uf' --man-path p",
+            "git --html-path push -uf",
+            "git --info-path clean -df",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
