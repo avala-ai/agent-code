@@ -691,14 +691,27 @@ const EXPORTING_BUILTINS: &[&str] = &["export"];
 /// Builtins that declare a variable but export it only with `-x`.
 const DECLARING_BUILTINS: &[&str] = &["declare", "typeset", "readonly", "local"];
 
-/// True when `invocation`'s head declares *and* exports: `export …`,
-/// or a declaration builtin given `-x`.
-fn exports_variables(words: &[String]) -> bool {
-    let Some(head) = words
+/// The head a statement runs, with builtin wrappers and their options
+/// (`command -p export …`) skipped.
+fn effective_head(words: &[String]) -> Option<String> {
+    words
         .iter()
         .map(|word| base_name(word))
         .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
-    else {
+}
+
+/// True when the head assigns a shell variable, whether or not it
+/// exports one.
+fn declares_variables(words: &[String]) -> bool {
+    effective_head(words).is_some_and(|head| {
+        EXPORTING_BUILTINS.contains(&head.as_str()) || DECLARING_BUILTINS.contains(&head.as_str())
+    })
+}
+
+/// True when `invocation`'s head declares *and* exports: `export …`,
+/// or a declaration builtin given `-x`.
+fn exports_variables(words: &[String]) -> bool {
+    let Some(head) = effective_head(words) else {
         return false;
     };
     if EXPORTING_BUILTINS.contains(&head.as_str()) {
@@ -724,6 +737,11 @@ fn allexport_transition(parsed: &ParsedCommand) -> Option<bool> {
         }
         let rest: Vec<String> = words.collect();
         for (index, word) in rest.iter().enumerate() {
+            // `set -a -- +a` ends option parsing: `+a` is a positional
+            // argument, not a toggle.
+            if word == "--" {
+                break;
+            }
             let Some(cluster) = word.strip_prefix(['-', '+']) else {
                 continue;
             };
@@ -784,20 +802,36 @@ fn apply_statement_env(
                     .collect::<Vec<_>>(),
             )
         });
+    // A declaration builtin assigns whether or not it exports: after
+    // `declare FOO=/tmp/g`, a later `export FOO` sends that value on.
+    // `-x` decides the attribute, not whether the value is recorded.
+    let declares = exports
+        || declares_variables(&words)
+        || parsed.invocations.iter().any(|invocation| {
+            declares_variables(
+                &invocation
+                    .iter()
+                    .map(|t| unquote_token(t))
+                    .collect::<Vec<_>>(),
+            )
+        });
     let mut assigned: Vec<(String, String)> = Vec::new();
-    if exports || parsed.invocations.is_empty() {
+    if declares || parsed.invocations.is_empty() {
         for (name, value) in &parsed.assignments {
             push_assignment(&mut assigned, &format!("{name}={}", unquote_token(value)));
         }
     }
-    if exports {
+    if declares {
         for invocation in &parsed.invocations {
             for token in invocation {
                 push_assignment(&mut assigned, &unquote_token(token));
             }
         }
-        // `export FOO` with no value exports a variable assigned
-        // earlier, so the name alone carries the attribute.
+    }
+    // `export FOO` with no value exports a variable assigned earlier,
+    // so the name alone carries the attribute. A declaration without
+    // `-x` grants nothing, hence `exports` rather than `declares`.
+    if exports {
         for word in words.iter().skip(1) {
             if !word.contains('=')
                 && !word.starts_with(['-', '+'])
@@ -1733,6 +1767,11 @@ mod tests {
             // The export attribute sticks to the name.
             "export GIT_CONFIG_GLOBAL=/dev/null; GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "GIT_CONFIG_GLOBAL=/tmp/g; export GIT_CONFIG_GLOBAL; git p",
+            // A declaration keeps its value for a later export.
+            "declare GIT_CONFIG_GLOBAL=/tmp/g; export GIT_CONFIG_GLOBAL; git p",
+            // `--` ends option parsing, so the later `+a` is an
+            // argument rather than a toggle.
+            "set -a -- +a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
