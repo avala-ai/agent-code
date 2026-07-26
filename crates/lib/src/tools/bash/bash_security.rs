@@ -238,10 +238,26 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // the state a shell would: each variable's latest value, and which
     // names carry the export attribute. That attribute sticks, so a
     // later bare assignment to an exported name still reaches git.
+    //
+    // The walk models a plain sequence of statements. Where the shell
+    // stops being one — a branch that may not run, a heredoc whose
+    // body is data rather than code, a `set` whose options this cannot
+    // resolve — the state after it is unknown, and a git command
+    // downstream of an unknown environment is refused rather than
+    // read against a state that may be wrong in either direction.
+    let statements = shell_statements(&cmd.raw);
+    if state_is_unresolvable(&cmd.raw, &statements) && carries_git_config(&statements) {
+        findings.push(DestructiveFinding {
+            level: DestructivenessLevel::Destructive,
+            reason: "git configuration is set where the shell state cannot be followed; what it \
+                     runs cannot be determined"
+                .to_string(),
+        });
+    }
     let mut shell_vars: Vec<(String, String)> = Vec::new();
     let mut exported: Vec<String> = Vec::new();
     let mut allexport = false;
-    for statement in shell_statements(&cmd.raw) {
+    for statement in statements {
         let Some(parsed) = parse_bash(&statement) else {
             continue;
         };
@@ -724,6 +740,75 @@ fn exports_variables(words: &[String]) -> bool {
         })
 }
 
+/// Environment variables that decide where git finds its
+/// configuration, and so what aliases it has.
+const GIT_CONFIG_SELECTORS: &[&str] = &[
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "HOME",
+    "XDG_CONFIG_HOME",
+];
+
+/// True when the command does something the statement walk cannot
+/// follow: a branch whose statements may not run, a heredoc whose body
+/// is data rather than statements, or a `set` carrying operands whose
+/// effect on `allexport` cannot be read off.
+///
+/// Only structure is judged here. Whether it matters is
+/// [`carries_git_config`]'s question, so an ordinary `git status &&
+/// git log` is untouched.
+fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
+    if raw.contains("&&") || raw.contains("||") || raw.contains("<<") {
+        return true;
+    }
+    statements.iter().any(|statement| {
+        let words = split_alias_value(statement);
+        if words.first().map(|word| base_name(word)).as_deref() != Some("set") {
+            return false;
+        }
+        let mut index = 1;
+        while let Some(word) = words.get(index) {
+            let Some(cluster) = word.strip_prefix(['-', '+']) else {
+                return true;
+            };
+            // `-o NAME` names a shell option; the name is its operand,
+            // not a positional argument.
+            index += if cluster == "o" { 2 } else { 1 };
+        }
+        false
+    })
+}
+
+/// True when some statement assigns a variable that selects git's
+/// configuration *and* is a candidate for outliving its statement —
+/// a bare assignment or a declaration, not a command prefix, which the
+/// shell scopes to the command it introduces.
+fn carries_git_config(statements: &[String]) -> bool {
+    statements.iter().any(|statement| {
+        let Some(parsed) = parse_bash(statement) else {
+            return false;
+        };
+        let words = split_alias_value(statement);
+        if !parsed.invocations.is_empty() && !declares_variables(&words) {
+            return false;
+        }
+        let mut assigned: Vec<(String, String)> = Vec::new();
+        for (name, value) in &parsed.assignments {
+            push_assignment(&mut assigned, &format!("{name}={}", unquote_token(value)));
+        }
+        for word in &words {
+            push_assignment(&mut assigned, word);
+        }
+        assigned.iter().any(|(name, _)| {
+            let name = name.to_ascii_uppercase();
+            GIT_CONFIG_SELECTORS.contains(&name.as_str()) || name.starts_with("GIT_CONFIG")
+        })
+    })
+}
+
 /// Whether a statement switches `allexport` on or off — `set -a` /
 /// `set -o allexport` and their `+` counterparts, which turn it back
 /// off. `None` when the statement says nothing about it.
@@ -743,7 +828,8 @@ fn allexport_transition(parsed: &ParsedCommand) -> Option<bool> {
                 break;
             }
             let Some(cluster) = word.strip_prefix(['-', '+']) else {
-                continue;
+                // The first operand ends option processing.
+                break;
             };
             let on = word.starts_with('-');
             if cluster == "o" {
@@ -1020,9 +1106,12 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         // A config *file* can define aliases too, and its contents are
         // not in the command at all. `/dev/null` and an empty path are
         // the documented way to ask for no config, and define nothing.
+        // `HOME` and `XDG_CONFIG_HOME` select where git looks for its
+        // ordinary config, so redirecting them supplies aliases just
+        // as naming a config file does.
         if matches!(
             name.as_str(),
-            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG"
+            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG" | "HOME" | "XDG_CONFIG_HOME"
         ) {
             return !matches!(value.as_str(), "/dev/null" | "");
         }
@@ -1772,6 +1861,17 @@ mod tests {
             // `--` ends option parsing, so the later `+a` is an
             // argument rather than a toggle.
             "set -a -- +a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // An operand ends `set` option processing too.
+            "set -a x +a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // A branch that may not run leaves the state unknown.
+            "GIT_CONFIG_GLOBAL=/tmp/g; export GIT_CONFIG_GLOBAL; \
+             false && GIT_CONFIG_GLOBAL=/dev/null; git p",
+            // A heredoc body is data, not statements.
+            "export GIT_CONFIG_GLOBAL=/tmp/g; cat <<EOF\nGIT_CONFIG_GLOBAL=/dev/null\nEOF\ngit p",
+            // `HOME` and `XDG_CONFIG_HOME` choose where git reads its
+            // config, aliases and all.
+            "HOME=/tmp/h git p",
+            "XDG_CONFIG_HOME=/tmp/h git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
