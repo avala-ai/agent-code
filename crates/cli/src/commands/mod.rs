@@ -1740,6 +1740,10 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                 let report = std::thread::spawn(move || {
                     rt.block_on(async move {
                         let mut guard = store.lock().await;
+                        // Re-read the file so the listing (and the count
+                        // in the clear message) reflects what other live
+                        // sessions have saved or cleared since load.
+                        guard.refresh();
                         if clearing {
                             let n = guard.len();
                             match guard.clear() {

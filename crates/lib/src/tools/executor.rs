@@ -429,9 +429,11 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 /// edit into a permanent license to write *anything* to that path.
 ///
 /// - `Bash`/`PowerShell`: the command string is the full operation
-///   (`description`/`timeout` are advisory), but the sandbox-bypass flag
-///   changes what an approval means, so it is part of the key — a grant
-///   recorded for a sandboxed run must not cover the unsandboxed variant.
+///   (`description`/`timeout` are advisory), but the sandbox-bypass and
+///   background flags change what an approval means, so they are part of
+///   the key — a grant recorded for a sandboxed foreground run must not
+///   cover the unsandboxed variant, and background runs skip the sandbox
+///   wrapper entirely.
 /// - `WebFetch`: the URL is the side effect.
 /// - Everything else, including every write tool, keys on the full input:
 ///   serde_json maps serialize with sorted keys (`preserve_order` is off),
@@ -446,7 +448,14 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value) -> String {
                 .get("dangerouslyDisableSandbox")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            format!("cmd:{command}\0nosandbox:{unsandboxed}")
+            // Background execution spawns bash directly and never goes
+            // through `sandbox.wrap`, so a foreground approval must not
+            // cover the backgrounded (effectively unsandboxed) variant.
+            let background = input
+                .get("run_in_background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            format!("cmd:{command}\0nosandbox:{unsandboxed}\0bg:{background}")
         }
         "WebFetch" => input
             .get("url")
@@ -470,7 +479,9 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value) -> String {
 
 /// FNV-1a, 64-bit. Not cryptographic — the grant file is trusted local
 /// state, the hash only needs to be deterministic and collision-sparse.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+/// Shared with `permissions::grants` for the grant-file name, which has
+/// the same stability requirement.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= u64::from(b);
@@ -575,6 +586,14 @@ mod session_allow_tests {
             &serde_json::json!({"command": "make", "dangerouslyDisableSandbox": true}),
         );
         assert_ne!(sandboxed, unsandboxed);
+        // Background runs skip the sandbox wrapper entirely, so the
+        // background flag splits the key the same way.
+        let backgrounded = persistent_grant_key(
+            "Bash",
+            &serde_json::json!({"command": "make", "run_in_background": true}),
+        );
+        assert_ne!(sandboxed, backgrounded);
+        assert_ne!(unsandboxed, backgrounded);
         // Advisory fields do not change what runs, so they do not split
         // the key — otherwise every grant would be single-use in practice.
         assert_eq!(

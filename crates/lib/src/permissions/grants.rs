@@ -101,9 +101,28 @@ impl GrantStore {
         }
     }
 
-    /// True when `key` has a recorded grant.
-    pub fn contains(&self, key: &str) -> bool {
+    /// True when `key` has a recorded grant, judged against the file as
+    /// it exists *right now*: the cached view is re-read first, so a
+    /// `/permissions clear` in another live session revokes here on the
+    /// very next check — a suppressed prompt must never outlive the file
+    /// that justified it. The re-read is cheap and this path only runs
+    /// for calls that would otherwise prompt a human.
+    pub fn contains(&mut self, key: &str) -> bool {
+        self.refresh();
         self.keys.contains(key)
+    }
+
+    /// Replace the cached view with the file as it exists on disk.
+    /// No-op for ephemeral stores. Callers that *display* grant state
+    /// (`/permissions`) should refresh first too, so the user never
+    /// revokes against a stale listing.
+    pub fn refresh(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let disk = read_grant_file(&path);
+        self.keys = disk.grants.iter().map(|g| g.key.clone()).collect();
+        self.labels = disk.grants.into_iter().map(|g| (g.key, g.label)).collect();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -117,9 +136,11 @@ impl GrantStore {
     /// Record a grant and persist it. Returns whether anything was
     /// written — a repeat grant is a no-op.
     ///
-    /// A write failure is reported to the caller but the in-memory grant
-    /// still stands for this session: the user said "always", and losing
-    /// the file should not also lose the answer they just gave.
+    /// A write failure is reported to the caller; the answer the user
+    /// just gave is not lost because the executor also records every
+    /// "always" in the session-allow store. (This store's cached view
+    /// tracks the *file* — see [`Self::contains`] — so it cannot promise
+    /// to remember what the file could not.)
     ///
     /// The write is serialized against other live sessions: under an
     /// exclusive file lock the current file is re-read and only this one
@@ -241,14 +262,33 @@ fn read_grant_file(path: &Path) -> GrantFile {
 /// so the file is named by a hash of the project path rather than stored
 /// alongside the code.
 fn grant_file_path(project_root: &Path) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
     let dir = crate::config::agent_config_dir()?;
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    canonical.to_string_lossy().hash(&mut h);
-    Some(dir.join("grants").join(format!("{:016x}.toml", h.finish())))
+    // Hash the raw path bytes, not a lossy string: lossy conversion maps
+    // every invalid byte to U+FFFD, which would let two different
+    // projects share one grant file — and therefore each other's
+    // approvals. FNV also keeps the filename stable across toolchains,
+    // which `DefaultHasher` explicitly does not guarantee.
+    #[cfg(unix)]
+    let bytes: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        canonical.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        canonical
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let bytes: Vec<u8> = canonical.to_string_lossy().into_owned().into_bytes();
+    let hash = crate::tools::executor::fnv1a64(&bytes);
+    Some(dir.join("grants").join(format!("{hash:016x}.toml")))
 }
 
 #[cfg(test)]
@@ -289,7 +329,7 @@ mod tests {
                 .unwrap()
         );
 
-        let reloaded = GrantStore::load(project.path());
+        let mut reloaded = GrantStore::load(project.path());
         assert!(reloaded.contains("Bash\0git status"));
         assert_eq!(reloaded.len(), 1);
     }
@@ -330,7 +370,7 @@ mod tests {
             .insert("Bash\0cargo test", "Bash: cargo test")
             .unwrap();
 
-        let store_b = GrantStore::load(b.path());
+        let mut store_b = GrantStore::load(b.path());
         assert!(
             !store_b.contains("Bash\0cargo test"),
             "a grant crossed into another project"
@@ -408,7 +448,7 @@ mod tests {
             .insert("Bash\0cargo fmt", "Bash: cargo fmt")
             .unwrap();
 
-        let on_disk = GrantStore::load(project.path());
+        let mut on_disk = GrantStore::load(project.path());
         assert!(on_disk.contains("Bash\0cargo test"), "A's grant was lost");
         assert!(on_disk.contains("Bash\0cargo fmt"), "B's grant was lost");
     }
@@ -435,7 +475,7 @@ mod tests {
             .insert("Bash\0new grant", "Bash: new grant")
             .unwrap();
 
-        let on_disk = GrantStore::load(project.path());
+        let mut on_disk = GrantStore::load(project.path());
         assert!(
             !on_disk.contains("Bash\0old grant"),
             "a stale session's insert resurrected a cleared grant"
@@ -466,8 +506,8 @@ mod tests {
         );
 
         store.insert("Bash\0ls", "Bash: ls").unwrap();
-        let a_reload = GrantStore::load(a.path());
-        let b_reload = GrantStore::load(b.path());
+        let mut a_reload = GrantStore::load(a.path());
+        let mut b_reload = GrantStore::load(b.path());
         assert!(
             !a_reload.contains("Bash\0ls"),
             "grant written to the old project"
@@ -478,5 +518,58 @@ mod tests {
             "old project lost its grant"
         );
         assert!(!b_reload.contains("Bash\0make deploy"));
+    }
+
+    /// Revocation must be immediate across live sessions: once any
+    /// session clears the file, another session's already-loaded store
+    /// must stop honoring the grant on the very next check — not after
+    /// a restart.
+    #[test]
+    fn a_clear_in_another_live_session_revokes_immediately() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut session_a = GrantStore::load(project.path());
+        session_a
+            .insert("Bash\0cargo run", "Bash: cargo run")
+            .unwrap();
+
+        let mut session_b = GrantStore::load(project.path());
+        assert!(session_b.contains("Bash\0cargo run"));
+
+        session_a.clear().unwrap();
+        assert!(
+            !session_b.contains("Bash\0cargo run"),
+            "a cleared grant kept suppressing prompts in a live session"
+        );
+    }
+
+    /// Two project paths that differ only in invalid UTF-8 bytes have
+    /// identical lossy renderings; hashing raw bytes must still give
+    /// them separate grant files, or they would share approvals.
+    #[cfg(unix)]
+    #[test]
+    fn projects_differing_only_in_invalid_utf8_get_separate_grant_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let _s = Sandbox::new();
+        let base = tempfile::tempdir().unwrap();
+        let a = base
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"proj-\xff\xfe"));
+        let b = base
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"proj-\xfe\xff"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "precondition: the lossy renderings collide"
+        );
+        assert_ne!(
+            grant_file_path(&a).unwrap(),
+            grant_file_path(&b).unwrap(),
+            "two different projects were assigned the same grant file"
+        );
     }
 }
