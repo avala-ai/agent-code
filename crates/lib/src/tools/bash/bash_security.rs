@@ -312,11 +312,18 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
 /// destructive. The text patterns only match a flag written on its
 /// own (`git push -f`), but short options cluster: `git push -uf`
 /// forces the same update and `git clean -df` deletes the same files.
-const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char])] = &[
-    ("push", &['f']),
-    ("clean", &['f', 'd']),
-    ("checkout", &['f']),
-    ("branch", &['D']),
+/// Each entry is the subcommand, its destructive short flags, and the
+/// long spellings of the same thing — `git push -u --force` never
+/// writes `git push --force` adjacently, so the text patterns miss it.
+const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char], &[&str])] = &[
+    (
+        "push",
+        &['f'],
+        &["force", "force-with-lease", "force-if-includes"],
+    ),
+    ("clean", &['f', 'd'], &["force"]),
+    ("checkout", &['f'], &["force"]),
+    ("branch", &['D'], &["delete", "force"]),
 ];
 
 /// A destructive short flag reached through a cluster, e.g. the `f` in
@@ -361,11 +368,12 @@ fn clustered_git_flag(invocation: &[String]) -> Option<String> {
 /// needs no option grammar at all, and an operand that happens to be
 /// spelled `push` only costs an over-block.
 fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
+    let after_git = expand_inline_aliases(after_git);
     for (idx, token) in after_git.iter().enumerate() {
         let subcommand = token.to_lowercase();
-        let Some((_, flags)) = DESTRUCTIVE_GIT_FLAGS
+        let Some((_, flags, longs)) = DESTRUCTIVE_GIT_FLAGS
             .iter()
-            .find(|(name, _)| *name == subcommand)
+            .find(|(name, _, _)| *name == subcommand)
         else {
             continue;
         };
@@ -379,7 +387,14 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
             let Some(cluster) = token.strip_prefix('-') else {
                 continue;
             };
-            if cluster.starts_with('-') {
+            if let Some(long) = cluster.strip_prefix('-') {
+                // `--force` need not sit next to the subcommand.
+                // `--no-force` turns it back off, so only the
+                // affirmative spelling counts.
+                let name = long.split('=').next().unwrap_or(long).to_lowercase();
+                if longs.contains(&name.as_str()) {
+                    return Some(format!("git {subcommand} with '--{name}'"));
+                }
                 continue;
             }
             // `git branch -D` is the destructive spelling; `-d`
@@ -395,6 +410,48 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Replace subcommand tokens that an inline `-c alias.NAME=VALUE`
+/// defines with what they expand to: `git -c alias.p=push p -uf …`
+/// runs `git push -uf …`, and the alias name alone matches no
+/// subcommand.
+///
+/// Only aliases defined in the same command are resolvable — one from
+/// the user's config is invisible here, and the raw scans remain the
+/// only cover for that.
+fn expand_inline_aliases(tokens: &[String]) -> Vec<String> {
+    let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
+    for token in tokens {
+        // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
+        // as one.
+        let body = token.strip_prefix("-c").unwrap_or(token);
+        let Some(definition) = body.strip_prefix("alias.") else {
+            continue;
+        };
+        if let Some((name, value)) = definition.split_once('=')
+            && !name.is_empty()
+        {
+            aliases.push((
+                name.to_lowercase(),
+                value.split_whitespace().map(str::to_string).collect(),
+            ));
+        }
+    }
+    if aliases.is_empty() {
+        return tokens.to_vec();
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match aliases
+            .iter()
+            .find(|(name, _)| *name == token.to_lowercase())
+        {
+            Some((_, expansion)) => out.extend(expansion.iter().cloned()),
+            None => out.push(token.clone()),
+        }
+    }
+    out
 }
 
 /// Commands that take a command string and run it in a fresh shell.
@@ -726,6 +783,15 @@ mod tests {
             "git --git-dir .git push -uf origin main",
             "git --work-tree /tmp/repo clean -df",
             "git --namespace ns push -uf origin main",
+            // A long force option that is not adjacent to the
+            // subcommand.
+            "git push -u --force origin main",
+            "git push --verbose --force origin main",
+            "git push --quiet --force-with-lease origin main",
+            "git branch --quiet --delete old",
+            // Aliases defined in the same command.
+            "git -c alias.p=push p -uf origin main",
+            "git -c alias.p='push --force' p origin main",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -807,6 +873,10 @@ mod tests {
             // Past `--` a dash-prefixed word is a pathspec.
             "git clean -n -- -dir",
             "git checkout main -- -file",
+            // `--no-force` turns the option back off.
+            "git push --no-force origin main",
+            // An alias that expands to something harmless.
+            "git -c alias.s=status s",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
