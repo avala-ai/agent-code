@@ -32,12 +32,13 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk shape. A plain list keeps the file reviewable by hand, which
 /// matters for something that grants execution.
+///
+/// Deliberately does NOT record the project path in cleartext: paths are
+/// user-controlled strings that can embed credentials, and this file
+/// lives in the config directory, where secrets must never be written.
+/// The filename (a digest of the project root) already scopes it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct GrantFile {
-    /// Project this file belongs to, recorded for auditability. Not used
-    /// for matching — the filename already scopes it.
-    #[serde(default)]
-    project: String,
     #[serde(default)]
     grants: Vec<GrantEntry>,
 }
@@ -55,7 +56,6 @@ struct GrantEntry {
 #[derive(Debug)]
 pub struct GrantStore {
     path: Option<PathBuf>,
-    project: String,
     keys: HashSet<String>,
     labels: Vec<(String, String)>,
     /// Exact keys the user answered "always" to that could not be
@@ -65,16 +65,18 @@ pub struct GrantStore {
 }
 
 impl GrantStore {
-    /// Load the grants recorded for `project_root`.
+    /// Load the grants recorded for the project containing `start`.
+    ///
+    /// The scope is the enclosing repository root when there is one, so
+    /// `/cd` between directories of one project keeps the same grants;
+    /// a directory outside any repository is its own scope.
     ///
     /// Never fails: an unreadable or malformed file yields an empty store
     /// so a corrupt grant file makes the agent ask *more*, not less.
-    pub fn load(project_root: &Path) -> Self {
-        let project = project_root.to_string_lossy().into_owned();
-        let path = grant_file_path(project_root);
+    pub fn load(start: &Path) -> Self {
+        let path = grant_file_path(&scope_root(start));
         let mut store = Self {
             path,
-            project,
             keys: HashSet::new(),
             session_fallback: HashSet::new(),
             labels: Vec::new(),
@@ -100,7 +102,6 @@ impl GrantStore {
     pub fn ephemeral() -> Self {
         Self {
             path: None,
-            project: String::new(),
             keys: HashSet::new(),
             session_fallback: HashSet::new(),
             labels: Vec::new(),
@@ -226,11 +227,7 @@ impl GrantStore {
 
     /// Write `file` to `path`. Caller must hold the grant-file lock.
     fn write_locked(&self, path: &Path, file: &GrantFile) -> Result<(), String> {
-        let file = GrantFile {
-            project: self.project.clone(),
-            grants: file.grants.clone(),
-        };
-        let body = toml::to_string_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
+        let body = toml::to_string_pretty(file).map_err(|e| format!("serialize: {e}"))?;
         // Same atomic + restrictive-permissions write the credential
         // paths use: this file decides what runs without asking.
         crate::config::atomic::atomic_write_secret(path, body.as_bytes())
@@ -280,6 +277,25 @@ fn read_grant_file(path: &Path) -> GrantFile {
 /// A repository must not be able to ship approvals to whoever clones it,
 /// so the file is named by a hash of the project path rather than stored
 /// alongside the code.
+/// The directory that scopes grants: the enclosing repository root
+/// (`.git` directory, or `.git` link file in a worktree) when there is
+/// one, else the starting directory itself. `/cd src/` inside one
+/// repository must keep the same grant file; separate worktrees stay
+/// separate scopes on purpose — they can be on different branches with
+/// different code, so approvals should not cross.
+fn scope_root(start: &Path) -> PathBuf {
+    let canonical = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    let mut dir = canonical.clone();
+    loop {
+        if dir.join(".git").exists() {
+            return dir;
+        }
+        if !dir.pop() {
+            return canonical;
+        }
+    }
+}
+
 fn grant_file_path(project_root: &Path) -> Option<PathBuf> {
     let dir = crate::config::agent_config_dir()?;
     let canonical = project_root
@@ -548,6 +564,28 @@ mod tests {
         assert!(
             !session_b.contains("Bash\0cargo run"),
             "a cleared grant kept suppressing prompts in a live session"
+        );
+    }
+
+    /// `/cd` between directories of one repository must keep the same
+    /// grant scope — grants belong to the project, not the exact cwd.
+    #[test]
+    fn subdirectories_of_one_repository_share_the_grant_scope() {
+        let _s = Sandbox::new();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let sub = repo.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+
+        let mut root_store = GrantStore::load(repo.path());
+        root_store
+            .insert("Bash\0cargo test", "Bash: cargo test")
+            .unwrap();
+
+        let mut sub_store = GrantStore::load(&sub);
+        assert!(
+            sub_store.contains("Bash\0cargo test"),
+            "grants vanished after moving into a subdirectory of the same repo"
         );
     }
 

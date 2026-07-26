@@ -508,15 +508,12 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
             )
         }
         _ => {
+            // Digest only — no readable path prefix. File and MCP paths
+            // can themselves carry credentials (signed tokens in file
+            // names, secret-bearing MCP path fields), and this key is
+            // persisted; the path is already inside the hashed input.
             let s = serde_json::to_string(input).unwrap_or_default();
-            // Keep the path readable in the key for file tools so the
-            // grant file stays auditable; the digest pins the payload.
-            let path = input
-                .get("file_path")
-                .or_else(|| input.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("{path}\0sha256:{}", sha256_hex(s.as_bytes()))
+            format!("sha256:{}", sha256_hex(s.as_bytes()))
         }
     };
     format!("{tool}\0{shape}")
@@ -547,18 +544,10 @@ pub fn persistent_grant_label(tool: &str, input: &serde_json::Value) -> String {
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("WebFetch: {} (exact URL; not stored)", url_host(url))
         }
-        _ => {
-            let path = input
-                .get("file_path")
-                .or_else(|| input.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if path.is_empty() {
-                format!("{tool}: exact input (hashed)")
-            } else {
-                format!("{tool}: {path} (exact payload)")
-            }
-        }
+        // No path in the label either: paths are user-controlled strings
+        // that can embed credentials, and the label is persisted. The
+        // tool name plus "exact call" is the whole safe audit surface.
+        _ => format!("{tool}: one exact call (input stored as digest)"),
     }
 }
 
@@ -823,6 +812,18 @@ mod session_allow_tests {
             ),
             "different URLs must not share a grant"
         );
+
+        // Paths can carry secrets too (signed tokens in file names, MCP
+        // path fields): they appear only inside the digest, never in
+        // cleartext, in both the key and the label.
+        let write_input = serde_json::json!({
+            "file_path": format!("/tmp/export-{secret}.csv"),
+            "content": "data",
+        });
+        let key = pkey("FileWrite", &write_input);
+        let label = persistent_grant_label("FileWrite", &write_input);
+        assert!(!key.contains(secret), "path secret leaked into key: {key}");
+        assert!(!label.contains(secret), "path secret leaked: {label}");
     }
 
     /// The sanitizers themselves must not be leak vectors: a leading
