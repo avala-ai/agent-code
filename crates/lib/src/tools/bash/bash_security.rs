@@ -656,6 +656,18 @@ const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly"
 /// `FOO=bar` on its own, or `export FOO=bar` — outlives the statement.
 fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
+    // `command -v export FOO=bar` prints a description of `export` and
+    // exports nothing.
+    if parsed.invocations.iter().any(|invocation| {
+        wrapper_only_reports(
+            &invocation
+                .iter()
+                .map(|t| unquote_token(t))
+                .collect::<Vec<_>>(),
+        )
+    }) {
+        return pairs;
+    }
     // `command export FOO=bar` exports just as `export FOO=bar` does,
     // so the builtin wrappers come off before the head is read.
     let exports_via_builtin = parsed.invocations.iter().any(|invocation| {
@@ -834,12 +846,20 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         let name = name.to_ascii_uppercase();
         let dynamic_value = value.contains('$') || value.contains('`');
         let names_an_alias = value.to_lowercase().starts_with("alias.");
+        // A name the shell still has to expand could be any variable,
+        // including one that configures git: `env "$K=/tmp/g" git p`
+        // sets whatever `K` holds.
+        if name.contains(['$', '`']) {
+            return true;
+        }
         if name == "GIT_CONFIG_PARAMETERS" {
-            let value = value.to_lowercase();
+            // Each parameter is `'key'='value'`; the key is what
+            // decides, and `user.alias.foo` is not an alias.
             return dynamic_value
-                || ["alias.", "include.", "includeif."]
+                || split_alias_value(value)
                     .iter()
-                    .any(|prefix| value.contains(prefix));
+                    .flat_map(|pair| pair.split('=').next())
+                    .any(config_key_is_opaque);
         }
         // A config *file* can define aliases too, and its contents are
         // not in the command at all. `/dev/null` and an empty path are
@@ -1226,20 +1246,30 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
             }
         } else if base == "git"
             && let Some(AliasExpansion::Tokens(expansion)) = expand_command_alias(rest)
-            && let Some(shell_form) = expansion.first().and_then(|first| first.strip_prefix('!'))
+            && let Some(first) = expansion.first()
         {
-            // A `!` alias is a shell command, not a git subcommand:
-            // `-c "alias.p=!sh -c 'git push -uf'"` runs a shell. Its
-            // words go through as payloads so the nested command is
-            // scanned rather than read as one opaque token.
-            payloads.push(shell_form.to_string());
-            payloads.extend(expansion[1..].iter().cloned());
-            payloads.push(
-                std::iter::once(shell_form.to_string())
-                    .chain(expansion[1..].iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            match first.strip_prefix('!') {
+                // A `!` alias is a shell command, not a git
+                // subcommand: `-c "alias.p=!sh -c 'git push -uf'"`
+                // runs a shell. Its words go through as payloads so
+                // the nested command is scanned rather than read as
+                // one opaque token.
+                Some(shell_form) => {
+                    payloads.push(shell_form.to_string());
+                    payloads.extend(expansion[1..].iter().cloned());
+                    payloads.push(
+                        std::iter::once(shell_form.to_string())
+                            .chain(expansion[1..].iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                // An ordinary alias expands to a git command, which
+                // has to face every destructive rule rather than only
+                // the flag table: `-c 'alias.p=reset --hard' p` runs
+                // `git reset --hard`.
+                None => payloads.push(format!("git {}", expansion.join(" "))),
+            }
         }
     }
     payloads
@@ -1581,6 +1611,13 @@ mod tests {
             "git -c include.path=/tmp/g p",
             "git --config-env=include.path=VAR p",
             "GIT_CONFIG_PARAMETERS=\"'include.path'='/tmp/g'\" git p",
+            // An alias that expands to a destructive operation with no
+            // flag cluster of its own.
+            "git -c 'alias.p=reset --hard' p",
+            "git -c 'alias.p=stash clear' p",
+            // An assignment name the shell has still to expand could
+            // be any variable at all.
+            "env \"$K=/tmp/g\" git p",
             // An interpreter that can run a command does not make its
             // operands data.
             "awk 'BEGIN{system(ARGV[1] \" \" ARGV[2] \" \" ARGV[3]); exit}' git push -uf",
@@ -1702,6 +1739,10 @@ mod tests {
             // A prefix-scoped assignment on a data command: the `git`
             // here is a word to print, not a command.
             "GIT_CONFIG_GLOBAL=/tmp/g printf '%s\\n' git",
+            // A key that merely contains `alias.` does not define one.
+            "GIT_CONFIG_PARAMETERS=\"'user.alias.foo'='x'\" git status",
+            // `command -v` describes the builtin, it does not run it.
+            "command -v export GIT_CONFIG_GLOBAL=/tmp/g; git status",
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true && git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
