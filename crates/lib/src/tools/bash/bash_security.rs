@@ -220,10 +220,18 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // a prefix assignment belongs to the command it precedes, and
     // `GIT_CONFIG_GLOBAL=… /bin/true; git status` must not tar the
     // second statement with the first one's environment.
+    //
+    // Environment that outlives its statement is carried forward:
+    // only a *command prefix* (`FOO=bar cmd`) is scoped to one command
+    // by the shell. A bare `FOO=bar` statement, or one behind `export`
+    // and friends, sets the variable for everything after it, so
+    // `export GIT_CONFIG_GLOBAL=…; git p` must be read as one story.
+    let mut carried: Vec<(String, String)> = Vec::new();
     for statement in shell_statements(&cmd.raw) {
         let Some(parsed) = parse_bash(&statement) else {
             continue;
         };
+        carried.extend(exported_env_pairs(&statement, &parsed));
         // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
         // bash -c 'git p'` configures the git inside the payload. The
         // payload is one token here, so tokens are searched word by
@@ -246,11 +254,13 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         if !runs_git {
             continue;
         }
-        let mut pairs: Vec<(String, String)> = parsed
-            .assignments
-            .iter()
-            .map(|(name, value)| (unquote_token(name), unquote_token(value)))
-            .collect();
+        let mut pairs: Vec<(String, String)> = carried.clone();
+        pairs.extend(
+            parsed
+                .assignments
+                .iter()
+                .map(|(name, value)| (unquote_token(name), unquote_token(value))),
+        );
         for invocation in &parsed.invocations {
             pairs.extend(runner_env_pairs(invocation));
         }
@@ -627,6 +637,40 @@ fn shell_statements(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Builtins that set a variable for everything that follows rather
+/// than for one command.
+const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local", "set"];
+
+/// The assignments a statement leaves behind for later statements.
+///
+/// A command prefix (`FOO=bar cmd`) is scoped to that command by the
+/// shell and is *not* carried. Everything else that assigns —
+/// `FOO=bar` on its own, or `export FOO=bar` — outlives the statement.
+fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let exports_via_builtin = parsed.invocations.iter().any(|invocation| {
+        invocation
+            .first()
+            .is_some_and(|t| EXPORTING_BUILTINS.contains(&base_name(&unquote_token(t)).as_str()))
+    });
+    if exports_via_builtin {
+        for invocation in &parsed.invocations {
+            for token in invocation.iter().skip(1) {
+                push_assignment(&mut pairs, &unquote_token(token));
+            }
+        }
+        return pairs;
+    }
+    // A statement that is only assignments runs no command, so its
+    // assignments are not a prefix — they persist.
+    if parsed.invocations.is_empty() {
+        for word in split_alias_value(statement) {
+            push_assignment(&mut pairs, &word);
+        }
+    }
+    pairs
+}
+
 /// True when a statement names a `GIT_CONFIG…` variable that the
 /// positional walk did not collect, so what git will be configured
 /// with cannot be said.
@@ -944,9 +988,15 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
             (token == "--config-env")
                 .then(|| tokens.get(i + 1))?
                 .map(String::as_str)
-        }) && let Some(name) = alias_key_name(definition)
-        {
-            opaque.push(name);
+        }) {
+            // The key's own spelling can be expanded, and then which
+            // command it binds to is decided by the shell, not here.
+            if definition.contains(['$', '`']) {
+                return Some(AliasExpansion::Unresolved);
+            }
+            if let Some(name) = alias_key_name(definition) {
+                opaque.push(name);
+            }
         }
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
         // as one.
@@ -1459,6 +1509,12 @@ mod tests {
             // An alias name the shell still has to expand binds to a
             // command word only at run time.
             "git -c alias.${PATH:+p}='push --force' p",
+            "A='push --force' git --config-env=alias.$NAME=A p",
+            // Environment that outlives its statement reaches a later
+            // git.
+            "export GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "GIT_CONFIG_GLOBAL=/tmp/g\ngit p",
+            "export GIT_CONFIG_GLOBAL=/tmp/g && git p",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
