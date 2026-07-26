@@ -669,11 +669,10 @@ fn draw_permission_modal(
         lines,
         &format!(" permission · {} ", pending.name),
         accent,
-        // Keep ≤ ~40 cols so min-width modals still show every binding
-        // (digits 1/2/3 work the same as y/a/n; listed in /help).
-        Some(key_hint_line(
-            "[y] once   [a] session   [A] always   [n]/[Esc] deny",
-        )),
+        // Keep ≤ 40 cols so min-width modals still show every binding —
+        // the deny action must never be the one that gets clipped.
+        // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
+        Some(key_hint_line("[y] once [a] session [A] always [n] deny")),
     );
 }
 

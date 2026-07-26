@@ -291,22 +291,7 @@ fn grant_file_path(project_root: &Path) -> Option<PathBuf> {
     // approvals. SHA-256 keeps the filename stable across toolchains
     // (which `DefaultHasher` explicitly does not guarantee) and makes
     // engineered filename collisions unrealistic.
-    #[cfg(unix)]
-    let bytes: Vec<u8> = {
-        use std::os::unix::ffi::OsStrExt;
-        canonical.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(windows)]
-    let bytes: Vec<u8> = {
-        use std::os::windows::ffi::OsStrExt;
-        canonical
-            .as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect()
-    };
-    #[cfg(not(any(unix, windows)))]
-    let bytes: Vec<u8> = canonical.to_string_lossy().into_owned().into_bytes();
+    let bytes = crate::config::os_path_bytes(&canonical);
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(&bytes);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();

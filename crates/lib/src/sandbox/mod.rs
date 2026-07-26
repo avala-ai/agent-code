@@ -209,13 +209,15 @@ impl SandboxExecutor {
             h.update(bytes);
         };
         part(self.strategy.name().as_bytes());
-        part(self.policy.project_dir.to_string_lossy().as_bytes());
+        // Raw path bytes, not lossy strings: paths differing only in
+        // invalid UTF-8 must not collapse into one fingerprint.
+        part(&crate::config::os_path_bytes(&self.policy.project_dir));
         for p in &self.policy.allowed_write_paths {
-            part(p.to_string_lossy().as_bytes());
+            part(&crate::config::os_path_bytes(p));
         }
         part(b"|forbidden|");
         for p in &self.policy.forbidden_paths {
-            part(p.to_string_lossy().as_bytes());
+            part(&crate::config::os_path_bytes(p));
         }
         part(&[
             u8::from(self.policy.allow_network),
@@ -402,6 +404,29 @@ mod tests {
             SandboxExecutor::from_config(&sample_config(true, "none"), Path::new("/other"))
                 .isolation_fingerprint(),
             "a different project dir is a different regime"
+        );
+    }
+
+    /// Policy paths that differ only in invalid UTF-8 bytes render to
+    /// the same lossy string; the fingerprint must hash raw bytes and
+    /// keep them distinct.
+    #[cfg(unix)]
+    #[test]
+    fn isolation_fingerprint_distinguishes_invalid_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let a = PathBuf::from(OsStr::from_bytes(b"/proj-\xff\xfe"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/proj-\xfe\xff"));
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "precondition: lossy renderings collide"
+        );
+        let cfg = sample_config(true, "none");
+        assert_ne!(
+            SandboxExecutor::from_config(&cfg, &a).isolation_fingerprint(),
+            SandboxExecutor::from_config(&cfg, &b).isolation_fingerprint(),
+            "two different policies collapsed into one fingerprint"
         );
     }
 
