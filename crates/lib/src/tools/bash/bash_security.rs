@@ -257,7 +257,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // command text, which is the same answer as any other
     // unresolvable input — refuse rather than read the untranslated
     // source as if it were the result.
-    if has_locale_translation(&cmd.raw) {
+    if shell_text_facts(&cmd.raw).locale_quote {
         findings.push(DestructiveFinding {
             level: DestructivenessLevel::Destructive,
             reason: "locale-translated string ($\"…\"); what it runs cannot be determined"
@@ -834,82 +834,98 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "XDG_CONFIG_HOME",
 ];
 
-/// True when the command contains a locale-translated string, whose
-/// content the catalogue decides rather than the command text. Inside
-/// quotes `$"` is ordinary characters, so only an unquoted one counts.
-fn has_locale_translation(raw: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some('\'') => {
-                if c == '\'' {
-                    quote = None;
-                }
-            }
-            Some(_) => match c {
-                '"' => quote = None,
-                '\\' => {
-                    chars.next();
-                }
-                _ => {}
-            },
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '\\' => {
-                    chars.next();
-                }
-                '$' if chars.peek() == Some(&'"') => return true,
-                _ => {}
-            },
-        }
-    }
-    false
+/// What a quote-aware pass over the command text found.
+///
+/// One pass answers both questions, so a construct either scanner
+/// would have missed — a substitution that restarts quoting, a
+/// comment — cannot be handled correctly by one and not the other.
+struct ShellTextFacts {
+    /// `&&`, `||` or a heredoc as an actual shell construct.
+    control_operator: bool,
+    /// A locale-translated `$"…"` string, whose content the catalogue
+    /// decides rather than the command text.
+    locale_quote: bool,
 }
 
-/// True when `&&`, `||` or a heredoc appears as an actual shell
-/// construct rather than inside quoted data or a comment: `printf
-/// '%s\n' 'a && b'` branches nowhere.
-fn has_unquoted_operator(raw: &str) -> bool {
-    let mut quote: Option<char> = None;
+/// Read `raw` the way the shell reads it: quotes nest, a substitution
+/// restarts quoting inside itself, and a `#` beginning a word starts a
+/// comment.
+fn shell_text_facts(raw: &str) -> ShellTextFacts {
+    enum Context {
+        Single,
+        Double,
+        Paren,
+        Brace,
+        Backtick,
+    }
+    let mut facts = ShellTextFacts {
+        control_operator: false,
+        locale_quote: false,
+    };
+    let mut stack: Vec<Context> = Vec::new();
     let mut at_word_start = true;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
-        let was_word_start = at_word_start;
+        let word_start = at_word_start;
         at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
-        let at_word_start = was_word_start;
-        match quote {
-            Some('\'') => {
-                if c == '\'' {
-                    quote = None;
+        if matches!(stack.last(), Some(Context::Single)) {
+            if c == '\'' {
+                stack.pop();
+            }
+            continue;
+        }
+        let in_double = matches!(stack.last(), Some(Context::Double));
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' if !in_double => stack.push(Context::Single),
+            '"' => {
+                if in_double {
+                    stack.pop();
+                } else {
+                    stack.push(Context::Double);
                 }
             }
-            Some(_) => match c {
-                '"' => quote = None,
-                '\\' => {
+            // `$(` restarts quoting inside the substitution; `$"`
+            // opens a translated string, but only where a `$` is
+            // special — inside double quotes it is literal text.
+            '$' => match chars.peek() {
+                Some('(') => {
                     chars.next();
+                    stack.push(Context::Paren);
                 }
+                Some('"') if !in_double => facts.locale_quote = true,
                 _ => {}
             },
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '\\' => {
+            '`' => {
+                if matches!(stack.last(), Some(Context::Backtick)) {
+                    stack.pop();
+                } else {
+                    stack.push(Context::Backtick);
+                }
+            }
+            '(' if !in_double => stack.push(Context::Paren),
+            '{' if !in_double => stack.push(Context::Brace),
+            ')' if matches!(stack.last(), Some(Context::Paren)) => {
+                stack.pop();
+            }
+            '}' if matches!(stack.last(), Some(Context::Brace)) => {
+                stack.pop();
+            }
+            '#' if word_start && !in_double => {
+                while chars.peek().is_some_and(|next| *next != '\n') {
                     chars.next();
                 }
-                // A comment runs to the end of the line — but `#`
-                // starts one only at the beginning of a word, so
-                // `false#x` is an ordinary word.
-                '#' if at_word_start => {
-                    while chars.peek().is_some_and(|next| *next != '\n') {
-                        chars.next();
-                    }
-                }
-                '&' | '|' | '<' if chars.peek() == Some(&c) => return true,
-                _ => {}
-            },
+            }
+            '&' | '|' | '<' if !in_double && chars.peek() == Some(&c) => {
+                facts.control_operator = true;
+                chars.next();
+            }
+            _ => {}
         }
     }
-    false
+    facts
 }
 
 /// True when the command does something the statement walk cannot
@@ -921,7 +937,7 @@ fn has_unquoted_operator(raw: &str) -> bool {
 /// [`carries_git_config`]'s question, so an ordinary `git status &&
 /// git log` is untouched.
 fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
-    if has_unquoted_operator(raw) {
+    if shell_text_facts(raw).control_operator {
         return true;
     }
     statements.iter().any(|statement| {
@@ -2067,6 +2083,9 @@ mod tests {
             // The locale catalogue decides what a `$\"…\"` string is,
             // so even an innocuous-looking one is unknown.
             "$\"cat\" file.txt",
+            // A substitution restarts quoting, so the translation
+            // inside it is one too.
+            "echo \"$($\"cat\" /tmp/file)\"",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
@@ -2135,6 +2154,8 @@ mod tests {
             // translation.
             "echo \"$\"",
             "echo '$\"cat\"'",
+            // A comment is never evaluated.
+            "echo ok # $\"translation example\"",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
