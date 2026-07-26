@@ -201,14 +201,6 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             continue;
         }
         let unwrapped = unwrapped_argv(invocation);
-        // Assignments are collected from both views: `env -S 'FOO=bar
-        // git p'` keeps them inside one token until the wrapper is
-        // unwrapped, while a plain `env FOO=bar git p` loses them when
-        // it is.
-        let mut env_pairs = git_env_pairs(cmd, invocation);
-        if let Some(unwrapped) = unwrapped.as_deref() {
-            env_pairs.extend(git_env_pairs(cmd, unwrapped));
-        }
         for tokens in [Some(invocation.as_slice()), unwrapped.as_deref()]
             .into_iter()
             .flatten()
@@ -219,23 +211,50 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                     reason,
                 });
             }
-            // Config from the environment never appears in argv, so an
-            // alias defined there turns any command word into something
-            // this scan cannot read. The variables reach git either as
-            // a shell prefix assignment or as an `env` operand, and
-            // unwrapping strips the latter, so both are collected.
-            if env_defines_opaque_git_alias(&env_pairs)
-                && tokens
+        }
+    }
+
+    // Git configuration handed over through the environment never
+    // appears in the argv, so an alias defined there turns the command
+    // word into something this scan cannot read. Done per statement:
+    // a prefix assignment belongs to the command it precedes, and
+    // `GIT_CONFIG_GLOBAL=… /bin/true; git status` must not tar the
+    // second statement with the first one's environment.
+    for statement in shell_statements(&cmd.raw) {
+        let Some(parsed) = parse_bash(&statement) else {
+            continue;
+        };
+        let runs_git = parsed.invocations.iter().any(|invocation| {
+            [
+                Some(invocation.as_slice()),
+                unwrapped_argv(invocation).as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|tokens| {
+                tokens
                     .iter()
                     .any(|t| base_name(&unquote_token(t)).to_lowercase() == "git")
-            {
-                findings.push(DestructiveFinding {
-                    level: DestructivenessLevel::Destructive,
-                    reason: "git alias comes from the environment; what it runs cannot be \
-                             determined"
-                        .to_string(),
-                });
-            }
+            })
+        });
+        if !runs_git {
+            continue;
+        }
+        let mut pairs: Vec<(String, String)> = parsed
+            .assignments
+            .iter()
+            .map(|(name, value)| (unquote_token(name), unquote_token(value)))
+            .collect();
+        for invocation in &parsed.invocations {
+            pairs.extend(runner_env_pairs(invocation));
+        }
+        if env_defines_opaque_git_alias(&pairs) {
+            findings.push(DestructiveFinding {
+                level: DestructivenessLevel::Destructive,
+                reason: "git configuration comes from the environment; what it runs cannot be \
+                         determined"
+                    .to_string(),
+            });
         }
     }
 
@@ -492,20 +511,73 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
 
-/// Every environment assignment that reaches the command, with shell
-/// quoting removed: shell prefixes (`FOO=bar cmd`) and `env` operands
-/// (`env FOO=bar cmd`) both set the variable, and the parser keeps
-/// them in different places.
-fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = cmd
-        .assignments
-        .iter()
-        .map(|(name, value)| (unquote_token(name), unquote_token(value)))
-        .collect();
-    // Only where a runner would actually apply them. A `NAME=VALUE`
-    // string among the operands of an ordinary command is data:
-    // `printf '%s\n' 'GIT_CONFIG_KEY_0=alias.p' git` prints two words
-    // and sets nothing.
+/// The command's statements, split on the separators that end one:
+/// `;`, `&&`, `||`, `|`, `&` and newlines. Quoted separators are not
+/// separators, so a `;` inside an argument keeps its statement whole.
+///
+/// A prefix assignment applies to the statement it introduces and no
+/// other, so environment questions are answered per statement rather
+/// than over the whole script.
+fn shell_statements(raw: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(open) => {
+                current.push(c);
+                if c == open {
+                    quote = None;
+                } else if c == '\\'
+                    && open == '"'
+                    && let Some(escaped) = chars.next()
+                {
+                    current.push(escaped);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                '\\' => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                }
+                ';' | '\n' | '|' | '&' => {
+                    // Consume the second character of `&&` and `||`.
+                    if (c == '|' || c == '&') && chars.peek() == Some(&c) {
+                        chars.next();
+                    }
+                    statements.push(std::mem::take(&mut current));
+                }
+                _ => current.push(c),
+            },
+        }
+    }
+    statements.push(current);
+    statements
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// Short options of `env` that take a separate operand, so the token
+/// after them is not the command and not an assignment.
+const ENV_OPERAND_OPTIONS: &[&str] = &["-u", "--unset", "-C", "--chdir"];
+
+/// The environment assignments a runner invocation applies, with shell
+/// quoting removed.
+///
+/// Only where a runner would actually apply them. A `NAME=VALUE`
+/// string among the operands of an ordinary command is data:
+/// `printf '%s\n' 'GIT_CONFIG_KEY_0=alias.p' git` prints two words and
+/// sets nothing.
+fn runner_env_pairs(invocation: &[String]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let head = invocation
         .first()
         .map(|t| base_name(&unquote_token(t)).to_lowercase());
@@ -532,7 +604,14 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
             continue;
         }
         if unquoted.starts_with('-') {
-            idx += 1;
+            // An option with a separate operand takes the next token
+            // with it — `env -u X GIT_CONFIG_GLOBAL=… git p` would
+            // otherwise read `X` as the command and stop.
+            idx += if ENV_OPERAND_OPTIONS.contains(&unquoted.as_str()) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         if !push_assignment(&mut pairs, &unquoted) {
@@ -1260,6 +1339,9 @@ mod tests {
             // A config file can define aliases the command never shows.
             "GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
             "env GIT_CONFIG_SYSTEM=/tmp/g git p origin main",
+            // An option operand must not be mistaken for the command.
+            "env -u X GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
+            "env -C /tmp GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
@@ -1372,6 +1454,10 @@ mod tests {
             // Asking for no config at all defines nothing.
             "GIT_CONFIG_GLOBAL=/dev/null git status",
             "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git log -p",
+            // A prefix assignment belongs to the statement it
+            // introduces, not to a later one.
+            "GIT_CONFIG_GLOBAL=/tmp/g /bin/true; git status",
+            "GIT_CONFIG_GLOBAL=/tmp/g /bin/true && git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
             "printf '%s\\n' 'GIT_CONFIG_KEY_0=alias.p' git",
