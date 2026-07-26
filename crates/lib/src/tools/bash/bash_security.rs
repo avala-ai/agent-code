@@ -10,7 +10,7 @@
 //! invocations are blocked.
 
 use crate::tools::bash_parse::{
-    ParsedCommand, base_name, parse_bash, unquote_token, unwrapped_argv,
+    ParsedCommand, base_name, is_env_assignment, parse_bash, unquote_token, unwrapped_argv,
 };
 
 /// Severity of a destructive-command finding.
@@ -212,8 +212,10 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             }
             // Config from the environment never appears in argv, so an
             // alias defined there turns any command word into something
-            // this scan cannot read.
-            if env_defines_opaque_git_alias(&cmd.assignments)
+            // this scan cannot read. The variables reach git either as
+            // a shell prefix assignment or as an `env` operand, and
+            // unwrapping strips the latter, so both are collected.
+            if env_defines_opaque_git_alias(&git_env_pairs(cmd, invocation))
                 && tokens
                     .iter()
                     .any(|t| base_name(&unquote_token(t)).to_lowercase() == "git")
@@ -480,6 +482,27 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
 
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// Every environment assignment that reaches the command, with shell
+/// quoting removed: shell prefixes (`FOO=bar cmd`) and `env` operands
+/// (`env FOO=bar cmd`) both set the variable, and the parser keeps
+/// them in different places.
+fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = cmd
+        .assignments
+        .iter()
+        .map(|(name, value)| (unquote_token(name), unquote_token(value)))
+        .collect();
+    for token in invocation {
+        let unquoted = unquote_token(token);
+        if is_env_assignment(&unquoted)
+            && let Some((name, value)) = unquoted.split_once('=')
+        {
+            pairs.push((name.to_string(), value.to_string()));
+        }
+    }
+    pairs
+}
 
 /// True when a prefix assignment hands git configuration through the
 /// environment in a way that could define an alias:
@@ -1107,6 +1130,12 @@ mod tests {
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push --force' \
              git p origin main",
             "GIT_CONFIG_PARAMETERS='alias.p=push --force' git p origin main",
+            // The same variables as `env` operands rather than shell
+            // prefix assignments, and with the key itself quoted.
+            "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p \
+             GIT_CONFIG_VALUE_0='push --force' git p origin main",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='alias.p' \
+             GIT_CONFIG_VALUE_0='push --force' git p origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
