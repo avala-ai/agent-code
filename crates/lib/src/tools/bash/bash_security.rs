@@ -536,6 +536,13 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
             continue;
         }
         if !push_assignment(&mut pairs, &unquoted) {
+            // Another wrapper: its own operands are still environment
+            // for whatever runs at the end of the chain, so keep
+            // walking. `env env FOO=bar git p` sets FOO.
+            if COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquoted).to_lowercase().as_str()) {
+                idx += 1;
+                continue;
+            }
             // The command word: later operands belong to it.
             break;
         }
@@ -599,6 +606,15 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         let names_an_alias = value.to_lowercase().starts_with("alias.");
         if name == "GIT_CONFIG_PARAMETERS" {
             return dynamic_value || value.to_lowercase().contains("alias.");
+        }
+        // A config *file* can define aliases too, and its contents are
+        // not in the command at all. `/dev/null` and an empty path are
+        // the documented way to ask for no config, and define nothing.
+        if matches!(
+            name.as_str(),
+            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG"
+        ) {
+            return !matches!(value.as_str(), "/dev/null" | "");
         }
         // A name the shell still has to expand cannot be ruled out:
         // `GIT_CONFIG_KEY_$I=alias.p` is `GIT_CONFIG_KEY_0` by the time
@@ -1238,6 +1254,12 @@ mod tests {
              GIT_CONFIG_VALUE_0='push --force' git p origin main\"",
             "env -S 'GIT_CONFIG_COUNT=1\\_GIT_CONFIG_KEY_0=alias.p\\_\
              GIT_CONFIG_VALUE_0=\"push\\_--force\"\\_git\\_p\\_origin\\_main'",
+            // An `env` behind another wrapper still sets the variable.
+            "env env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p \
+             GIT_CONFIG_VALUE_0='push -uf' git p origin main",
+            // A config file can define aliases the command never shows.
+            "GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
+            "env GIT_CONFIG_SYSTEM=/tmp/g git p origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
@@ -1347,6 +1369,9 @@ mod tests {
             // Ordinary env config defines no alias.
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=me git commit",
             "env GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=me git commit",
+            // Asking for no config at all defines nothing.
+            "GIT_CONFIG_GLOBAL=/dev/null git status",
+            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
             "printf '%s\\n' 'GIT_CONFIG_KEY_0=alias.p' git",
