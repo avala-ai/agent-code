@@ -531,7 +531,15 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
             }
         }
     }
-    if let Some(reason) = scan_git_subcommands(after_git) {
+    // From the command word onwards, so a global's operand is not read
+    // as the subcommand: `git -C push grep -f …` greps in a directory
+    // named `push`. When the command word cannot be located the whole
+    // tail is scanned instead, which over-matches rather than missing.
+    let tail = match git_command_index(after_git) {
+        Some(index) => &after_git[index..],
+        None => after_git,
+    };
+    if let Some(reason) = scan_git_subcommands(tail) {
         return Some(reason);
     }
     // Nothing literal. The command token may still be an alias defined
@@ -2106,6 +2114,10 @@ mod tests {
             // An operator inside quoted data branches nowhere.
             "export GIT_CONFIG_GLOBAL=/dev/null; printf '%s\\n' 'a && b'; git status",
             "export GIT_CONFIG_GLOBAL=/dev/null; echo '<<EOF'; git status",
+            // A global's operand is not the subcommand: this greps in
+            // a directory that happens to be named `push`.
+            "git -C push grep -f ../patterns",
+            "git --git-dir clean status",
             // A key that merely contains `alias.` does not define one.
             "GIT_CONFIG_PARAMETERS=\"'user.alias.foo'='x'\" git status",
             // `command -v` describes the builtin, it does not run it.
