@@ -249,35 +249,36 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // the text the inner shell receives.
     for invocation in &cmd.invocations {
         let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
-        // `env bash -c …` and `command bash -c …` run the inner
-        // shell, so the wrapper chain has to come off before the
-        // head means anything. Reuses the wrapper resolution the
-        // parser already models rather than a second copy of it.
+        // `env bash -c …` and `command bash -c …` run the inner shell,
+        // so the wrapper chain has to come off before the head means
+        // anything. Reuses the wrapper resolution the parser already
+        // models rather than a second copy of it. When it resolves,
+        // the wrapped view is the *only* accurate one — scanning the
+        // wrapper's own argv as well would read `env` as the head and
+        // lose which command the operands belong to.
         let unwrapped = unwrapped_argv(invocation);
-        for tokens in [Some(&unquoted), unwrapped.as_ref()].into_iter().flatten() {
-            for payload in shell_payloads(tokens) {
-                // Out of budget with a shell payload still in hand:
-                // what it runs is unknown, and an unknown nested
-                // command cannot be waved through. Refusing here
-                // over-blocks deeply nested but innocent commands —
-                // the safe direction, and the same call
-                // `protected_paths` makes at its own depth cap.
-                if depth >= MAX_SHELL_SCAN_DEPTH {
-                    findings.push(DestructiveFinding {
-                        level: DestructivenessLevel::Destructive,
-                        reason: format!(
-                            "nested shell payload exceeds scan depth {MAX_SHELL_SCAN_DEPTH}; \
-                             what it runs cannot be determined"
-                        ),
-                    });
-                    continue;
-                }
-                let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
-                    raw: payload.clone(),
-                    ..ParsedCommand::default()
+        let tokens = unwrapped.as_ref().unwrap_or(&unquoted);
+        for payload in shell_payloads(tokens) {
+            // Out of budget with a shell payload still in hand: what
+            // it runs is unknown, and an unknown nested command cannot
+            // be waved through. Refusing here over-blocks deeply
+            // nested but innocent commands — the safe direction, and
+            // the same call `protected_paths` makes at its own cap.
+            if depth >= MAX_SHELL_SCAN_DEPTH {
+                findings.push(DestructiveFinding {
+                    level: DestructivenessLevel::Destructive,
+                    reason: format!(
+                        "nested shell payload exceeds scan depth {MAX_SHELL_SCAN_DEPTH}; \
+                         what it runs cannot be determined"
+                    ),
                 });
-                findings.extend(find_destructive_depth(&inner, depth + 1));
+                continue;
             }
+            let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
+                raw: payload.clone(),
+                ..ParsedCommand::default()
+            });
+            findings.extend(find_destructive_depth(&inner, depth + 1));
         }
     }
 
@@ -611,6 +612,10 @@ mod tests {
             "echo bash -c \"'rm' -rf /tmp/x\"",
             // `-C` is noclobber in bash, not an init command.
             "bash -C safe.sh \"'git' push --force\"",
+            // A data command behind a wrapper: the wrapped view is the
+            // one that says which command the operands belong to.
+            "env printf '%s\\n' bash -c \"'git' push --force\"",
+            "command echo bash -c \"'rm' -rf /tmp/x\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
