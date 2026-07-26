@@ -368,7 +368,15 @@ fn clustered_git_flag(invocation: &[String]) -> Option<String> {
 /// needs no option grammar at all, and an operand that happens to be
 /// spelled `push` only costs an over-block.
 fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
-    let after_git = expand_inline_aliases(after_git);
+    if let Some(reason) = scan_git_subcommands(after_git) {
+        return Some(reason);
+    }
+    // Nothing literal. The command token may still be an alias defined
+    // in this same command, which only expansion reveals.
+    scan_git_subcommands(&expand_command_alias(after_git)?)
+}
+
+fn scan_git_subcommands(after_git: &[String]) -> Option<String> {
     for (idx, token) in after_git.iter().enumerate() {
         let subcommand = token.to_lowercase();
         let Some((_, flags, longs)) = DESTRUCTIVE_GIT_FLAGS
@@ -420,15 +428,35 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
     None
 }
 
-/// Replace subcommand tokens that an inline `-c alias.NAME=VALUE`
-/// defines with what they expand to: `git -c alias.p=push p -uf …`
+/// Git global options that take a separate operand, so the token
+/// after them is not the command.
+const GIT_GLOBAL_OPERAND_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--super-prefix",
+    "--config-env",
+];
+
+/// How many alias hops to follow. Aliases can name other aliases.
+const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// The tokens with the git *command* replaced by what an inline
+/// `-c alias.NAME=VALUE` defines it as: `git -c alias.p=push p -uf …`
 /// runs `git push -uf …`, and the alias name alone matches no
-/// subcommand.
+/// subcommand. `None` when nothing expanded.
+///
+/// Only the command token is rewritten. Substituting every matching
+/// token would turn the pathspec in `git -c 'alias.p=push --force'
+/// status p` into a force push that never runs.
 ///
 /// Only aliases defined in the same command are resolvable — one from
 /// the user's config is invisible here, and the raw scans remain the
 /// only cover for that.
-fn expand_inline_aliases(tokens: &[String]) -> Vec<String> {
+fn expand_command_alias(tokens: &[String]) -> Option<Vec<String>> {
     let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
     for token in tokens {
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
@@ -447,23 +475,49 @@ fn expand_inline_aliases(tokens: &[String]) -> Vec<String> {
         }
     }
     if aliases.is_empty() {
-        return tokens.to_vec();
+        return None;
     }
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        // Git takes the last `-c` value for a repeated key, so the
-        // search runs backwards: `-c alias.p=status -c 'alias.p=push
-        // --force'` defines `p` as the force push.
-        match aliases
+    // Git takes the last `-c` value for a repeated key, so lookups run
+    // backwards: `-c alias.p=status -c 'alias.p=push --force'` defines
+    // `p` as the force push.
+    let lookup = |name: &str| {
+        aliases
             .iter()
             .rev()
-            .find(|(name, _)| *name == token.to_lowercase())
-        {
-            Some((_, expansion)) => out.extend(expansion.iter().cloned()),
-            None => out.push(token.clone()),
+            .find(|(alias, _)| alias == name)
+            .map(|(_, expansion)| expansion.clone())
+    };
+
+    // The command is the first token that is neither an option nor the
+    // operand of one.
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if !token.starts_with('-') {
+            break;
         }
+        idx += if GIT_GLOBAL_OPERAND_OPTIONS.contains(&token.as_str()) {
+            2
+        } else {
+            1
+        };
     }
-    out
+    let mut expansion = lookup(&tokens.get(idx)?.to_lowercase())?;
+    // An alias can name another alias. Follow the chain, refusing to
+    // revisit a name so a cycle cannot spin.
+    let mut seen = vec![tokens[idx].to_lowercase()];
+    for _ in 0..MAX_GIT_ALIAS_DEPTH {
+        let Some(head) = expansion.first().map(|t| t.to_lowercase()) else {
+            break;
+        };
+        if seen.contains(&head) {
+            break;
+        }
+        let Some(next) = lookup(&head) else { break };
+        seen.push(head);
+        expansion.splice(0..1, next);
+    }
+    expansion.extend_from_slice(&tokens[idx + 1..]);
+    Some(expansion)
 }
 
 /// Commands that take a command string and run it in a fresh shell.
@@ -806,6 +860,8 @@ mod tests {
             "git -c alias.p='push --force' p origin main",
             // Git takes the last value for a repeated key.
             "git -c alias.p=status -c 'alias.p=push --force' p origin main",
+            // An alias that names another alias.
+            "git -c alias.p=q -c 'alias.q=push -uf' p origin main",
             // Unambiguous abbreviations of a long option.
             "git push --quiet --force-w origin main",
             "git push --quiet --forc origin main",
@@ -894,6 +950,9 @@ mod tests {
             "git push --no-force origin main",
             // An alias that expands to something harmless.
             "git -c alias.s=status s",
+            // An alias name reused as an operand of another
+            // subcommand is not the command token.
+            "git -c 'alias.p=push --force' status p",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
