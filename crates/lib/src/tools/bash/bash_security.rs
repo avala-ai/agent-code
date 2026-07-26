@@ -255,10 +255,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // parser already models rather than a second copy of it.
         let unwrapped = unwrapped_argv(invocation);
         for tokens in [Some(&unquoted), unwrapped.as_ref()].into_iter().flatten() {
-            let Some((head, args)) = tokens.split_first() else {
-                continue;
-            };
-            for payload in shell_payloads(&base_name(head).to_lowercase(), args) {
+            for payload in shell_payloads(tokens) {
                 // Out of budget with a shell payload still in hand:
                 // what it runs is unknown, and an unknown nested
                 // command cannot be waved through. Refusing here
@@ -287,34 +284,42 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     findings
 }
 
+/// Commands that take a command string and run it in a fresh shell.
+const SHELL_LAUNCHERS: &[&str] = &["bash", "sh", "zsh", "dash", "ash", "ksh", "exec"];
+
 /// The literal command strings an invocation may hand to another
-/// shell. `eval` concatenates its arguments; a shell takes its command
-/// from `-c`.
+/// shell.
 ///
-/// For a shell, every argument is treated as a candidate rather than
-/// only the operand after `-c`. Locating `-c` exactly would mean
+/// A shell name is looked for at *any* position, not just the head.
+/// Anything that runs another program can sit in front of one —
+/// `timeout 10 bash -c '…'`, `sudo bash -c '…'`, `xargs bash -c '…'`,
+/// `nice`, `stdbuf`, `chroot` — and enumerating those runners is a
+/// list that is always one entry short. What the payload needs is a
+/// shell to interpret it, and the shell has to be named in the argv,
+/// so keying on that instead holds for runners nobody listed.
+///
+/// After the shell name every remaining token is a candidate rather
+/// than only the operand of `-c`. Locating `-c` exactly would mean
 /// trusting bash's full option grammar — `-o option`, `-O shopt`,
 /// `--rcfile FILE` and clusters all take operands, and one
 /// misunderstood spelling (`bash -O extglob -c '…'`) silently skips
-/// the payload. Scanning every argument cannot be dodged by option
-/// ordering, and an option's own operand (`extglob`, `posix`) parses
-/// as a harmless bare word.
+/// the payload. An option's own operand (`extglob`, `posix`) parses as
+/// a harmless bare word, so the looser rule costs nothing.
 ///
-/// `exec` gets the same treatment: it replaces the shell with the
-/// command it is given (`exec bash -c '…'`), and its own `-a NAME`
-/// operand is just another bare word.
-fn shell_payloads(head: &str, args: &[String]) -> Vec<String> {
-    match head {
-        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" | "exec" => args.to_vec(),
-        "eval" => {
-            if args.is_empty() {
-                Vec::new()
-            } else {
-                vec![args.join(" ")]
-            }
+/// `eval` instead concatenates everything after it, which is how bash
+/// evaluates it.
+fn shell_payloads(tokens: &[String]) -> Vec<String> {
+    let mut payloads = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let base = base_name(token).to_lowercase();
+        let rest = &tokens[i + 1..];
+        if SHELL_LAUNCHERS.contains(&base.as_str()) {
+            payloads.extend(rest.iter().cloned());
+        } else if base == "eval" && !rest.is_empty() {
+            payloads.push(rest.join(" "));
         }
-        _ => Vec::new(),
     }
+    payloads
 }
 
 #[cfg(test)]
@@ -388,6 +393,13 @@ mod tests {
             // `exec` replaces the shell with what follows it.
             "exec bash -c \"'git' push --force\"",
             "exec -a login bash -c \"'rm' -rf /tmp/x\"",
+            // Runners in front of a shell: the shell is named in the
+            // argv wherever it sits, so no list of runners is needed.
+            "timeout 10 bash -c \"'git' push --force\"",
+            "sudo bash -c \"'rm' -rf /tmp/x\"",
+            "nice -n 5 sh -c \"'git' push --force\"",
+            "xargs bash -c \"'rm' -rf /tmp/x\"",
+            "stdbuf -oL bash -c \"'git' push --force\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -461,6 +473,11 @@ mod tests {
             "bash -o posix -c 'echo hi'",
             "env bash -c 'cargo build'",
             "bash script.sh",
+            "timeout 10 bash -c 'cargo test'",
+            // Naming a shell without handing it a command is not a
+            // payload.
+            "which bash",
+            "man bash",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
