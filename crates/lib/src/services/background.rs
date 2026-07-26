@@ -307,6 +307,10 @@ impl TaskManager {
         if let Some(parent) = output_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Truncate up front: ids and cache paths recur across process
+        // starts, so a reader must never see a previous run's output —
+        // and reading before this run finishes means "empty", not ENOENT.
+        let _ = std::fs::File::create(&output_file);
 
         let info = TaskInfo {
             id: id.clone(),
@@ -414,6 +418,10 @@ impl TaskManager {
         if let Some(parent) = output_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Truncate up front: ids and cache paths recur across process
+        // starts, so a reader must never see a previous run's output —
+        // and reading before this run finishes means "empty", not ENOENT.
+        let _ = std::fs::File::create(&output_file);
 
         let info = TaskInfo {
             id: id.clone(),
@@ -1045,13 +1053,52 @@ mod tests {
         }
     }
 
+    /// A still-running task must read as empty output, not ENOENT — and
+    /// never as a previous run's leftovers under a recycled id/path.
+    #[tokio::test]
+    async fn registering_truncates_any_stale_output_file() {
+        // Dream kind ('d' ids): the other tests in this module churn the
+        // shared 'a'/'b' output paths concurrently.
+        let payload = || TaskPayload::Dream { note: None };
+        let mgr = TaskManager::new();
+        let id = mgr.register("first", TaskKind::Dream, payload()).await;
+        assert_eq!(
+            mgr.read_output(&id).await.unwrap(),
+            "",
+            "running task did not read as empty"
+        );
+        mgr.write_output(&id, "stale from a previous run")
+            .await
+            .unwrap();
+
+        // Simulate an id recycled by a later process start: registering
+        // over the same output path must truncate it.
+        let mgr2 = TaskManager::new();
+        let id2 = mgr2.register("second", TaskKind::Dream, payload()).await;
+        assert_eq!(id2, id, "test premise: ids recycle across managers");
+        assert_eq!(
+            mgr2.read_output(&id2).await.unwrap(),
+            "",
+            "stale output survived re-registration"
+        );
+    }
+
     /// Viewers show a tail; the read must be bounded rather than
     /// materializing an arbitrarily large output file first.
     #[tokio::test]
     async fn read_output_tail_skips_the_head_of_large_output() {
+        // RemoteAgent kind ('r' ids): shell tests churn the shared 'b'
+        // output paths concurrently, and registering truncates them.
         let mgr = TaskManager::new();
         let id = mgr
-            .register("big", TaskKind::LocalShell, shell_payload("noop"))
+            .register(
+                "big",
+                TaskKind::RemoteAgent,
+                TaskPayload::RemoteAgent {
+                    routine_id: "noop".into(),
+                    timeout: None,
+                },
+            )
             .await;
         let big = format!("{}\nTHE-END", "x".repeat(100));
         mgr.write_output(&id, &big).await.unwrap();
