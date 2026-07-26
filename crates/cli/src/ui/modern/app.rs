@@ -419,8 +419,11 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
-    /// User keybindings from `keybindings.json`. Loaded once at startup;
-    /// only user-defined chords are dispatched from here.
+    /// User keybindings. Construction installs the built-in defaults
+    /// only; the run loop injects the registry loaded from
+    /// `keybindings.json` at startup. Constructors must not read the
+    /// file — tests build hundreds of Apps and would otherwise depend on
+    /// the machine's real config.
     pub keybindings: std::sync::Arc<crate::ui::keybindings::KeybindingRegistry>,
     /// `/theme` in-TUI theme picker (live preview, Esc reverts).
     pub theme_picker: Option<super::theme_picker::ThemePicker>,
@@ -587,7 +590,7 @@ impl App {
             command_palette: None,
             model_picker: None,
             keybindings: std::sync::Arc::new(
-                crate::ui::keybindings::KeybindingRegistry::load(),
+                crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
             theme_picker: None,
             theme_name: "auto".to_string(),
@@ -1373,6 +1376,9 @@ impl App {
                     " (built-in)"
                 };
                 out.push_str(&format!("\n  {chord:<14}  {action}{origin}"));
+            }
+            if let Some(d) = agent_code_lib::config::agent_config_dir() {
+                out.push_str(&format!("\nfile: {}", d.join("keybindings.json").display()));
             }
             out.push_str("\nedits to keybindings.json load at startup — restart to apply");
             self.transcript.push(TranscriptItem::System(out));

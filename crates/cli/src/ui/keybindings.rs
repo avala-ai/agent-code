@@ -101,6 +101,12 @@ impl KeybindingRegistry {
     fn add_user_bindings(&mut self, bindings: Vec<Keybinding>) {
         for binding in bindings {
             let key = binding.key.trim().to_lowercase();
+            if is_reserved_chord(&key) {
+                tracing::warn!(
+                    "Ignoring keybinding for reserved chord `{key}` — it can never fire"
+                );
+                continue;
+            }
             self.user_defined.insert(key.clone());
             self.bindings.insert(key, binding);
         }
@@ -145,6 +151,31 @@ fn load_keybindings_file(path: &PathBuf) -> Result<Vec<Keybinding>, String> {
 /// out of a binding that turned out to be a mistake — so they stay
 /// fixed. Everything else is fair game.
 pub const RESERVED_CHORDS: &[&str] = &["ctrl+c", "esc"];
+
+/// True for chords the run loop's escape hatches consume before user
+/// dispatch, so a binding on them could never fire:
+///
+/// - `esc` with any modifiers — the Esc handler matches the key code
+///   alone;
+/// - `ctrl+…+c` without shift — the cancel chord accepts extra
+///   modifiers, but `ctrl+shift+c` is deliberately left bindable (it is
+///   the copy shortcut).
+///
+/// These are dropped at load time so `/keybindings` never lists a
+/// binding that cannot execute, and filtered again at dispatch as
+/// defense in depth.
+pub fn is_reserved_chord(chord: &str) -> bool {
+    let (mods, base) = match chord.rsplit_once('+') {
+        Some((mods, base)) => (mods, base),
+        None => ("", chord),
+    };
+    let has = |m: &str| mods.split('+').any(|part| part == m);
+    match base {
+        "esc" => true,
+        "c" => has("ctrl") && !has("shift"),
+        _ => false,
+    }
+}
 
 /// Render a key event as the chord string used in `keybindings.json`
 /// (`ctrl+k`, `alt+shift+r`, `f5`, `enter`).
@@ -228,7 +259,7 @@ impl KeybindingRegistry {
         mods: crossterm::event::KeyModifiers,
     ) -> Option<&KeyAction> {
         let chord = chord_string(code, mods)?;
-        if RESERVED_CHORDS.contains(&chord.as_str()) {
+        if is_reserved_chord(&chord) {
             return None;
         }
         self.lookup(&chord)
@@ -325,6 +356,62 @@ mod tests {
                 .is_none(),
             "esc was rebindable"
         );
+    }
+
+    /// A reserved or preempted chord in the user's file is dropped at
+    /// load, so `/keybindings` never lists a binding that cannot fire.
+    #[test]
+    fn reserved_chords_in_the_user_file_are_dropped() {
+        let make = |key: &str| Keybinding {
+            key: key.to_string(),
+            action: KeyAction::Prompt {
+                prompt: "hijacked".into(),
+            },
+            description: None,
+        };
+        let registry = KeybindingRegistry::from_user_bindings(vec![
+            make("ctrl+c"),
+            make("esc"),
+            make("ctrl+alt+c"),
+            make("shift+esc"),
+            make("ctrl+shift+c"),
+        ]);
+        for chord in ["ctrl+c", "esc", "ctrl+alt+c", "shift+esc"] {
+            assert!(
+                !registry.is_user_defined(chord),
+                "{chord} was accepted but can never fire"
+            );
+        }
+        // The default ctrl+c entry survives an attempted override.
+        assert!(
+            matches!(
+                registry.lookup("ctrl+c"),
+                Some(KeyAction::Command { command }) if command == "cancel"
+            ),
+            "the built-in ctrl+c default was clobbered"
+        );
+        // Ctrl+Shift+C is the copy shortcut, deliberately still bindable.
+        assert!(
+            registry.is_user_defined("ctrl+shift+c"),
+            "ctrl+shift+c should remain bindable"
+        );
+    }
+
+    #[test]
+    fn reserved_chord_predicate_matches_the_run_loop_guards() {
+        for chord in [
+            "esc",
+            "ctrl+esc",
+            "alt+esc",
+            "shift+esc",
+            "ctrl+c",
+            "ctrl+alt+c",
+        ] {
+            assert!(is_reserved_chord(chord), "{chord} should be reserved");
+        }
+        for chord in ["ctrl+shift+c", "alt+c", "ctrl+k", "shift+tab", "f5"] {
+            assert!(!is_reserved_chord(chord), "{chord} should be bindable");
+        }
     }
 
     /// Built-in defaults describe chords the hardcoded handler already

@@ -140,7 +140,9 @@ exactly as typed.
 
 ## Custom keybindings
 
-Put a `keybindings.json` in your config directory (`~/.config/agent-code/`):
+Put a `keybindings.json` in your config directory — `~/.config/agent-code/` on
+Linux, `~/Library/Application Support/agent-code/` on macOS,
+`%APPDATA%\agent-code\` on Windows. `/keybindings` prints the resolved path.
 
 ```json
 [
@@ -159,6 +161,9 @@ letter and cannot be bound either.
 
 `ctrl+c` and `esc` are reserved and cannot be rebound — they are how you get
 out of a stuck state, including a binding that turned out to be a mistake.
+This covers modified variants the escape hatches also consume (`ctrl+alt+c`,
+`esc` with any modifier); entries for them in the file are ignored with a
+warning. `ctrl+shift+c` (copy) remains bindable.
 Bindings never fire while a permission prompt (or any modal) is open, and a
 binding that runs never discards the prompt you were composing.
 

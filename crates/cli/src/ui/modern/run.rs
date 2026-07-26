@@ -74,6 +74,9 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
     let session = Session::new(engine);
     let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
+    // Constructors install defaults only; the user's file is read once
+    // here so tests building Apps stay independent of machine config.
+    app.keybindings = std::sync::Arc::new(crate::ui::keybindings::KeybindingRegistry::load());
     // The picker previews by mutating the global theme, so the App has to
     // remember what the user actually configured in order to revert.
     app.theme_name = configured.clone();
