@@ -264,7 +264,7 @@ async fn execute_single_tool(
                 Some(ref s) if s.is_active() => s.isolation_fingerprint(),
                 _ => "none".to_string(),
             };
-            let grant_key = persistent_grant_key(&call.name, &call.input, &sandbox_state);
+            let grant_key = persistent_grant_key(&call.name, &call.input, &sandbox_state, &ctx.cwd);
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
                 None => false,
@@ -465,20 +465,39 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 ///   *weaker* in a later session. Only `description` is advisory and
 ///   excluded.
 /// - `WebFetch`: a digest of the URL, prefixed by the host for the
-///   audit trail.
+///   audit trail. Not cwd-bound — a fetch means the same thing from any
+///   directory.
 /// - Everything else, including every write tool, keys on the full input:
 ///   serde_json maps serialize with sorted keys (`preserve_order` is off),
 ///   so the string is canonical.
 ///
+/// Shell and file keys are additionally bound to a digest of the
+/// canonicalized `cwd`: the grant scope is the repository root and the
+/// session can `/cd` inside it, so `./build.sh` approved in one
+/// directory must not cover the identically spelled call somewhere
+/// else, where it runs different code.
+///
 /// Two properties of the digests are load-bearing. They are SHA-256
 /// because this is an authorization boundary — the hash must resist
 /// adversarially chosen collisions, not merely be collision-sparse. And
-/// commands and URLs appear *only* as digests, never verbatim: an
-/// approved call can embed inline credentials (`curl -H 'Authorization:
-/// Bearer …'`, signed URLs), and this key is persisted into the config
-/// directory, where secrets must never be written. Equality matching
-/// needs nothing more than the digest.
-pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state: &str) -> String {
+/// commands, URLs, and paths (including the cwd) appear *only* as
+/// digests, never verbatim: an approved call can embed inline
+/// credentials (`curl -H 'Authorization: Bearer …'`, signed URLs), and
+/// this key is persisted into the config directory, where secrets must
+/// never be written. Equality matching needs nothing more than the
+/// digest.
+pub fn persistent_grant_key(
+    tool: &str,
+    input: &serde_json::Value,
+    sandbox_state: &str,
+    cwd: &std::path::Path,
+) -> String {
+    let cwd_digest = {
+        let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        // Raw path bytes, not a lossy string — same rule as every other
+        // path that feeds a persisted digest.
+        sha256_hex(&crate::config::os_path_bytes(&canonical))
+    };
     let shape = match tool {
         "Bash" | "PowerShell" => {
             let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -495,7 +514,7 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
             // budget re-prompts.
             let timeout = crate::tools::bash::effective_timeout_ms(input);
             format!(
-                "cmd-sha256:{}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}",
+                "cmd-sha256:{}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}\0cwd-sha256:{cwd_digest}",
                 sha256_hex(command.as_bytes())
             )
         }
@@ -513,7 +532,10 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
             // names, secret-bearing MCP path fields), and this key is
             // persisted; the path is already inside the hashed input.
             let s = serde_json::to_string(input).unwrap_or_default();
-            format!("sha256:{}", sha256_hex(s.as_bytes()))
+            format!(
+                "sha256:{}\0cwd-sha256:{cwd_digest}",
+                sha256_hex(s.as_bytes())
+            )
         }
     };
     format!("{tool}\0{shape}")
@@ -521,32 +543,21 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
 
 /// Label safe to persist next to a grant key. The description shown in
 /// the live modal may embed the full command line or URL, which can
-/// carry inline credentials; the on-disk audit label keeps only the
-/// program name or host, so the config directory never stores secrets.
+/// carry inline credentials, and *any* user-controlled token — program
+/// path, file path, leading assignment — can too. So the persisted
+/// label is fixed per tool, with the host as the single exception
+/// (WebFetch), where the conservative `url_host` parser fails closed.
 pub fn persistent_grant_label(tool: &str, input: &serde_json::Value) -> String {
     match tool {
+        // Not even the first token: it can be an executable path like
+        // `/tmp/export-<secret>/run`, and a persisted guess is a leak.
         "Bash" | "PowerShell" => {
-            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let first = command.split_whitespace().next().unwrap_or("");
-            // A leading `NAME=value` assignment would put the value —
-            // often a credential — into the persisted label. Fall back
-            // to a fixed label rather than hunting for the "real"
-            // program: quoted assignments fragment under whitespace
-            // splitting, and a wrong guess writes a secret to disk.
-            let program = if first.is_empty() || first.contains('=') {
-                "(command)"
-            } else {
-                first
-            };
-            format!("{tool}: {program} … (exact command; arguments not stored)")
+            format!("{tool}: one exact command (stored as digest)")
         }
         "WebFetch" => {
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("WebFetch: {} (exact URL; not stored)", url_host(url))
         }
-        // No path in the label either: paths are user-controlled strings
-        // that can embed credentials, and the label is persisted. The
-        // tool name plus "exact call" is the whole safe audit surface.
         _ => format!("{tool}: one exact call (input stored as digest)"),
     }
 }
@@ -602,10 +613,40 @@ fn url_host(url: &str) -> String {
 mod session_allow_tests {
     use super::*;
 
-    /// `persistent_grant_key` with no active isolation — the common
-    /// fixture for properties that do not concern the sandbox state.
+    /// `persistent_grant_key` with no active isolation and a fixed cwd —
+    /// the common fixture for properties that concern neither.
     fn pkey(tool: &str, input: &serde_json::Value) -> String {
-        persistent_grant_key(tool, input, "none")
+        persistent_grant_key(tool, input, "none", std::path::Path::new("/test-cwd"))
+    }
+
+    /// The grant scope is the repository root while the session can
+    /// `/cd` inside it, so the effective cwd is part of the key:
+    /// `./build.sh` approved in one directory must not cover the same
+    /// spelling elsewhere. A fetch, by contrast, means the same thing
+    /// from any directory.
+    #[test]
+    fn a_grant_key_is_bound_to_the_effective_cwd() {
+        let cmd = serde_json::json!({"command": "./build.sh"});
+        let a = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"));
+        let b = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/b"));
+        assert_ne!(a, b, "a relative command crossed directories");
+        assert_eq!(
+            a,
+            persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"))
+        );
+
+        let write = serde_json::json!({"file_path": "notes.md", "content": "x"});
+        assert_ne!(
+            persistent_grant_key("FileWrite", &write, "none", std::path::Path::new("/repo/a")),
+            persistent_grant_key("FileWrite", &write, "none", std::path::Path::new("/repo/b")),
+            "a relative write crossed directories"
+        );
+
+        let fetch = serde_json::json!({"url": "https://example.com/x"});
+        assert_eq!(
+            persistent_grant_key("WebFetch", &fetch, "none", std::path::Path::new("/repo/a")),
+            persistent_grant_key("WebFetch", &fetch, "none", std::path::Path::new("/repo/b")),
+        );
     }
 
     /// The property that makes exact-key grants safe: appending to an
@@ -724,15 +765,25 @@ mod session_allow_tests {
     #[test]
     fn a_bash_grant_key_is_bound_to_the_effective_sandbox_state() {
         let input = serde_json::json!({"command": "make"});
-        let isolated = persistent_grant_key("Bash", &input, "fp-strict-policy");
+        let isolated = persistent_grant_key(
+            "Bash",
+            &input,
+            "fp-strict-policy",
+            std::path::Path::new("/test-cwd"),
+        );
         assert_ne!(
             isolated,
-            persistent_grant_key("Bash", &input, "none"),
+            persistent_grant_key("Bash", &input, "none", std::path::Path::new("/test-cwd")),
             "a grant crossed between isolated and unisolated sessions"
         );
         assert_ne!(
             isolated,
-            persistent_grant_key("Bash", &input, "fp-weaker-policy"),
+            persistent_grant_key(
+                "Bash",
+                &input,
+                "fp-weaker-policy",
+                std::path::Path::new("/test-cwd")
+            ),
             "a grant survived an isolation-policy change"
         );
     }
@@ -785,9 +836,9 @@ mod session_allow_tests {
         let label = persistent_grant_label("Bash", &bash_input);
         assert!(!key.contains(secret), "secret leaked into the grant key");
         assert!(!label.contains(secret), "secret leaked into the label");
-        assert!(
-            label.starts_with("Bash: curl"),
-            "label lost its audit value: {label}"
+        assert_eq!(
+            label, "Bash: one exact command (stored as digest)",
+            "labels must be fixed per tool — any command token can carry a secret"
         );
         // Same call still matches; a different command does not.
         assert_eq!(key, pkey("Bash", &bash_input));
@@ -845,7 +896,7 @@ mod session_allow_tests {
                 !label.contains("hunter2"),
                 "assignment value leaked into the label: {label}"
             );
-            assert!(label.starts_with("Bash: (command)"), "{label}");
+            assert_eq!(label, "Bash: one exact command (stored as digest)");
         }
 
         // Backslash after the authority: lenient fetchers treat it as a
