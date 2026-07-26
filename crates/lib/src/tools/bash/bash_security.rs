@@ -243,8 +243,8 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         let Some(parsed) = parse_bash(&statement) else {
             continue;
         };
-        if enables_allexport(&parsed) {
-            allexport = true;
+        if let Some(state) = allexport_transition(&parsed) {
+            allexport = state;
         }
         carried.extend(exported_env_pairs(&statement, &parsed, allexport));
         // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
@@ -664,22 +664,62 @@ fn shell_statements(raw: &str) -> Vec<String> {
 /// than for one command.
 /// `set` is deliberately absent: its trailing operands become
 /// positional parameters, so `set -- FOO=bar` assigns nothing.
-const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
+///
+/// Only `export` exports on its own. The declaration builtins make a
+/// shell variable that a child never sees unless `-x` is given, so
+/// they are listed separately.
+const EXPORTING_BUILTINS: &[&str] = &["export"];
 
-/// True when a statement turns on `allexport`, after which every
-/// assignment is exported: `set -a` / `set -o allexport`.
-fn enables_allexport(parsed: &ParsedCommand) -> bool {
-    parsed.invocations.iter().any(|invocation| {
+/// Builtins that declare a variable but export it only with `-x`.
+const DECLARING_BUILTINS: &[&str] = &["declare", "typeset", "readonly", "local"];
+
+/// True when `invocation`'s head declares *and* exports: `export …`,
+/// or a declaration builtin given `-x`.
+fn exports_variables(words: &[String]) -> bool {
+    let Some(head) = words
+        .iter()
+        .map(|word| base_name(word))
+        .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
+    else {
+        return false;
+    };
+    if EXPORTING_BUILTINS.contains(&head.as_str()) {
+        return true;
+    }
+    DECLARING_BUILTINS.contains(&head.as_str())
+        && words.iter().any(|word| {
+            word.strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains('x'))
+        })
+}
+
+/// Whether a statement switches `allexport` on or off — `set -a` /
+/// `set -o allexport` and their `+` counterparts, which turn it back
+/// off. `None` when the statement says nothing about it.
+fn allexport_transition(parsed: &ParsedCommand) -> Option<bool> {
+    for invocation in &parsed.invocations {
         let mut words = invocation.iter().map(|t| unquote_token(t));
-        if words.next().map(|w| base_name(&w)) != Some("set".to_string()) {
-            return false;
+        if words.next().map(|w| base_name(&w)).as_deref() != Some("set") {
+            continue;
         }
         let rest: Vec<String> = words.collect();
-        rest.iter().any(|word| {
-            word.strip_prefix('-')
-                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains('a'))
-        }) || rest.windows(2).any(|pair| pair == ["-o", "allexport"])
-    })
+        for (index, word) in rest.iter().enumerate() {
+            let Some(cluster) = word.strip_prefix(['-', '+']) else {
+                continue;
+            };
+            let on = word.starts_with('-');
+            if cluster == "o" {
+                if rest.get(index + 1).is_some_and(|next| next == "allexport") {
+                    return Some(on);
+                }
+                continue;
+            }
+            if !cluster.starts_with(['-', '+']) && cluster.contains('a') {
+                return Some(on);
+            }
+        }
+    }
+    None
 }
 
 /// The assignments a statement puts into the *environment* of later
@@ -709,22 +749,19 @@ fn exported_env_pairs(
     }
     // `command export FOO=bar` exports just as `export FOO=bar` does,
     // so the builtin wrappers come off before the head is read.
+    // A wrapper's own options (`command -p export …`, `command --
+    // export …`) sit between it and the command it runs.
     let exports_via_builtin = parsed.invocations.iter().any(|invocation| {
-        invocation
-            .iter()
-            .map(|t| base_name(&unquote_token(t)))
-            // A wrapper's own options (`command -p export …`, `command
-            // -- export …`) sit between it and the command it runs.
-            .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
-            .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()))
+        exports_variables(
+            &invocation
+                .iter()
+                .map(|t| unquote_token(t))
+                .collect::<Vec<_>>(),
+        )
     });
     // `export FOO=bar` parses as a declaration rather than a command,
     // so the statement's own first word answers for that spelling.
-    let exports_via_declaration = split_alias_value(statement)
-        .iter()
-        .map(|word| base_name(word))
-        .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
-        .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()));
+    let exports_via_declaration = exports_variables(&split_alias_value(statement));
     if exports_via_builtin || exports_via_declaration {
         for (name, value) in &parsed.assignments {
             push_assignment(&mut pairs, &format!("{name}={}", unquote_token(value)));
@@ -1653,6 +1690,9 @@ mod tests {
             // `set -a` exports every later assignment.
             "set -a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "set -o allexport; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // A declaration builtin exports with `-x`.
+            "declare -x GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "typeset -x GIT_CONFIG_GLOBAL=/tmp/g; git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
@@ -1807,6 +1847,12 @@ mod tests {
             // An unexported shell variable never reaches git.
             "GIT_CONFIG_GLOBAL=/tmp/g; git status",
             "GIT_CONFIG_GLOBAL+=/tmp/g\ngit status",
+            // A declaration without `-x` is not exported.
+            "declare GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            "local GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            // Auto-export switched back off.
+            "set -a; set +a; GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            "set -o allexport; set +o allexport; GIT_CONFIG_GLOBAL=/tmp/g; git status",
             // A data command's operands are text, however they are
             // quoted.
             "printf '%s\\n' 'git' push --force",
