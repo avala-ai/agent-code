@@ -771,7 +771,11 @@ fn push_assignment(pairs: &mut Vec<(String, String)>, word: &str) -> bool {
     let Some((name, value)) = word.split_once('=') else {
         return false;
     };
-    if name.is_empty() || !(is_env_assignment(word) || name.contains(['$', '`'])) {
+    // `NAME+=value` appends, and appending to an unset variable just
+    // sets it. The `+` is part of the operator, not of the name.
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let canonical = format!("{name}={value}");
+    if name.is_empty() || !(is_env_assignment(&canonical) || name.contains(['$', '`'])) {
         return false;
     }
     pairs.push((name.to_string(), unquote_token(value)));
@@ -1100,10 +1104,14 @@ const BUILTIN_PREFIXES: &[&str] = &["command", "builtin", "exec", "nohup", "sets
 /// Only this direction is listed. An unrecognised head keeps counting
 /// as a possible runner, so `firejail bash -c '…'` and every other
 /// runner nobody enumerated still recurse.
+/// Interpreters that can run a command are deliberately absent, even
+/// though their operands look like text: `awk 'BEGIN{system(ARGV[1] …
+/// )}' git push -uf` executes what follows, and `sed`'s `e` and the
+/// pagers' shell escapes do the same. Their arguments are not data.
 const DATA_COMMANDS: &[&str] = &[
-    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "sed", "awk", "tr",
-    "cut", "paste", "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq",
-    "yq", "less", "more", "strings", "logger",
+    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "tr", "cut", "paste",
+    "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq", "yq", "strings",
+    "logger",
 ];
 
 /// The literal command strings an invocation may hand to another
@@ -1515,6 +1523,12 @@ mod tests {
             "export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "GIT_CONFIG_GLOBAL=/tmp/g\ngit p",
             "export GIT_CONFIG_GLOBAL=/tmp/g && git p",
+            // Appending to an unset variable just sets it.
+            "export GIT_CONFIG_GLOBAL+=/tmp/g; git p",
+            "GIT_CONFIG_GLOBAL+=/tmp/g\ngit p",
+            // An interpreter that can run a command does not make its
+            // operands data.
+            "awk 'BEGIN{system(ARGV[1] \" \" ARGV[2] \" \" ARGV[3]); exit}' git push -uf",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
