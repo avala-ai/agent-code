@@ -501,22 +501,71 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
         .iter()
         .map(|(name, value)| (unquote_token(name), unquote_token(value)))
         .collect();
-    for token in invocation {
+    // Only where a runner would actually apply them. A `NAME=VALUE`
+    // string among the operands of an ordinary command is data:
+    // `printf '%s\n' 'GIT_CONFIG_KEY_0=alias.p' git` prints two words
+    // and sets nothing.
+    let head = invocation
+        .first()
+        .map(|t| base_name(&unquote_token(t)).to_lowercase());
+    if !head.is_some_and(|h| COMMAND_RUNNER_WRAPPERS.contains(&h.as_str())) {
+        return pairs;
+    }
+    let mut idx = 1;
+    while let Some(token) = invocation.get(idx) {
         let unquoted = unquote_token(token);
-        // A token can carry a whole argument list: `env -S 'FOO=bar
-        // git p'` holds the assignments inside one word, and the
-        // wrapper parser consumes them rather than handing them back,
-        // so neither view lists them separately. Splitting on
-        // whitespace finds them wherever they are packed.
-        for word in unquoted.split_whitespace() {
-            if is_env_assignment(word)
-                && let Some((name, value)) = word.split_once('=')
-            {
-                pairs.push((name.to_string(), unquote_token(value)));
+        // `env -S 'FOO=bar git p'` packs the assignments into one
+        // word, and the wrapper parser consumes them rather than
+        // handing them back, so neither view lists them separately.
+        // Split that payload the way env does.
+        if let Some(payload) = split_string_payload(&unquoted, invocation.get(idx + 1)) {
+            for word in split_alias_value(&payload) {
+                push_assignment(&mut pairs, &word);
             }
+            idx += 2;
+            continue;
         }
+        if unquoted.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        if !push_assignment(&mut pairs, &unquoted) {
+            // The command word: later operands belong to it.
+            break;
+        }
+        idx += 1;
     }
     pairs
+}
+
+/// Record `word` as an environment assignment. A name carrying an
+/// expansion counts too — `GIT_CONFIG_KEY_$I=alias.p` names a real
+/// config key once the shell is done with it, and only the classifier
+/// downstream can decide what that means.
+fn push_assignment(pairs: &mut Vec<(String, String)>, word: &str) -> bool {
+    let Some((name, value)) = word.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() || !(is_env_assignment(word) || name.contains(['$', '`'])) {
+        return false;
+    }
+    pairs.push((name.to_string(), unquote_token(value)));
+    true
+}
+
+/// The operand of `env -S` / `--split-string`, in any of its
+/// spellings.
+fn split_string_payload(token: &str, next: Option<&String>) -> Option<String> {
+    if token == "-S" || token == "--split-string" {
+        return next.map(|t| unquote_token(t));
+    }
+    if let Some(rest) = token.strip_prefix("--split-string=") {
+        return Some(rest.to_string());
+    }
+    token
+        .strip_prefix("-S")
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
 }
 
 /// True when a prefix assignment hands git configuration through the
@@ -529,13 +578,20 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
 fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
     assignments.iter().any(|(name, value)| {
         let name = name.to_ascii_uppercase();
-        let dynamic = value.contains('$') || value.contains('`');
+        let dynamic_value = value.contains('$') || value.contains('`');
+        let names_an_alias = value.to_lowercase().starts_with("alias.");
         if name == "GIT_CONFIG_PARAMETERS" {
-            return dynamic || value.to_lowercase().contains("alias.");
+            return dynamic_value || value.to_lowercase().contains("alias.");
+        }
+        // A name the shell still has to expand cannot be ruled out:
+        // `GIT_CONFIG_KEY_$I=alias.p` is `GIT_CONFIG_KEY_0` by the time
+        // git reads it, and `$K=alias.p` could be anything at all.
+        if name.contains(['$', '`']) {
+            return names_an_alias || dynamic_value || name.starts_with("GIT_CONFIG");
         }
         match name.strip_prefix("GIT_CONFIG_KEY_") {
             Some(index) if index.chars().all(|c| c.is_ascii_digit()) => {
-                dynamic || value.to_lowercase().starts_with("alias.")
+                dynamic_value || names_an_alias
             }
             _ => false,
         }
@@ -1155,6 +1211,10 @@ mod tests {
             // the wrapper is unwrapped.
             "env -S \"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p \
              GIT_CONFIG_VALUE_0='push --force' git p origin main\"",
+            // A key name the shell has still to expand names a real
+            // config key once it is done.
+            "env \"GIT_CONFIG_KEY_$I=alias.p\" GIT_CONFIG_COUNT=1 \
+             GIT_CONFIG_VALUE_0='push --force' git p origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
@@ -1263,6 +1323,11 @@ mod tests {
             "git -c \"alias.p=!echo hi\" p",
             // Ordinary env config defines no alias.
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=me git commit",
+            "env GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=me git commit",
+            // An assignment-looking operand of a command that sets
+            // nothing is data.
+            "printf '%s\\n' 'GIT_CONFIG_KEY_0=alias.p' git",
+            "echo GIT_CONFIG_KEY_0=alias.p git",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
