@@ -530,7 +530,17 @@ pub fn persistent_grant_label(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "Bash" | "PowerShell" => {
             let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let program = command.split_whitespace().next().unwrap_or("(empty)");
+            let first = command.split_whitespace().next().unwrap_or("");
+            // A leading `NAME=value` assignment would put the value —
+            // often a credential — into the persisted label. Fall back
+            // to a fixed label rather than hunting for the "real"
+            // program: quoted assignments fragment under whitespace
+            // splitting, and a wrong guess writes a secret to disk.
+            let program = if first.is_empty() || first.contains('=') {
+                "(command)"
+            } else {
+                first
+            };
             format!("{tool}: {program} … (exact command; arguments not stored)")
         }
         "WebFetch" => {
@@ -563,19 +573,35 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Scheme+host prefix of a URL, without path or query — the only parts
 /// of a URL that are safe to persist (paths and queries carry signed
 /// tokens and other secrets).
+///
+/// Fail closed: this is a hand parser, and lenient fetchers accept
+/// delimiters it may not know about (`\` is the known one and is
+/// handled), so any authority containing characters outside the
+/// conservative host charset is persisted as `"(url)"` rather than
+/// guessed at — a wrong guess writes a secret to disk.
 fn url_host(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (s, r),
         None => ("", url),
     };
     let host = rest
-        .split(['/', '?', '#'])
+        // `\` included: many URL consumers treat a backslash after the
+        // authority as a path separator, so it must end the host here
+        // too or path bytes leak into the persisted prefix.
+        .split(['/', '?', '#', '\\'])
         .next()
         .unwrap_or("")
         // Strip userinfo — `https://user:token@host/` must not leak.
         .rsplit('@')
         .next()
         .unwrap_or("");
+    let plausible_host = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
+    if !plausible_host {
+        return "(url)".to_string();
+    }
     if scheme.is_empty() {
         host.to_string()
     } else {
@@ -796,6 +822,48 @@ mod session_allow_tests {
                 &serde_json::json!({"url": "https://files.example.com/download?sig=other"}),
             ),
             "different URLs must not share a grant"
+        );
+    }
+
+    /// The sanitizers themselves must not be leak vectors: a leading
+    /// env assignment is not a program name, and a backslash ends the
+    /// URL authority just like a slash does.
+    #[test]
+    fn sanitized_labels_survive_assignment_and_backslash_tricks() {
+        let secret = "hunter2-super-secret";
+
+        // `API_KEY=… curl` — the assignment must not be mistaken for
+        // the program, including when quoting fragments the token.
+        for cmd in [
+            format!("API_KEY={secret} curl https://api.example.com"),
+            format!("API_KEY='{secret} x' curl https://api.example.com"),
+        ] {
+            let input = serde_json::json!({ "command": cmd });
+            let label = persistent_grant_label("Bash", &input);
+            assert!(
+                !label.contains("hunter2"),
+                "assignment value leaked into the label: {label}"
+            );
+            assert!(label.starts_with("Bash: (command)"), "{label}");
+        }
+
+        // Backslash after the authority: lenient fetchers treat it as a
+        // path separator, so the persisted host must stop there too.
+        let input = serde_json::json!({
+            "url": format!("https://files.example.com\\{secret}?sig={secret}")
+        });
+        let key = pkey("WebFetch", &input);
+        let label = persistent_grant_label("WebFetch", &input);
+        assert!(!key.contains("hunter2"), "secret leaked into key: {key}");
+        assert!(!label.contains("hunter2"), "secret leaked: {label}");
+        assert!(key.contains("host:https://files.example.com\0"), "{key}");
+
+        // Anything that does not look like a host is not persisted at
+        // all — fail closed instead of guessing.
+        let weird = serde_json::json!({ "url": format!("https://{secret}=v al?x") });
+        assert!(
+            persistent_grant_label("WebFetch", &weird).contains("(url)"),
+            "implausible authority must collapse to (url)"
         );
     }
 
