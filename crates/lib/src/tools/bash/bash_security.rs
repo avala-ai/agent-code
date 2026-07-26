@@ -446,19 +446,21 @@ const GIT_GLOBAL_OPERAND_OPTIONS: &[&str] = &[
     "--git-dir",
     "--work-tree",
     "--namespace",
-    "--exec-path",
     "--super-prefix",
     "--config-env",
 ];
 
 /// Git globals that print something and exit without dispatching a
 /// subcommand, so nothing after them runs.
+/// Bare `--exec-path` belongs here too: only the attached
+/// `--exec-path=<path>` form configures a command that then runs.
 const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
     "--html-path",
     "--man-path",
     "--info-path",
     "--version",
     "--help",
+    "--exec-path",
 ];
 
 /// How many alias hops to follow. Aliases can name other aliases.
@@ -737,6 +739,22 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
             if !rest.is_empty() {
                 payloads.push(rest.join(" "));
             }
+        } else if base == "git"
+            && let Some(AliasExpansion::Tokens(expansion)) = expand_command_alias(rest)
+            && let Some(shell_form) = expansion.first().and_then(|first| first.strip_prefix('!'))
+        {
+            // A `!` alias is a shell command, not a git subcommand:
+            // `-c "alias.p=!sh -c 'git push -uf'"` runs a shell. Its
+            // words go through as payloads so the nested command is
+            // scanned rather than read as one opaque token.
+            payloads.push(shell_form.to_string());
+            payloads.extend(expansion[1..].iter().cloned());
+            payloads.push(
+                std::iter::once(shell_form.to_string())
+                    .chain(expansion[1..].iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
         }
     }
     payloads
@@ -987,6 +1005,9 @@ mod tests {
             // word.
             "git -c 'alias.p=push \"--force\"' p origin main",
             "git -c 'alias.p=push \\-\\-force' p origin main",
+            // A `!` alias is a shell command, not a git subcommand.
+            "git -c \"alias.p=!sh -c 'git push -uf origin main'\" p",
+            "git -c \"alias.p=!git push -uf origin main\" p",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
@@ -1088,6 +1109,11 @@ mod tests {
             "git -c 'alias.p=push -uf' --man-path p",
             "git --html-path push -uf",
             "git --info-path clean -df",
+            // Bare `--exec-path` prints and exits; only the attached
+            // form configures a command that then runs.
+            "git --exec-path push -uf",
+            // A `!` alias that runs something harmless.
+            "git -c \"alias.p=!echo hi\" p",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
