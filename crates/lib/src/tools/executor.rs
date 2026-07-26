@@ -325,8 +325,12 @@ async fn execute_single_tool(
                             // keeps the answer in memory if the disk
                             // write fails.
                             Some(ref grants) => {
-                                if let Err(e) = grants.lock().await.insert(&grant_key, &description)
-                                {
+                                // Persist-safe label, NOT `description`:
+                                // the description embeds the full command
+                                // line / URL, which may carry credentials
+                                // that must never reach the config dir.
+                                let label = persistent_grant_label(&call.name, &call.input);
+                                if let Err(e) = grants.lock().await.insert(&grant_key, &label) {
                                     tracing::warn!("could not persist permission grant: {e}");
                                 }
                             }
@@ -450,22 +454,30 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 /// session the user is watching, but on disk it would turn one approved
 /// edit into a permanent license to write *anything* to that path.
 ///
-/// - `Bash`/`PowerShell`: the command string plus everything that changes
-///   what an approval *means*: the sandbox-bypass flag, the background
-///   flag (background runs skip the sandbox wrapper), the normalized
-///   effective timeout (a longer timeout lets later side effects of the
-///   same command run), and `sandbox_state` — a fingerprint of the
-///   effective isolation policy ("none" when nothing isolates). A grant
-///   recorded under isolation must not authorize the same command when
-///   the sandbox is off, degraded open, or merely *weaker* (network
-///   enabled, write paths widened) in a later session.
-///   Only `description` is advisory and excluded.
-/// - `WebFetch`: the URL is the side effect.
+/// - `Bash`/`PowerShell`: a digest of the command string plus everything
+///   that changes what an approval *means*: the sandbox-bypass flag, the
+///   background flag (background runs skip the sandbox wrapper), the
+///   normalized effective timeout (a longer timeout lets later side
+///   effects of the same command run), and `sandbox_state` — a
+///   fingerprint of the effective isolation policy ("none" when nothing
+///   isolates). A grant recorded under isolation must not authorize the
+///   same command when the sandbox is off, degraded open, or merely
+///   *weaker* in a later session. Only `description` is advisory and
+///   excluded.
+/// - `WebFetch`: a digest of the URL, prefixed by the host for the
+///   audit trail.
 /// - Everything else, including every write tool, keys on the full input:
 ///   serde_json maps serialize with sorted keys (`preserve_order` is off),
-///   so the string is canonical, and SHA-256 pins the payload — this is
-///   an authorization boundary, so the digest must be collision-resistant
-///   against adversarially chosen payloads, not merely collision-sparse.
+///   so the string is canonical.
+///
+/// Two properties of the digests are load-bearing. They are SHA-256
+/// because this is an authorization boundary — the hash must resist
+/// adversarially chosen collisions, not merely be collision-sparse. And
+/// commands and URLs appear *only* as digests, never verbatim: an
+/// approved call can embed inline credentials (`curl -H 'Authorization:
+/// Bearer …'`, signed URLs), and this key is persisted into the config
+/// directory, where secrets must never be written. Equality matching
+/// needs nothing more than the digest.
 pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state: &str) -> String {
     let shape = match tool {
         "Bash" | "PowerShell" => {
@@ -483,16 +495,19 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
             // budget re-prompts.
             let timeout = crate::tools::bash::effective_timeout_ms(input);
             format!(
-                "cmd:{command}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}"
+                "cmd-sha256:{}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}",
+                sha256_hex(command.as_bytes())
             )
         }
-        "WebFetch" => input
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!(
+                "host:{}\0url-sha256:{}",
+                url_host(url),
+                sha256_hex(url.as_bytes())
+            )
+        }
         _ => {
-            use sha2::{Digest, Sha256};
             let s = serde_json::to_string(input).unwrap_or_default();
             // Keep the path readable in the key for file tools so the
             // grant file stays auditable; the digest pins the payload.
@@ -501,12 +516,71 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state
                 .or_else(|| input.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let digest = Sha256::digest(s.as_bytes());
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            format!("{path}\0sha256:{hex}")
+            format!("{path}\0sha256:{}", sha256_hex(s.as_bytes()))
         }
     };
     format!("{tool}\0{shape}")
+}
+
+/// Label safe to persist next to a grant key. The description shown in
+/// the live modal may embed the full command line or URL, which can
+/// carry inline credentials; the on-disk audit label keeps only the
+/// program name or host, so the config directory never stores secrets.
+pub fn persistent_grant_label(tool: &str, input: &serde_json::Value) -> String {
+    match tool {
+        "Bash" | "PowerShell" => {
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let program = command.split_whitespace().next().unwrap_or("(empty)");
+            format!("{tool}: {program} … (exact command; arguments not stored)")
+        }
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("WebFetch: {} (exact URL; not stored)", url_host(url))
+        }
+        _ => {
+            let path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() {
+                format!("{tool}: exact input (hashed)")
+            } else {
+                format!("{tool}: {path} (exact payload)")
+            }
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Scheme+host prefix of a URL, without path or query — the only parts
+/// of a URL that are safe to persist (paths and queries carry signed
+/// tokens and other secrets).
+fn url_host(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("", url),
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        // Strip userinfo — `https://user:token@host/` must not leak.
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    if scheme.is_empty() {
+        host.to_string()
+    } else {
+        format!("{scheme}://{host}")
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +753,49 @@ mod session_allow_tests {
                 "Bash",
                 &serde_json::json!({"command": "make", "timeout": 999_999_999_u64}),
             ),
+        );
+    }
+
+    /// Grant keys and labels are persisted into the config directory,
+    /// where secrets must never be written: a command line or URL can
+    /// embed inline credentials, so neither may appear verbatim — only
+    /// digests, program names, and hosts.
+    #[test]
+    fn persisted_keys_and_labels_never_contain_the_command_or_url() {
+        let secret = "hunter2-super-secret";
+        let bash_input = serde_json::json!({
+            "command": format!("curl -H 'Authorization: Bearer {secret}' https://api.example.com")
+        });
+        let key = pkey("Bash", &bash_input);
+        let label = persistent_grant_label("Bash", &bash_input);
+        assert!(!key.contains(secret), "secret leaked into the grant key");
+        assert!(!label.contains(secret), "secret leaked into the label");
+        assert!(
+            label.starts_with("Bash: curl"),
+            "label lost its audit value: {label}"
+        );
+        // Same call still matches; a different command does not.
+        assert_eq!(key, pkey("Bash", &bash_input));
+        assert_ne!(key, pkey("Bash", &serde_json::json!({"command": "curl"})));
+
+        let url_input = serde_json::json!({
+            "url": format!("https://user:{secret}@files.example.com/download?sig={secret}")
+        });
+        let key = pkey("WebFetch", &url_input);
+        let label = persistent_grant_label("WebFetch", &url_input);
+        assert!(!key.contains(secret), "secret leaked into the URL key");
+        assert!(!label.contains(secret), "secret leaked into the URL label");
+        assert!(
+            key.contains("files.example.com"),
+            "host missing from the audit trail: {key}"
+        );
+        assert_ne!(
+            key,
+            pkey(
+                "WebFetch",
+                &serde_json::json!({"url": "https://files.example.com/download?sig=other"}),
+            ),
+            "different URLs must not share a grant"
         );
     }
 
