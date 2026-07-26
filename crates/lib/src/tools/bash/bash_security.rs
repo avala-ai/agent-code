@@ -373,7 +373,12 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
     }
     // Nothing literal. The command token may still be an alias defined
     // in this same command, which only expansion reveals.
-    scan_git_subcommands(&expand_command_alias(after_git)?)
+    match expand_command_alias(after_git)? {
+        AliasExpansion::Tokens(tokens) => scan_git_subcommands(&tokens),
+        AliasExpansion::Unresolved => Some(format!(
+            "git alias chain exceeds {MAX_GIT_ALIAS_DEPTH} hops; what it runs cannot be determined"
+        )),
+    }
 }
 
 fn scan_git_subcommands(after_git: &[String]) -> Option<String> {
@@ -441,8 +446,85 @@ const GIT_GLOBAL_OPERAND_OPTIONS: &[&str] = &[
     "--config-env",
 ];
 
+/// Git globals that print something and exit without dispatching a
+/// subcommand, so nothing after them runs.
+const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
+    "--html-path",
+    "--man-path",
+    "--info-path",
+    "--version",
+    "--help",
+];
+
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// Outcome of resolving the git command token through inline aliases.
+enum AliasExpansion {
+    /// The fully expanded token list.
+    Tokens(Vec<String>),
+    /// The chain was still unwinding when the budget ran out, so what
+    /// git would run is unknown.
+    Unresolved,
+}
+
+/// Split an alias value the way git does before scanning it: words
+/// separated by unquoted whitespace, with quotes and backslashes
+/// removed. `alias.p=push "--force"` runs `git push --force`, so
+/// leaving the quotes in the word would hide the option.
+fn split_alias_value(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => match chars.next() {
+                    Some(escaped) => current.push(escaped),
+                    None => break,
+                },
+                _ => current.push(c),
+            },
+            None => match c {
+                '\'' | '"' => {
+                    started = true;
+                    quote = Some(c);
+                }
+                '\\' => {
+                    started = true;
+                    match chars.next() {
+                        Some(escaped) => current.push(escaped),
+                        None => break,
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                _ => {
+                    started = true;
+                    current.push(c);
+                }
+            },
+        }
+    }
+    if started {
+        words.push(current);
+    }
+    words
+}
 
 /// The tokens with the git *command* replaced by what an inline
 /// `-c alias.NAME=VALUE` defines it as: `git -c alias.p=push p -uf …`
@@ -456,7 +538,7 @@ const MAX_GIT_ALIAS_DEPTH: usize = 8;
 /// Only aliases defined in the same command are resolvable — one from
 /// the user's config is invisible here, and the raw scans remain the
 /// only cover for that.
-fn expand_command_alias(tokens: &[String]) -> Option<Vec<String>> {
+fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
     let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
     for token in tokens {
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
@@ -468,10 +550,7 @@ fn expand_command_alias(tokens: &[String]) -> Option<Vec<String>> {
         if let Some((name, value)) = definition.split_once('=')
             && !name.is_empty()
         {
-            aliases.push((
-                name.to_lowercase(),
-                value.split_whitespace().map(str::to_string).collect(),
-            ));
+            aliases.push((name.to_lowercase(), split_alias_value(value)));
         }
     }
     if aliases.is_empty() {
@@ -495,6 +574,11 @@ fn expand_command_alias(tokens: &[String]) -> Option<Vec<String>> {
         if !token.starts_with('-') {
             break;
         }
+        // `git --version p` prints a version and exits; nothing after
+        // it is a command at all.
+        if GIT_REPORT_ONLY_GLOBALS.contains(&token.as_str()) {
+            return None;
+        }
         idx += if GIT_GLOBAL_OPERAND_OPTIONS.contains(&token.as_str()) {
             2
         } else {
@@ -505,19 +589,27 @@ fn expand_command_alias(tokens: &[String]) -> Option<Vec<String>> {
     // An alias can name another alias. Follow the chain, refusing to
     // revisit a name so a cycle cannot spin.
     let mut seen = vec![tokens[idx].to_lowercase()];
+    let mut resolved = false;
     for _ in 0..MAX_GIT_ALIAS_DEPTH {
         let Some(head) = expansion.first().map(|t| t.to_lowercase()) else {
+            resolved = true;
             break;
         };
-        if seen.contains(&head) {
+        if seen.contains(&head) || lookup(&head).is_none() {
+            resolved = true;
             break;
         }
-        let Some(next) = lookup(&head) else { break };
+        let next = lookup(&head)?;
         seen.push(head);
         expansion.splice(0..1, next);
     }
+    if !resolved {
+        // Still unwinding when the budget ran out: what git ends up
+        // running is unknown, and unknown must not mean allowed.
+        return Some(AliasExpansion::Unresolved);
+    }
     expansion.extend_from_slice(&tokens[idx + 1..]);
-    Some(expansion)
+    Some(AliasExpansion::Tokens(expansion))
 }
 
 /// Commands that take a command string and run it in a fresh shell.
@@ -862,6 +954,14 @@ mod tests {
             "git -c alias.p=status -c 'alias.p=push --force' p origin main",
             // An alias that names another alias.
             "git -c alias.p=q -c 'alias.q=push -uf' p origin main",
+            // Quotes inside an alias value are git's, not part of the
+            // word.
+            "git -c 'alias.p=push \"--force\"' p origin main",
+            "git -c 'alias.p=push \\-\\-force' p origin main",
+            // A chain longer than the hop budget is unknown, not safe.
+            "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
+             -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
+             -c alias.a9=a10 -c 'alias.a10=push -uf' a1 origin main",
             // Unambiguous abbreviations of a long option.
             "git push --quiet --force-w origin main",
             "git push --quiet --forc origin main",
@@ -953,6 +1053,9 @@ mod tests {
             // An alias name reused as an operand of another
             // subcommand is not the command token.
             "git -c 'alias.p=push --force' status p",
+            // A global that prints and exits dispatches no subcommand.
+            "git -c 'alias.p=push -uf' --html-path p",
+            "git -c 'alias.p=push -uf' --man-path p",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
