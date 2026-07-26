@@ -191,6 +191,12 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                 reason: format!("destructive command '{base}'"),
             });
         }
+        if let Some(reason) = clustered_git_flag(invocation) {
+            findings.push(DestructiveFinding {
+                level: DestructivenessLevel::Destructive,
+                reason,
+            });
+        }
     }
 
     // Historical raw pipeline scan, kept byte-for-byte: an exact,
@@ -286,6 +292,59 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     }
 
     findings
+}
+
+/// Git subcommands paired with the short flags that make them
+/// destructive. The text patterns only match a flag written on its
+/// own (`git push -f`), but short options cluster: `git push -uf`
+/// forces the same update and `git clean -df` deletes the same files.
+const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char])] = &[
+    ("push", &['f']),
+    ("clean", &['f', 'd']),
+    ("checkout", &['f']),
+    ("branch", &['D']),
+];
+
+/// A destructive short flag reached through a cluster, e.g. the `f` in
+/// `git push -uf origin main`.
+fn clustered_git_flag(invocation: &[String]) -> Option<String> {
+    let tokens: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
+    if base_name(tokens.first()?).to_lowercase() != "git" {
+        return None;
+    }
+    // The subcommand is the first token that is not an option or one
+    // of git's own `-C dir` / `-c key=value` operands.
+    let mut idx = 1;
+    while let Some(token) = tokens.get(idx) {
+        if let Some(flag) = token.strip_prefix('-') {
+            idx += if matches!(flag, "C" | "c") { 2 } else { 1 };
+            continue;
+        }
+        break;
+    }
+    let subcommand = tokens.get(idx)?.to_lowercase();
+    let (_, flags) = DESTRUCTIVE_GIT_FLAGS
+        .iter()
+        .find(|(name, _)| *name == subcommand)?;
+    for token in &tokens[idx + 1..] {
+        let Some(cluster) = token.strip_prefix('-') else {
+            continue;
+        };
+        if cluster.starts_with('-') {
+            continue;
+        }
+        // `git branch -D` is the destructive spelling; `-d` refuses to
+        // delete an unmerged branch. The text scan lowercases and so
+        // flags both, and this must not go the other way and miss the
+        // upper-case one.
+        if let Some(found) = cluster
+            .chars()
+            .find(|c| flags.contains(c) || (flags.contains(&'D') && *c == 'd'))
+        {
+            return Some(format!("git {subcommand} with '-{found}'"));
+        }
+    }
+    None
 }
 
 /// Commands that take a command string and run it in a fresh shell.
@@ -571,6 +630,15 @@ mod tests {
             // Bash consumes `--` before evaluating the rest.
             "eval -- \"'rm' victim.txt\"",
             "eval -- \"'git' push --force\"",
+            // Short options cluster: the text patterns only see a flag
+            // written on its own.
+            "'git' push -uf origin main",
+            "git push -uf origin main",
+            "git clean -df",
+            "git checkout -qf main",
+            "git branch -Dq old",
+            "git -C /tmp/repo push -uf origin main",
+            "bash -c \"'git' push -uf origin main\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -640,6 +708,13 @@ mod tests {
             "bash -c \"printf '%s\\n' 'git push' --force\"",
             "eval 'echo hi'",
             "eval -- 'echo hi'",
+            // Clusters without a destructive flag stay allowed.
+            "git push -u origin main",
+            "git push -qu origin main",
+            "git clean -n",
+            "git checkout -b feature",
+            "git -C /tmp/repo push -u origin main",
+            "git log -p",
             // Shell options and their operands are not payloads.
             "bash -O extglob -c 'ls'",
             "bash -o posix -c 'echo hi'",
