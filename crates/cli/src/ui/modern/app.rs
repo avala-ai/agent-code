@@ -2038,11 +2038,20 @@ impl App {
                 // A row this task already owns (folded or synthesized on
                 // an earlier poll — its task_id matches) is re-claimed
                 // first so repeated polls converge instead of appending.
-                let unclaimed = next.iter().enumerate().position(|(i, t)| {
-                    !claimed[i]
-                        && (t.task_id.as_deref() == Some(row.id.as_str())
-                            || (t.task_id.is_none() && t.agent_id == sid))
-                });
+                // Prefer a live event row: if one appeared after an
+                // earlier poll synthesized a row for this task, folding
+                // into the event row lets the cleanup below retire the
+                // synthesized duplicate. Otherwise re-claim the row this
+                // task already owns (matched by task id).
+                let unclaimed = next
+                    .iter()
+                    .enumerate()
+                    .position(|(i, t)| !claimed[i] && t.task_id.is_none() && t.agent_id == sid)
+                    .or_else(|| {
+                        next.iter().enumerate().position(|(i, t)| {
+                            !claimed[i] && t.task_id.as_deref() == Some(row.id.as_str())
+                        })
+                    });
                 if let Some(idx) = unclaimed {
                     claimed[idx] = true;
                     next[idx].state = state;
@@ -3487,6 +3496,33 @@ mod tests {
             app.sync_background_tasks(vec![row("a3", "done"), row("a5", "working")]);
         }
         assert_eq!(app.tasks.len(), 2, "rows grew across identical polls");
+    }
+
+    /// A poll can synthesize a row before the queued SubagentUpdate is
+    /// applied; once the event row exists, the next poll must fold into
+    /// it and retire the synthesized duplicate.
+    #[test]
+    fn a_late_event_row_absorbs_the_synthesized_row() {
+        use crate::ui::modern::tasks::{ManagerRow, TaskState};
+        let mut app = App::new("m", "/tmp", "s");
+        let row = |state: &str| ManagerRow {
+            id: "a3".into(),
+            state: state.into(),
+            headline: "scan".into(),
+            subagent_id: Some("scan-repo".into()),
+        };
+        app.sync_background_tasks(vec![row("working")]);
+        assert_eq!(app.tasks.len(), 1, "expected a synthesized row");
+
+        // The event catches up late.
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "scan-repo", "working", "[explore] scan");
+        assert_eq!(app.tasks.len(), 2);
+
+        app.sync_background_tasks(vec![row("done")]);
+        assert_eq!(app.tasks.len(), 1, "synthesized duplicate survived");
+        assert_eq!(app.tasks[0].agent_id, "scan-repo");
+        assert_eq!(app.tasks[0].state, TaskState::Done);
+        assert_eq!(app.tasks[0].task_id.as_deref(), Some("a3"));
     }
 
     /// `/tasks clear` removes manager records; rows they backed (folded

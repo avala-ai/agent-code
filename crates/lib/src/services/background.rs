@@ -310,7 +310,9 @@ impl TaskManager {
         // Truncate up front: ids and cache paths recur across process
         // starts, so a reader must never see a previous run's output —
         // and reading before this run finishes means "empty", not ENOENT.
-        let _ = std::fs::File::create(&output_file);
+        if let Err(e) = tokio::fs::File::create(&output_file).await {
+            debug!("could not pre-create task output {output_file:?}: {e}");
+        }
 
         let info = TaskInfo {
             id: id.clone(),
@@ -421,7 +423,9 @@ impl TaskManager {
         // Truncate up front: ids and cache paths recur across process
         // starts, so a reader must never see a previous run's output —
         // and reading before this run finishes means "empty", not ENOENT.
-        let _ = std::fs::File::create(&output_file);
+        if let Err(e) = tokio::fs::File::create(&output_file).await {
+            debug!("could not pre-create task output {output_file:?}: {e}");
+        }
 
         let info = TaskInfo {
             id: id.clone(),
