@@ -304,13 +304,21 @@ const SHELL_LAUNCHERS: &[&str] = &[
 /// shell to interpret it, and the shell has to be named in the argv,
 /// so keying on that instead holds for runners nobody listed.
 ///
-/// After the shell name every remaining token is a candidate rather
-/// than only the operand of `-c`. Locating `-c` exactly would mean
+/// A launcher only counts when it is actually asked to interpret a
+/// command string — some later token is a `-c` option. Without that,
+/// the name is inert data (`printf '%s\n' bash "'git' push --force"`
+/// prints two words) or names a script to run, and re-parsing what
+/// follows would refuse harmless commands.
+///
+/// Given a `-c`, every remaining token is a candidate rather than only
+/// the operand of that flag. Locating the operand exactly would mean
 /// trusting bash's full option grammar — `-o option`, `-O shopt`,
 /// `--rcfile FILE` and clusters all take operands, and one
 /// misunderstood spelling (`bash -O extglob -c '…'`) silently skips
 /// the payload. An option's own operand (`extglob`, `posix`) parses as
-/// a harmless bare word, so the looser rule costs nothing.
+/// a harmless bare word, so the looser rule costs nothing; the
+/// positional parameters after a `-c` string are re-parsed too, which
+/// can only over-block.
 ///
 /// `eval` instead concatenates everything after it, which is how bash
 /// evaluates it.
@@ -325,12 +333,44 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
         let base = base_name(token).to_lowercase();
         let rest = &tokens[i + 1..];
         if SHELL_LAUNCHERS.contains(&base.as_str()) {
-            payloads.extend(rest.iter().cloned());
+            if rest.iter().any(|t| takes_command_string(t)) {
+                payloads.extend(rest.iter().cloned());
+                // `--command=CMD` carries the command inside the option
+                // token, where a parser reads it as an assignment and
+                // drops it. Hand over the operand on its own too.
+                payloads.extend(rest.iter().filter_map(|t| inline_operand(t)));
+            }
         } else if base == "eval" && !rest.is_empty() {
             payloads.push(rest.join(" "));
         }
     }
     payloads
+}
+
+/// True for an option that makes a shell read its commands from an
+/// operand: `-c`, a cluster containing it (`-lc`, `-ec`), and fish's
+/// `--command`/`--command=…` spelling.
+fn takes_command_string(token: &str) -> bool {
+    match token.strip_prefix("--") {
+        Some(long) => long.split('=').next().is_some_and(|name| {
+            !name.is_empty() && "command".starts_with(name) && name.starts_with('c')
+        }),
+        None => token
+            .strip_prefix('-')
+            .is_some_and(|cluster| cluster.contains('c')),
+    }
+}
+
+/// The operand written inside a command-string option
+/// (`--command=CMD`), if there is one.
+fn inline_operand(token: &str) -> Option<String> {
+    if !takes_command_string(token) {
+        return None;
+    }
+    token
+        .split_once('=')
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -416,6 +456,9 @@ mod tests {
             "csh -c \"'rm' -rf /tmp/x\"",
             "tcsh -c \"'git' push --force\"",
             "busybox sh -c \"'rm' -rf /tmp/x\"",
+            // fish's long spelling of `-c`.
+            "fish --command \"'git' push --force\"",
+            "fish --command=\"'git' push --force\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -497,6 +540,10 @@ mod tests {
             // `exec` of a normal binary passes argv data, not a
             // command string for a shell to interpret.
             "exec printf '%s\\n' \"'git' push --force\"",
+            // A launcher name as inert data, with no `-c` asking any
+            // shell to interpret anything.
+            "printf '%s\\n' bash \"'git' push --force\"",
+            "echo sh zsh fish",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
