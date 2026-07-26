@@ -10,7 +10,8 @@
 //! invocations are blocked.
 
 use crate::tools::bash_parse::{
-    ParsedCommand, base_name, is_env_assignment, parse_bash, unquote_token, unwrapped_argv,
+    ParsedCommand, base_name, env_split_string, is_env_assignment, parse_bash, unquote_token,
+    unwrapped_argv,
 };
 
 /// Severity of a destructive-command finding.
@@ -519,7 +520,12 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
         // handing them back, so neither view lists them separately.
         // Split that payload the way env does.
         if let Some(payload) = split_string_payload(&unquoted, invocation.get(idx + 1)) {
-            for word in split_alias_value(&payload) {
+            // env's own splitting rules, not an approximation of them:
+            // an unquoted `\_` separates words while a quoted one is a
+            // literal space, and getting that backwards merges the
+            // assignments into a single meaningless one.
+            let words = env_split_string(&payload).unwrap_or_else(|| split_alias_value(&payload));
+            for word in words {
                 push_assignment(&mut pairs, &word);
             }
             idx += 2;
@@ -554,18 +560,29 @@ fn push_assignment(pairs: &mut Vec<(String, String)>, word: &str) -> bool {
 }
 
 /// The operand of `env -S` / `--split-string`, in any of its
-/// spellings.
+/// spellings — including `-S` reached through a short-option cluster
+/// (`-vS'…'`), where the payload is whatever follows the `S`.
 fn split_string_payload(token: &str, next: Option<&String>) -> Option<String> {
-    if token == "-S" || token == "--split-string" {
-        return next.map(|t| unquote_token(t));
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, inline) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        if name.is_empty() || !"split-string".starts_with(name) {
+            return None;
+        }
+        return inline
+            .map(str::to_string)
+            .or_else(|| next.map(|t| unquote_token(t)));
     }
-    if let Some(rest) = token.strip_prefix("--split-string=") {
-        return Some(rest.to_string());
+    let cluster = token.strip_prefix('-')?;
+    let position = cluster.find('S')?;
+    let attached = &cluster[position + 1..];
+    if attached.is_empty() {
+        next.map(|t| unquote_token(t))
+    } else {
+        Some(attached.to_string())
     }
-    token
-        .strip_prefix("-S")
-        .filter(|rest| !rest.is_empty())
-        .map(str::to_string)
 }
 
 /// True when a prefix assignment hands git configuration through the
@@ -1215,6 +1232,12 @@ mod tests {
             // config key once it is done.
             "env \"GIT_CONFIG_KEY_$I=alias.p\" GIT_CONFIG_COUNT=1 \
              GIT_CONFIG_VALUE_0='push --force' git p origin main",
+            // `-S` reached through a cluster, and env's own `\\_` word
+            // separator rather than a plain space.
+            "env -vS\"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p \
+             GIT_CONFIG_VALUE_0='push --force' git p origin main\"",
+            "env -S 'GIT_CONFIG_COUNT=1\\_GIT_CONFIG_KEY_0=alias.p\\_\
+             GIT_CONFIG_VALUE_0=\"push\\_--force\"\\_git\\_p\\_origin\\_main'",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \

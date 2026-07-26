@@ -748,6 +748,20 @@ pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
         .collect()
 }
 
+/// The words GNU `env -S` splits an operand into. `None` when the
+/// split cannot be known statically (`$` expansion decides it) or when
+/// env would reject the string, so nothing runs behind it.
+///
+/// Exposed so gates that need to see what `-S` unpacks — environment
+/// assignments, for one — read the same semantics the wrapper
+/// resolution uses instead of approximating them.
+pub fn env_split_string(operand: &str) -> Option<Vec<String>> {
+    match split_env_s(operand) {
+        Unwrap::Tokens(words) => Some(words),
+        _ => None,
+    }
+}
+
 /// The tokens a wrapper chain runs, for gates that need the argv
 /// rather than the joined text of [`unwrapped_invocation_texts`].
 /// `None` when the head is not a wrapper, or no wrapped command can be
