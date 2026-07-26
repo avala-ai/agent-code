@@ -158,7 +158,18 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // `printf '%s\n' 'git push' --force` prints two strings, it does
     // not push. Mask intra-token spaces so a pattern can only match
     // across real argv boundaries.
+    //
+    // Under a head whose operands are text the quoting is the user's
+    // meaning, not a disguise: `printf '%s\n' 'git' push --force`
+    // prints four words. The raw scan still reads those invocations,
+    // so this only declines to *add* a match the text does not have.
     for invocation in &cmd.invocations {
+        let head_is_data = invocation.first().is_some_and(|t| {
+            DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        if head_is_data {
+            continue;
+        }
         let normalized = invocation
             .iter()
             .map(|t| unquote_token(t).replace(' ', "\u{0}"))
@@ -227,11 +238,15 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // and friends, sets the variable for everything after it, so
     // `export GIT_CONFIG_GLOBAL=…; git p` must be read as one story.
     let mut carried: Vec<(String, String)> = Vec::new();
+    let mut allexport = false;
     for statement in shell_statements(&cmd.raw) {
         let Some(parsed) = parse_bash(&statement) else {
             continue;
         };
-        carried.extend(exported_env_pairs(&statement, &parsed));
+        if enables_allexport(&parsed) {
+            allexport = true;
+        }
+        carried.extend(exported_env_pairs(&statement, &parsed, allexport));
         // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
         // bash -c 'git p'` configures the git inside the payload. The
         // payload is one token here, so tokens are searched word by
@@ -651,12 +666,34 @@ fn shell_statements(raw: &str) -> Vec<String> {
 /// positional parameters, so `set -- FOO=bar` assigns nothing.
 const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
 
-/// The assignments a statement leaves behind for later statements.
+/// True when a statement turns on `allexport`, after which every
+/// assignment is exported: `set -a` / `set -o allexport`.
+fn enables_allexport(parsed: &ParsedCommand) -> bool {
+    parsed.invocations.iter().any(|invocation| {
+        let mut words = invocation.iter().map(|t| unquote_token(t));
+        if words.next().map(|w| base_name(&w)) != Some("set".to_string()) {
+            return false;
+        }
+        let rest: Vec<String> = words.collect();
+        rest.iter().any(|word| {
+            word.strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains('a'))
+        }) || rest.windows(2).any(|pair| pair == ["-o", "allexport"])
+    })
+}
+
+/// The assignments a statement puts into the *environment* of later
+/// commands.
 ///
 /// A command prefix (`FOO=bar cmd`) is scoped to that command by the
-/// shell and is *not* carried. Everything else that assigns —
-/// `FOO=bar` on its own, or `export FOO=bar` — outlives the statement.
-fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, String)> {
+/// shell, and a bare `FOO=bar` statement makes a shell variable that
+/// a child process never sees. Only an exporting builtin — or any
+/// assignment once `allexport` is on — reaches git.
+fn exported_env_pairs(
+    statement: &str,
+    parsed: &ParsedCommand,
+    allexport: bool,
+) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     // `command -v export FOO=bar` prints a description of `export` and
     // exports nothing.
@@ -681,7 +718,17 @@ fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, S
             .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
             .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()))
     });
-    if exports_via_builtin {
+    // `export FOO=bar` parses as a declaration rather than a command,
+    // so the statement's own first word answers for that spelling.
+    let exports_via_declaration = split_alias_value(statement)
+        .iter()
+        .map(|word| base_name(word))
+        .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
+        .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()));
+    if exports_via_builtin || exports_via_declaration {
+        for (name, value) in &parsed.assignments {
+            push_assignment(&mut pairs, &format!("{name}={}", unquote_token(value)));
+        }
         for invocation in &parsed.invocations {
             for token in invocation {
                 push_assignment(&mut pairs, &unquote_token(token));
@@ -689,9 +736,10 @@ fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, S
         }
         return pairs;
     }
-    // A statement that is only assignments runs no command, so its
-    // assignments are not a prefix — they persist.
-    if parsed.invocations.is_empty() {
+    // A statement that is only assignments runs no command, so these
+    // are shell variables. They reach a child process only once
+    // `allexport` is on.
+    if allexport && parsed.invocations.is_empty() {
         for word in split_alias_value(statement) {
             push_assignment(&mut pairs, &word);
         }
@@ -1597,11 +1645,14 @@ mod tests {
             // Environment that outlives its statement reaches a later
             // git.
             "export GIT_CONFIG_GLOBAL=/tmp/g; git p",
-            "GIT_CONFIG_GLOBAL=/tmp/g\ngit p",
+            "export GIT_CONFIG_GLOBAL=/tmp/g\ngit p",
             "export GIT_CONFIG_GLOBAL=/tmp/g && git p",
             // Appending to an unset variable just sets it.
             "export GIT_CONFIG_GLOBAL+=/tmp/g; git p",
-            "GIT_CONFIG_GLOBAL+=/tmp/g\ngit p",
+            "set -a; GIT_CONFIG_GLOBAL+=/tmp/g; git p",
+            // `set -a` exports every later assignment.
+            "set -a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "set -o allexport; GIT_CONFIG_GLOBAL=/tmp/g; git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
@@ -1753,6 +1804,13 @@ mod tests {
             "set -- GIT_CONFIG_GLOBAL=/tmp/g; git status",
             // Printing an alias example is not defining one.
             "printf '%s\\n' git -c 'alias.p=reset --hard' p",
+            // An unexported shell variable never reaches git.
+            "GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            "GIT_CONFIG_GLOBAL+=/tmp/g\ngit status",
+            // A data command's operands are text, however they are
+            // quoted.
+            "printf '%s\\n' 'git' push --force",
+            "grep -r 'rm' -rf docs/",
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true && git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
