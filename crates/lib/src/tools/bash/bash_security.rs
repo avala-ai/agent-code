@@ -592,9 +592,16 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
         // as one.
         let body = token.strip_prefix("-c").unwrap_or(token);
-        let Some(definition) = body.strip_prefix("alias.") else {
+        // Git config section and key names are case-insensitive, so
+        // `Alias.p` defines the same alias as `alias.p`.
+        const PREFIX: &str = "alias.";
+        if !body
+            .get(..PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+        {
             continue;
-        };
+        }
+        let definition = &body[PREFIX.len()..];
         if let Some((name, value)) = definition.split_once('=')
             && !name.is_empty()
         {
@@ -1008,6 +1015,10 @@ mod tests {
             // A `!` alias is a shell command, not a git subcommand.
             "git -c \"alias.p=!sh -c 'git push -uf origin main'\" p",
             "git -c \"alias.p=!git push -uf origin main\" p",
+            // Config section names are case-insensitive.
+            "git -c \"Alias.p=!git push -uf origin main\" p",
+            "git -c 'ALIAS.p=push -uf' p origin main",
+            "git -c 'alias.P=push -uf' P origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
