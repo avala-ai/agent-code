@@ -233,6 +233,11 @@ mod tests {
             "$'sh'utdown -h now",
             "env $'git' push --force",
             "nohup $'rm' -rf /tmp/x",
+            // Bash drops a NUL and the rest of the quoted segment, so
+            // these run `git push --force` / `rm -rf`.
+            "$'git\\x00junk' push --force",
+            "$'rm\\0junk' -rf /tmp/x",
+            "$'git\\c@junk' push --force",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
@@ -282,6 +287,9 @@ mod tests {
             "printf $'%s\\n' one two",
             "echo \"$100 reward\"",
             "echo $HOME",
+            // `\c3` is control byte 0x13, not `s` — this only prints a
+            // control character and must not read as `shutdown`.
+            "printf %s $'\\c3hutdown'",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(

@@ -225,7 +225,25 @@ pub fn unquote_token(raw: &str) -> String {
             // ANSI-C string body: `$'…'`, tracked as `Some('$')`.
             Some('$') => match c {
                 '\'' => quote = None,
-                '\\' => push_ansi_c_escape(&mut chars, &mut out),
+                '\\' => {
+                    // An escape that evaluates to NUL truncates: bash
+                    // drops the NUL and the rest of the quoted segment,
+                    // so `$'git\x00junk'` is `git`. Skip to the closing
+                    // quote (escapes still pair, so `\'` cannot end the
+                    // segment early) or the head stays hidden.
+                    if push_ansi_c_escape(&mut chars, &mut out) {
+                        while let Some(rest) = chars.next() {
+                            match rest {
+                                '\'' => break,
+                                '\\' => {
+                                    chars.next();
+                                }
+                                _ => {}
+                            }
+                        }
+                        quote = None;
+                    }
+                }
                 _ => out.push(c),
             },
             Some(_) => unreachable!("only ', \" and $' open a quote"),
@@ -262,7 +280,14 @@ pub fn unquote_token(raw: &str) -> String {
 /// so numeric escapes must decode to their character or the pattern
 /// scans compare against the wrong text. Escapes bash leaves alone
 /// are kept literally.
-fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+///
+/// Returns `true` when the escape evaluates to NUL (`\0`, `\x00`,
+/// `\u0000`, `\c@`, …): bash discards the NUL and everything after it
+/// in the quoted segment, and the caller must truncate the same way.
+fn push_ansi_c_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) -> bool {
     fn radix_value(
         chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
         radix: u32,
@@ -283,9 +308,17 @@ fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out:
         }
         value
     }
+    fn push_nul_or(decoded: char, out: &mut String) -> bool {
+        if decoded == '\0' {
+            true
+        } else {
+            out.push(decoded);
+            false
+        }
+    }
     let Some(esc) = chars.next() else {
         out.push('\\');
-        return;
+        return false;
     };
     match esc {
         'a' => out.push('\x07'),
@@ -298,7 +331,9 @@ fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out:
         'v' => out.push('\x0b'),
         '\\' | '\'' | '"' | '?' => out.push(esc),
         'x' => match chars.peek().and_then(|c| c.to_digit(16)) {
-            Some(_) => out.push(char::from(radix_value(chars, 16, 2, 0) as u8)),
+            Some(_) => {
+                return push_nul_or(char::from(radix_value(chars, 16, 2, 0) as u8), out);
+            }
             None => out.push_str("\\x"),
         },
         'u' | 'U' => {
@@ -307,7 +342,10 @@ fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out:
                 // An invalid code point can never be pattern text; the
                 // replacement character keeps the scan conservative.
                 Some(_) => {
-                    out.push(char::from_u32(radix_value(chars, 16, max, 0)).unwrap_or('\u{fffd}'))
+                    return push_nul_or(
+                        char::from_u32(radix_value(chars, 16, max, 0)).unwrap_or('\u{fffd}'),
+                        out,
+                    );
                 }
                 None => {
                     out.push('\\');
@@ -319,12 +357,16 @@ fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out:
             // Octal, up to three digits counting this one; bash keeps
             // the low eight bits.
             let value = radix_value(chars, 8, 2, d.to_digit(8).unwrap_or(0));
-            out.push(char::from((value & 0xff) as u8));
+            return push_nul_or(char::from((value & 0xff) as u8), out);
         }
         'c' => match chars.next() {
-            // `\cX` is Ctrl-X — a control byte, never pattern text.
+            // `\cX` is Ctrl-X, masked the way bash masks it: `x & 0x1f`
+            // (with `\c?` as DEL). An XOR would map non-letters onto
+            // printable text — `\c3` must become byte 0x13, not `s`,
+            // or `printf %s $'\c3hutdown'` reads as `shutdown`.
+            Some('?') => out.push('\x7f'),
             Some(ctl) if ctl.is_ascii() => {
-                out.push(char::from((ctl.to_ascii_uppercase() as u8) ^ 0x40));
+                return push_nul_or(char::from((ctl as u8) & 0x1f), out);
             }
             Some(other) => out.push(other),
             None => out.push_str("\\c"),
@@ -334,6 +376,7 @@ fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out:
             out.push(other);
         }
     }
+    false
 }
 
 /// Strip a leading path from an already-unquoted command name.
@@ -884,7 +927,12 @@ mod tests {
     fn test_detect_ansi_c_quoted_dangerous_command() {
         // `$'rm'` executes `rm`; the ANSI-C decode in `unquote_token`
         // must reach the AST head check as well.
-        for cmd in ["$'rm' -rf /", "$'r\\x6d' -rf /", "env $'rm' -rf /"] {
+        for cmd in [
+            "$'rm' -rf /",
+            "$'r\\x6d' -rf /",
+            "env $'rm' -rf /",
+            "$'rm\\x00junk' -rf /",
+        ] {
             let parsed = parse_bash(cmd).unwrap();
             let violations = check_parsed_security(&parsed);
             assert!(
@@ -980,6 +1028,22 @@ mod tests {
         // `$'` is not special inside double or single quotes.
         assert_eq!(unquote_token("\"$'x'\""), "$'x'");
         assert_eq!(unquote_token("'$'"), "$");
+        // A NUL escape truncates the quoted segment, exactly as bash
+        // does: `$'git\x00junk'` executes `git`.
+        assert_eq!(unquote_token("$'git\\x00junk'"), "git");
+        assert_eq!(unquote_token("$'git\\0junk'"), "git");
+        assert_eq!(unquote_token("$'git\\c@junk'"), "git");
+        assert_eq!(unquote_token("$'git\\u0000junk'"), "git");
+        // An escaped quote inside the discarded remainder does not end
+        // the segment early.
+        assert_eq!(unquote_token("$'a\\0b\\'c'"), "a");
+        // Text concatenated after the closing quote still appends.
+        assert_eq!(unquote_token("$'gi\\0zz't"), "git");
+        // Bash's control mask is `& 0x1f` (`\c?` is DEL): `\c3` is byte
+        // 0x13, not the printable `s` an XOR would produce.
+        assert_eq!(unquote_token("$'\\c3'"), "\u{13}");
+        assert_eq!(unquote_token("$'\\c?'"), "\u{7f}");
+        assert_eq!(unquote_token("$'\\ca'"), "\u{1}");
     }
 
     #[test]
