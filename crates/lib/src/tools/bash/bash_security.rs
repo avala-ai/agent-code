@@ -248,7 +248,16 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         for invocation in &parsed.invocations {
             pairs.extend(runner_env_pairs(invocation));
         }
-        if env_defines_opaque_git_alias(&pairs) {
+        // A `GIT_CONFIG…` word the positional walk did not account for
+        // is the end of the argument: the walk models one option
+        // grammar, and `timeout 5 env GIT_CONFIG_GLOBAL=… git p`,
+        // `env -S'FOO=x' GIT_CONFIG_GLOBAL=… git p` and `env --uns X
+        // GIT_CONFIG_GLOBAL=… git p` each hand git the variable
+        // through a spelling the walk does not follow. Rather than
+        // model every one, an unaccounted mention is unknown — except
+        // under a head whose operands are text, where it is data.
+        let unaccounted = statement_mentions_unaccounted_git_config(&parsed, &pairs);
+        if env_defines_opaque_git_alias(&pairs) || unaccounted {
             findings.push(DestructiveFinding {
                 level: DestructivenessLevel::Destructive,
                 reason: "git configuration comes from the environment; what it runs cannot be \
@@ -513,7 +522,10 @@ const MAX_GIT_ALIAS_DEPTH: usize = 8;
 
 /// The command's statements, split on the separators that end one:
 /// `;`, `&&`, `||`, `|`, `&` and newlines. Quoted separators are not
-/// separators, so a `;` inside an argument keeps its statement whole.
+/// separators, so a `;` inside an argument keeps its statement whole,
+/// and neither are separators nested inside `$( … )`, backticks or a
+/// subshell — `GIT_CONFIG_GLOBAL=$(printf /tmp/g; true) git p` is one
+/// statement whose assignment and command belong together.
 ///
 /// A prefix assignment applies to the statement it introduces and no
 /// other, so environment questions are answered per statement rather
@@ -522,6 +534,8 @@ fn shell_statements(raw: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut in_backticks = false;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
         match quote {
@@ -547,7 +561,19 @@ fn shell_statements(raw: &str) -> Vec<String> {
                         current.push(escaped);
                     }
                 }
-                ';' | '\n' | '|' | '&' => {
+                '`' => {
+                    in_backticks = !in_backticks;
+                    current.push(c);
+                }
+                '(' | '{' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(c);
+                }
+                ';' | '\n' | '|' | '&' if depth == 0 && !in_backticks => {
                     // Consume the second character of `&&` and `||`.
                     if (c == '|' || c == '&') && chars.peek() == Some(&c) {
                         chars.next();
@@ -563,6 +589,33 @@ fn shell_statements(raw: &str) -> Vec<String> {
         .into_iter()
         .filter(|s| !s.trim().is_empty())
         .collect()
+}
+
+/// True when a statement names a `GIT_CONFIG…` variable that the
+/// positional walk did not collect, so what git will be configured
+/// with cannot be said.
+///
+/// The exception is a head whose operands are text: `printf '%s\n'
+/// 'GIT_CONFIG_KEY_0=alias.p' git` prints the string and sets nothing.
+fn statement_mentions_unaccounted_git_config(
+    parsed: &ParsedCommand,
+    collected: &[(String, String)],
+) -> bool {
+    parsed.invocations.iter().any(|invocation| {
+        let head_is_data = invocation.first().is_some_and(|t| {
+            DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        if head_is_data {
+            return false;
+        }
+        invocation.iter().skip(1).any(|token| {
+            split_alias_value(&unquote_token(token)).iter().any(|word| {
+                let name = word.split('=').next().unwrap_or(word);
+                name.to_ascii_uppercase().starts_with("GIT_CONFIG")
+                    && !collected.iter().any(|(seen, _)| seen == name)
+            })
+        })
+    })
 }
 
 /// Short options of `env` that take a separate operand, so the token
@@ -1342,6 +1395,16 @@ mod tests {
             // An option operand must not be mistaken for the command.
             "env -u X GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
             "env -C /tmp GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
+            // Spellings the positional walk does not follow: an
+            // unaccounted mention is unknown, not safe.
+            "timeout 5 env GIT_CONFIG_GLOBAL=/tmp/g git p",
+            "env -S'FOO=x' GIT_CONFIG_GLOBAL=/tmp/g git p",
+            "env --uns X GIT_CONFIG_GLOBAL=/tmp/g git p",
+            "sudo env GIT_CONFIG_GLOBAL=/tmp/g git p",
+            // A separator inside a substitution does not end the
+            // statement, so the assignment and the command stay
+            // together.
+            "GIT_CONFIG_GLOBAL=$(printf /tmp/g; true) git p",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
