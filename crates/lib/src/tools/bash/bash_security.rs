@@ -517,6 +517,20 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
     if dispatches_no_subcommand(after_git) {
         return None;
     }
+    // The text patterns want `git reset --hard` written adjacently, so
+    // any global between the two hides it. Rebuilding the invocation
+    // from the command word — `git --no-pager reset --hard` becomes
+    // `git reset --hard` — hands every git pattern the spelling it
+    // expects, current and future, with no second table to keep in
+    // step.
+    if let Some(index) = git_command_index(after_git) {
+        let canonical = format!("git {}", after_git[index..].join(" ")).to_lowercase();
+        for pattern in DESTRUCTIVE_PATTERNS {
+            if pattern.starts_with("git ") && canonical.contains(pattern) {
+                return Some(format!("contains '{pattern}'"));
+            }
+        }
+    }
     if let Some(reason) = scan_git_subcommands(after_git) {
         return Some(reason);
     }
@@ -1957,6 +1971,11 @@ mod tests {
             // flag cluster of its own.
             "git -c 'alias.p=reset --hard' p",
             "git -c 'alias.p=stash clear' p",
+            // A global between git and its subcommand hides the
+            // adjacency the text patterns look for.
+            "git --no-pager reset --hard HEAD~1",
+            "git -c core.foo=bar reset --hard HEAD~1",
+            "git --git-dir .git stash clear",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
