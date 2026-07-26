@@ -895,6 +895,10 @@ fn translation_can_reach_a_command(cmd: &ParsedCommand) -> bool {
         .invocations
         .iter()
         .map(|invocation| {
+            // `env printf …` prints just as `printf …` does, so the
+            // wrapper comes off before the head is read.
+            let unwrapped = unwrapped_argv(invocation);
+            let invocation = unwrapped.as_ref().unwrap_or(invocation);
             // A head that is itself a translation cannot vouch for
             // anything: `$"cat" file.txt` reads as `cat` only until
             // the catalogue says otherwise.
@@ -944,6 +948,8 @@ struct ShellTextFacts {
 fn shell_text_facts(raw: &str) -> ShellTextFacts {
     enum Context {
         Single,
+        /// `$'…'`, where a backslash escapes the closing quote.
+        AnsiC,
         Double,
         /// `$( … )` and `<( … )`, whose result joins the surrounding
         /// word.
@@ -989,6 +995,19 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             i += 1;
             continue;
         }
+        // Inside `$'…'` a backslash escapes the next character, so an
+        // escaped quote does not close the literal.
+        if matches!(stack.last(), Some(Context::AnsiC)) {
+            match c {
+                '\\' => i += 1,
+                '\'' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
         let in_double = matches!(stack.last(), Some(Context::Double));
         match c {
             '\\' => i += 1,
@@ -1007,6 +1026,10 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                 Some('(') => {
                     i += 1;
                     stack.push(Context::Substitution);
+                }
+                Some('\'') if !in_double => {
+                    i += 1;
+                    stack.push(Context::AnsiC);
                 }
                 Some('"') if !in_double => facts.locale_quote = true,
                 _ => {}
@@ -2453,6 +2476,11 @@ mod tests {
             // A translation that is only data cannot change what runs.
             "printf '%s\\n' $\"hello\"",
             "grep $\"message\" log.txt",
+            // A wrapper does not change whose operands those are.
+            "env printf '%s\\n' $\"hello\"",
+            "command grep $\"message\" log.txt",
+            // An escaped quote inside `$'…'` keeps the literal open.
+            "touch $'X\\'$\"SAFE'",
             "cat <<EOF\n$\"cat\"\nEOF",
             // A separator inside a comment separates nothing.
             "export GIT_CONFIG_GLOBAL=/tmp/g # comment; git status",
