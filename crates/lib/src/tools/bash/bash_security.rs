@@ -247,25 +247,39 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // become command boundaries again — so the payload gets the whole
     // scan, not the inert-data treatment. One unquote layer is exactly
     // the text the inner shell receives.
-    if depth < MAX_SHELL_SCAN_DEPTH {
-        for invocation in &cmd.invocations {
-            let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
-            // `env bash -c …` and `command bash -c …` run the inner
-            // shell, so the wrapper chain has to come off before the
-            // head means anything. Reuses the wrapper resolution the
-            // parser already models rather than a second copy of it.
-            let unwrapped = unwrapped_argv(invocation);
-            for tokens in [Some(&unquoted), unwrapped.as_ref()].into_iter().flatten() {
-                let Some((head, args)) = tokens.split_first() else {
-                    continue;
-                };
-                for payload in shell_payloads(&base_name(head).to_lowercase(), args) {
-                    let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
-                        raw: payload.clone(),
-                        ..ParsedCommand::default()
+    for invocation in &cmd.invocations {
+        let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
+        // `env bash -c …` and `command bash -c …` run the inner
+        // shell, so the wrapper chain has to come off before the
+        // head means anything. Reuses the wrapper resolution the
+        // parser already models rather than a second copy of it.
+        let unwrapped = unwrapped_argv(invocation);
+        for tokens in [Some(&unquoted), unwrapped.as_ref()].into_iter().flatten() {
+            let Some((head, args)) = tokens.split_first() else {
+                continue;
+            };
+            for payload in shell_payloads(&base_name(head).to_lowercase(), args) {
+                // Out of budget with a shell payload still in hand:
+                // what it runs is unknown, and an unknown nested
+                // command cannot be waved through. Refusing here
+                // over-blocks deeply nested but innocent commands —
+                // the safe direction, and the same call
+                // `protected_paths` makes at its own depth cap.
+                if depth >= MAX_SHELL_SCAN_DEPTH {
+                    findings.push(DestructiveFinding {
+                        level: DestructivenessLevel::Destructive,
+                        reason: format!(
+                            "nested shell payload exceeds scan depth {MAX_SHELL_SCAN_DEPTH}; \
+                             what it runs cannot be determined"
+                        ),
                     });
-                    findings.extend(find_destructive_depth(&inner, depth + 1));
+                    continue;
                 }
+                let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
+                    raw: payload.clone(),
+                    ..ParsedCommand::default()
+                });
+                findings.extend(find_destructive_depth(&inner, depth + 1));
             }
         }
     }
@@ -285,9 +299,13 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
 /// the payload. Scanning every argument cannot be dodged by option
 /// ordering, and an option's own operand (`extglob`, `posix`) parses
 /// as a harmless bare word.
+///
+/// `exec` gets the same treatment: it replaces the shell with the
+/// command it is given (`exec bash -c '…'`), and its own `-a NAME`
+/// operand is just another bare word.
 fn shell_payloads(head: &str, args: &[String]) -> Vec<String> {
     match head {
-        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" => args.to_vec(),
+        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" | "exec" => args.to_vec(),
         "eval" => {
             if args.is_empty() {
                 Vec::new()
@@ -367,6 +385,12 @@ mod tests {
             "command bash -c \"'rm' -rf /tmp/x\"",
             "nohup sh -c \"'git' push --force\"",
             "env -u PATH bash -c \"'git' push --force\"",
+            // `exec` replaces the shell with what follows it.
+            "exec bash -c \"'git' push --force\"",
+            "exec -a login bash -c \"'rm' -rf /tmp/x\"",
+            // Out of scan budget with a shell payload still in hand:
+            // unknown, so refused rather than allowed.
+            "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
