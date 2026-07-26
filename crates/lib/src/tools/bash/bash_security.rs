@@ -372,8 +372,18 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
                 // drops it. Hand over the operand on its own too.
                 payloads.extend(rest.iter().filter_map(|t| inline_operand(t, fish)));
             }
-        } else if base == "eval" && !rest.is_empty() && in_command_position(tokens, i) {
-            payloads.push(rest.join(" "));
+        } else if base == "eval" && in_command_position(tokens, i) {
+            // Bash consumes an option terminator before evaluating, so
+            // `eval -- "'rm' x"` runs `rm x`. Leaving the `--` in place
+            // would put it in the head position of the re-parse and
+            // hide the command behind it.
+            let rest = match rest.split_first() {
+                Some((first, tail)) if first == "--" => tail,
+                _ => rest,
+            };
+            if !rest.is_empty() {
+                payloads.push(rest.join(" "));
+            }
         }
     }
     payloads
@@ -558,6 +568,9 @@ mod tests {
             // that runs the word after it.
             "eval \"'rm' -rf /tmp/x\"",
             "command eval \"'git' push --force\"",
+            // Bash consumes `--` before evaluating the rest.
+            "eval -- \"'rm' victim.txt\"",
+            "eval -- \"'git' push --force\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -626,6 +639,7 @@ mod tests {
             "bash -c 'echo hello world'",
             "bash -c \"printf '%s\\n' 'git push' --force\"",
             "eval 'echo hi'",
+            "eval -- 'echo hi'",
             // Shell options and their operands are not payloads.
             "bash -O extglob -c 'ls'",
             "bash -o posix -c 'echo hi'",
