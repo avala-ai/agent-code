@@ -854,7 +854,10 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     enum Context {
         Single,
         Double,
-        Paren,
+        /// `$( … )`, whose result joins the surrounding word.
+        Substitution,
+        /// `( … )`, a compound command that ends the word.
+        Subshell,
         Brace,
         Backtick,
     }
@@ -896,7 +899,7 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             '$' => match chars.peek() {
                 Some('(') => {
                     chars.next();
-                    stack.push(Context::Paren);
+                    stack.push(Context::Substitution);
                 }
                 Some('"') if !in_double => facts.locale_quote = true,
                 _ => {}
@@ -908,10 +911,20 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                     stack.push(Context::Backtick);
                 }
             }
-            '(' if !in_double => stack.push(Context::Paren),
+            '(' if !in_double => stack.push(Context::Subshell),
             '{' if !in_double => stack.push(Context::Brace),
-            ')' if matches!(stack.last(), Some(Context::Paren)) => {
-                stack.pop();
+            ')' if matches!(
+                stack.last(),
+                Some(Context::Substitution | Context::Subshell)
+            ) =>
+            {
+                // A substitution's result joins the word around it; a
+                // subshell is a compound command, and what follows its
+                // `)` starts a new word — so `(true)# …` is a comment
+                // while `$(true)#x` is not.
+                if matches!(stack.pop(), Some(Context::Subshell)) {
+                    at_word_start = true;
+                }
             }
             '}' if matches!(stack.last(), Some(Context::Brace)) => {
                 stack.pop();
@@ -2162,6 +2175,9 @@ mod tests {
             "echo '$\"cat\"'",
             // A comment is never evaluated.
             "echo ok # $\"translation example\"",
+            // A subshell's `)` ends the word, so this `#` does start
+            // a comment.
+            "(true)# $\"cat\"",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
