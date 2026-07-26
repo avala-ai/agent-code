@@ -988,11 +988,14 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                 }
                 if run == 2 {
                     facts.control_operator = true;
-                    let (word, strip_tabs, next) = read_heredoc_delimiter(&text, i + run);
+                    let (word, strip_tabs, translated, next) =
+                        read_heredoc_delimiter(&text, i + run);
                     // A translated delimiter is decided by the
                     // catalogue, so where the body ends — and what
                     // between here and there is code — is unknown.
-                    if word.contains("$\"") {
+                    // Only an active `$\"` counts: inside other
+                    // quoting those are literal characters.
+                    if translated {
                         facts.locale_quote = true;
                     }
                     let delimiter = unquote_token(&word);
@@ -1048,9 +1051,10 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
 
 /// Read a heredoc's delimiter word, given the index just past its
 /// `<<`. Returns the word as written, whether the operator was `<<-`
-/// (which strips leading tabs from the terminator), and the index just
-/// past the word.
-fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, usize) {
+/// (which strips leading tabs from the terminator), whether the word
+/// contains an *active* `$\"…\"` translation, and the index just past
+/// the word.
+fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, bool, usize) {
     let strip_tabs = text.get(i) == Some(&'-');
     if strip_tabs {
         i += 1;
@@ -1063,6 +1067,7 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, usize) 
     // `$EOF`. Quotes inside the word do not end it.
     let mut word = String::new();
     let mut quote: Option<char> = None;
+    let mut translated = false;
     while let Some(&c) = text.get(i) {
         match quote {
             Some(open) => {
@@ -1089,12 +1094,15 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, usize) 
                 if matches!(c, '\'' | '"') {
                     quote = Some(c);
                 }
+                if c == '$' && text.get(i + 1) == Some(&'"') {
+                    translated = true;
+                }
                 word.push(c);
             }
         }
         i += 1;
     }
-    (word, strip_tabs, i)
+    (word, strip_tabs, translated, i)
 }
 
 /// Skip a heredoc body, given the index of the newline that ends its
@@ -2378,6 +2386,10 @@ mod tests {
             "(true)# $\"cat\"",
             // A heredoc body is data: nothing in it is translated.
             "cat <<'EOF'\n$\"cat\"\nEOF",
+            // A `$\"` protected by other quoting is a literal
+            // delimiter, not a translation.
+            "cat <<'$\"SAFE\"'\nbody\n$\"SAFE\"",
+            "cat <<$'$\"SAFE\"'\nbody\n$\"SAFE\"",
             "cat <<EOF\n$\"cat\"\nEOF",
             // A separator inside a comment separates nothing.
             "export GIT_CONFIG_GLOBAL=/tmp/g # comment; git status",
