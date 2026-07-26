@@ -9,7 +9,9 @@
 //! that lived in `bash.rs` so that a refactor does not change which
 //! invocations are blocked.
 
-use crate::tools::bash_parse::{ParsedCommand, base_name, parse_bash, unquote_token};
+use crate::tools::bash_parse::{
+    ParsedCommand, base_name, parse_bash, unquote_token, unwrapped_argv,
+};
 
 /// Severity of a destructive-command finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,52 +250,52 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     if depth < MAX_SHELL_SCAN_DEPTH {
         for invocation in &cmd.invocations {
             let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
-            let Some((head, args)) = unquoted.split_first() else {
-                continue;
-            };
-            let Some(payload) = shell_payload(&base_name(head).to_lowercase(), args) else {
-                continue;
-            };
-            let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
-                raw: payload.clone(),
-                ..ParsedCommand::default()
-            });
-            findings.extend(find_destructive_depth(&inner, depth + 1));
+            // `env bash -c …` and `command bash -c …` run the inner
+            // shell, so the wrapper chain has to come off before the
+            // head means anything. Reuses the wrapper resolution the
+            // parser already models rather than a second copy of it.
+            let unwrapped = unwrapped_argv(invocation);
+            for tokens in [Some(&unquoted), unwrapped.as_ref()].into_iter().flatten() {
+                let Some((head, args)) = tokens.split_first() else {
+                    continue;
+                };
+                for payload in shell_payloads(&base_name(head).to_lowercase(), args) {
+                    let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
+                        raw: payload.clone(),
+                        ..ParsedCommand::default()
+                    });
+                    findings.extend(find_destructive_depth(&inner, depth + 1));
+                }
+            }
         }
     }
 
     findings
 }
 
-/// The literal command string an invocation hands to another shell,
-/// if it does: `bash -c CMD` (also `-ec`, `-lc`, … clusters) and
-/// `eval WORDS…`. Payloads only run-time expansion can produce are
-/// left to the raw scans.
-fn shell_payload(head: &str, args: &[String]) -> Option<String> {
+/// The literal command strings an invocation may hand to another
+/// shell. `eval` concatenates its arguments; a shell takes its command
+/// from `-c`.
+///
+/// For a shell, every argument is treated as a candidate rather than
+/// only the operand after `-c`. Locating `-c` exactly would mean
+/// trusting bash's full option grammar — `-o option`, `-O shopt`,
+/// `--rcfile FILE` and clusters all take operands, and one
+/// misunderstood spelling (`bash -O extglob -c '…'`) silently skips
+/// the payload. Scanning every argument cannot be dodged by option
+/// ordering, and an option's own operand (`extglob`, `posix`) parses
+/// as a harmless bare word.
+fn shell_payloads(head: &str, args: &[String]) -> Vec<String> {
     match head {
-        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" => {
-            for (i, a) in args.iter().enumerate() {
-                let cluster = a.strip_prefix('-')?;
-                if a == "--" {
-                    return None;
-                }
-                // `-c` alone or inside a short-option cluster (`-lc`,
-                // `-ec`): the next operand is the command string.
-                if !cluster.starts_with('-') && cluster.contains('c') {
-                    return args.get(i + 1).cloned();
-                }
-            }
-            None
-        }
+        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" => args.to_vec(),
         "eval" => {
-            // `eval` concatenates its arguments and evaluates them.
             if args.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(args.join(" "))
+                vec![args.join(" ")]
             }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -355,6 +357,16 @@ mod tests {
             "bash -lc \"'git' push --force\"",
             "eval \"'git' push --force\"",
             "bash -c \"bash -c \\\"'git' push --force\\\"\"",
+            // Operand-taking shell options must not move the payload
+            // out of view.
+            "bash -O extglob -c \"'git' push --force\"",
+            "bash -o posix -c \"'rm' -rf /tmp/x\"",
+            "bash --rcfile /dev/null -c \"'git' push --force\"",
+            // Wrapper chains run the inner shell.
+            "env bash -c \"'git' push --force\"",
+            "command bash -c \"'rm' -rf /tmp/x\"",
+            "nohup sh -c \"'git' push --force\"",
+            "env -u PATH bash -c \"'git' push --force\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
@@ -420,6 +432,11 @@ mod tests {
             "bash -c 'echo hello world'",
             "bash -c \"printf '%s\\n' 'git push' --force\"",
             "eval 'echo hi'",
+            // Shell options and their operands are not payloads.
+            "bash -O extglob -c 'ls'",
+            "bash -o posix -c 'echo hi'",
+            "env bash -c 'cargo build'",
+            "bash script.sh",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(

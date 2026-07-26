@@ -748,6 +748,19 @@ pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
         .collect()
 }
 
+/// The tokens a wrapper chain runs, for gates that need the argv
+/// rather than the joined text of [`unwrapped_invocation_texts`].
+/// `None` when the head is not a wrapper, or no wrapped command can be
+/// identified — including the dynamic case, which
+/// [`has_dynamic_wrapper`] reports separately so callers can fail
+/// closed instead of treating it as "nothing wrapped".
+pub fn unwrapped_argv(argv: &[String]) -> Option<Vec<String>> {
+    match unwrapped_tokens(argv) {
+        Unwrap::Tokens(tokens) => Some(tokens),
+        _ => None,
+    }
+}
+
 /// True when some invocation runs a command whose identity only
 /// run-time expansion decides (`env -S '${CMD} -rf x'`). The command
 /// text a gate would match is unknowable, so widening rules must fail
