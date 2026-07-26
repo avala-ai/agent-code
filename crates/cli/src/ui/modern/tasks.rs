@@ -54,17 +54,53 @@ impl TaskState {
     }
 }
 
-/// One tracked subagent.
+/// Where a row came from, which decides the group it renders under.
+///
+/// Subagent rows arrive live from engine events; background rows are
+/// polled from the shared `TaskManager`. They are different sources, but
+/// the user thinks of them as one list of "things running for me", so
+/// they share a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSource {
+    /// An Agent-tool subagent, reported via `EngineEvent::SubagentUpdate`.
+    Subagent,
+    /// A `TaskManager` job: `&`-prefixed shell, workflow, or monitor.
+    Background,
+}
+
+impl TaskSource {
+    pub fn heading(self) -> &'static str {
+        match self {
+            TaskSource::Subagent => "agents",
+            TaskSource::Background => "background",
+        }
+    }
+}
+
+/// One tracked subagent or background task.
 #[derive(Debug, Clone)]
 pub struct TaskEntry {
     pub agent_id: String,
     pub state: TaskState,
     pub headline: String,
+    pub source: TaskSource,
 }
 
 /// Upsert a subagent update into `tasks`, keeping entries ordered by state
 /// (needs-input → working → done/failed) with a stable within-section order.
 pub fn upsert(tasks: &mut Vec<TaskEntry>, agent_id: &str, state: &str, headline: &str) {
+    upsert_with_source(tasks, agent_id, state, headline, TaskSource::Subagent);
+}
+
+/// Upsert a row from a specific source. Background rows are replaced
+/// wholesale on each poll, so their state always reflects the manager.
+pub fn upsert_with_source(
+    tasks: &mut Vec<TaskEntry>,
+    agent_id: &str,
+    state: &str,
+    headline: &str,
+    source: TaskSource,
+) {
     let state = TaskState::parse(state);
     if let Some(existing) = tasks.iter_mut().find(|t| t.agent_id == agent_id) {
         existing.state = state;
@@ -76,14 +112,68 @@ pub fn upsert(tasks: &mut Vec<TaskEntry>, agent_id: &str, state: &str, headline:
             agent_id: agent_id.to_string(),
             state,
             headline: headline.to_string(),
+            source,
         });
     }
-    // Stable sort by section so needs-input rows float to the top.
-    tasks.sort_by_key(|t| t.state.order());
+    // Group by source, then float needs-input rows to the top within it.
+    // Stable, so arrival order is preserved inside a section.
+    tasks.sort_by_key(|t| (t.source.heading(), t.state.order()));
 }
 
 #[cfg(test)]
 mod tests {
+    /// The pane was fed only by `EngineEvent::SubagentUpdate`, so a
+    /// background job (`&` shell, workflow, monitor) never appeared in it
+    /// at all — the user had to run `/tasks list` to see one.
+    #[test]
+    fn background_rows_and_subagent_rows_share_the_pane() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "agent-1", "working", "explore parser");
+        upsert_with_source(
+            &mut tasks,
+            "b3",
+            "working",
+            "cargo build --release",
+            TaskSource::Background,
+        );
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|t| t.source == TaskSource::Subagent));
+        assert!(tasks.iter().any(|t| t.source == TaskSource::Background));
+    }
+
+    /// Rows group by source so the pane reads as two lists, and
+    /// needs-input still floats to the top within its group.
+    #[test]
+    fn rows_group_by_source_then_by_state() {
+        let mut tasks = Vec::new();
+        upsert_with_source(&mut tasks, "b1", "done", "build", TaskSource::Background);
+        upsert(&mut tasks, "a1", "working", "explore");
+        upsert_with_source(&mut tasks, "b2", "working", "test", TaskSource::Background);
+        upsert(&mut tasks, "a2", "needs_input", "asks");
+
+        let sources: Vec<_> = tasks.iter().map(|t| t.source).collect();
+        // All of one source before all of the other — no interleaving.
+        let first = sources[0];
+        let split = sources
+            .iter()
+            .position(|s| *s != first)
+            .unwrap_or(sources.len());
+        assert!(
+            sources[split..].iter().all(|s| *s != first),
+            "sources interleaved: {sources:?}"
+        );
+
+        let agents: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.source == TaskSource::Subagent)
+            .collect();
+        assert_eq!(
+            agents[0].state,
+            TaskState::NeedsInput,
+            "needs-input did not float to the top of its group"
+        );
+    }
+
     use super::*;
 
     #[test]

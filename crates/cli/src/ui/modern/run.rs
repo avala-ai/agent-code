@@ -315,6 +315,17 @@ pub(super) async fn event_loop(
     anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut flush_tick = tokio::time::interval(super::stream_buffer::FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Background tasks live in the shared `TaskManager`, which emits no
+    // events, so the pane has to ask. Polled only while a turn is live or
+    // rows already exist, so an idle session still never wakes — and the
+    // sync only marks the frame dirty when something actually changed.
+    let mut tasks_tick = tokio::time::interval(Duration::from_millis(750));
+    tasks_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let task_manager = {
+        let engine_arc = session.engine();
+        let eng = engine_arc.lock().await;
+        eng.state().task_manager.clone()
+    };
 
     // Sync SessionMode with the engine when it changes.
     let mut last_mode = app.mode;
@@ -756,6 +767,24 @@ pub(super) async fn event_loop(
             // Coalescer flush deadline (only while text is buffered).
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
+            }
+            // Background-task rows (`&` shell jobs, workflows, monitors).
+            _ = tasks_tick.tick(), if live || !app.tasks.is_empty() => {
+                let rows = task_manager
+                    .list()
+                    .await
+                    .into_iter()
+                    .map(|t| {
+                        let state = match &t.status {
+                            agent_code_lib::services::background::TaskStatus::Running => "working",
+                            agent_code_lib::services::background::TaskStatus::Completed => "done",
+                            agent_code_lib::services::background::TaskStatus::Failed(_) => "failed",
+                            agent_code_lib::services::background::TaskStatus::Killed => "failed",
+                        };
+                        (t.id.to_string(), state.to_string(), t.description.clone())
+                    })
+                    .collect();
+                app.sync_background_tasks(rows);
             }
             // Micro-animations: spinner, action-required blink, toast decay.
             _ = anim_tick.tick(), if live || app.needs_anim_tick() => {

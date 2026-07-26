@@ -633,8 +633,24 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use super::tasks::TaskState;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let inner_w = area.width.saturating_sub(2) as usize;
+    let mut last_source: Option<super::tasks::TaskSource> = None;
     for t in &app.tasks {
         let p = palette();
+        // Group header when the source changes. Subagents and background
+        // jobs arrive from different places but read as one list, so they
+        // share the pane with a heading to tell them apart.
+        if last_source != Some(t.source) {
+            if last_source.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                t.source.heading().to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            last_source = Some(t.source);
+        }
         let color = match t.state {
             TaskState::Working => Color::Blue,
             TaskState::NeedsInput => p.warning,

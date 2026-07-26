@@ -1994,6 +1994,44 @@ impl App {
 
     /// Toggle the tasks pane (Ctrl+T). No-op display-wise when no tasks exist,
     /// since the pane is hidden without any.
+    /// Replace the background-task rows with the manager's current view.
+    ///
+    /// Background rows are owned by the `TaskManager`, so they are
+    /// rebuilt wholesale rather than upserted: a task that disappeared
+    /// from the manager must disappear from the pane. Subagent rows,
+    /// which arrive as live events, are left untouched.
+    ///
+    /// Returns true when anything changed, so the caller can avoid
+    /// repainting an idle screen.
+    pub fn sync_background_tasks(&mut self, rows: Vec<(String, String, String)>) -> bool {
+        use super::tasks::{TaskEntry, TaskSource, TaskState};
+        let mut next: Vec<TaskEntry> = self
+            .tasks
+            .iter()
+            .filter(|t| t.source == TaskSource::Subagent)
+            .cloned()
+            .collect();
+        for (id, state, headline) in rows {
+            next.push(TaskEntry {
+                agent_id: id,
+                state: TaskState::parse(&state),
+                headline,
+                source: TaskSource::Background,
+            });
+        }
+        next.sort_by_key(|t| (t.source.heading(), t.state.order()));
+
+        let changed = next.len() != self.tasks.len()
+            || next.iter().zip(self.tasks.iter()).any(|(a, b)| {
+                a.agent_id != b.agent_id || a.state != b.state || a.headline != b.headline
+            });
+        if changed {
+            self.tasks = next;
+            self.dirty = true;
+        }
+        changed
+    }
+
     pub fn toggle_tasks(&mut self) {
         self.show_tasks = !self.show_tasks;
         self.dirty = true;
@@ -3146,6 +3184,49 @@ mod tests {
             app.pending_submit.is_none(),
             "opening a picker is not a turn"
         );
+    }
+
+    #[test]
+    fn syncing_background_tasks_replaces_only_background_rows() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.sync_background_tasks(vec![("b1".into(), "working".into(), "cargo build".into())]);
+        assert_eq!(app.tasks.len(), 2);
+
+        // A manager that no longer reports b1 must drop it, while the
+        // subagent row — which is event-driven, not polled — survives.
+        app.sync_background_tasks(vec![]);
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].source, TaskSource::Subagent);
+    }
+
+    /// The poll runs on a timer, so a sync that changes nothing must not
+    /// mark the frame dirty — otherwise the zero-frame idle guarantee is
+    /// gone for any session with a finished task still listed.
+    #[test]
+    fn an_unchanged_background_sync_does_not_repaint() {
+        let mut app = App::new("m", "/tmp", "s");
+        let rows = vec![("b1".to_string(), "working".to_string(), "build".to_string())];
+        assert!(
+            app.sync_background_tasks(rows.clone()),
+            "first sync adds a row"
+        );
+        app.dirty = false;
+        assert!(
+            !app.sync_background_tasks(rows),
+            "an identical sync reported a change"
+        );
+        assert!(!app.dirty, "an identical sync marked the frame dirty");
+    }
+
+    #[test]
+    fn a_background_state_change_repaints() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.sync_background_tasks(vec![("b1".into(), "working".into(), "build".into())]);
+        app.dirty = false;
+        assert!(app.sync_background_tasks(vec![("b1".into(), "done".into(), "build".into())]));
+        assert!(app.dirty);
     }
 
     #[test]
