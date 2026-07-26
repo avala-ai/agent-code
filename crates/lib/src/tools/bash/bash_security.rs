@@ -921,24 +921,37 @@ fn translation_can_reach_a_command(cmd: &ParsedCommand) -> bool {
         .invocations
         .iter()
         .map(|invocation| {
-            // `env printf …` prints just as `printf …` does, so the
-            // wrapper comes off before the head is read.
-            let unwrapped = unwrapped_argv(invocation);
-            let invocation = unwrapped.as_ref().unwrap_or(invocation);
-            // A head that is itself a translation cannot vouch for
-            // anything: `$"cat" file.txt` reads as `cat` only until
-            // the catalogue says otherwise.
-            let head_is_data = invocation.first().is_some_and(|t| {
-                DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
-                    && !shell_text_facts(t).locale_quote
-            });
+            // The parser can split `$"…"` into a `$` token and a
+            // string token, so the invocation is read as one piece of
+            // text — and always the *raw* tokens, since unwrapping
+            // unquotes them and would erase the syntax in question.
+            let carries_translation = shell_text_facts(&invocation.join("")).locale_quote;
             let has_substitution = invocation
                 .iter()
                 .any(|token| token.contains("$(") || token.contains('`'));
-            // The parser can split `$\"…\"` into a `$` token and a
-            // string token, so the invocation is read as one piece of
-            // text rather than token by token.
-            let carries_translation = shell_text_facts(&invocation.join("")).locale_quote;
+            // `env printf …` prints just as `printf …` does, so the
+            // wrapper comes off before the head is read.
+            let unwrapped = unwrapped_argv(invocation);
+            let effective = unwrapped.as_ref().unwrap_or(invocation);
+            // A head that is itself a translation cannot vouch for
+            // anything: `env $"cat" file.txt` reads as `cat` only
+            // until the catalogue says otherwise. The raw text up to
+            // where that name appears decides — a translation after
+            // it is an operand, one before it is the name.
+            let head_is_data = effective.first().is_some_and(|head| {
+                let name = base_name(&unquote_token(head)).to_lowercase();
+                if !DATA_COMMANDS.contains(&name.as_str()) {
+                    return false;
+                }
+                let mut prefix = String::new();
+                for token in invocation {
+                    prefix.push_str(token);
+                    if base_name(&unquote_token(token)).to_lowercase() == name {
+                        break;
+                    }
+                }
+                !shell_text_facts(&prefix).locale_quote
+            });
             carries_translation && (!head_is_data || has_substitution)
         })
         .collect();
@@ -2406,6 +2419,11 @@ mod tests {
             // A substitution restarts quoting, so the translation
             // inside it is one too.
             "echo \"$($\"cat\" /tmp/file)\"",
+            // A wrapper does not make a translated head into data.
+            "env $\"cat\" file.txt",
+            // Bash omits an out-of-range code point rather than
+            // replacing it.
+            "$'\\Uffffffffgit' push --force",
             // What follows a closing `)` joins the same word, so this
             // `#` is a character rather than a comment.
             "echo $(true)#x; $\"cat\" /tmp/file",

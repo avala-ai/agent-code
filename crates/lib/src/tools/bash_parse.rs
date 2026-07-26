@@ -339,13 +339,15 @@ fn push_ansi_c_escape(
         'u' | 'U' => {
             let max = if esc == 'u' { 4 } else { 8 };
             match chars.peek().and_then(|c| c.to_digit(16)) {
-                // An invalid code point can never be pattern text; the
-                // replacement character keeps the scan conservative.
+                // Bash omits an out-of-range code point rather than
+                // substituting anything, so `$'\Uffffffffgit'` is
+                // `git`; inventing a character here would hide it.
                 Some(_) => {
-                    return push_nul_or(
-                        char::from_u32(radix_value(chars, 16, max, 0)).unwrap_or('\u{fffd}'),
-                        out,
-                    );
+                    let value = radix_value(chars, 16, max, 0);
+                    return match char::from_u32(value) {
+                        Some(decoded) => push_nul_or(decoded, out),
+                        None => false,
+                    };
                 }
                 None => {
                     out.push('\\');
