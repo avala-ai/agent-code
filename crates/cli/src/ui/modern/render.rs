@@ -256,10 +256,34 @@ fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     } else {
         Style::default().fg(p.accent)
     };
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     let prefix = "  find: ";
+    // Editing happens at the end of the query, so when it outgrows the
+    // row show a horizontally scrolled tail with a leading ellipsis —
+    // clipping the right edge would hide exactly the part being edited.
+    let avail = (bar.width as usize).saturating_sub(prefix.len() + 1);
+    let qw = s.query.as_str().width();
+    let (shown, shown_w) = if qw <= avail {
+        (s.query.clone(), qw)
+    } else {
+        let target = avail.saturating_sub(1);
+        let mut w = 0usize;
+        let mut kept: Vec<&str> = Vec::new();
+        for g in s.query.as_str().graphemes(true).rev() {
+            let gw = g.width().max(1);
+            if w + gw > target {
+                break;
+            }
+            w += gw;
+            kept.push(g);
+        }
+        let tail: String = kept.iter().rev().copied().collect();
+        (format!("…{tail}"), w + 1)
+    };
     let line = Line::from(vec![
         Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-        Span::styled(s.query.clone(), Style::default().fg(p.text)),
+        Span::styled(shown, Style::default().fg(p.text)),
         Span::styled(counter, Style::default().fg(Color::DarkGray)),
         Span::styled(
             "   [↓/↑] next/prev  [Enter] keep  [Esc] cancel",
@@ -270,11 +294,10 @@ fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), bar);
     // Typed and pasted input lands here, so the caret must too — the
     // composer suppresses its own while the bar is open.
-    use unicode_width::UnicodeWidthStr;
     let x = bar
         .x
         .saturating_add(prefix.len() as u16)
-        .saturating_add(s.query.as_str().width() as u16)
+        .saturating_add(shown_w as u16)
         .min(bar.x.saturating_add(bar.width.saturating_sub(1)));
     frame.set_cursor_position((x, bar.y));
 }
@@ -1490,6 +1513,31 @@ mod tests {
         assert_eq!(cur.y, bar_row, "caret must be on the search row:\n{s}");
         assert_eq!(cur.x, 8 + 2, "caret must sit right after the query");
         assert_ne!(cur.y, composer_cursor.y, "caret must leave the composer");
+    }
+
+    /// A query wider than the row scrolls horizontally so the tail being
+    /// edited stays visible next to the caret.
+    #[test]
+    fn long_query_keeps_its_editable_tail_visible() {
+        let backend = TestBackend::new(40, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "prefix_that_is_much_longer_than_the_row_tail".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s.lines().find(|l| l.contains("find:")).expect("bar row");
+        assert!(
+            row.contains("_tail"),
+            "the end of the query must stay visible: {row:?}"
+        );
+        assert!(row.contains('…'), "scrolled query must be marked: {row:?}");
+        let cur = term.get_cursor_position().unwrap();
+        assert_eq!(cur.x, 39, "caret must sit at the visible end");
     }
 
     /// Stepping matches must visibly anchor the `n/m` counter.

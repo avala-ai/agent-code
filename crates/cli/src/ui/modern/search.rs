@@ -173,21 +173,26 @@ impl App {
                         }
                     })
                     .collect();
-                let Some(pos) = folded.concat().find(&needle) else {
-                    continue;
-                };
-                // Report the match at the display row its first byte
-                // falls on, so the jump lands where the text starts.
-                let mut off = 0usize;
-                let mut at = rows[0].0;
-                for ((abs, _), f) in rows.iter().zip(&folded) {
-                    if pos < off + f.len() {
-                        at = *abs;
-                        break;
+                // Every occurrence counts, each reported at the display
+                // row its first byte falls on so the jump lands where the
+                // text starts. Highlight and navigation are row-granular,
+                // so occurrences sharing a row collapse into one stop.
+                let mut last_at = usize::MAX;
+                for (pos, _) in folded.concat().match_indices(&needle) {
+                    let mut off = 0usize;
+                    let mut at = rows[0].0;
+                    for ((abs, _), f) in rows.iter().zip(&folded) {
+                        if pos < off + f.len() {
+                            at = *abs;
+                            break;
+                        }
+                        off += f.len();
                     }
-                    off += f.len();
+                    if at != last_at {
+                        matches.push(at);
+                        last_at = at;
+                    }
                 }
-                matches.push(at);
             }
         }
         if let Some(s) = self.search.as_mut() {
@@ -370,6 +375,49 @@ mod tests {
             (1, 1),
             "wrapped match not found: {rows:?}"
         );
+    }
+
+    /// Two occurrences inside one logical line, wrapped onto different
+    /// display rows, are two distinct stops.
+    #[test]
+    fn every_wrapped_occurrence_in_a_logical_line_is_reachable() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        app.transcript.push(TranscriptItem::System(format!(
+            "needle{}needle",
+            "x".repeat(10)
+        )));
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 10, &expanded, None);
+        app.open_search();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        let s = app.search.as_ref().unwrap();
+        assert_eq!(
+            s.matches.len(),
+            2,
+            "both occurrences must be stops: {:?}",
+            s.matches
+        );
+        assert_ne!(s.matches[0], s.matches[1], "stops must be distinct rows");
+    }
+
+    /// Navigation and highlight are row-granular, so occurrences that
+    /// share a display row collapse into a single stop.
+    #[test]
+    fn occurrences_sharing_a_row_collapse_into_one_stop() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        app.transcript
+            .push(TranscriptItem::System("needle needle".into()));
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 80, &expanded, None);
+        app.open_search();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        assert_eq!(app.search.as_ref().unwrap().position(), (1, 1));
     }
 
     #[test]
