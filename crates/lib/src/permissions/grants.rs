@@ -269,8 +269,9 @@ fn grant_file_path(project_root: &Path) -> Option<PathBuf> {
     // Hash the raw path bytes, not a lossy string: lossy conversion maps
     // every invalid byte to U+FFFD, which would let two different
     // projects share one grant file — and therefore each other's
-    // approvals. FNV also keeps the filename stable across toolchains,
-    // which `DefaultHasher` explicitly does not guarantee.
+    // approvals. SHA-256 keeps the filename stable across toolchains
+    // (which `DefaultHasher` explicitly does not guarantee) and makes
+    // engineered filename collisions unrealistic.
     #[cfg(unix)]
     let bytes: Vec<u8> = {
         use std::os::unix::ffi::OsStrExt;
@@ -287,8 +288,10 @@ fn grant_file_path(project_root: &Path) -> Option<PathBuf> {
     };
     #[cfg(not(any(unix, windows)))]
     let bytes: Vec<u8> = canonical.to_string_lossy().into_owned().into_bytes();
-    let hash = crate::tools::executor::fnv1a64(&bytes);
-    Some(dir.join("grants").join(format!("{hash:016x}.toml")))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Some(dir.join("grants").join(format!("{hex}.toml")))
 }
 
 #[cfg(test)]

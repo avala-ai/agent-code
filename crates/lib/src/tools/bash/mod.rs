@@ -223,11 +223,7 @@ impl Tool for BashTool {
             )));
         }
 
-        let timeout_ms = input
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(120_000)
-            .min(600_000);
+        let timeout_ms = effective_timeout_ms(&input);
 
         let run_in_background = input
             .get("run_in_background")
@@ -370,6 +366,20 @@ async fn read_stream_emitting(
 }
 
 /// Run a command in the background, returning a task ID immediately.
+/// Effective timeout for a bash call: tool-supplied, defaulted, clamped.
+/// Shared with the durable grant key
+/// ([`crate::tools::executor::persistent_grant_key`]), which must record
+/// the operation as it would actually run — so an omitted timeout and an
+/// explicit default produce the same key, and a genuinely different
+/// budget does not.
+pub(crate) fn effective_timeout_ms(input: &serde_json::Value) -> u64 {
+    input
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(120_000)
+        .min(600_000)
+}
+
 async fn run_background(
     command: &str,
     cwd: &std::path::Path,
