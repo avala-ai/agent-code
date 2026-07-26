@@ -328,54 +328,70 @@ const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char])] = &[
 /// list of wrappers will ever fully cover. A head whose operands are
 /// text keeps its arguments inert, so `echo git push -uf` is not a
 /// force push.
+/// Every `git` token is tried, not just the first: an inert operand
+/// spelled `git` sits in front of the real one in
+/// `find … -exec echo git \; -exec git push -uf … \;`.
 fn clustered_git_flag(invocation: &[String]) -> Option<String> {
     let tokens: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
     let head_is_data = tokens
         .first()
         .is_some_and(|t| DATA_COMMANDS.contains(&base_name(t).to_lowercase().as_str()));
-    let git = tokens
-        .iter()
-        .position(|token| base_name(token).to_lowercase() == "git")?;
-    if head_is_data && !in_command_position(&tokens, git) {
-        return None;
-    }
-    let tokens = &tokens[git..];
-    // The subcommand is the first token that is not an option or one
-    // of git's own `-C dir` / `-c key=value` operands.
-    let mut idx = 1;
-    while let Some(token) = tokens.get(idx) {
-        if let Some(flag) = token.strip_prefix('-') {
-            idx += if matches!(flag, "C" | "c") { 2 } else { 1 };
+    for (idx, token) in tokens.iter().enumerate() {
+        if base_name(token).to_lowercase() != "git" {
             continue;
         }
-        break;
-    }
-    let subcommand = tokens.get(idx)?.to_lowercase();
-    let (_, flags) = DESTRUCTIVE_GIT_FLAGS
-        .iter()
-        .find(|(name, _)| *name == subcommand)?;
-    for token in &tokens[idx + 1..] {
-        // Past `--` everything is a pathspec, however it is spelled:
-        // `git clean -n -- -dir` is a dry run against a file named
-        // `-dir`, not a `-d` cluster.
-        if token == "--" {
-            break;
+        if head_is_data && !in_command_position(&tokens, idx) {
+            continue;
         }
-        let Some(cluster) = token.strip_prefix('-') else {
+        if let Some(reason) = destructive_git_subcommand(&tokens[idx + 1..]) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// The first destructive subcommand + cluster pair in the tokens after
+/// a `git`.
+///
+/// The subcommand is found by name rather than by counting past git's
+/// global options: several of them take a separate operand
+/// (`--git-dir DIR`, `--work-tree DIR`, `--namespace NAME`,
+/// `-C dir`…), and mistaking one operand for the subcommand is what
+/// let `git --git-dir .git push -uf …` through. Matching the name
+/// needs no option grammar at all, and an operand that happens to be
+/// spelled `push` only costs an over-block.
+fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
+    for (idx, token) in after_git.iter().enumerate() {
+        let subcommand = token.to_lowercase();
+        let Some((_, flags)) = DESTRUCTIVE_GIT_FLAGS
+            .iter()
+            .find(|(name, _)| *name == subcommand)
+        else {
             continue;
         };
-        if cluster.starts_with('-') {
-            continue;
-        }
-        // `git branch -D` is the destructive spelling; `-d` refuses to
-        // delete an unmerged branch. The text scan lowercases and so
-        // flags both, and this must not go the other way and miss the
-        // upper-case one.
-        if let Some(found) = cluster
-            .chars()
-            .find(|c| flags.contains(c) || (flags.contains(&'D') && *c == 'd'))
-        {
-            return Some(format!("git {subcommand} with '-{found}'"));
+        for token in &after_git[idx + 1..] {
+            // Past `--` everything is a pathspec, however it is
+            // spelled: `git clean -n -- -dir` is a dry run against a
+            // file named `-dir`, not a `-d` cluster.
+            if token == "--" {
+                break;
+            }
+            let Some(cluster) = token.strip_prefix('-') else {
+                continue;
+            };
+            if cluster.starts_with('-') {
+                continue;
+            }
+            // `git branch -D` is the destructive spelling; `-d`
+            // refuses to delete an unmerged branch. The text scan
+            // lowercases and so flags both, and this must not go the
+            // other way and miss the upper-case one.
+            if let Some(found) = cluster
+                .chars()
+                .find(|c| flags.contains(c) || (flags.contains(&'D') && *c == 'd'))
+            {
+                return Some(format!("git {subcommand} with '-{found}'"));
+            }
         }
     }
     None
@@ -704,6 +720,12 @@ mod tests {
             "sudo git push -uf origin main",
             "stdbuf -oL git clean -df",
             "nice -n 5 git checkout -qf main",
+            // An inert `git` operand before the executable one.
+            "find . -maxdepth 0 -exec echo git \\; -exec git push -uf origin main \\;",
+            // Global options that take a separate operand.
+            "git --git-dir .git push -uf origin main",
+            "git --work-tree /tmp/repo clean -df",
+            "git --namespace ns push -uf origin main",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
