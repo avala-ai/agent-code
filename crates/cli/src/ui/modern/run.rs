@@ -488,6 +488,13 @@ pub(super) async fn event_loop(
                         app.force_full_redraw = true;
                     }
                     app.dirty = true;
+                    drop(eng);
+                    // The command may have mutated the TaskManager
+                    // (`/tasks kill`, `/tasks clear`): refresh the pane
+                    // now, because the gated poll can be parked when
+                    // every listed task is already terminal.
+                    let rows = manager_rows(&task_manager).await;
+                    app.sync_background_tasks(rows);
                 }
                 Err(_) => {
                     // Turn holds the lock — retry next loop.
@@ -868,10 +875,20 @@ async fn manager_rows(
             }
         })
         .collect();
-    // The manager's map iterates in arbitrary order; sort by task id so
-    // reconciliation (which record folds into an event row) and row
-    // order are stable across polls.
-    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    // The manager's map iterates in arbitrary order; sort by the id's
+    // numeric sequence so reconciliation (which record folds into an
+    // event row) is stable and chronological. The sequence is unpadded
+    // ("a9", "a10"), so a lexical sort would misorder digit boundaries.
+    fn task_seq(id: &str) -> u64 {
+        id.trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .unwrap_or(u64::MAX)
+    }
+    rows.sort_by(|a, b| {
+        task_seq(&a.id)
+            .cmp(&task_seq(&b.id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     rows
 }
 

@@ -2035,10 +2035,14 @@ impl App {
                 // state wins, while the richer event headline is kept.
                 // Manager rows arrive sorted by task id, so the fold is
                 // deterministic: the oldest task claims the event row.
-                let unclaimed = next
-                    .iter()
-                    .enumerate()
-                    .position(|(i, t)| t.agent_id == sid && !claimed[i]);
+                // A row this task already owns (folded or synthesized on
+                // an earlier poll — its task_id matches) is re-claimed
+                // first so repeated polls converge instead of appending.
+                let unclaimed = next.iter().enumerate().position(|(i, t)| {
+                    !claimed[i]
+                        && (t.task_id.as_deref() == Some(row.id.as_str())
+                            || (t.task_id.is_none() && t.agent_id == sid))
+                });
                 if let Some(idx) = unclaimed {
                     claimed[idx] = true;
                     next[idx].state = state;
@@ -2067,6 +2071,15 @@ impl App {
                 task_id: Some(row.id),
             });
         }
+        // A manager-backed agent row whose record vanished (e.g.
+        // `/tasks clear`) has nothing behind it any more — drop it like
+        // a background row. Pure event rows (no task_id) always stay.
+        let mut next: Vec<TaskEntry> = next
+            .into_iter()
+            .zip(claimed)
+            .filter(|(t, c)| *c || t.task_id.is_none())
+            .map(|(t, _)| t)
+            .collect();
         next.sort_by_key(|t| (t.source.heading(), t.state.order()));
 
         let changed = next.len() != self.tasks.len()
@@ -3467,6 +3480,35 @@ mod tests {
                 .any(|t| t.agent_id == "a5" && t.task_id.as_deref() == Some("a5")),
             "extra run lost its own row"
         );
+
+        // Repeated polls must converge: the synthesized row is re-claimed
+        // by its task id, never appended again.
+        for _ in 0..3 {
+            app.sync_background_tasks(vec![row("a3", "done"), row("a5", "working")]);
+        }
+        assert_eq!(app.tasks.len(), 2, "rows grew across identical polls");
+    }
+
+    /// `/tasks clear` removes manager records; rows they backed (folded
+    /// or synthesized) must disappear with them, while pure event rows
+    /// survive.
+    #[test]
+    fn cleared_manager_records_drop_their_rows() {
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "fg-agent", "working", "inline run");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "bg-agent", "working", "bg run");
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a4".into(),
+            state: "done".into(),
+            headline: "bg run".into(),
+            subagent_id: Some("bg-agent".into()),
+        }]);
+        assert_eq!(app.tasks.len(), 2);
+
+        app.sync_background_tasks(vec![]);
+        assert_eq!(app.tasks.len(), 1, "cleared task's row survived");
+        assert_eq!(app.tasks[0].agent_id, "fg-agent");
     }
 
     /// The poll gate: persistent subagent rows alone must not keep the
