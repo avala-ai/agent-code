@@ -232,12 +232,14 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // `GIT_CONFIG_GLOBAL=… /bin/true; git status` must not tar the
     // second statement with the first one's environment.
     //
-    // Environment that outlives its statement is carried forward:
-    // only a *command prefix* (`FOO=bar cmd`) is scoped to one command
-    // by the shell. A bare `FOO=bar` statement, or one behind `export`
-    // and friends, sets the variable for everything after it, so
-    // `export GIT_CONFIG_GLOBAL=…; git p` must be read as one story.
-    let mut carried: Vec<(String, String)> = Vec::new();
+    // Environment that outlives its statement is carried forward.
+    // Only a *command prefix* (`FOO=bar cmd`) is scoped to one command
+    // by the shell; everything else is shell state, so the walk keeps
+    // the state a shell would: each variable's latest value, and which
+    // names carry the export attribute. That attribute sticks, so a
+    // later bare assignment to an exported name still reaches git.
+    let mut shell_vars: Vec<(String, String)> = Vec::new();
+    let mut exported: Vec<String> = Vec::new();
     let mut allexport = false;
     for statement in shell_statements(&cmd.raw) {
         let Some(parsed) = parse_bash(&statement) else {
@@ -246,7 +248,23 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         if let Some(state) = allexport_transition(&parsed) {
             allexport = state;
         }
-        carried.extend(exported_env_pairs(&statement, &parsed, allexport));
+        apply_statement_env(
+            &statement,
+            &parsed,
+            allexport,
+            &mut shell_vars,
+            &mut exported,
+        );
+        let carried: Vec<(String, String)> = exported
+            .iter()
+            .filter_map(|name| {
+                shell_vars
+                    .iter()
+                    .rev()
+                    .find(|(known, _)| known == name)
+                    .cloned()
+            })
+            .collect();
         // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
         // bash -c 'git p'` configures the git inside the payload. The
         // payload is one token here, so tokens are searched word by
@@ -697,6 +715,8 @@ fn exports_variables(words: &[String]) -> bool {
 /// `set -o allexport` and their `+` counterparts, which turn it back
 /// off. `None` when the statement says nothing about it.
 fn allexport_transition(parsed: &ParsedCommand) -> Option<bool> {
+    // `set +a -a` is one command with two toggles; the last one wins.
+    let mut state = None;
     for invocation in &parsed.invocations {
         let mut words = invocation.iter().map(|t| unquote_token(t));
         if words.next().map(|w| base_name(&w)).as_deref() != Some("set") {
@@ -710,31 +730,35 @@ fn allexport_transition(parsed: &ParsedCommand) -> Option<bool> {
             let on = word.starts_with('-');
             if cluster == "o" {
                 if rest.get(index + 1).is_some_and(|next| next == "allexport") {
-                    return Some(on);
+                    state = Some(on);
                 }
                 continue;
             }
             if !cluster.starts_with(['-', '+']) && cluster.contains('a') {
-                return Some(on);
+                state = Some(on);
             }
         }
     }
-    None
+    state
 }
 
-/// The assignments a statement puts into the *environment* of later
-/// commands.
+/// Apply one statement to the shell state a later git would inherit:
+/// each variable's latest value, and which names carry the export
+/// attribute.
 ///
 /// A command prefix (`FOO=bar cmd`) is scoped to that command by the
-/// shell, and a bare `FOO=bar` statement makes a shell variable that
-/// a child process never sees. Only an exporting builtin — or any
-/// assignment once `allexport` is on — reaches git.
-fn exported_env_pairs(
+/// shell, so it changes nothing here. A bare `FOO=bar` statement makes
+/// a shell variable, which a child sees only once the name is
+/// exported — by `export`, by a declaration builtin with `-x`, or by
+/// `allexport`. The attribute sticks to the name, so a later plain
+/// assignment to an already-exported variable reaches git too.
+fn apply_statement_env(
     statement: &str,
     parsed: &ParsedCommand,
     allexport: bool,
-) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
+    shell_vars: &mut Vec<(String, String)>,
+    exported: &mut Vec<String>,
+) {
     // `command -v export FOO=bar` prints a description of `export` and
     // exports nothing.
     if parsed.invocations.iter().any(|invocation| {
@@ -745,43 +769,54 @@ fn exported_env_pairs(
                 .collect::<Vec<_>>(),
         )
     }) {
-        return pairs;
+        return;
     }
-    // `command export FOO=bar` exports just as `export FOO=bar` does,
-    // so the builtin wrappers come off before the head is read.
-    // A wrapper's own options (`command -p export …`, `command --
-    // export …`) sit between it and the command it runs.
-    let exports_via_builtin = parsed.invocations.iter().any(|invocation| {
-        exports_variables(
-            &invocation
-                .iter()
-                .map(|t| unquote_token(t))
-                .collect::<Vec<_>>(),
-        )
-    });
+    let words = split_alias_value(statement);
     // `export FOO=bar` parses as a declaration rather than a command,
-    // so the statement's own first word answers for that spelling.
-    let exports_via_declaration = exports_variables(&split_alias_value(statement));
-    if exports_via_builtin || exports_via_declaration {
+    // so the statement's own first word answers for that spelling;
+    // `command export FOO=bar` arrives as an invocation instead.
+    let exports = exports_variables(&words)
+        || parsed.invocations.iter().any(|invocation| {
+            exports_variables(
+                &invocation
+                    .iter()
+                    .map(|t| unquote_token(t))
+                    .collect::<Vec<_>>(),
+            )
+        });
+    let mut assigned: Vec<(String, String)> = Vec::new();
+    if exports || parsed.invocations.is_empty() {
         for (name, value) in &parsed.assignments {
-            push_assignment(&mut pairs, &format!("{name}={}", unquote_token(value)));
+            push_assignment(&mut assigned, &format!("{name}={}", unquote_token(value)));
         }
+    }
+    if exports {
         for invocation in &parsed.invocations {
             for token in invocation {
-                push_assignment(&mut pairs, &unquote_token(token));
+                push_assignment(&mut assigned, &unquote_token(token));
             }
         }
-        return pairs;
-    }
-    // A statement that is only assignments runs no command, so these
-    // are shell variables. They reach a child process only once
-    // `allexport` is on.
-    if allexport && parsed.invocations.is_empty() {
-        for word in split_alias_value(statement) {
-            push_assignment(&mut pairs, &word);
+        // `export FOO` with no value exports a variable assigned
+        // earlier, so the name alone carries the attribute.
+        for word in words.iter().skip(1) {
+            if !word.contains('=')
+                && !word.starts_with(['-', '+'])
+                && is_env_assignment(&format!("{word}=x"))
+                && !exported.contains(word)
+            {
+                exported.push(word.clone());
+            }
         }
     }
-    pairs
+    for (name, value) in assigned {
+        match shell_vars.iter_mut().find(|(known, _)| *known == name) {
+            Some(slot) => slot.1 = value,
+            None => shell_vars.push((name.clone(), value)),
+        }
+        if (exports || allexport) && !exported.contains(&name) {
+            exported.push(name);
+        }
+    }
 }
 
 /// True when a statement names a `GIT_CONFIG…` variable that the
@@ -1693,6 +1728,11 @@ mod tests {
             // A declaration builtin exports with `-x`.
             "declare -x GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "typeset -x GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // The last toggle in one `set` wins.
+            "set +a -a; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // The export attribute sticks to the name.
+            "export GIT_CONFIG_GLOBAL=/dev/null; GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "GIT_CONFIG_GLOBAL=/tmp/g; export GIT_CONFIG_GLOBAL; git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
