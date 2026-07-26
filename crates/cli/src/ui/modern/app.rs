@@ -1345,6 +1345,42 @@ impl App {
             self.cursor = 0;
             return;
         }
+        if text == "/keybindings" {
+            // List the registry this session actually dispatches from, not
+            // a fresh load of the file — after a mid-session edit those
+            // differ, and showing the file would report bindings as live
+            // that are inactive until restart.
+            use crate::ui::keybindings::KeyAction;
+            let mut out = String::from("keybindings (active this session):");
+            for b in self.keybindings.all() {
+                let chord = b.key.trim().to_lowercase();
+                let action = match &b.action {
+                    KeyAction::Command { command } => format!("/{command}"),
+                    KeyAction::Prompt { prompt } => {
+                        let short: String = prompt.chars().take(40).collect();
+                        let ellipsis = if prompt.chars().count() > 40 {
+                            "…"
+                        } else {
+                            ""
+                        };
+                        format!("prompt: \"{short}{ellipsis}\"")
+                    }
+                    KeyAction::Toggle { setting } => format!("toggle: {setting}"),
+                };
+                let origin = if self.keybindings.is_user_defined(&chord) {
+                    " (user)"
+                } else {
+                    " (built-in)"
+                };
+                out.push_str(&format!("\n  {chord:<14}  {action}{origin}"));
+            }
+            out.push_str("\nedits to keybindings.json load at startup — restart to apply");
+            self.transcript.push(TranscriptItem::System(out));
+            self.input.clear();
+            self.cursor = 0;
+            self.dirty = true;
+            return;
+        }
         if text == "/queue" {
             self.toggle_queue_pane();
             self.input.clear();
@@ -2938,6 +2974,39 @@ mod tests {
         assert!(
             full.contains("note: expected u32"),
             "full output retained (was first-line-only): {full}"
+        );
+    }
+
+    /// `/keybindings` must describe the registry this session dispatches
+    /// from — not a fresh load of the file, which can differ after a
+    /// mid-session edit and would report inactive bindings as live.
+    #[test]
+    fn keybindings_listing_reflects_the_active_registry() {
+        use crate::ui::keybindings::{KeyAction, Keybinding, KeybindingRegistry};
+        let mut app = App::new("m", "/tmp", "s");
+        app.keybindings =
+            std::sync::Arc::new(KeybindingRegistry::from_user_bindings(vec![Keybinding {
+                key: "ctrl+k".into(),
+                action: KeyAction::Command {
+                    command: "tasks".into(),
+                },
+                description: None,
+            }]));
+        app.input = "/keybindings".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(app.pending_submit.is_none(), "listing became a turn");
+        let listing = match app.transcript.last() {
+            Some(TranscriptItem::System(s)) => s.clone(),
+            other => panic!("expected a system listing, got {other:?}"),
+        };
+        assert!(
+            listing.contains("ctrl+k") && listing.contains("(user)"),
+            "active user binding missing from listing: {listing}"
+        );
+        assert!(
+            listing.contains("restart to apply"),
+            "listing does not say file edits need a restart: {listing}"
         );
     }
 

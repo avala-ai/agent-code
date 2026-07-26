@@ -45,8 +45,9 @@ pub struct KeybindingRegistry {
 }
 
 impl KeybindingRegistry {
-    /// Load keybindings from the config file.
-    pub fn load() -> Self {
+    /// Built-in defaults only. Reads no files, so it is independent of
+    /// the machine's `keybindings.json` — tests build on this.
+    pub fn defaults() -> Self {
         let mut registry = Self {
             bindings: HashMap::new(),
             user_defined: std::collections::HashSet::new(),
@@ -75,18 +76,19 @@ impl KeybindingRegistry {
             "Clear conversation",
         );
 
-        // Load user overrides.
+        registry
+    }
+
+    /// Load keybindings: the built-in defaults overlaid with the user's
+    /// config file.
+    pub fn load() -> Self {
+        let mut registry = Self::defaults();
+
         if let Some(path) = keybindings_path()
             && path.exists()
         {
             match load_keybindings_file(&path) {
-                Ok(user_bindings) => {
-                    for binding in user_bindings {
-                        let key = binding.key.trim().to_lowercase();
-                        registry.user_defined.insert(key.clone());
-                        registry.bindings.insert(key, binding);
-                    }
-                }
+                Ok(user_bindings) => registry.add_user_bindings(user_bindings),
                 Err(e) => {
                     tracing::warn!("Failed to load keybindings: {e}");
                 }
@@ -94,6 +96,14 @@ impl KeybindingRegistry {
         }
 
         registry
+    }
+
+    fn add_user_bindings(&mut self, bindings: Vec<Keybinding>) {
+        for binding in bindings {
+            let key = binding.key.trim().to_lowercase();
+            self.user_defined.insert(key.clone());
+            self.bindings.insert(key, binding);
+        }
     }
 
     fn add_default(&mut self, key: &str, action: KeyAction, desc: &str) {
@@ -149,8 +159,11 @@ pub fn chord_string(
 
     let name = match code {
         KeyCode::Char(c) => {
-            // Shift is already encoded in the character the terminal
-            // reports, so it is not repeated as a modifier for letters.
+            // The character is normalized to lowercase; when the terminal
+            // reports an explicit SHIFT modifier it is preserved as a
+            // `shift+` prefix below, so `Ctrl+Shift+P` arriving as
+            // `Char('P')`+CONTROL+SHIFT renders as `ctrl+shift+p`, not
+            // `ctrl+p`.
             let lower = c.to_ascii_lowercase().to_string();
             if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                 lower
@@ -185,8 +198,9 @@ pub fn chord_string(
     if mods.contains(KeyModifiers::ALT) {
         out.push_str("alt+");
     }
-    // Shift is only reported separately for non-character keys.
-    if mods.contains(KeyModifiers::SHIFT) && !matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
+    // BackTab already spells its own `shift+tab`; everything else keeps
+    // an explicitly reported SHIFT, including modified characters.
+    if mods.contains(KeyModifiers::SHIFT) && !matches!(code, KeyCode::BackTab) {
         out.push_str("shift+");
     }
     out.push_str(&name);
@@ -194,15 +208,13 @@ pub fn chord_string(
 }
 
 impl KeybindingRegistry {
-    /// Build a registry from user bindings only, for tests.
+    /// Build a registry from the built-in defaults plus the given user
+    /// bindings, for tests. Reads no files, so tests stay independent of
+    /// the machine's real `keybindings.json`.
     #[cfg(test)]
     pub fn from_user_bindings(bindings: Vec<Keybinding>) -> Self {
-        let mut registry = Self::load();
-        for b in bindings {
-            let key = b.key.trim().to_lowercase();
-            registry.user_defined.insert(key.clone());
-            registry.bindings.insert(key, b);
-        }
+        let mut registry = Self::defaults();
+        registry.add_user_bindings(bindings);
         registry
     }
 
@@ -242,6 +254,18 @@ mod tests {
             (KeyCode::Char('k'), KeyModifiers::CONTROL, Some("ctrl+k")),
             (KeyCode::Char('K'), KeyModifiers::CONTROL, Some("ctrl+k")),
             (KeyCode::Char('r'), KeyModifiers::ALT, Some("alt+r")),
+            // A terminal that reports Ctrl+Shift+P as Char('P')+SHIFT
+            // must keep the shift, or the chord silently becomes ctrl+p.
+            (
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                Some("ctrl+shift+p"),
+            ),
+            (
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                Some("ctrl+shift+p"),
+            ),
             (
                 KeyCode::Char('p'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -305,9 +329,11 @@ mod tests {
 
     /// Built-in defaults describe chords the hardcoded handler already
     /// owns. Dispatching them from the registry too would run them twice.
+    /// Built from `defaults()`, not `load()`, so the machine's real
+    /// `keybindings.json` cannot fail (or vacuously pass) this test.
     #[test]
     fn built_in_defaults_are_not_user_defined() {
-        let registry = KeybindingRegistry::load();
+        let registry = KeybindingRegistry::defaults();
         for chord in ["ctrl+c", "ctrl+d", "ctrl+l"] {
             assert!(
                 registry.lookup(chord).is_some(),

@@ -150,12 +150,17 @@ Put a `keybindings.json` in your config directory (`~/.config/agent-code/`):
 ]
 ```
 
-Chord syntax is `ctrl+`/`alt+` prefixes plus a key name — a letter, `f1`–`f12`,
-or `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `enter` `tab`
-`backspace` `delete` `insert`. A bare letter with no modifier is ordinary
-typing and cannot be bound.
+Chord syntax is `ctrl+`/`alt+`/`shift+` prefixes plus a key name — a letter,
+`f1`–`f12`, or `up` `down` `left` `right` `home` `end` `pageup` `pagedown`
+`enter` `tab` `backspace` `delete` `insert`. Prefixes render in
+`ctrl+alt+shift` order (`ctrl+shift+p`). A bare letter with no modifier is
+ordinary typing and cannot be bound; a bare `shift+letter` is just a capital
+letter and cannot be bound either.
 
 `ctrl+c` and `esc` are reserved and cannot be rebound — they are how you get
 out of a stuck state, including a binding that turned out to be a mistake.
+Bindings never fire while a permission prompt (or any modal) is open, and a
+binding that runs never discards the prompt you were composing.
 
-`/keybindings` lists what is loaded.
+The file is read once at startup; `/keybindings` lists the bindings active in
+the current session — after editing the file, restart to apply.

@@ -1357,6 +1357,12 @@ fn apply_user_keybinding(app: &mut App, key: &KeyEvent) -> bool {
     let Some(action) = registry.action_for(key.code, key.modifiers) else {
         return false;
     };
+    // Bound actions submit their own text, never the composer's draft —
+    // stash the draft so opening the tasks pane (or any binding) does not
+    // silently discard what the user was writing.
+    let draft = std::mem::take(&mut app.input);
+    let draft_cursor = app.cursor;
+    app.cursor = 0;
     match action {
         // Both go through the normal submit path so slash dispatch,
         // queueing and mid-turn behaviour are identical to typing it.
@@ -1393,6 +1399,9 @@ fn apply_user_keybinding(app: &mut App, key: &KeyEvent) -> bool {
             }
         }
     }
+    app.input = draft;
+    app.cursor = draft_cursor;
+    app.dirty = true;
     true
 }
 
@@ -1659,6 +1668,50 @@ mod tests {
             Some("run the tests"),
             "the bound prompt was not submitted"
         );
+    }
+
+    /// A binding fired mid-composition must not eat the draft: the bound
+    /// action submits its own text, the user's half-written prompt stays.
+    #[test]
+    fn a_bound_command_keeps_the_composer_draft() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "ctrl+k",
+            KeyAction::Command {
+                command: "tasks".into(),
+            },
+        );
+        app.input = "half a thought".to_string();
+        app.cursor = 4;
+        let before = app.show_tasks;
+        handle_key(&mut app, ctrl('k'));
+        assert_ne!(app.show_tasks, before, "the bound command did not run");
+        assert_eq!(app.input, "half a thought", "the binding ate the draft");
+        assert_eq!(app.cursor, 4, "the binding moved the cursor");
+    }
+
+    #[test]
+    fn a_bound_prompt_keeps_the_composer_draft() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "alt+r",
+            KeyAction::Prompt {
+                prompt: "run the tests".into(),
+            },
+        );
+        app.input = "half a thought".to_string();
+        app.cursor = 3;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("run the tests"),
+            "the bound prompt was not submitted"
+        );
+        assert_eq!(app.input, "half a thought", "the binding ate the draft");
+        assert_eq!(app.cursor, 3, "the binding moved the cursor");
     }
 
     /// An unbound chord must still reach the built-in handler.
