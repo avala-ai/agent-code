@@ -419,6 +419,9 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
+    /// User keybindings from `keybindings.json`. Loaded once at startup;
+    /// only user-defined chords are dispatched from here.
+    pub keybindings: std::sync::Arc<crate::ui::keybindings::KeybindingRegistry>,
     /// `/theme` in-TUI theme picker (live preview, Esc reverts).
     pub theme_picker: Option<super::theme_picker::ThemePicker>,
     /// Theme id the session is configured with (`auto`, `one-dark`, …).
@@ -583,6 +586,9 @@ impl App {
             queue_selected: 0,
             command_palette: None,
             model_picker: None,
+            keybindings: std::sync::Arc::new(
+                crate::ui::keybindings::KeybindingRegistry::load(),
+            ),
             theme_picker: None,
             theme_name: "auto".to_string(),
             inherit_fg: false,

@@ -137,3 +137,25 @@ exactly as typed.
 | More than **256 KiB** across all mentions | Remaining mentions skipped, noted |
 
 `/copy` and `y`/`Y` use the clipboard cascade: native → tmux buffer → OSC 52.
+
+## Custom keybindings
+
+Put a `keybindings.json` in your config directory (`~/.config/agent-code/`):
+
+```json
+[
+  { "key": "ctrl+k", "action": { "type": "command", "command": "tasks" } },
+  { "key": "alt+r",  "action": { "type": "prompt",  "prompt": "run the tests" } },
+  { "key": "f5",     "action": { "type": "toggle",  "setting": "queue" } }
+]
+```
+
+Chord syntax is `ctrl+`/`alt+` prefixes plus a key name — a letter, `f1`–`f12`,
+or `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `enter` `tab`
+`backspace` `delete` `insert`. A bare letter with no modifier is ordinary
+typing and cannot be bound.
+
+`ctrl+c` and `esc` are reserved and cannot be rebound — they are how you get
+out of a stuck state, including a binding that turned out to be a mistake.
+
+`/keybindings` lists what is loaded.
