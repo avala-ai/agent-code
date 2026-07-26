@@ -138,7 +138,14 @@ pub fn upsert_with_source(
     source: TaskSource,
 ) {
     let state = TaskState::parse(state);
-    if let Some(existing) = tasks.iter_mut().find(|t| t.agent_id == agent_id) {
+    // Match within the source: an agent whose id happens to equal a
+    // background task id (e.g. a description of "b1") must not update
+    // that unrelated row — the next poll would rebuild it and drop the
+    // agent from the pane entirely.
+    if let Some(existing) = tasks
+        .iter_mut()
+        .find(|t| t.agent_id == agent_id && t.source == source)
+    {
         existing.state = state;
         if !headline.is_empty() {
             existing.headline = headline.to_string();
@@ -212,6 +219,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// An agent id colliding with a background task id must create its
+    /// own row in its own group, not hijack the background row.
+    #[test]
+    fn colliding_ids_across_sources_stay_separate_rows() {
+        let mut tasks = Vec::new();
+        upsert_with_source(&mut tasks, "b1", "working", "build", TaskSource::Background);
+        upsert(&mut tasks, "b1", "working", "agent named b1");
+        assert_eq!(tasks.len(), 2, "sources shared a row");
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.source == TaskSource::Subagent && t.headline == "agent named b1")
+        );
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.source == TaskSource::Background && t.headline == "build")
+        );
+    }
 
     /// Heading + gap accounting for the layout's strip sizing: agents
     /// heading, two rows, blank, background heading, two rows = 7.
