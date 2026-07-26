@@ -647,7 +647,9 @@ fn shell_statements(raw: &str) -> Vec<String> {
 
 /// Builtins that set a variable for everything that follows rather
 /// than for one command.
-const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local", "set"];
+/// `set` is deliberately absent: its trailing operands become
+/// positional parameters, so `set -- FOO=bar` assigns nothing.
+const EXPORTING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
 
 /// The assignments a statement leaves behind for later statements.
 ///
@@ -1245,6 +1247,9 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
                 payloads.push(rest.join(" "));
             }
         } else if base == "git"
+            // A `git` among the operands of a data command is a word
+            // being printed, alias definitions and all.
+            && (!head_is_data || in_command_position(tokens, i))
             && let Some(AliasExpansion::Tokens(expansion)) = expand_command_alias(rest)
             && let Some(first) = expansion.first()
         {
@@ -1743,6 +1748,11 @@ mod tests {
             "GIT_CONFIG_PARAMETERS=\"'user.alias.foo'='x'\" git status",
             // `command -v` describes the builtin, it does not run it.
             "command -v export GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            // `set` operands become positional parameters, not
+            // environment.
+            "set -- GIT_CONFIG_GLOBAL=/tmp/g; git status",
+            // Printing an alias example is not defining one.
+            "printf '%s\\n' git -c 'alias.p=reset --hard' p",
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true && git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
