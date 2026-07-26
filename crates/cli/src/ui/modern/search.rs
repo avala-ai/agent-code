@@ -25,6 +25,9 @@ pub struct Search {
     /// Scroll position when the search opened, restored on cancel so a
     /// search that finds nothing useful costs the reader their place.
     pub origin: super::scroll::ScrollState,
+    /// [`super::layout::LayoutCache::revision`] the match list was built
+    /// against; the per-frame rescan is skipped while it is current.
+    pub layout_rev: u64,
 }
 
 impl Search {
@@ -62,9 +65,13 @@ impl App {
         self.show_shortcuts = false;
         self.search = Some(Search {
             origin: self.scroll,
+            // Stale on purpose: the first frame after opening rescans and
+            // makes the match list current.
+            layout_rev: self.layout.revision().wrapping_sub(1),
             ..Search::default()
         });
-        self.status_message = "search · type to find · Enter/n next · N prev · Esc close".into();
+        self.status_message =
+            "search · type to find · ↓/↑ next/prev · Enter keep · Esc cancel".into();
         self.dirty = true;
     }
 
@@ -108,6 +115,19 @@ impl App {
         self.recompute_search(true);
     }
 
+    /// Append bracketed-paste text to the query. Control characters
+    /// (including newlines) are dropped — the query is a single line.
+    pub fn search_insert_str(&mut self, text: &str) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        let before = s.query.len();
+        s.query.extend(text.chars().filter(|c| !c.is_control()));
+        if s.query.len() != before {
+            self.recompute_search(true);
+        }
+    }
+
     /// Move to the next match, wrapping at the end.
     pub fn search_next(&mut self) {
         self.step_search(1);
@@ -139,6 +159,7 @@ impl App {
         let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
             return;
         };
+        let layout_rev = self.layout.revision();
         let mut matches = Vec::new();
         if !query.is_empty() {
             let needle = if query.chars().any(|c| c.is_uppercase()) {
@@ -157,6 +178,7 @@ impl App {
         }
         if let Some(s) = self.search.as_mut() {
             s.matches = matches;
+            s.layout_rev = layout_rev;
             if reset || s.current >= s.matches.len() {
                 s.current = 0;
             }

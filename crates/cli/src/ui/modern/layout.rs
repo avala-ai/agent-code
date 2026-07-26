@@ -32,6 +32,10 @@ pub struct LayoutCache {
     width: u16,
     blocks: Vec<Cached>,
     total: usize,
+    /// Bumped whenever a [`Self::sync`] actually changed cached lines, so
+    /// derived state (in-transcript search) can rescan only on change
+    /// instead of every frame.
+    revision: u64,
 }
 
 impl std::fmt::Debug for LayoutCache {
@@ -77,11 +81,15 @@ impl LayoutCache {
         if width_changed {
             self.blocks.clear();
         }
+        let mut changed = width_changed;
 
         // Fold consecutive read-only successes into groups (plan §M4); the
         // cache is keyed by display block, not raw item, so a group's hash
         // changes if any member does.
         let display = super::toolcard::plan_display(items);
+        if display.len() != self.blocks.len() {
+            changed = true;
+        }
         self.blocks.truncate(display.len());
 
         for (i, d) in display.iter().enumerate() {
@@ -117,10 +125,20 @@ impl LayoutCache {
                     } else {
                         self.blocks.push(entry);
                     }
+                    changed = true;
                 }
             }
         }
         self.total = self.blocks.iter().map(|b| b.lines.len()).sum();
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Monotonic change counter: unchanged between two [`Self::sync`]
+    /// calls iff the cached lines are byte-identical.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Drop every cached block so the next [`Self::sync`] re-renders the
@@ -649,6 +667,28 @@ mod tests {
             text.contains("src/a.rs"),
             "clean details still render: {text:?}"
         );
+    }
+
+    /// The search rescan is gated on this counter, so a sync that changed
+    /// nothing must not bump it — otherwise every spinner frame rescans.
+    #[test]
+    fn revision_bumps_only_when_cached_lines_change() {
+        let mut c = LayoutCache::default();
+        let mut items = vec![
+            TranscriptItem::System("one".into()),
+            TranscriptItem::System("two".into()),
+        ];
+        let exp = HashSet::new();
+        c.sync(&items, 80, &exp, None);
+        let r1 = c.revision();
+        c.sync(&items, 80, &exp, None);
+        assert_eq!(c.revision(), r1, "no-op sync must not bump the revision");
+        items.push(TranscriptItem::System("three".into()));
+        c.sync(&items, 80, &exp, None);
+        let r2 = c.revision();
+        assert_ne!(r2, r1, "new content must bump the revision");
+        c.sync(&items, 40, &exp, None);
+        assert_ne!(c.revision(), r2, "a width change rewraps everything");
     }
 
     #[test]

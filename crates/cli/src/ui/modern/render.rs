@@ -40,6 +40,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         0
     };
+    // The search bar gets its own row so it never overdraws the composer
+    // border (or transcript rows in minimal mode).
+    let search_h = if app.search_open() && app.phase != Phase::Permission {
+        1
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -48,6 +55,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),            // status
             Constraint::Length(chips_h),      // queue chips
             Constraint::Length(queue_pane_h), // queue pane
+            Constraint::Length(search_h),     // search bar
             Constraint::Length(prompt_h),     // input
         ])
         .split(area);
@@ -84,7 +92,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if queue_pane_h > 0 {
         draw_queue_pane(frame, chunks[4], app);
     }
-    draw_input(frame, chunks[5], app);
+    if search_h > 0 {
+        draw_search_bar(frame, chunks[5], app);
+    }
+    draw_input(frame, chunks[6], app);
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()
@@ -108,10 +119,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_theme_picker(frame, area, app);
     } else if app.command_palette_open() && app.phase != Phase::Permission {
         draw_command_palette(frame, area, app);
-    }
-
-    if app.search_open() && app.phase != Phase::Permission {
-        draw_search_bar(frame, area, app);
     }
 
     if app.show_shortcuts && app.phase != Phase::Permission {
@@ -228,10 +235,10 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// One-line search bar pinned just above the prompt, with the match
-/// counter. A modal box would cover the transcript the user is trying to
-/// look at, which defeats the purpose.
-fn draw_search_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// One-line search bar in its own reserved row above the prompt, with
+/// the match counter. A modal box would cover the transcript the user is
+/// trying to look at, which defeats the purpose.
+fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     let Some(s) = app.search.as_ref() else {
         return;
     };
@@ -254,13 +261,10 @@ fn draw_search_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(s.query.clone(), Style::default().fg(p.text)),
         Span::styled(counter, Style::default().fg(Color::DarkGray)),
         Span::styled(
-            "   [Enter/↓] next  [↑/N] prev  [Esc] cancel",
+            "   [↓/↑] next/prev  [Enter] keep  [Esc] cancel",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    // Sit directly above the prompt row.
-    let y = area.height.saturating_sub(4);
-    let bar = Rect::new(area.x, y, area.width, 1);
     frame.render_widget(Clear, bar);
     frame.render_widget(Paragraph::new(line), bar);
 }
@@ -845,8 +849,11 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // The transcript may have grown since the query was typed, so the
     // line indices behind the match list can go stale. Recompute without
     // resetting the selection, so streaming output does not yank the
-    // reader off the match they are on.
-    if app.search_open() {
+    // reader off the match they are on. Gated on the layout revision:
+    // spinner frames repaint every ~80ms and an O(transcript) rescan per
+    // frame would make long sessions crawl.
+    if app.search_open() && app.search.as_ref().map(|s| s.layout_rev) != Some(app.layout.revision())
+    {
         app.recompute_search(false);
     }
     // Record the bottom screen row for mouse hit-testing (jump pill).
@@ -1410,6 +1417,33 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("no matches"), "buffer:\n{s}");
+    }
+
+    /// The bar gets a reserved layout row; drawing it at a fixed offset
+    /// used to overwrite the composer's top border.
+    #[test]
+    fn search_bar_does_not_overdraw_the_composer_border() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript
+            .push(TranscriptItem::System("alpha auth".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let corners_before = buffer_to_string(term.backend().buffer())
+            .matches('╭')
+            .count();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert_eq!(
+            s.matches('╭').count(),
+            corners_before,
+            "search bar must not eat a border row:\n{s}"
+        );
     }
 
     #[test]
