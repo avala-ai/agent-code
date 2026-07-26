@@ -1065,6 +1065,17 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (Option<String>, bool,
                 word.push(c);
             }
             None => {
+                // A backslash escapes the next character, whitespace
+                // included: `<<EO\ F` ends at a line reading `EO F`.
+                if c == '\\' {
+                    word.push(c);
+                    if let Some(&escaped) = text.get(i + 1) {
+                        word.push(escaped);
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
                 if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '<' | '>') {
                     break;
                 }
@@ -2281,6 +2292,8 @@ mod tests {
             "cat <<EOF; $\"safe\"\nbody\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
+            // An escaped space belongs to the delimiter.
+            "cat <<EO\\ F\nbody\nEO F\n$\"safe\" -rf /tmp/x",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
