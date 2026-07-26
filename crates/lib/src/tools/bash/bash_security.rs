@@ -380,9 +380,9 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
     // in this same command, which only expansion reveals.
     match expand_command_alias(after_git)? {
         AliasExpansion::Tokens(tokens) => scan_git_subcommands(&tokens),
-        AliasExpansion::Unresolved => Some(format!(
-            "git alias chain exceeds {MAX_GIT_ALIAS_DEPTH} hops; what it runs cannot be determined"
-        )),
+        AliasExpansion::Unresolved => {
+            Some("git alias cannot be resolved; what it runs cannot be determined".to_string())
+        }
     }
 }
 
@@ -465,6 +465,20 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
 
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// The alias name a config key defines, if it defines one:
+/// `alias.p=A` yields `p`. Section names are case-insensitive.
+fn alias_key_name(definition: &str) -> Option<String> {
+    const PREFIX: &str = "alias.";
+    if !definition
+        .get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+    {
+        return None;
+    }
+    let name = definition[PREFIX.len()..].split('=').next()?;
+    (!name.is_empty()).then(|| name.to_lowercase())
+}
 
 /// Index of the git command word — the first token that is neither a
 /// global option nor the operand of one. `None` when a global makes
@@ -588,7 +602,19 @@ fn split_alias_value(value: &str) -> Vec<String> {
 /// only cover for that.
 fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
     let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
-    for token in tokens {
+    // Aliases whose value cannot be read from the command text:
+    // `--config-env=alias.p=A` takes it from the environment, and a
+    // value carrying an expansion is decided at run time.
+    let mut opaque: Vec<String> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(definition) = token.strip_prefix("--config-env=").or_else(|| {
+            (token == "--config-env")
+                .then(|| tokens.get(i + 1))?
+                .map(String::as_str)
+        }) && let Some(name) = alias_key_name(definition)
+        {
+            opaque.push(name);
+        }
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
         // as one.
         let body = token.strip_prefix("-c").unwrap_or(token);
@@ -605,10 +631,14 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
         if let Some((name, value)) = definition.split_once('=')
             && !name.is_empty()
         {
+            if value.contains('$') || value.contains('`') {
+                // Run-time expansion decides the value.
+                opaque.push(name.to_lowercase());
+            }
             aliases.push((name.to_lowercase(), split_alias_value(value)));
         }
     }
-    if aliases.is_empty() {
+    if aliases.is_empty() && opaque.is_empty() {
         return None;
     }
     // Git takes the last `-c` value for a repeated key, so lookups run
@@ -623,16 +653,25 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
     };
 
     let idx = git_command_index(tokens)?;
-    let mut expansion = lookup(&tokens.get(idx)?.to_lowercase())?;
+    let command = tokens.get(idx)?.to_lowercase();
+    // A command that an opaque definition names runs something this
+    // check cannot read, so it must not be treated as safe.
+    if opaque.contains(&command) {
+        return Some(AliasExpansion::Unresolved);
+    }
+    let mut expansion = lookup(&command)?;
     // An alias can name another alias. Follow the chain, refusing to
     // revisit a name so a cycle cannot spin.
-    let mut seen = vec![tokens[idx].to_lowercase()];
+    let mut seen = vec![command];
     let mut resolved = false;
     for _ in 0..MAX_GIT_ALIAS_DEPTH {
         let Some(head) = expansion.first().map(|t| t.to_lowercase()) else {
             resolved = true;
             break;
         };
+        if opaque.contains(&head) {
+            return Some(AliasExpansion::Unresolved);
+        }
         if seen.contains(&head) || lookup(&head).is_none() {
             resolved = true;
             break;
@@ -1019,6 +1058,12 @@ mod tests {
             "git -c \"Alias.p=!git push -uf origin main\" p",
             "git -c 'ALIAS.p=push -uf' p origin main",
             "git -c 'alias.P=push -uf' P origin main",
+            // An alias whose value comes from the environment or from
+            // run-time expansion cannot be read here: unknown, not
+            // safe.
+            "A=push git --config-env=alias.p=A p -uf origin main",
+            "git --config-env alias.p=A p -uf origin main",
+            "git -c 'alias.p=$CMD' p -uf origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
