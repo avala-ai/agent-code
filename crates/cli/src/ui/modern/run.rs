@@ -1246,10 +1246,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         {
             app.tasks_select(1);
         }
+        // Retained prompts win the empty Enter: after an aborted turn the
+        // UI promises "press Enter to send", so drill-in only claims the
+        // key when no queued prompt is waiting for dispatch.
         (m, KeyCode::Enter)
             if m.is_empty()
                 && app.tasks_visible()
                 && !app.show_queue_pane
+                && app.queue.is_empty()
                 && app.input.is_empty() =>
         {
             app.drill_into_selected_task();
@@ -1665,6 +1669,26 @@ mod tests {
         // Plain Enter still drives the pane (subagent row → explanation).
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.status_message.contains("no separate output"));
+    }
+
+    /// After an aborted turn the UI says "queued prompts kept — press
+    /// Enter to send"; a visible tasks pane must not swallow that Enter.
+    #[test]
+    fn queued_prompts_take_enter_before_task_drill_in() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.show_tasks = true;
+        app.queue.push_back("retained prompt".into());
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.pending_task_output.is_none() && !app.status_message.contains("output"),
+            "drill-in stole the queue-dispatch Enter"
+        );
+        assert!(
+            app.queue.is_empty() && app.pending_submit.is_some(),
+            "queued prompt was not dispatched"
+        );
     }
 
     /// LocalAgent manager records must carry their stream subagent id so
