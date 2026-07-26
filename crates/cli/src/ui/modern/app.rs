@@ -2019,6 +2019,11 @@ impl App {
             .filter(|t| t.source == TaskSource::Subagent)
             .cloned()
             .collect();
+        // Rows an earlier manager record already folded into: a second
+        // record with the same subagent id (two Agent calls sharing a
+        // description resolve to one id) must not overwrite it — each
+        // task keeps its own row and its own output.
+        let mut claimed = vec![false; next.len()];
         for row in rows {
             let state = TaskState::parse(&row.state);
             if let Some(sid) = row.subagent_id {
@@ -2028,21 +2033,32 @@ impl App {
                 // the manager is the only source that sees a background
                 // run finish (the stream stops at "working"), so its
                 // state wins, while the richer event headline is kept.
-                if let Some(existing) = next.iter_mut().find(|t| t.agent_id == sid) {
-                    existing.state = state;
-                    existing.task_id = Some(row.id);
+                // Manager rows arrive sorted by task id, so the fold is
+                // deterministic: the oldest task claims the event row.
+                let unclaimed = next
+                    .iter()
+                    .enumerate()
+                    .position(|(i, t)| t.agent_id == sid && !claimed[i]);
+                if let Some(idx) = unclaimed {
+                    claimed[idx] = true;
+                    next[idx].state = state;
+                    next[idx].task_id = Some(row.id);
                 } else {
-                    // No event row — e.g. a task adopted after restart.
+                    // No unclaimed event row — a task adopted after a
+                    // restart, or an extra run sharing the same id.
+                    // Key it by task id so the rows stay distinct.
                     next.push(TaskEntry {
-                        agent_id: sid,
+                        agent_id: row.id.clone(),
                         state,
                         headline: row.headline,
                         source: TaskSource::Subagent,
                         task_id: Some(row.id),
                     });
+                    claimed.push(true);
                 }
                 continue;
             }
+            claimed.push(true);
             next.push(TaskEntry {
                 agent_id: row.id.clone(),
                 state,
@@ -2067,6 +2083,19 @@ impl App {
             self.dirty = true;
         }
         changed
+    }
+
+    /// Whether any manager-backed row can still change state.
+    ///
+    /// Gates the background poll: event-driven subagent rows persist for
+    /// the whole session, so polling "while any rows exist" would wake
+    /// every 750 ms forever. Terminal manager states never change again;
+    /// only a still-working manager task justifies the timer.
+    pub fn has_live_manager_tasks(&self) -> bool {
+        use super::tasks::TaskState;
+        self.tasks
+            .iter()
+            .any(|t| t.task_id.is_some() && t.state == TaskState::Working)
     }
 
     /// Identity of the currently selected pane row, if any.
@@ -3408,6 +3437,55 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    /// Two Agent runs sharing a description resolve to one subagent id;
+    /// both manager records must survive as distinct rows, with the
+    /// oldest task (rows arrive id-sorted) claiming the event row.
+    #[test]
+    fn tasks_sharing_a_subagent_id_stay_distinct() {
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "scan-repo", "working", "[explore] scan");
+        let row = |id: &str, state: &str| ManagerRow {
+            id: id.into(),
+            state: state.into(),
+            headline: "scan".into(),
+            subagent_id: Some("scan-repo".into()),
+        };
+        app.sync_background_tasks(vec![row("a3", "done"), row("a5", "working")]);
+        assert_eq!(app.tasks.len(), 2, "second record was folded away");
+        let folded = app
+            .tasks
+            .iter()
+            .find(|t| t.agent_id == "scan-repo")
+            .unwrap();
+        assert_eq!(folded.task_id.as_deref(), Some("a3"), "fold not id-ordered");
+        assert!(
+            app.tasks
+                .iter()
+                .any(|t| t.agent_id == "a5" && t.task_id.as_deref() == Some("a5")),
+            "extra run lost its own row"
+        );
+    }
+
+    /// The poll gate: persistent subagent rows alone must not keep the
+    /// timer alive, but a still-working manager task must.
+    #[test]
+    fn poll_gate_tracks_live_manager_work_only() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        assert!(
+            !app.has_live_manager_tasks(),
+            "event-only rows armed the timer"
+        );
+        app.sync_background_tasks(vec![bg("b1", "working", "build")]);
+        assert!(app.has_live_manager_tasks());
+        app.sync_background_tasks(vec![bg("b1", "done", "build")]);
+        assert!(
+            !app.has_live_manager_tasks(),
+            "terminal task kept the timer alive"
+        );
     }
 
     /// Output cards show the tail of a long file, not all of it.

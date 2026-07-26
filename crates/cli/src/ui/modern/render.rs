@@ -705,22 +705,35 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // list, so the marked task must stay on screen — and say how many
     // tasks are hidden rather than silently truncating mid-task.
     let max_rows = inner.height as usize;
-    if lines.len() > max_rows && max_rows >= 2 {
-        let visible_h = max_rows - 1;
+    if lines.len() > max_rows && max_rows > 0 {
         let sel_end = task_ends.get(app.tasks_selected).copied().unwrap_or(0);
-        let offset = sel_end
-            .saturating_sub(visible_h - 1)
-            .min(lines.len() - visible_h);
-        let shown = task_ends
-            .iter()
-            .filter(|&&e| e >= offset && e < offset + visible_h)
-            .count();
-        let hidden = app.tasks.len().saturating_sub(shown);
-        lines = lines.into_iter().skip(offset).take(visible_h).collect();
-        lines.push(Line::from(Span::styled(
-            format!("… +{hidden} more (↑/↓)"),
-            Style::default().fg(Color::DarkGray),
-        )));
+        // The status row (with the ❯ marker) sits directly above the
+        // headline row; when space is too tight for both, the marker
+        // row is the one that must survive.
+        let sel_start = sel_end.saturating_sub(1);
+        if max_rows == 1 {
+            let row = lines
+                .into_iter()
+                .nth(sel_start)
+                .unwrap_or_else(|| Line::from("…"));
+            lines = vec![row];
+        } else {
+            let visible_h = max_rows - 1;
+            let anchor = if visible_h >= 2 { sel_end } else { sel_start };
+            let offset = anchor
+                .saturating_sub(visible_h - 1)
+                .min(lines.len() - visible_h);
+            let shown = task_ends
+                .iter()
+                .filter(|&&e| e >= offset && e < offset + visible_h)
+                .count();
+            let hidden = app.tasks.len().saturating_sub(shown);
+            lines = lines.into_iter().skip(offset).take(visible_h).collect();
+            lines.push(Line::from(Span::styled(
+                format!("… +{hidden} more (↑/↓)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }

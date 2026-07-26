@@ -330,6 +330,9 @@ pub(super) async fn event_loop(
     // back here, so a slow filesystem never blocks the event loop.
     let (task_out_tx, mut task_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
+    // Seed the pane once so tasks adopted from a previous process show
+    // before the first turn arms the periodic poll.
+    app.sync_background_tasks(manager_rows(&task_manager).await);
 
     // Sync SessionMode with the engine when it changes.
     let mut last_mode = app.mode;
@@ -796,7 +799,10 @@ pub(super) async fn event_loop(
                 app.show_task_output(&id, out);
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
-            _ = tasks_tick.tick(), if live || !app.tasks.is_empty() => {
+            // Gated on work that can still change: polling while any
+            // rows exist at all would tick forever once a subagent row
+            // (which persists for the session) appears.
+            _ = tasks_tick.tick(), if live || app.has_live_manager_tasks() => {
                 let rows = manager_rows(&task_manager).await;
                 app.sync_background_tasks(rows);
             }
@@ -834,7 +840,8 @@ async fn manager_rows(
     tm: &std::sync::Arc<agent_code_lib::services::background::TaskManager>,
 ) -> Vec<super::tasks::ManagerRow> {
     use agent_code_lib::services::background::{TaskKind, TaskPayload, TaskStatus};
-    tm.list()
+    let mut rows: Vec<super::tasks::ManagerRow> = tm
+        .list()
         .await
         .into_iter()
         .map(|t| {
@@ -860,7 +867,12 @@ async fn manager_rows(
                 subagent_id,
             }
         })
-        .collect()
+        .collect();
+    // The manager's map iterates in arbitrary order; sort by task id so
+    // reconciliation (which record folds into an event row) and row
+    // order are stable across polls.
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
