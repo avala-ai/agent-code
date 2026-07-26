@@ -159,20 +159,58 @@ pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
         }
     }
 
-    // Pipeline scan: any segment whose head is intrinsically destructive
-    // is flagged even if the whole-string pattern scan did not catch it.
-    // The head is unquoted and de-pathed first, so `/bin/rm` and `'rm'`
-    // are both recognised as `rm`.
-    for segment in cmd.raw.split('|') {
-        let trimmed = segment.trim();
-        let head = trimmed.split_whitespace().next().unwrap_or("");
+    // Head scan: any invocation whose head is intrinsically destructive
+    // is flagged even if the pattern scans did not catch it. The parsed
+    // invocations are quote-aware, so `'keep|rm'` stays one argument
+    // instead of minting a synthetic pipe segment, while a disguised
+    // head (`/bin/rm`, `'rm'`, `$'rm'`) still normalizes to `rm`.
+    for invocation in &cmd.invocations {
+        let Some(head) = invocation.first() else {
+            continue;
+        };
         let base_owned = base_name(&unquote_token(head)).to_lowercase();
         let base = base_owned.as_str();
         if DESTRUCTIVE_PIPELINE_BASES.contains(&base) {
             findings.push(DestructiveFinding {
                 level: DestructivenessLevel::Destructive,
+                reason: format!("destructive command '{base}'"),
+            });
+        }
+    }
+
+    // Historical raw pipeline scan, kept byte-for-byte: an exact,
+    // unnormalized head match per `|` segment. The invocation scan
+    // above sees only what parses as a command, and this one also
+    // fires on text mentions (heredoc bodies, quoted arguments), which
+    // over-blocks — the safe direction — so removing it would narrow
+    // the check.
+    for segment in cmd.raw.split('|') {
+        let trimmed = segment.trim();
+        let base = trimmed.split_whitespace().next().unwrap_or("");
+        if DESTRUCTIVE_PIPELINE_BASES.contains(&base) {
+            findings.push(DestructiveFinding {
+                level: DestructivenessLevel::Destructive,
                 reason: format!("destructive command '{base}' in pipe"),
             });
+        }
+    }
+
+    // Without a trustworthy parse there are no invocations to walk, so
+    // fall back to splitting the raw text on `|`. Unquoting the head can
+    // over-match inside what was really a quoted argument, but with no
+    // parse to say otherwise that is the safe direction to fail.
+    if cmd.invocations.is_empty() || cmd.has_parse_error {
+        for segment in cmd.raw.split('|') {
+            let trimmed = segment.trim();
+            let head = trimmed.split_whitespace().next().unwrap_or("");
+            let base_owned = base_name(&unquote_token(head)).to_lowercase();
+            let base = base_owned.as_str();
+            if DESTRUCTIVE_PIPELINE_BASES.contains(&base) {
+                findings.push(DestructiveFinding {
+                    level: DestructivenessLevel::Destructive,
+                    reason: format!("destructive command '{base}' in pipe"),
+                });
+            }
         }
     }
 
@@ -238,6 +276,11 @@ mod tests {
             "$'git\\x00junk' push --force",
             "$'rm\\0junk' -rf /tmp/x",
             "$'git\\c@junk' push --force",
+            // Disguised heads behind a pipe or chain: the parsed
+            // invocation scan must normalize them, not the raw text.
+            "true | /bin/rm x",
+            "true | $'rm' x",
+            "echo hi && $'rm' x",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
@@ -290,6 +333,10 @@ mod tests {
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
             "printf %s $'\\c3hutdown'",
+            // A `|` inside a quoted argument is not a pipe boundary:
+            // the segment after it must not be unquoted into a head.
+            "printf '%s\\n' 'keep|rm'",
+            "grep 'foo|dd' notes.txt",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
