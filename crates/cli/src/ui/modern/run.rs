@@ -1350,6 +1350,13 @@ fn handle_theme_picker_key(app: &mut App, key: KeyEvent) {
 fn apply_user_keybinding(app: &mut App, key: &KeyEvent) -> bool {
     use crate::ui::keybindings::{KeyAction, chord_string};
 
+    // A held key emits Repeat events; dispatching a binding on each one
+    // would queue a duplicate turn per repeat from a single hold. Only
+    // the initial press fires — built-in handlers below keep their own
+    // repeat behavior (held Ctrl+C must still count).
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
     let Some(chord) = chord_string(key.code, key.modifiers) else {
         return false;
     };
@@ -1670,6 +1677,37 @@ mod tests {
             app.pending_submit.as_deref(),
             Some("run the tests"),
             "the bound prompt was not submitted"
+        );
+    }
+
+    /// A held chord emits Repeat events; each must not re-fire the
+    /// binding — one hold of a prompt binding would otherwise queue a
+    /// duplicate turn (and a duplicate model call) per repeat.
+    #[test]
+    fn a_held_chord_repeat_does_not_refire_the_binding() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "alt+r",
+            KeyAction::Prompt {
+                prompt: "run the tests".into(),
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("run the tests"),
+            "the initial press did not fire"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('r'), KeyModifiers::ALT, KeyEventKind::Repeat),
+        );
+        assert!(
+            app.queue.is_empty(),
+            "a key repeat queued a duplicate prompt"
         );
     }
 
