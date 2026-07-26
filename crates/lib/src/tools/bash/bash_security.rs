@@ -210,6 +210,21 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                     reason,
                 });
             }
+            // Config from the environment never appears in argv, so an
+            // alias defined there turns any command word into something
+            // this scan cannot read.
+            if env_defines_opaque_git_alias(&cmd.assignments)
+                && tokens
+                    .iter()
+                    .any(|t| base_name(&unquote_token(t)).to_lowercase() == "git")
+            {
+                findings.push(DestructiveFinding {
+                    level: DestructivenessLevel::Destructive,
+                    reason: "git alias comes from the environment; what it runs cannot be \
+                             determined"
+                        .to_string(),
+                });
+            }
         }
     }
 
@@ -465,6 +480,29 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
 
 /// How many alias hops to follow. Aliases can name other aliases.
 const MAX_GIT_ALIAS_DEPTH: usize = 8;
+
+/// True when a prefix assignment hands git configuration through the
+/// environment in a way that could define an alias:
+/// `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push
+/// --force' git p` runs a force push that nothing in the argv shows.
+///
+/// Only alias-defining or unreadable keys count; ordinary env config
+/// (`GIT_CONFIG_KEY_0=user.name`) says nothing about what runs.
+fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
+    assignments.iter().any(|(name, value)| {
+        let name = name.to_ascii_uppercase();
+        let dynamic = value.contains('$') || value.contains('`');
+        if name == "GIT_CONFIG_PARAMETERS" {
+            return dynamic || value.to_lowercase().contains("alias.");
+        }
+        match name.strip_prefix("GIT_CONFIG_KEY_") {
+            Some(index) if index.chars().all(|c| c.is_ascii_digit()) => {
+                dynamic || value.to_lowercase().starts_with("alias.")
+            }
+            _ => false,
+        }
+    })
+}
 
 /// The alias name a config key defines, if it defines one:
 /// `alias.p=A` yields `p`. Section names are case-insensitive.
@@ -1064,6 +1102,11 @@ mod tests {
             "A=push git --config-env=alias.p=A p -uf origin main",
             "git --config-env alias.p=A p -uf origin main",
             "git -c 'alias.p=$CMD' p -uf origin main",
+            // Config handed to git through the environment never shows
+            // in the argv at all.
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push --force' \
+             git p origin main",
+            "GIT_CONFIG_PARAMETERS='alias.p=push --force' git p origin main",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
@@ -1170,6 +1213,8 @@ mod tests {
             "git --exec-path push -uf",
             // A `!` alias that runs something harmless.
             "git -c \"alias.p=!echo hi\" p",
+            // Ordinary env config defines no alias.
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=me git commit",
             // Describe-and-exit deeper in a wrapper chain.
             "command env --help git push -uf origin main",
             // A git token among the operands of a data command. Only
