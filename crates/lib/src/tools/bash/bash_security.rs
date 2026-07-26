@@ -384,9 +384,12 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
 /// `command -v bash -c '…'` prints a path. The trailing words are
 /// then operands of a wrapper that never executes them.
 ///
-/// Only the wrapper's own leading options are inspected. A `--help`
-/// after the wrapped command name belongs to that command and says
-/// nothing about whether it runs.
+/// Only the option *immediately* after the wrapper counts. Later
+/// options can be operands of earlier ones — `env -u --help bash -c
+/// '…'` unsets a variable named `--help` and then runs the payload —
+/// and re-deriving which is which would mean a second copy of env's
+/// option grammar. Anything past the first token keeps the scan,
+/// which at worst over-blocks a wrapper that would have printed help.
 fn wrapper_only_reports(tokens: &[String]) -> bool {
     let Some(wrapper) = tokens.first().map(|t| base_name(t).to_lowercase()) else {
         return false;
@@ -394,17 +397,14 @@ fn wrapper_only_reports(tokens: &[String]) -> bool {
     if !COMMAND_RUNNER_WRAPPERS.contains(&wrapper.as_str()) {
         return false;
     }
-    tokens[1..]
-        .iter()
-        .take_while(|t| t.starts_with('-'))
-        .any(|token| match wrapper.as_str() {
-            // `command -v`/`-V` describe; `env -v` is verbose and
-            // still runs the command, so it must not count here.
-            "command" => token
-                .strip_prefix('-')
-                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(['v', 'V'])),
-            _ => token == "--help" || token == "--version",
-        })
+    tokens.get(1).is_some_and(|token| match wrapper.as_str() {
+        // `command -v`/`-V` describe; `env -v` is verbose and still
+        // runs the command, so it must not count here.
+        "command" => token
+            .strip_prefix('-')
+            .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(['v', 'V'])),
+        _ => token == "--help" || token == "--version",
+    })
 }
 
 /// Wrappers whose job is to run the command word after them.
@@ -527,6 +527,10 @@ mod tests {
             // `env -v` is verbose, not a describe-and-exit option: the
             // command still runs.
             "env -v bash -c \"'git' push --force\"",
+            // `--help` as the operand of `-u` names a variable to
+            // unset; env still runs the payload.
+            "env -u --help bash -c \"'git' push --force\"",
+            "env -u --version bash -c \"'rm' -rf /tmp/x\"",
             // `exec` replaces the shell with what follows it.
             "exec bash -c \"'git' push --force\"",
             "exec -a login bash -c \"'rm' -rf /tmp/x\"",
