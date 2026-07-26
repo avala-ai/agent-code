@@ -867,7 +867,10 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
         let word_start = at_word_start;
-        at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
+        // A closing `)` does not end the word: bash joins what follows
+        // onto it, so the `#` in `echo $(true)#x` is a literal
+        // character rather than the start of a comment.
+        at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(');
         if matches!(stack.last(), Some(Context::Single)) {
             if c == '\'' {
                 stack.pop();
@@ -2086,6 +2089,9 @@ mod tests {
             // A substitution restarts quoting, so the translation
             // inside it is one too.
             "echo \"$($\"cat\" /tmp/file)\"",
+            // What follows a closing `)` joins the same word, so this
+            // `#` is a character rather than a comment.
+            "echo $(true)#x; $\"cat\" /tmp/file",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
