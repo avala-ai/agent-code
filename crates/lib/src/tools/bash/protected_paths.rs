@@ -452,23 +452,34 @@ fn apply_directory_change(head: &str, args: &[String], state: &mut ScanState) {
     if is_shell_absolute(&target) {
         // An absolute `cd` pins the directory regardless of where the
         // command started — worth following even from `Anchor::None`.
-        let resolved = path
-            .canonicalize()
-            .unwrap_or_else(|_| crate::permissions::lexical_normalize(path));
-        state.anchor = Anchor::Dir(resolved);
+        state.anchor = Anchor::Dir(resolve_dir(path));
         return;
     }
     match &state.anchor {
         Anchor::Dir(dir) => {
-            let joined = dir.join(path);
-            let resolved = joined
-                .canonicalize()
-                .unwrap_or_else(|_| crate::permissions::lexical_normalize(&joined));
-            state.anchor = Anchor::Dir(resolved);
+            state.anchor = Anchor::Dir(resolve_dir(&dir.join(path)));
         }
         // Without a starting directory a relative `cd` teaches us
         // nothing; the anchored pass in `check_at` is what resolves it.
         Anchor::None | Anchor::Unavailable => {}
+    }
+}
+
+/// Resolve a directory the command changes into.
+///
+/// Canonicalization is a host operation, so it is only meaningful for a
+/// path the host itself calls absolute. On Windows, `Path::canonicalize`
+/// of the bash-absolute `/` succeeds and answers with the *drive* root
+/// (`\\?\C:\`), which matches none of the `/etc/`-style protected
+/// entries — `cd /` then looked harmless there. A bash-absolute path
+/// that the host does not recognize keeps its own spelling instead, so
+/// the protected lists still match it.
+fn resolve_dir(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.canonicalize()
+            .unwrap_or_else(|_| crate::permissions::lexical_normalize(path))
+    } else {
+        crate::permissions::lexical_normalize(path)
     }
 }
 
@@ -1666,6 +1677,14 @@ mod tests {
         for p in ["etc", "out/config", "../.git", "."] {
             assert!(!is_shell_absolute(p), "{p} should count as relative");
         }
+        // A bash-absolute directory keeps its own spelling when the
+        // host cannot resolve it, so the protected lists still match.
+        // On Windows `canonicalize("/")` answers with the drive root,
+        // which matches nothing in those lists.
+        assert_eq!(
+            join_components(&resolve_dir(Path::new("/nonexistent-agent-code-dir"))),
+            "/nonexistent-agent-code-dir"
+        );
     }
 
     /// A `cd` moves every later relative destination in the command:
