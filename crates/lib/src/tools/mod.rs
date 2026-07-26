@@ -172,8 +172,10 @@ pub trait Tool: Send + Sync {
 pub enum PermissionResponse {
     AllowOnce,
     AllowSession,
-    /// Approve and remember across sessions. Recorded by exact key, so
-    /// it covers this call and nothing adjacent to it — see
+    /// Approve and remember across sessions. Recorded by exact key over
+    /// the full normalized operation
+    /// ([`crate::tools::executor::persistent_grant_key`]), so it covers
+    /// this call and nothing adjacent to it — see
     /// [`crate::permissions::grants`].
     AllowAlways,
     Deny,

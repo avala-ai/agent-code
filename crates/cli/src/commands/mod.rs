@@ -3419,6 +3419,10 @@ fn execute_cd(args: Option<&str>, engine: &mut QueryEngine) {
     // Invalidate the system-prompt cache — the cwd is baked in and
     // the agent would otherwise keep believing it's in the old dir.
     engine.reset_system_prompt_cache();
+    // Persistent grants are per-project: re-scope so approvals from the
+    // old project stop suppressing prompts here, and new ones land in
+    // the new project's grant file.
+    engine.rescope_persistent_grants(&canonical);
 
     // Fire CwdChanged so file-indexer / repo-watcher hooks can retune
     // without re-polling state. Use block_on to bridge the sync

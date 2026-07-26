@@ -304,6 +304,28 @@ impl QueryEngine {
         self.persistent_grants.clone()
     }
 
+    /// Re-scope persistent grants to a new project root. Must be called
+    /// whenever the session cwd changes (`/cd`): grants are per-project,
+    /// so an approval saved in the old project must not keep suppressing
+    /// prompts in the new one, and new grants must be written to the new
+    /// project's file. No-op when the feature was never enabled.
+    pub fn rescope_persistent_grants(&mut self, project_root: &std::path::Path) {
+        let Some(store) = self.persistent_grants.clone() else {
+            return;
+        };
+        // Mutate in place so ToolContext clones from the current turn see
+        // the new scope too. `try_lock` cannot contend in practice —
+        // slash commands run between turns — but if it ever does, swap
+        // the Arc so at minimum every future turn is scoped correctly.
+        match store.try_lock() {
+            Ok(mut guard) => guard.rescope(project_root),
+            Err(_) => {
+                let fresh = crate::permissions::grants::GrantStore::load(project_root);
+                self.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(fresh)));
+            }
+        }
+    }
+
     /// Install the multi-choice question asker (modern TUI modal).
     ///
     /// Without this, [`AskUserQuestion`](crate::tools::ask_user::AskUserQuestionTool)

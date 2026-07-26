@@ -1321,16 +1321,10 @@ impl App {
             self.dirty = true;
             return;
         }
-        if text == "/permissions" {
-            self.transcript.push(TranscriptItem::System(format!(
-                "permissions: mode={} · Shift+Tab cycles Manual/Normal/AcceptEdits/Auto/Plan · \
-                 modal: y once / a session / n deny",
-                self.mode.label()
-            )));
-            self.input.clear();
-            self.cursor = 0;
-            return;
-        }
+        // `/permissions` is deliberately NOT intercepted here: the
+        // command bridge owns it, so the listing includes rules and the
+        // saved always-allow grants — an approval the user cannot see is
+        // one they cannot revoke.
         if text == "/queue" {
             self.toggle_queue_pane();
             self.input.clear();
@@ -3338,6 +3332,25 @@ mod tests {
                 "{cmd} must reach the command bridge"
             );
             assert_eq!(app.show_tasks, before, "{cmd} must not toggle the pane");
+        }
+    }
+
+    /// `/permissions` must reach the command bridge (which lists rules
+    /// and saved always-allow grants), not a local static message that
+    /// would hide the grant listing from the only surface that can
+    /// create grants.
+    #[test]
+    fn permissions_reaches_the_command_bridge() {
+        for cmd in ["/permissions", "/permissions clear"] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.input = cmd.into();
+            app.cursor = app.input.len();
+            app.submit();
+            assert_eq!(
+                app.pending_slash.as_deref(),
+                Some(cmd),
+                "{cmd} must reach the command bridge"
+            );
         }
     }
 

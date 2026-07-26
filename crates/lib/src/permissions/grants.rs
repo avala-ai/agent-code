@@ -5,12 +5,13 @@
 //! keep that from becoming a way to smuggle work past the user.
 //!
 //! **Exact match, never prefix.** A grant is keyed by
-//! [`crate::tools::executor::session_allow_key`] — the same shape the
-//! session-scoped store uses — and matched by equality. A grant for
-//! `git status` therefore does not cover `git status && rm -rf /`, which
-//! is precisely what a prefix match would have allowed. Prefix-scoped
-//! grants are a separate, more dangerous feature and are deliberately
-//! not implemented here.
+//! [`crate::tools::executor::persistent_grant_key`] — the full normalized
+//! operation, stricter than the session-scoped key — and matched by
+//! equality. A grant for `git status` therefore does not cover
+//! `git status && rm -rf /`, and a grant for one write payload does not
+//! cover a different payload to the same path. Prefix-scoped grants are
+//! a separate, more dangerous feature and are deliberately not
+//! implemented here.
 //!
 //! **Only reachable from `Ask`.** The executor consults grants inside the
 //! `Ask` arm, after rules and the default mode have already run, so a
@@ -43,7 +44,7 @@ struct GrantFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GrantEntry {
-    /// `session_allow_key` output: `"{tool}\0{shape}"`, stored escaped.
+    /// `persistent_grant_key` output: `"{tool}\0{shape}"`, stored escaped.
     key: String,
     /// Human-readable reminder of what was approved, for the audit trail.
     #[serde(default)]
@@ -119,20 +120,63 @@ impl GrantStore {
     /// A write failure is reported to the caller but the in-memory grant
     /// still stands for this session: the user said "always", and losing
     /// the file should not also lose the answer they just gave.
+    ///
+    /// The write is serialized against other live sessions: under an
+    /// exclusive file lock the current file is re-read and only this one
+    /// grant is added on top of it. Persisting this store's full snapshot
+    /// instead would resurrect every grant another session cleared after
+    /// we loaded — a stale process must never widen what is on disk.
     pub fn insert(&mut self, key: &str, label: &str) -> Result<bool, String> {
         if !self.keys.insert(key.to_string()) {
             return Ok(false);
         }
         self.labels.push((key.to_string(), label.to_string()));
-        self.persist()?;
+        let Some(path) = self.path.clone() else {
+            return Ok(true);
+        };
+        let _lock = lock_grant_file(&path)?;
+        let mut disk = read_grant_file(&path);
+        if !disk.grants.iter().any(|g| g.key == key) {
+            disk.grants.push(GrantEntry {
+                key: key.to_string(),
+                label: label.to_string(),
+            });
+        }
+        // Adopt the merged view: what is on disk now, plus this grant.
+        // In-memory grants another session cleared stop applying here
+        // too — the clear wins. This session's own past answers are
+        // unaffected: they also live in the session-allow store.
+        self.keys = disk.grants.iter().map(|g| g.key.clone()).collect();
+        self.labels = disk
+            .grants
+            .iter()
+            .map(|g| (g.key.clone(), g.label.clone()))
+            .collect();
+        self.write_locked(&path, &disk)?;
         Ok(true)
     }
 
     /// Drop every grant for this project and persist the empty file.
+    ///
+    /// Takes the same file lock as [`Self::insert`] so a clear cannot
+    /// interleave with another session's read-merge-write.
     pub fn clear(&mut self) -> Result<(), String> {
         self.keys.clear();
         self.labels.clear();
-        self.persist()
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let _lock = lock_grant_file(&path)?;
+        self.write_locked(&path, &GrantFile::default())
+    }
+
+    /// Re-bind this store to a different project root, dropping the old
+    /// project's grants and loading the new one's. Called when the
+    /// session's cwd moves (`/cd`): grants are per-project, so approvals
+    /// from the old project must not follow the session into the new
+    /// one, and new grants must land in the new project's file.
+    pub fn rescope(&mut self, project_root: &Path) {
+        *self = Self::load(project_root);
     }
 
     /// Human-readable labels, for a "what have I approved" listing.
@@ -140,25 +184,11 @@ impl GrantStore {
         self.labels.iter().map(|(_, l)| l.as_str())
     }
 
-    fn persist(&self) -> Result<(), String> {
-        let Some(ref path) = self.path else {
-            return Ok(());
-        };
-        if let Some(dir) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            return Err(format!("create {}: {e}", dir.display()));
-        }
+    /// Write `file` to `path`. Caller must hold the grant-file lock.
+    fn write_locked(&self, path: &Path, file: &GrantFile) -> Result<(), String> {
         let file = GrantFile {
             project: self.project.clone(),
-            grants: self
-                .labels
-                .iter()
-                .map(|(key, label)| GrantEntry {
-                    key: key.clone(),
-                    label: label.clone(),
-                })
-                .collect(),
+            grants: file.grants.clone(),
         };
         let body = toml::to_string_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
         // Same atomic + restrictive-permissions write the credential
@@ -166,6 +196,42 @@ impl GrantStore {
         crate::config::atomic::atomic_write_secret(path, body.as_bytes())
             .map_err(|e| format!("write {}: {e}", path.display()))
     }
+}
+
+/// Take an exclusive advisory lock serializing grant-file mutations
+/// across processes. The lock lives on a sibling `.lock` file, never on
+/// the grant file itself: the grant file is replaced by rename on every
+/// write, and a lock on a renamed-away inode guards nothing. Released
+/// when the returned handle drops.
+///
+/// Reads stay lock-free on purpose — atomic rename means a reader sees
+/// a complete old or complete new file, and a stale *read* only ever
+/// fails safe (asks again); only mutations can widen what is on disk.
+fn lock_grant_file(path: &Path) -> Result<std::fs::File, String> {
+    let lock_path = path.with_extension("lock");
+    if let Some(dir) = lock_path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        return Err(format!("create {}: {e}", dir.display()));
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    f.lock()
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    Ok(f)
+}
+
+/// Parse the grant file as it exists on disk right now. Malformed or
+/// missing yields empty — same fail-safe direction as [`GrantStore::load`].
+fn read_grant_file(path: &Path) -> GrantFile {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| toml::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 /// Where this project's grants live: inside the user's config directory,
@@ -190,35 +256,28 @@ mod tests {
     use super::*;
 
     /// `XDG_CONFIG_HOME` redirects `agent_config_dir`, giving each test a
-    /// private grant directory. Serialized because it is process-global.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// private grant directory. Uses the crate-wide
+    /// [`crate::test_support::EnvGuard`] — a module-local lock would not
+    /// serialize against the other test modules that mutate the same
+    /// process-global variable.
     struct Sandbox {
         _dir: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
+        _env: crate::test_support::EnvGuard,
     }
 
     impl Sandbox {
         fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
-            let prev = std::env::var_os("XDG_CONFIG_HOME");
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-            Self { _dir: dir, prev }
-        }
-    }
-
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            let env = crate::test_support::EnvGuard::set("XDG_CONFIG_HOME", dir.path());
+            Self {
+                _dir: dir,
+                _env: env,
             }
         }
     }
 
     #[test]
     fn a_grant_survives_a_reload() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -239,7 +298,6 @@ mod tests {
     /// command must not inherit its grant.
     #[test]
     fn a_grant_does_not_cover_an_appended_command() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -263,7 +321,6 @@ mod tests {
 
     #[test]
     fn grants_are_scoped_to_one_project() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
@@ -284,7 +341,6 @@ mod tests {
     /// repo shipping its own approvals would be a supply-chain problem.
     #[test]
     fn the_grant_file_is_stored_outside_the_project() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -300,7 +356,6 @@ mod tests {
     /// A corrupt file must make the agent ask more, not less.
     #[test]
     fn a_malformed_file_yields_no_grants() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -314,7 +369,6 @@ mod tests {
 
     #[test]
     fn clearing_removes_every_grant() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -328,7 +382,6 @@ mod tests {
 
     #[test]
     fn repeating_a_grant_is_a_no_op() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = Sandbox::new();
         let project = tempfile::tempdir().unwrap();
 
@@ -336,5 +389,94 @@ mod tests {
         assert!(store.insert("Bash\0ls", "Bash: ls").unwrap());
         assert!(!store.insert("Bash\0ls", "Bash: ls").unwrap());
         assert_eq!(store.len(), 1);
+    }
+
+    /// Two live sessions, each with its own snapshot: an insert from the
+    /// staler one must merge with the file, not overwrite the other
+    /// session's grant.
+    #[test]
+    fn an_insert_from_a_stale_snapshot_keeps_the_other_sessions_grant() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut session_a = GrantStore::load(project.path());
+        let mut session_b = GrantStore::load(project.path());
+        session_a
+            .insert("Bash\0cargo test", "Bash: cargo test")
+            .unwrap();
+        session_b
+            .insert("Bash\0cargo fmt", "Bash: cargo fmt")
+            .unwrap();
+
+        let on_disk = GrantStore::load(project.path());
+        assert!(on_disk.contains("Bash\0cargo test"), "A's grant was lost");
+        assert!(on_disk.contains("Bash\0cargo fmt"), "B's grant was lost");
+    }
+
+    /// The cross-session failure codex flagged: session B loaded before
+    /// session A cleared, then B inserts. B's write must not resurrect
+    /// the grants the user cleared — the clear wins.
+    #[test]
+    fn an_insert_does_not_resurrect_grants_cleared_by_another_session() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut session_a = GrantStore::load(project.path());
+        session_a
+            .insert("Bash\0old grant", "Bash: old grant")
+            .unwrap();
+
+        // B snapshots the file while the old grant is still in it.
+        let mut session_b = GrantStore::load(project.path());
+        assert!(session_b.contains("Bash\0old grant"));
+
+        session_a.clear().unwrap();
+        session_b
+            .insert("Bash\0new grant", "Bash: new grant")
+            .unwrap();
+
+        let on_disk = GrantStore::load(project.path());
+        assert!(
+            !on_disk.contains("Bash\0old grant"),
+            "a stale session's insert resurrected a cleared grant"
+        );
+        assert!(on_disk.contains("Bash\0new grant"));
+        // B's own view honours the clear too, not just the file.
+        assert!(!session_b.contains("Bash\0old grant"));
+    }
+
+    /// `/cd` re-scopes the store: grants must not follow the session out
+    /// of the project they were approved in, and new grants must land in
+    /// the new project's file.
+    #[test]
+    fn rescoping_swaps_projects_without_leaking_grants_either_way() {
+        let _s = Sandbox::new();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+
+        let mut store = GrantStore::load(a.path());
+        store
+            .insert("Bash\0make deploy", "Bash: make deploy")
+            .unwrap();
+
+        store.rescope(b.path());
+        assert!(
+            !store.contains("Bash\0make deploy"),
+            "a grant followed the session into another project"
+        );
+
+        store.insert("Bash\0ls", "Bash: ls").unwrap();
+        let a_reload = GrantStore::load(a.path());
+        let b_reload = GrantStore::load(b.path());
+        assert!(
+            !a_reload.contains("Bash\0ls"),
+            "grant written to the old project"
+        );
+        assert!(b_reload.contains("Bash\0ls"));
+        assert!(
+            a_reload.contains("Bash\0make deploy"),
+            "old project lost its grant"
+        );
+        assert!(!b_reload.contains("Bash\0make deploy"));
     }
 }
