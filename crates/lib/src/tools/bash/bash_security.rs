@@ -224,6 +224,10 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         let Some(parsed) = parse_bash(&statement) else {
             continue;
         };
+        // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
+        // bash -c 'git p'` configures the git inside the payload. The
+        // payload is one token here, so tokens are searched word by
+        // word rather than whole.
         let runs_git = parsed.invocations.iter().any(|invocation| {
             [
                 Some(invocation.as_slice()),
@@ -232,9 +236,11 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             .into_iter()
             .flatten()
             .any(|tokens| {
-                tokens
-                    .iter()
-                    .any(|t| base_name(&unquote_token(t)).to_lowercase() == "git")
+                tokens.iter().any(|token| {
+                    split_alias_value(&unquote_token(token))
+                        .iter()
+                        .any(|word| base_name(word).to_lowercase() == "git")
+                })
             })
         });
         if !runs_git {
@@ -958,6 +964,13 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
         if let Some((name, value)) = definition.split_once('=')
             && !name.is_empty()
         {
+            if name.contains(['$', '`']) {
+                // Expansion decides which command the alias binds to,
+                // so no command word in this invocation can be ruled
+                // out: `git -c alias.${X:+p}='push --force' p` defines
+                // `p` only once the shell is done.
+                return Some(AliasExpansion::Unresolved);
+            }
             if value.contains('$') || value.contains('`') {
                 // Run-time expansion decides the value.
                 opaque.push(name.to_lowercase());
@@ -1439,6 +1452,13 @@ mod tests {
             // and the `;` is inside the substitution throughout.
             "GIT_CONFIG_GLOBAL=\"$(printf \"/tmp/g;\")\" git p",
             "GIT_CONFIG_GLOBAL=\"`printf \"/tmp/g;\"`\" git p",
+            // A launcher inherits the environment, so the git inside
+            // the payload is configured by it too.
+            "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git p'",
+            "GIT_CONFIG_GLOBAL=/tmp/g sh -c \"git p origin main\"",
+            // An alias name the shell still has to expand binds to a
+            // command word only at run time.
+            "git -c alias.${PATH:+p}='push --force' p",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
