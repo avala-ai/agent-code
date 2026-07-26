@@ -9,7 +9,7 @@
 //! that lived in `bash.rs` so that a refactor does not change which
 //! invocations are blocked.
 
-use crate::tools::bash_parse::{ParsedCommand, base_name, unquote_token};
+use crate::tools::bash_parse::{ParsedCommand, base_name, parse_bash, unquote_token};
 
 /// Severity of a destructive-command finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,9 +120,17 @@ pub fn classify_destructive(cmd: &ParsedCommand) -> DestructivenessLevel {
         .unwrap_or(DestructivenessLevel::Safe)
 }
 
+/// How deep to follow `bash -c` / `eval` payloads. Mirrors the
+/// interpreter-depth cap in `protected_paths`.
+const MAX_SHELL_SCAN_DEPTH: u8 = 3;
+
 /// Like [`classify_destructive`] but returns every finding so callers
 /// can present a useful message to the user.
 pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
+    find_destructive_depth(cmd, 0)
+}
+
+fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFinding> {
     let mut findings = Vec::new();
     let raw_lower = cmd.raw.to_lowercase();
 
@@ -232,7 +240,61 @@ pub fn find_destructive(cmd: &ParsedCommand) -> Vec<DestructiveFinding> {
         }
     }
 
+    // Recursive shell payloads. `bash -c "'git' push --force"` hands
+    // its literal argument to another shell, where intra-token spaces
+    // become command boundaries again — so the payload gets the whole
+    // scan, not the inert-data treatment. One unquote layer is exactly
+    // the text the inner shell receives.
+    if depth < MAX_SHELL_SCAN_DEPTH {
+        for invocation in &cmd.invocations {
+            let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
+            let Some((head, args)) = unquoted.split_first() else {
+                continue;
+            };
+            let Some(payload) = shell_payload(&base_name(head).to_lowercase(), args) else {
+                continue;
+            };
+            let inner = parse_bash(&payload).unwrap_or_else(|| ParsedCommand {
+                raw: payload.clone(),
+                ..ParsedCommand::default()
+            });
+            findings.extend(find_destructive_depth(&inner, depth + 1));
+        }
+    }
+
     findings
+}
+
+/// The literal command string an invocation hands to another shell,
+/// if it does: `bash -c CMD` (also `-ec`, `-lc`, … clusters) and
+/// `eval WORDS…`. Payloads only run-time expansion can produce are
+/// left to the raw scans.
+fn shell_payload(head: &str, args: &[String]) -> Option<String> {
+    match head {
+        "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh" => {
+            for (i, a) in args.iter().enumerate() {
+                let cluster = a.strip_prefix('-')?;
+                if a == "--" {
+                    return None;
+                }
+                // `-c` alone or inside a short-option cluster (`-lc`,
+                // `-ec`): the next operand is the command string.
+                if !cluster.starts_with('-') && cluster.contains('c') {
+                    return args.get(i + 1).cloned();
+                }
+            }
+            None
+        }
+        "eval" => {
+            // `eval` concatenates its arguments and evaluates them.
+            if args.is_empty() {
+                None
+            } else {
+                Some(args.join(" "))
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +348,13 @@ mod tests {
             "true | /bin/rm x",
             "true | $'rm' x",
             "echo hi && $'rm' x",
+            // A literal payload handed to another shell is re-parsed
+            // there, so its spaces are command boundaries after all.
+            "bash -c \"'git' push --force\"",
+            "sh -c \"'rm' -rf /tmp/x\"",
+            "bash -lc \"'git' push --force\"",
+            "eval \"'git' push --force\"",
+            "bash -c \"bash -c \\\"'git' push --force\\\"\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
@@ -346,6 +415,11 @@ mod tests {
             // boundary: this prints two strings, it does not push.
             "printf '%s\\n' 'git push' --force",
             "printf '%s' 'git clean' -f",
+            // Shell payloads recurse without over-blocking: the inner
+            // command gets the same data-vs-boundary treatment.
+            "bash -c 'echo hello world'",
+            "bash -c \"printf '%s\\n' 'git push' --force\"",
+            "eval 'echo hi'",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
