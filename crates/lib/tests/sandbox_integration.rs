@@ -67,6 +67,26 @@ async fn bash_runs_normally_with_disabled_sandbox() {
 }
 
 #[tokio::test]
+async fn bash_call_refuses_system_path_writes_before_sandbox() {
+    // The protected-path check runs in `call()` anchored to the real
+    // cwd, ahead of any sandbox decision — a system-path write is
+    // refused even when no sandbox is configured at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(tmp.path().to_path_buf(), None);
+    let bash = BashTool;
+    let result = bash
+        .call(
+            serde_json::json!({"command": "echo test > /etc/agent-code-no-sandbox-marker"}),
+            &ctx,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "system-path write must be refused before dispatch, got: {result:?}"
+    );
+}
+
+#[tokio::test]
 #[cfg_attr(
     target_os = "windows",
     ignore = "BashTool invokes bash(1); Windows Git-Bash subprocess handling diverges"
@@ -384,7 +404,12 @@ async fn bwrap_blocks_writes_outside_project_dir() {
     }
     let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
     let bash = BashTool;
-    let marker = "/etc/agent-code-bwrap-test-marker";
+    // Not `/etc/...`: the protected-path check refuses the system-path
+    // list before the sandbox is even consulted (see
+    // `bash_call_refuses_system_path_writes_before_sandbox`). This test
+    // is about the bwrap layer, so probe an outside-project path that
+    // only the sandbox blocks.
+    let marker = "/opt/agent-code-bwrap-test-marker";
     let result = bash
         .call(
             serde_json::json!({
@@ -395,7 +420,7 @@ async fn bwrap_blocks_writes_outside_project_dir() {
         .await
         .expect("bash tool call should return a ToolResult");
 
-    // The ro-bind / / mount means /etc is read-only inside the namespace;
+    // The ro-bind / / mount means /opt is read-only inside the namespace;
     // the write will fail with Permission denied / Read-only file system.
     assert!(
         result.content.contains("denied")
@@ -548,7 +573,10 @@ async fn bwrap_dangerously_disable_sandbox_is_ignored_when_bypass_denied() {
     assert!(!exec.allow_bypass());
     let ctx = make_ctx(tmp.path().to_path_buf(), Some(exec));
     let bash = BashTool;
-    let marker = "/etc/agent-code-bwrap-bypass-denied-marker";
+    // `/opt`, not `/etc`, for the same reason as
+    // `bwrap_blocks_writes_outside_project_dir`: the protected-path
+    // check would refuse `/etc` before the sandbox decision is reached.
+    let marker = "/opt/agent-code-bwrap-bypass-denied-marker";
     let result = bash
         .call(
             serde_json::json!({

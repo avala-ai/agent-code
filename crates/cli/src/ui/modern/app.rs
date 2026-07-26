@@ -421,6 +421,17 @@ pub struct App {
     pub model_picker: Option<super::model_picker::ModelPicker>,
     /// Ctrl+F in-transcript search.
     pub search: Option<super::search::Search>,
+    /// `/theme` in-TUI theme picker (live preview, Esc reverts).
+    pub theme_picker: Option<super::theme_picker::ThemePicker>,
+    /// Theme id the session is configured with (`auto`, `one-dark`, …).
+    /// Tracked here because the global theme is mutated for live preview,
+    /// so `theme::current()` cannot answer "what did the user choose".
+    pub theme_name: String,
+    /// `[ui].inherit_fg` — preserved across theme switches so a picker
+    /// selection does not silently drop the user's override.
+    pub inherit_fg: bool,
+    /// Theme id the run loop should mirror into config and persist.
+    pub pending_theme: Option<String>,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -575,6 +586,10 @@ impl App {
             command_palette: None,
             model_picker: None,
             search: None,
+            theme_picker: None,
+            theme_name: "auto".to_string(),
+            inherit_fg: false,
+            pending_theme: None,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),
@@ -1309,19 +1324,12 @@ impl App {
             return;
         }
         if text == "/theme" {
-            // Cycle skins for now (full theme pack is later).
-            self.skin = match self.skin {
-                Skin::Fullscreen => Skin::Minimal,
-                Skin::Minimal => Skin::Fullscreen,
-            };
-            self.status_message = format!("skin → {:?}", self.skin);
-            self.transcript.push(TranscriptItem::System(format!(
-                "skin → {:?}  (/minimal · /fullscreen)",
-                self.skin
-            )));
+            // Selects a colour theme. Layout skins are `/minimal` and
+            // `/fullscreen`; this used to cycle those, which left the
+            // theme registry unreachable from a running session.
+            self.open_theme_picker();
             self.input.clear();
             self.cursor = 0;
-            self.dirty = true;
             return;
         }
         if text == "/permissions" {
@@ -3122,6 +3130,25 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         app.delete_newest_queued();
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn theme_slash_opens_the_picker_and_leaves_the_skin_alone() {
+        let _g = crate::ui::theme::test_lock();
+        let mut app = App::new("m", "/tmp", "s");
+        assert_eq!(app.skin, Skin::Fullscreen);
+        app.input = "/theme".into();
+        app.cursor = app.input.len();
+        app.submit();
+        // `/theme` used to cycle the layout skin, which left the theme
+        // registry unreachable from a running session while the docs
+        // advertised a picker. Layout stays on `/minimal`/`/fullscreen`.
+        assert!(app.theme_picker_open(), "/theme must open the picker");
+        assert_eq!(app.skin, Skin::Fullscreen, "/theme must not touch skin");
+        assert!(
+            app.pending_submit.is_none(),
+            "opening a picker is not a turn"
+        );
     }
 
     #[test]

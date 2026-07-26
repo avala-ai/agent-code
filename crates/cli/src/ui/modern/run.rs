@@ -74,6 +74,10 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
     let session = Session::new(engine);
     let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
+    // The picker previews by mutating the global theme, so the App has to
+    // remember what the user actually configured in order to revert.
+    app.theme_name = configured.clone();
+    app.inherit_fg = inherit_fg;
     app.show_thinking_blocks = show_thinking_blocks;
     app.effort = initial_effort;
     app.notifier_enabled = notifier_config.enabled;
@@ -362,6 +366,22 @@ pub(super) async fn event_loop(
             }
         }
 
+        // Mirror a `/theme` selection into the engine config and persist
+        // it, so `/config` agrees with the screen and the choice survives
+        // a restart. The global theme was already switched by the picker.
+        if let Some(theme_id) = app.pending_theme.take() {
+            match session.engine().try_lock() {
+                Ok(mut eng) => {
+                    eng.state_mut().config.ui.theme = theme_id.clone();
+                    // Not fatal: the theme is already live either way.
+                    if let Err(e) = crate::ui::onboarding::persist_theme(&theme_id) {
+                        app.status_message = format!("theme applied, not saved: {e}");
+                    }
+                }
+                Err(_) => app.pending_theme = Some(theme_id),
+            }
+        }
+
         // Apply a deferred `/clear` to the engine conversation (classic
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
@@ -441,6 +461,11 @@ pub(super) async fn event_loop(
                     // Keep TUI header/path and `!` shell in sync with engine
                     // after `/cd` (and any other cwd-changing command).
                     app.cwd = eng.state().cwd.clone();
+                    // Same for `/color`: the arm re-inits the palette and
+                    // updates the config, but only the app knows what the
+                    // theme picker should treat as current.
+                    let configured = eng.state().config.ui.theme.clone();
+                    app.sync_theme_from_config(&configured);
                     if interactive {
                         app.force_full_redraw = true;
                     }
@@ -841,6 +866,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         app.close_command_palette();
         app.close_model_picker();
+        // Reverts the live preview rather than leaving a browsed theme on.
+        app.theme_picker_cancel();
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
@@ -869,6 +896,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Model picker captures input when open (and no HITL modal is up).
     if app.model_picker_open() {
         handle_model_picker_key(app, key);
+        return;
+    }
+
+    // Theme picker captures input when open (and no HITL modal is up).
+    if app.theme_picker_open() {
+        handle_theme_picker_key(app, key);
         return;
     }
 
@@ -1306,6 +1339,28 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             app.search_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_theme_picker_key(app: &mut App, key: KeyEvent) {
+    // Esc / Ctrl+C revert to the theme that was active on open — a
+    // browse must never be able to leave a theme behind.
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.theme_picker_cancel();
+        return;
+    }
+    match key.code {
+        KeyCode::Up => app.theme_picker_move(-1),
+        KeyCode::Down => app.theme_picker_move(1),
+        KeyCode::Enter => app.theme_picker_accept(),
+        KeyCode::Backspace => app.theme_picker_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.theme_picker_insert_char(c);
         }
         _ => {}
     }
