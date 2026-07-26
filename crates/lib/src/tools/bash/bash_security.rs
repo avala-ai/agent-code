@@ -263,6 +263,12 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     let mut shell_vars: Vec<(String, String)> = Vec::new();
     let mut exported: Vec<String> = Vec::new();
     let mut allexport = false;
+    // Once git's configuration has been pointed somewhere unreadable,
+    // a later assignment cannot argue it back to safety: this walk
+    // cannot know that the later one is the value git ends up with —
+    // a subshell keeps its own copy, a branch may not run. So opacity
+    // sticks for the rest of the command.
+    let mut config_ever_opaque = false;
     for statement in statements {
         let Some(parsed) = parse_bash(&statement) else {
             continue;
@@ -270,13 +276,17 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         if let Some(state) = allexport_transition(&parsed) {
             allexport = state;
         }
-        apply_statement_env(
-            &statement,
-            &parsed,
-            allexport,
-            &mut shell_vars,
-            &mut exported,
-        );
+        // A subshell keeps its own environment, so what it assigns
+        // never reaches the parent's later commands.
+        if !statement.trim_start().starts_with('(') {
+            apply_statement_env(
+                &statement,
+                &parsed,
+                allexport,
+                &mut shell_vars,
+                &mut exported,
+            );
+        }
         let carried: Vec<(String, String)> = exported
             .iter()
             .filter_map(|name| {
@@ -287,6 +297,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                     .cloned()
             })
             .collect();
+        config_ever_opaque = config_ever_opaque || env_defines_opaque_git_alias(&carried);
         // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
         // bash -c 'git p'` configures the git inside the payload. The
         // payload is one token here, so tokens are searched word by
@@ -336,7 +347,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // model every one, an unaccounted mention is unknown — except
         // under a head whose operands are text, where it is data.
         let unaccounted = statement_mentions_unaccounted_git_config(&parsed, &pairs);
-        if env_defines_opaque_git_alias(&pairs) || unaccounted {
+        if config_ever_opaque || env_defines_opaque_git_alias(&pairs) || unaccounted {
             findings.push(DestructiveFinding {
                 level: DestructivenessLevel::Destructive,
                 reason: "git configuration comes from the environment; what it runs cannot be \
@@ -763,8 +774,12 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
 /// '%s\n' 'a && b'` branches nowhere.
 fn has_unquoted_operator(raw: &str) -> bool {
     let mut quote: Option<char> = None;
+    let mut at_word_start = true;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
+        let was_word_start = at_word_start;
+        at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
+        let at_word_start = was_word_start;
         match quote {
             Some('\'') => {
                 if c == '\'' {
@@ -783,8 +798,10 @@ fn has_unquoted_operator(raw: &str) -> bool {
                 '\\' => {
                     chars.next();
                 }
-                // A comment runs to the end of the line.
-                '#' => {
+                // A comment runs to the end of the line — but `#`
+                // starts one only at the beginning of a word, so
+                // `false#x` is an ordinary word.
+                '#' if at_word_start => {
                     while chars.peek().is_some_and(|next| *next != '\n') {
                         chars.next();
                     }
@@ -1917,6 +1934,11 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
+            // A later assignment cannot argue an opaque config back to
+            // safety: a subshell keeps its own copy, and a `#` in the
+            // middle of a word is not a comment.
+            "export GIT_CONFIG_GLOBAL=/tmp/g; (GIT_CONFIG_GLOBAL=/dev/null); git p",
+            "export GIT_CONFIG_GLOBAL=/tmp/g; false#x && GIT_CONFIG_GLOBAL=/dev/null; git p",
             // A builtin wrapper does not stop the export.
             "command export GIT_CONFIG_GLOBAL=/tmp/g; git p",
             "builtin export GIT_CONFIG_GLOBAL=/tmp/g && git p",
