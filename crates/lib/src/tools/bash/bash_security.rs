@@ -988,8 +988,15 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                 }
                 if run == 2 {
                     facts.control_operator = true;
-                    let (delimiter, strip_tabs, next) = read_heredoc_delimiter(&text, i + run);
-                    if let Some(delimiter) = delimiter {
+                    let (word, strip_tabs, next) = read_heredoc_delimiter(&text, i + run);
+                    // A translated delimiter is decided by the
+                    // catalogue, so where the body ends — and what
+                    // between here and there is code — is unknown.
+                    if word.contains("$\"") {
+                        facts.locale_quote = true;
+                    }
+                    let delimiter = unquote_token(&word);
+                    if !delimiter.is_empty() {
                         pending_heredocs.push((delimiter, strip_tabs));
                     }
                     i = next.saturating_sub(1);
@@ -1039,11 +1046,11 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     facts
 }
 
-/// Read a heredoc's delimiter, given the index just past its `<<`.
-/// Returns the delimiter (quoting removed), whether the operator was
-/// `<<-` (which strips leading tabs from the terminator), and the
-/// index just past the delimiter word.
-fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (Option<String>, bool, usize) {
+/// Read a heredoc's delimiter word, given the index just past its
+/// `<<`. Returns the word as written, whether the operator was `<<-`
+/// (which strips leading tabs from the terminator), and the index just
+/// past the word.
+fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, usize) {
     let strip_tabs = text.get(i) == Some(&'-');
     if strip_tabs {
         i += 1;
@@ -1087,8 +1094,7 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (Option<String>, bool,
         }
         i += 1;
     }
-    let delimiter = unquote_token(&word);
-    ((!delimiter.is_empty()).then_some(delimiter), strip_tabs, i)
+    (word, strip_tabs, i)
 }
 
 /// Skip a heredoc body, given the index of the newline that ends its
@@ -2294,6 +2300,9 @@ mod tests {
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
             "cat <<EO\\ F\nbody\nEO F\n$\"safe\" -rf /tmp/x",
+            // A translated delimiter decides where the body ends, so
+            // what lies between is unknown.
+            "cat <<$\"SAFE\"\nr\"\"m -rf /tmp/x\nSAFE",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
