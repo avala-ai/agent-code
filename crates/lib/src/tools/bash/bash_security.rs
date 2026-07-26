@@ -167,6 +167,16 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // `env printf …` prints just as `printf …` does, so the
         // wrapper comes off before the head is read — and the
         // wrapper's own view is not scanned as executable operands.
+        // A wrapper asked to describe itself runs none of what follows,
+        // so those words are operands of a command that never starts.
+        if wrapper_only_reports(
+            &invocation
+                .iter()
+                .map(|t| unquote_token(t))
+                .collect::<Vec<_>>(),
+        ) {
+            continue;
+        }
         let unwrapped = unwrapped_argv(invocation);
         let invocation = unwrapped.as_ref().unwrap_or(invocation);
         let head_is_data = invocation.first().is_some_and(|t| {
@@ -535,25 +545,34 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
     // as the subcommand: `git -C push grep -f …` greps in a directory
     // named `push`. When the command word cannot be located the whole
     // tail is scanned instead, which over-matches rather than missing.
-    let tail = match git_command_index(after_git) {
-        Some(index) => &after_git[index..],
-        None => after_git,
+    let (tail, only_command_word) = match git_command_index(after_git) {
+        Some(index) => (&after_git[index..], true),
+        None => (after_git, false),
     };
-    if let Some(reason) = scan_git_subcommands(tail) {
+    if let Some(reason) = scan_git_subcommands(tail, only_command_word) {
         return Some(reason);
     }
     // Nothing literal. The command token may still be an alias defined
     // in this same command, which only expansion reveals.
     match expand_command_alias(after_git)? {
-        AliasExpansion::Tokens(tokens) => scan_git_subcommands(&tokens),
+        AliasExpansion::Tokens(tokens) => scan_git_subcommands(&tokens, false),
         AliasExpansion::Unresolved => {
             Some("git alias cannot be resolved; what it runs cannot be determined".to_string())
         }
     }
 }
 
-fn scan_git_subcommands(after_git: &[String]) -> Option<String> {
-    for (idx, token) in after_git.iter().enumerate() {
+/// With `only_command_word`, just the first token is treated as the
+/// subcommand — `git grep push -f …` searches for the word `push`.
+/// Without it the command word could not be located, so every token is
+/// tried, which over-matches rather than missing.
+fn scan_git_subcommands(after_git: &[String], only_command_word: bool) -> Option<String> {
+    let candidates = if only_command_word {
+        1
+    } else {
+        after_git.len()
+    };
+    for (idx, token) in after_git.iter().enumerate().take(candidates) {
         let subcommand = token.to_lowercase();
         let Some((_, flags, longs)) = DESTRUCTIVE_GIT_FLAGS
             .iter()
@@ -2118,6 +2137,12 @@ mod tests {
             // a directory that happens to be named `push`.
             "git -C push grep -f ../patterns",
             "git --git-dir clean status",
+            // A subcommand's own argument is not another subcommand.
+            "git grep push -f ../patterns",
+            "git log branch -1",
+            // A wrapper that only describes itself runs none of this.
+            "env --help 'git' push --force",
+            "command -v 'git' push --force",
             // A key that merely contains `alias.` does not define one.
             "GIT_CONFIG_PARAMETERS=\"'user.alias.foo'='x'\" git status",
             // `command -v` describes the builtin, it does not run it.
