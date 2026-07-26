@@ -911,6 +911,13 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                     stack.push(Context::Backtick);
                 }
             }
+            // `<( … )` and `>( … )` are process substitutions: the
+            // result is a pathname that joins the surrounding word,
+            // exactly as `$( … )` does.
+            '<' | '>' if !in_double && chars.peek() == Some(&'(') => {
+                chars.next();
+                stack.push(Context::Substitution);
+            }
             '(' if !in_double => stack.push(Context::Subshell),
             '{' if !in_double => stack.push(Context::Brace),
             ')' if matches!(
@@ -2105,6 +2112,9 @@ mod tests {
             // What follows a closing `)` joins the same word, so this
             // `#` is a character rather than a comment.
             "echo $(true)#x; $\"cat\" /tmp/file",
+            // A process substitution's pathname joins the word too.
+            "true <(true)#x; $\"cat\"",
+            "true >(true)#x; $\"cat\"",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
