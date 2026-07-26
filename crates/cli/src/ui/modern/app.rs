@@ -425,6 +425,8 @@ pub struct App {
     /// file — tests build hundreds of Apps and would otherwise depend on
     /// the machine's real config.
     pub keybindings: std::sync::Arc<crate::ui::keybindings::KeybindingRegistry>,
+    /// Ctrl+F in-transcript search.
+    pub search: Option<super::search::Search>,
     /// `/theme` in-TUI theme picker (live preview, Esc reverts).
     pub theme_picker: Option<super::theme_picker::ThemePicker>,
     /// Theme id the session is configured with (`auto`, `one-dark`, …).
@@ -592,6 +594,7 @@ impl App {
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
+            search: None,
             theme_picker: None,
             theme_name: "auto".to_string(),
             inherit_fg: false,

@@ -871,6 +871,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.close_model_picker();
         // Reverts the live preview rather than leaving a browsed theme on.
         app.theme_picker_cancel();
+        // Restores the reader's place; a hidden search bar must not swallow
+        // the modal's answer keys.
+        app.cancel_search();
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
@@ -887,6 +890,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.show_shortcuts = false;
             app.dirty = true;
         }
+        return;
+    }
+
+    // Search captures input when open (and no HITL modal is up).
+    if app.search_open() {
+        handle_search_key(app, key);
         return;
     }
 
@@ -1108,6 +1117,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.request_full_redraw();
         }
         // Command palette (Ctrl+P / ?).
+        // Ctrl+F opens in-transcript search.
+        (m, KeyCode::Char('f') | KeyCode::Char('F')) if m.contains(KeyModifiers::CONTROL) => {
+            app.open_search();
+        }
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
             app.open_command_palette();
         }
@@ -1288,6 +1301,12 @@ fn handle_paste(app: &mut App, text: &str) {
     if app.phase == super::app::Phase::Permission {
         return;
     }
+    // The search bar owns typed input while open, so it owns pasted input
+    // too — otherwise the paste silently edits the composer behind it.
+    if app.search_open() {
+        app.search_insert_str(text);
+        return;
+    }
     app.insert_str(text);
 }
 
@@ -1315,6 +1334,43 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             app.palette_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    // Esc restores the reader's position; Ctrl+C is the cancel chord
+    // everywhere else, so it behaves like Esc here.
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.cancel_search();
+        return;
+    }
+    match key.code {
+        // Enter accepts: close the bar and stay on the match, so the
+        // composer is usable again at the spot that was searched for.
+        KeyCode::Enter => app.close_search(),
+        KeyCode::Down => app.search_next(),
+        KeyCode::Up => app.search_prev(),
+        // Ctrl+N / Ctrl+P mirror ↓/↑. Bare letters stay ordinary
+        // characters — `N` must be typable in a smart-case query
+        // like `API_NAME`.
+        KeyCode::Char('n') | KeyCode::Char('N')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.search_next();
+        }
+        KeyCode::Char('p') | KeyCode::Char('P')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.search_prev();
+        }
+        KeyCode::Backspace => app.search_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.search_insert_char(c);
         }
         _ => {}
     }
@@ -1969,6 +2025,101 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('y')));
         assert!(!app.command_palette_open());
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    #[test]
+    fn permission_phase_closes_search_and_takes_keys() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        assert!(app.search_open());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        app.force_hitl_answers_ready();
+        // y must reach the modal, not the search query — the bar is not
+        // even drawn during Permission, so a swallowed key looks dead.
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(!app.search_open());
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    /// Bare letters are query characters, full stop — `N` must be typable
+    /// in a smart-case query like `API_NAME`.
+    #[test]
+    fn search_uppercase_n_edits_the_query_instead_of_navigating() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        for c in "API_N".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search.as_ref().unwrap().query, "API_N");
+    }
+
+    /// Enter is the exit that stays at the found match; Esc is the one
+    /// that goes back. Without the former the bar had to stay open to
+    /// keep the position it found.
+    #[test]
+    fn search_enter_closes_the_bar_and_stays_put() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        for t in ["auth one", "filler", "auth two"] {
+            app.transcript
+                .push(super::super::app::TranscriptItem::System(t.into()));
+        }
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 80, &expanded, None);
+        app.scroll_to_top();
+        handle_key(&mut app, ctrl('f'));
+        for c in "auth".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let at_match = app.scroll;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.search_open(), "Enter must close the bar");
+        assert_eq!(app.scroll, at_match, "Enter must keep the match position");
+        assert!(app.pending_submit.is_none(), "Enter must not submit a turn");
+    }
+
+    #[test]
+    fn search_ctrl_n_and_ctrl_p_step_matches() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        for t in ["auth one", "filler", "auth two"] {
+            app.transcript
+                .push(super::super::app::TranscriptItem::System(t.into()));
+        }
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 80, &expanded, None);
+        handle_key(&mut app, ctrl('f'));
+        for c in "auth".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search.as_ref().unwrap().position(), (1, 2));
+        handle_key(&mut app, ctrl('n'));
+        assert_eq!(app.search.as_ref().unwrap().position(), (2, 2));
+        handle_key(&mut app, ctrl('p'));
+        assert_eq!(app.search.as_ref().unwrap().position(), (1, 2));
+    }
+
+    #[test]
+    fn paste_lands_in_the_open_search_query_not_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        handle_paste(&mut app, "auth token");
+        assert_eq!(app.search.as_ref().unwrap().query, "auth token");
+        assert!(
+            app.input.is_empty(),
+            "paste must not leak into the composer behind the bar"
+        );
     }
 
     #[test]

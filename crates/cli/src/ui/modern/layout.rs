@@ -24,6 +24,10 @@ use crate::ui::text_safety::escape_deceptive;
 struct Cached {
     hash: u64,
     lines: Vec<Line<'static>>,
+    /// `cont[i]` — `lines[i]` is a soft-wrap continuation of `lines[i-1]`
+    /// rather than the start of a logical line. Lets search operate on
+    /// logical lines so a match can cross a display-wrap boundary.
+    cont: Vec<bool>,
 }
 
 /// Per-block rendered-line cache with a prefix-sum line index.
@@ -32,6 +36,10 @@ pub struct LayoutCache {
     width: u16,
     blocks: Vec<Cached>,
     total: usize,
+    /// Bumped whenever a [`Self::sync`] actually changed cached lines, so
+    /// derived state (in-transcript search) can rescan only on change
+    /// instead of every frame.
+    revision: u64,
 }
 
 impl std::fmt::Debug for LayoutCache {
@@ -77,11 +85,15 @@ impl LayoutCache {
         if width_changed {
             self.blocks.clear();
         }
+        let mut changed = width_changed;
 
         // Fold consecutive read-only successes into groups (plan §M4); the
         // cache is keyed by display block, not raw item, so a group's hash
         // changes if any member does.
         let display = super::toolcard::plan_display(items);
+        if display.len() != self.blocks.len() {
+            changed = true;
+        }
         self.blocks.truncate(display.len());
 
         for (i, d) in display.iter().enumerate() {
@@ -110,17 +122,27 @@ impl LayoutCache {
             match self.blocks.get(i) {
                 Some(c) if c.hash == hash => {} // fresh
                 _ => {
-                    let lines = wrap_lines(render(), width);
-                    let entry = Cached { hash, lines };
+                    let (lines, cont) = wrap_lines_tagged(render(), width);
+                    let entry = Cached { hash, lines, cont };
                     if i < self.blocks.len() {
                         self.blocks[i] = entry;
                     } else {
                         self.blocks.push(entry);
                     }
+                    changed = true;
                 }
             }
         }
         self.total = self.blocks.iter().map(|b| b.lines.len()).sum();
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Monotonic change counter: unchanged between two [`Self::sync`]
+    /// calls iff the cached lines are byte-identical.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Drop every cached block so the next [`Self::sync`] re-renders the
@@ -212,6 +234,26 @@ impl LayoutCache {
     pub fn abs_line_at(&self, top: usize, row_in_view: usize) -> Option<usize> {
         let abs = top.saturating_add(row_in_view);
         if abs < self.total { Some(abs) } else { None }
+    }
+
+    /// Plain text grouped by logical line: each inner vec is the display
+    /// rows `(absolute index, text)` one pre-wrap line occupies. Search
+    /// scans these so a query can match across a display-wrap boundary.
+    pub fn logical_rows(&self) -> Vec<Vec<(usize, String)>> {
+        let mut out: Vec<Vec<(usize, String)>> = Vec::new();
+        let mut abs = 0usize;
+        for b in &self.blocks {
+            for (li, line) in b.lines.iter().enumerate() {
+                let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let cont = b.cont.get(li).copied().unwrap_or(false);
+                match out.last_mut() {
+                    Some(rows) if cont => rows.push((abs, plain)),
+                    _ => out.push(vec![(abs, plain)]),
+                }
+                abs += 1;
+            }
+        }
+        out
     }
 }
 
@@ -550,14 +592,26 @@ fn render_group(items: &[TranscriptItem], idxs: &[usize], selected: bool) -> Vec
 
 /// Wrap logical lines to `width` display columns, unicode-width aware.
 pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    wrap_lines_tagged(lines, width).0
+}
+
+/// [`wrap_lines`] plus a per-row continuation flag: `true` for rows that
+/// are soft-wrap overflow of the previous row (never the first row of a
+/// logical line).
+pub fn wrap_lines_tagged(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>, Vec<bool>) {
     if width == 0 {
-        return lines;
+        let cont = vec![false; lines.len()];
+        return (lines, cont);
     }
     let mut out = Vec::with_capacity(lines.len());
+    let mut cont = Vec::with_capacity(lines.len());
     for line in lines {
+        let first = out.len();
         wrap_one(line, width as usize, &mut out);
+        cont.resize(out.len(), true);
+        cont[first] = false;
     }
-    out
+    (out, cont)
 }
 
 /// Wrap a single styled line, preserving span styles across the split.
@@ -649,6 +703,56 @@ mod tests {
             text.contains("src/a.rs"),
             "clean details still render: {text:?}"
         );
+    }
+
+    #[test]
+    fn logical_rows_join_soft_wraps_but_not_separate_items() {
+        let mut c = LayoutCache::default();
+        let items = vec![
+            TranscriptItem::System("abcdefghijklmnopqrstuvwxyz".into()),
+            TranscriptItem::System("short".into()),
+        ];
+        c.sync(&items, 10, &HashSet::new(), None);
+        let logical = c.logical_rows();
+        let alphabet = logical
+            .iter()
+            .find(|rows| {
+                let joined: String = rows.iter().map(|(_, s)| s.as_str()).collect();
+                joined.contains("abcdefghijklmnopqrstuvwxyz")
+            })
+            .expect("alphabet joins back together across its wrap rows");
+        assert!(
+            alphabet.len() > 1,
+            "26 chars at width 10 must wrap: {alphabet:?}"
+        );
+        assert!(
+            logical
+                .iter()
+                .any(|rows| rows.len() == 1 && rows[0].1.contains("short")),
+            "separate items must stay separate logical lines"
+        );
+    }
+
+    /// The search rescan is gated on this counter, so a sync that changed
+    /// nothing must not bump it — otherwise every spinner frame rescans.
+    #[test]
+    fn revision_bumps_only_when_cached_lines_change() {
+        let mut c = LayoutCache::default();
+        let mut items = vec![
+            TranscriptItem::System("one".into()),
+            TranscriptItem::System("two".into()),
+        ];
+        let exp = HashSet::new();
+        c.sync(&items, 80, &exp, None);
+        let r1 = c.revision();
+        c.sync(&items, 80, &exp, None);
+        assert_eq!(c.revision(), r1, "no-op sync must not bump the revision");
+        items.push(TranscriptItem::System("three".into()));
+        c.sync(&items, 80, &exp, None);
+        let r2 = c.revision();
+        assert_ne!(r2, r1, "new content must bump the revision");
+        c.sync(&items, 40, &exp, None);
+        assert_ne!(c.revision(), r2, "a width change rewraps everything");
     }
 
     #[test]

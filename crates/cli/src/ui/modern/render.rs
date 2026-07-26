@@ -40,6 +40,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         0
     };
+    // The search bar gets its own row so it never overdraws the composer
+    // border (or transcript rows in minimal mode).
+    let search_h = if app.search_open() && app.phase != Phase::Permission {
+        1
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -48,6 +55,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),            // status
             Constraint::Length(chips_h),      // queue chips
             Constraint::Length(queue_pane_h), // queue pane
+            Constraint::Length(search_h),     // search bar
             Constraint::Length(prompt_h),     // input
         ])
         .split(area);
@@ -84,7 +92,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if queue_pane_h > 0 {
         draw_queue_pane(frame, chunks[4], app);
     }
-    draw_input(frame, chunks[5], app);
+    if search_h > 0 {
+        draw_search_bar(frame, chunks[5], app);
+    }
+    draw_input(frame, chunks[6], app);
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()
@@ -222,6 +233,73 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
         )),
     );
+}
+
+/// One-line search bar in its own reserved row above the prompt, with
+/// the match counter. A modal box would cover the transcript the user is
+/// trying to look at, which defeats the purpose.
+fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
+    let Some(s) = app.search.as_ref() else {
+        return;
+    };
+    let (pos, total) = s.position();
+    let counter = if s.query.is_empty() {
+        String::new()
+    } else if total == 0 {
+        "  no matches".to_string()
+    } else {
+        format!("  {pos}/{total}")
+    };
+    let p = palette();
+    let style = if total == 0 && !s.query.is_empty() {
+        Style::default().fg(p.error)
+    } else {
+        Style::default().fg(p.accent)
+    };
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let prefix = "  find: ";
+    // Editing happens at the end of the query, so when it outgrows the
+    // row show a horizontally scrolled tail with a leading ellipsis —
+    // clipping the right edge would hide exactly the part being edited.
+    let avail = (bar.width as usize).saturating_sub(prefix.len() + 1);
+    let qw = s.query.as_str().width();
+    let (shown, shown_w) = if qw <= avail {
+        (s.query.clone(), qw)
+    } else {
+        let target = avail.saturating_sub(1);
+        let mut w = 0usize;
+        let mut kept: Vec<&str> = Vec::new();
+        for g in s.query.as_str().graphemes(true).rev() {
+            let gw = g.width().max(1);
+            if w + gw > target {
+                break;
+            }
+            w += gw;
+            kept.push(g);
+        }
+        let tail: String = kept.iter().rev().copied().collect();
+        (format!("…{tail}"), w + 1)
+    };
+    let line = Line::from(vec![
+        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+        Span::styled(shown, Style::default().fg(p.text)),
+        Span::styled(counter, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "   [↓/↑] next/prev  [Enter] keep  [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Clear, bar);
+    frame.render_widget(Paragraph::new(line), bar);
+    // Typed and pasted input lands here, so the caret must too — the
+    // composer suppresses its own while the bar is open.
+    let x = bar
+        .x
+        .saturating_add(prefix.len() as u16)
+        .saturating_add(shown_w as u16)
+        .min(bar.x.saturating_add(bar.width.saturating_sub(1)));
+    frame.set_cursor_position((x, bar.y));
 }
 
 fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -801,6 +879,16 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.selected_item,
     );
     app.viewport_h = height;
+    // The transcript may have grown since the query was typed, so the
+    // line indices behind the match list can go stale. Recompute without
+    // resetting the selection, so streaming output does not yank the
+    // reader off the match they are on. Gated on the layout revision:
+    // spinner frames repaint every ~80ms and an O(transcript) rescan per
+    // frame would make long sessions crawl.
+    if app.search_open() && app.search.as_ref().map(|s| s.layout_rev) != Some(app.layout.revision())
+    {
+        app.recompute_search(false);
+    }
     // Record the bottom screen row for mouse hit-testing (jump pill).
     app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
     let total = app.layout.total_lines();
@@ -809,6 +897,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Apply selection highlight on the visible slice.
     let view = apply_selection_highlight(view, top, app.selection);
+    let view = apply_search_highlight(view, top, app);
 
     let title = match app.phase {
         Phase::Streaming => {
@@ -897,6 +986,36 @@ fn apply_selection_highlight(
                     .add_modifier(Modifier::BOLD),
             ));
         }
+    }
+    view
+}
+
+/// Paint the row the `2/3` counter points at, so stepping through
+/// matches is visibly anchored. Warning-on-black to stay distinct from
+/// the accent-colored mouse selection.
+fn apply_search_highlight(
+    mut view: Vec<Line<'static>>,
+    top: usize,
+    app: &App,
+) -> Vec<Line<'static>> {
+    if app.phase == Phase::Permission {
+        return view;
+    }
+    let Some(cur) = app.search.as_ref().and_then(|s| s.current_line()) else {
+        return view;
+    };
+    let Some(rel) = cur.checked_sub(top) else {
+        return view;
+    };
+    if let Some(line) = view.get_mut(rel) {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        *line = Line::from(Span::styled(
+            plain,
+            Style::default()
+                .fg(Color::Black)
+                .bg(palette().warning)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     view
 }
@@ -1160,6 +1279,11 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordere
     if body_area.width == 0 || body_area.height == 0 {
         return;
     }
+    // While the search bar is open it owns typed input, so it owns the
+    // caret too (`draw_search_bar` places it after the query).
+    if app.search_open() && app.phase != Phase::Permission {
+        return;
+    }
     let (line, col) = app.cursor_line_col();
     // Prefix "❯ " is 2 columns on line 0; continuation lines are indented 2.
     let prefix_cols: u16 = 2;
@@ -1325,6 +1449,159 @@ mod tests {
         assert!(
             s.contains("deploy<U+202E>hsilbup<U+202C>"),
             "override in the title not surfaced:\n{s}"
+        );
+    }
+
+    #[test]
+    fn search_bar_shows_the_query_and_match_count() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        // One frame to populate the layout the search reads.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert!(s.contains("1/2"), "match counter missing:\n{s}");
+    }
+
+    #[test]
+    fn search_bar_says_so_when_nothing_matches() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "zzz".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("no matches"), "buffer:\n{s}");
+    }
+
+    /// Focus follows input: while the bar is open the terminal caret must
+    /// sit after the query, not blink in the composer the keys no longer
+    /// reach.
+    #[test]
+    fn search_bar_owns_the_terminal_cursor() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let composer_cursor = term.get_cursor_position().unwrap();
+        app.open_search();
+        for c in "al".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let cur = term.get_cursor_position().unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let bar_row = s
+            .lines()
+            .position(|l| l.contains("find: al"))
+            .expect("search bar row") as u16;
+        assert_eq!(cur.y, bar_row, "caret must be on the search row:\n{s}");
+        assert_eq!(cur.x, 8 + 2, "caret must sit right after the query");
+        assert_ne!(cur.y, composer_cursor.y, "caret must leave the composer");
+    }
+
+    /// A query wider than the row scrolls horizontally so the tail being
+    /// edited stays visible next to the caret.
+    #[test]
+    fn long_query_keeps_its_editable_tail_visible() {
+        let backend = TestBackend::new(40, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "prefix_that_is_much_longer_than_the_row_tail".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s.lines().find(|l| l.contains("find:")).expect("bar row");
+        assert!(
+            row.contains("_tail"),
+            "the end of the query must stay visible: {row:?}"
+        );
+        assert!(row.contains('…'), "scrolled query must be marked: {row:?}");
+        let cur = term.get_cursor_position().unwrap();
+        assert_eq!(cur.x, 39, "caret must sit at the visible end");
+    }
+
+    /// Stepping matches must visibly anchor the `n/m` counter.
+    #[test]
+    fn current_search_match_row_is_highlighted() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s
+            .lines()
+            .position(|l| l.contains("alpha auth beta"))
+            .expect("first match visible") as u16;
+        let buf = term.backend().buffer();
+        let bg = |y: u16| buf.cell((0u16, y)).unwrap().style().bg;
+        assert_ne!(
+            bg(row),
+            Some(ratatui::style::Color::Reset),
+            "current match row must carry a highlight background:\n{s}"
+        );
+        let other = s
+            .lines()
+            .position(|l| l.contains("gamma"))
+            .expect("non-match visible") as u16;
+        assert_eq!(
+            bg(other),
+            Some(ratatui::style::Color::Reset),
+            "non-match rows must stay unhighlighted:\n{s}"
+        );
+    }
+
+    /// The bar gets a reserved layout row; drawing it at a fixed offset
+    /// used to overwrite the composer's top border.
+    #[test]
+    fn search_bar_does_not_overdraw_the_composer_border() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript
+            .push(TranscriptItem::System("alpha auth".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let corners_before = buffer_to_string(term.backend().buffer())
+            .matches('╭')
+            .count();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert_eq!(
+            s.matches('╭').count(),
+            corners_before,
+            "search bar must not eat a border row:\n{s}"
         );
     }
 
