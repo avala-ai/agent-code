@@ -285,7 +285,13 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
 }
 
 /// Commands that take a command string and run it in a fresh shell.
-const SHELL_LAUNCHERS: &[&str] = &["bash", "sh", "zsh", "dash", "ash", "ksh", "exec"];
+/// Not only the POSIX family: `fish -c` and `csh -c` interpret a
+/// command string just as readily, and an interpreter that is present
+/// on the host is a usable one.
+const SHELL_LAUNCHERS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "pdksh", "yash", "busybox", "fish", "csh",
+    "tcsh",
+];
 
 /// The literal command strings an invocation may hand to another
 /// shell.
@@ -308,6 +314,11 @@ const SHELL_LAUNCHERS: &[&str] = &["bash", "sh", "zsh", "dash", "ash", "ksh", "e
 ///
 /// `eval` instead concatenates everything after it, which is how bash
 /// evaluates it.
+///
+/// `exec` is deliberately not a launcher: it replaces the shell with
+/// whatever it is given, so `exec bash -c '…'` is already covered by
+/// the shell name sitting later in the argv, while `exec printf …`
+/// passes plain argv data that no shell will interpret.
 fn shell_payloads(tokens: &[String]) -> Vec<String> {
     let mut payloads = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
@@ -400,6 +411,11 @@ mod tests {
             "nice -n 5 sh -c \"'git' push --force\"",
             "xargs bash -c \"'rm' -rf /tmp/x\"",
             "stdbuf -oL bash -c \"'git' push --force\"",
+            // Non-POSIX shells interpret a command string too.
+            "fish -c \"'git' push --force\"",
+            "csh -c \"'rm' -rf /tmp/x\"",
+            "tcsh -c \"'git' push --force\"",
+            "busybox sh -c \"'rm' -rf /tmp/x\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -478,6 +494,9 @@ mod tests {
             // payload.
             "which bash",
             "man bash",
+            // `exec` of a normal binary passes argv data, not a
+            // command string for a shell to interpret.
+            "exec printf '%s\\n' \"'git' push --force\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
