@@ -256,6 +256,9 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // the wrapped view is the *only* accurate one — scanning the
         // wrapper's own argv as well would read `env` as the head and
         // lose which command the operands belong to.
+        if wrapper_only_reports(&unquoted) {
+            continue;
+        }
         let unwrapped = unwrapped_argv(invocation);
         let tokens = unwrapped.as_ref().unwrap_or(&unquoted);
         for payload in shell_payloads(tokens) {
@@ -376,6 +379,37 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
     payloads
 }
 
+/// True when the wrapper was asked to describe something instead of
+/// running it: `env --help bash -c '…'` prints env's help and exits,
+/// `command -v bash -c '…'` prints a path. The trailing words are
+/// then operands of a wrapper that never executes them.
+///
+/// Only the wrapper's own leading options are inspected. A `--help`
+/// after the wrapped command name belongs to that command and says
+/// nothing about whether it runs.
+fn wrapper_only_reports(tokens: &[String]) -> bool {
+    let Some(wrapper) = tokens.first().map(|t| base_name(t).to_lowercase()) else {
+        return false;
+    };
+    if !COMMAND_RUNNER_WRAPPERS.contains(&wrapper.as_str()) {
+        return false;
+    }
+    tokens[1..]
+        .iter()
+        .take_while(|t| t.starts_with('-'))
+        .any(|token| match wrapper.as_str() {
+            // `command -v`/`-V` describe; `env -v` is verbose and
+            // still runs the command, so it must not count here.
+            "command" => token
+                .strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(['v', 'V'])),
+            _ => token == "--help" || token == "--version",
+        })
+}
+
+/// Wrappers whose job is to run the command word after them.
+const COMMAND_RUNNER_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid", "builtin"];
+
 /// True when nothing before `i` can turn the token into plain data:
 /// every earlier token is an option, an assignment, or a builtin that
 /// runs the word after it.
@@ -490,6 +524,9 @@ mod tests {
             "command bash -c \"'rm' -rf /tmp/x\"",
             "nohup sh -c \"'git' push --force\"",
             "env -u PATH bash -c \"'git' push --force\"",
+            // `env -v` is verbose, not a describe-and-exit option: the
+            // command still runs.
+            "env -v bash -c \"'git' push --force\"",
             // `exec` replaces the shell with what follows it.
             "exec bash -c \"'git' push --force\"",
             "exec -a login bash -c \"'rm' -rf /tmp/x\"",
@@ -616,6 +653,10 @@ mod tests {
             // one that says which command the operands belong to.
             "env printf '%s\\n' bash -c \"'git' push --force\"",
             "command echo bash -c \"'rm' -rf /tmp/x\"",
+            // A wrapper asked to describe rather than run.
+            "env --help bash -c \"'git' push --force\"",
+            "env --version bash -c \"'rm' -rf /tmp/x\"",
+            "command -v bash -c \"'git' push --force\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
