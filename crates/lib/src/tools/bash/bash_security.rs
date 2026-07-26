@@ -191,11 +191,25 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                 reason: format!("destructive command '{base}'"),
             });
         }
-        if let Some(reason) = clustered_git_flag(invocation) {
-            findings.push(DestructiveFinding {
-                level: DestructivenessLevel::Destructive,
-                reason,
-            });
+        // `env git push -uf …` runs git, so the wrapper chain comes off
+        // before the cluster check can see the subcommand. The wrapper
+        // is skipped when it was only asked to describe itself.
+        let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
+        let unwrapped = if wrapper_only_reports(&unquoted) {
+            None
+        } else {
+            unwrapped_argv(invocation)
+        };
+        for tokens in [Some(invocation.as_slice()), unwrapped.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(reason) = clustered_git_flag(tokens) {
+                findings.push(DestructiveFinding {
+                    level: DestructivenessLevel::Destructive,
+                    reason,
+                });
+            }
         }
     }
 
@@ -639,6 +653,12 @@ mod tests {
             "git branch -Dq old",
             "git -C /tmp/repo push -uf origin main",
             "bash -c \"'git' push -uf origin main\"",
+            // Runners in front of git: the cluster check needs the
+            // unwrapped view to see the subcommand at all.
+            "env git push -uf origin main",
+            "nohup git clean -df",
+            "command git checkout -qf main",
+            "env -u PATH git push -uf origin main",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -715,6 +735,8 @@ mod tests {
             "git checkout -b feature",
             "git -C /tmp/repo push -u origin main",
             "git log -p",
+            "env git push -u origin main",
+            "env --help git push -uf origin main",
             // Shell options and their operands are not payloads.
             "bash -O extglob -c 'ls'",
             "bash -o posix -c 'echo hi'",
