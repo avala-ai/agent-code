@@ -297,6 +297,20 @@ const SHELL_LAUNCHERS: &[&str] = &[
 /// one is still in command position.
 const BUILTIN_PREFIXES: &[&str] = &["command", "builtin", "exec", "nohup", "setsid", "time"];
 
+/// Commands whose operands are text to print, match or transform —
+/// never a program to run. A shell name among *their* arguments is
+/// data: `printf '%s\n' bash -c "'git' push --force"` prints four
+/// words.
+///
+/// Only this direction is listed. An unrecognised head keeps counting
+/// as a possible runner, so `firejail bash -c '…'` and every other
+/// runner nobody enumerated still recurse.
+const DATA_COMMANDS: &[&str] = &[
+    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "sed", "awk", "tr",
+    "cut", "paste", "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq",
+    "yq", "less", "more", "strings", "logger",
+];
+
 /// The literal command strings an invocation may hand to another
 /// shell.
 ///
@@ -336,16 +350,23 @@ const BUILTIN_PREFIXES: &[&str] = &["command", "builtin", "exec", "nohup", "sets
 /// passes plain argv data that no shell will interpret.
 fn shell_payloads(tokens: &[String]) -> Vec<String> {
     let mut payloads = Vec::new();
+    let head_is_data = tokens
+        .first()
+        .is_some_and(|t| DATA_COMMANDS.contains(&base_name(t).to_lowercase().as_str()));
     for (i, token) in tokens.iter().enumerate() {
         let base = base_name(token).to_lowercase();
         let rest = &tokens[i + 1..];
         if SHELL_LAUNCHERS.contains(&base.as_str()) {
-            if rest.iter().any(|t| takes_command_string(t)) {
+            if head_is_data && !in_command_position(tokens, i) {
+                continue;
+            }
+            let fish = base == "fish";
+            if rest.iter().any(|t| takes_command_string(t, fish)) {
                 payloads.extend(rest.iter().cloned());
                 // `--command=CMD` carries the command inside the option
                 // token, where a parser reads it as an assignment and
                 // drops it. Hand over the operand on its own too.
-                payloads.extend(rest.iter().filter_map(|t| inline_operand(t)));
+                payloads.extend(rest.iter().filter_map(|t| inline_operand(t, fish)));
             }
         } else if base == "eval" && !rest.is_empty() && in_command_position(tokens, i) {
             payloads.push(rest.join(" "));
@@ -367,27 +388,31 @@ fn in_command_position(tokens: &[String], i: usize) -> bool {
 
 /// True for an option that makes a shell read its commands from an
 /// operand: `-c`, a cluster containing it (`-lc`, `-ec`), and the long
-/// spellings `--command` and fish's `--init-command`. Fish's `-C` is
-/// the same thing with an upper-case letter, so clusters are matched
-/// case-insensitively.
-fn takes_command_string(token: &str) -> bool {
+/// spelling `--command`.
+///
+/// `fish` additionally runs `-C` / `--init-command=COMMANDS` at
+/// startup, so those count only for fish — in bash `-C` is `noclobber`
+/// and the operand after it is a script name, not a command string.
+fn takes_command_string(token: &str, fish: bool) -> bool {
+    let longs: &[&str] = if fish {
+        &["command", "init-command"]
+    } else {
+        &["command"]
+    };
     match token.strip_prefix("--") {
         Some(long) => long.split('=').next().is_some_and(|name| {
-            !name.is_empty()
-                && ["command", "init-command"]
-                    .iter()
-                    .any(|full| full.starts_with(name))
+            !name.is_empty() && longs.iter().any(|full| full.starts_with(name))
         }),
         None => token
             .strip_prefix('-')
-            .is_some_and(|cluster| cluster.contains(['c', 'C'])),
+            .is_some_and(|cluster| cluster.contains('c') || (fish && cluster.contains('C'))),
     }
 }
 
 /// The operand written inside a command-string option
 /// (`--command=CMD`), if there is one.
-fn inline_operand(token: &str) -> Option<String> {
-    if !takes_command_string(token) {
+fn inline_operand(token: &str, fish: bool) -> Option<String> {
+    if !takes_command_string(token, fish) {
         return None;
     }
     token
@@ -580,6 +605,12 @@ mod tests {
             // so no runner can launch it from there.
             "echo eval \"'git' push --force\"",
             "printf '%s\\n' eval \"'rm' -rf /tmp/x\"",
+            // A shell name and a `-c` as ordinary data for a command
+            // whose operands are text.
+            "printf '%s\\n' bash -c \"'git' push --force\"",
+            "echo bash -c \"'rm' -rf /tmp/x\"",
+            // `-C` is noclobber in bash, not an init command.
+            "bash -C safe.sh \"'git' push --force\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
