@@ -679,6 +679,9 @@ const GIT_REPORT_ONLY_GLOBALS: &[&str] = &[
     "--version",
     "--help",
     "--exec-path",
+    // Git documents the short forms in its own usage line.
+    "-v",
+    "-h",
 ];
 
 /// How many alias hops to follow. Aliases can name other aliases.
@@ -1048,16 +1051,32 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (Option<String>, bool,
     while text.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
         i += 1;
     }
-    let mut delimiter = String::new();
+    // The word is read whole and then unquoted the way the shell
+    // unquotes it: `<<$'EOF'` ends at a line reading `EOF`, not
+    // `$EOF`. Quotes inside the word do not end it.
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
     while let Some(&c) = text.get(i) {
-        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '<' | '>') {
-            break;
-        }
-        if !matches!(c, '\'' | '"' | '\\') {
-            delimiter.push(c);
+        match quote {
+            Some(open) => {
+                if c == open {
+                    quote = None;
+                }
+                word.push(c);
+            }
+            None => {
+                if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '<' | '>') {
+                    break;
+                }
+                if matches!(c, '\'' | '"') {
+                    quote = Some(c);
+                }
+                word.push(c);
+            }
         }
         i += 1;
     }
+    let delimiter = unquote_token(&word);
     ((!delimiter.is_empty()).then_some(delimiter), strip_tabs, i)
 }
 
@@ -1300,8 +1319,7 @@ fn statement_mentions_unaccounted_git_config(
         invocation.iter().skip(1).any(|token| {
             split_alias_value(&unquote_token(token)).iter().any(|word| {
                 let name = word.split('=').next().unwrap_or(word);
-                name.to_ascii_uppercase().starts_with("GIT_CONFIG")
-                    && !collected.iter().any(|(seen, _)| seen == name)
+                name.starts_with("GIT_CONFIG") && !collected.iter().any(|(seen, _)| seen == name)
             })
         })
     })
@@ -2261,6 +2279,8 @@ mod tests {
             "true >(true)#x; $\"cat\"",
             // A command after the heredoc redirect still runs.
             "cat <<EOF; $\"safe\"\nbody\nEOF",
+            // The delimiter is unquoted the way the shell unquotes it.
+            "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
@@ -2350,6 +2370,10 @@ mod tests {
             // A report-only git call dispatches nothing.
             "GIT_CONFIG_GLOBAL=/tmp/g git --version",
             "HOME=/tmp git --html-path",
+            "GIT_CONFIG_GLOBAL=/tmp/g git -v",
+            "GIT_CONFIG_GLOBAL=/tmp/g git -h",
+            // An unmodelled runner in front of a lowercase variable.
+            "timeout 1 env git_config_global=/tmp/g git status",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
