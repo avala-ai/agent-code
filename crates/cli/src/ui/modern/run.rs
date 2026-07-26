@@ -326,6 +326,10 @@ pub(super) async fn event_loop(
         let eng = engine_arc.lock().await;
         eng.state().task_manager.clone()
     };
+    // Drill-in output reads run detached (see the select arm) and land
+    // back here, so a slow filesystem never blocks the event loop.
+    let (task_out_tx, mut task_out_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
 
     // Sync SessionMode with the engine when it changes.
     let mut last_mode = app.mode;
@@ -775,12 +779,21 @@ pub(super) async fn event_loop(
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
             }
-            // Drill-in: fetch the selected task's output off the UI path.
+            // Drill-in: kick the read off to its own task so a large or
+            // slow output file never stalls input handling; the result
+            // comes back through the channel arm below.
             _ = std::future::ready(()), if app.pending_task_output.is_some() => {
                 if let Some(id) = app.pending_task_output.take() {
-                    let out = task_manager.read_output(&id).await;
-                    app.show_task_output(&id, out);
+                    let tm = task_manager.clone();
+                    let tx = task_out_tx.clone();
+                    tokio::spawn(async move {
+                        let out = tm.read_output(&id).await;
+                        let _ = tx.send((id, out));
+                    });
                 }
+            }
+            Some((id, out)) = task_out_rx.recv() => {
+                app.show_task_output(&id, out);
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             _ = tasks_tick.tick(), if live || !app.tasks.is_empty() => {
@@ -1184,18 +1197,31 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.toggle_queue_pane();
         }
         // When the tasks pane is open (and the queue pane is not, which
-        // owns the same keys), arrows move the selection and Enter opens
-        // the selected task's output.
-        (_, KeyCode::Up) if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() => {
+        // owns the same keys), plain arrows move the selection and plain
+        // Enter opens the selected task's output. Modified presses fall
+        // through so global bindings (Ctrl+Enter interject, Alt+Enter
+        // newline) stay reachable while the pane is open.
+        (m, KeyCode::Up)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
+        {
             app.tasks_select(-1);
         }
-        (_, KeyCode::Down)
-            if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() =>
+        (m, KeyCode::Down)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
         {
             app.tasks_select(1);
         }
-        (_, KeyCode::Enter)
-            if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() =>
+        (m, KeyCode::Enter)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
         {
             app.drill_into_selected_task();
         }
@@ -1588,6 +1614,29 @@ fn apply_mode_to_engine(
 mod tests {
     use super::*;
     use crate::ui::modern::app::Phase;
+
+    /// The tasks-pane keys claim only unmodified presses: Ctrl+Enter must
+    /// still reach the global interject binding, not open task output.
+    #[test]
+    fn modified_enter_is_not_captured_by_the_tasks_pane() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.show_tasks = true;
+        assert!(app.tasks_visible());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(
+            app.pending_task_output.is_none() && !app.status_message.contains("output"),
+            "Ctrl+Enter was swallowed by the pane"
+        );
+
+        // Plain Enter still drives the pane (subagent row → explanation).
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.status_message.contains("no separate output"));
+    }
 
     /// LocalAgent manager records must carry their stream subagent id so
     /// the pane folds them into the event-driven row; every other kind

@@ -701,16 +701,24 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         task_ends.push(lines.len() - 1);
     }
     // When the area is still too short (many tasks, tiny terminal),
-    // clip to whole rows and say how many tasks are hidden rather than
-    // silently truncating mid-task.
+    // window the rows around the selection — Up/Down cycles the whole
+    // list, so the marked task must stay on screen — and say how many
+    // tasks are hidden rather than silently truncating mid-task.
     let max_rows = inner.height as usize;
     if lines.len() > max_rows && max_rows >= 2 {
-        let cut = max_rows - 1;
-        let visible = task_ends.iter().filter(|&&e| e < cut).count();
-        let hidden = app.tasks.len().saturating_sub(visible);
-        lines.truncate(cut);
+        let visible_h = max_rows - 1;
+        let sel_end = task_ends.get(app.tasks_selected).copied().unwrap_or(0);
+        let offset = sel_end
+            .saturating_sub(visible_h - 1)
+            .min(lines.len() - visible_h);
+        let shown = task_ends
+            .iter()
+            .filter(|&&e| e >= offset && e < offset + visible_h)
+            .count();
+        let hidden = app.tasks.len().saturating_sub(shown);
+        lines = lines.into_iter().skip(offset).take(visible_h).collect();
         lines.push(Line::from(Span::styled(
-            format!("… +{hidden} more"),
+            format!("… +{hidden} more (↑/↓)"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1722,6 +1730,31 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("… +"), "hidden-task indicator missing:\n{s}");
+    }
+
+    /// Up/Down cycles through every task, so the window must scroll to
+    /// keep the marked task on screen instead of clipping a fixed prefix.
+    #[test]
+    fn overflow_window_follows_the_selection() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        let rows = (0..6)
+            .map(|i| crate::ui::modern::tasks::ManagerRow {
+                id: format!("b{i}"),
+                state: "working".into(),
+                headline: format!("job number {i}"),
+                subagent_id: None,
+            })
+            .collect();
+        app.sync_background_tasks(rows);
+        app.tasks_selected = 5;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            s.contains("job number 5"),
+            "selected task scrolled out of view:\n{s}"
+        );
     }
 
     #[test]

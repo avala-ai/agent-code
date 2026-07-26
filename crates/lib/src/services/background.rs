@@ -463,11 +463,19 @@ impl TaskManager {
 
     /// Read the output of a completed task.
     pub async fn read_output(&self, id: &str) -> Result<String, String> {
-        let tasks = self.tasks.lock().await;
-        let info = tasks
-            .get(id)
-            .ok_or_else(|| format!("Task '{id}' not found"))?;
-        std::fs::read_to_string(&info.output_file)
+        // Clone the path out before touching the filesystem: a sync read
+        // under the map lock would stall every other manager call (and
+        // the caller's runtime thread) for the duration of the read.
+        let output_file = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?
+                .output_file
+                .clone()
+        };
+        tokio::fs::read_to_string(&output_file)
+            .await
             .map_err(|e| format!("Failed to read output: {e}"))
     }
 

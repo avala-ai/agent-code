@@ -868,7 +868,9 @@ impl App {
                 state,
                 headline,
             } => {
+                let selected = self.selected_task_key();
                 super::tasks::upsert(&mut self.tasks, &agent_id, &state, &headline);
+                self.keep_task_selection(selected);
             }
             EngineEvent::PermissionAsk {
                 name,
@@ -2059,10 +2061,38 @@ impl App {
                     || a.task_id != b.task_id
             });
         if changed {
+            let selected = self.selected_task_key();
             self.tasks = next;
+            self.keep_task_selection(selected);
             self.dirty = true;
         }
         changed
+    }
+
+    /// Identity of the currently selected pane row, if any.
+    fn selected_task_key(&self) -> Option<(String, super::tasks::TaskSource)> {
+        self.tasks
+            .get(self.tasks_selected)
+            .map(|t| (t.agent_id.clone(), t.source))
+    }
+
+    /// Re-point `tasks_selected` at the same task after rows moved.
+    ///
+    /// The list re-sorts whenever a state changes, but the selection is
+    /// a positional index — without this, a task finishing above the
+    /// cursor silently retargets the marker (and Enter) at a different
+    /// task.
+    fn keep_task_selection(&mut self, prev: Option<(String, super::tasks::TaskSource)>) {
+        if let Some((id, src)) = prev
+            && let Some(idx) = self
+                .tasks
+                .iter()
+                .position(|t| t.agent_id == id && t.source == src)
+        {
+            self.tasks_selected = idx;
+            return;
+        }
+        self.tasks_selected = self.tasks_selected.min(self.tasks.len().saturating_sub(1));
     }
 
     /// Move the tasks-pane selection, clamped to the row count.
@@ -2100,9 +2130,24 @@ impl App {
 
     /// Show a task's output in the transcript.
     pub fn show_task_output(&mut self, id: &str, output: Result<String, String>) {
+        // A task can produce arbitrarily much output; the transcript
+        // card shows the tail, like watching the job finish.
+        const TAIL_LINES: usize = 200;
         let body = match output {
             Ok(text) if text.trim().is_empty() => "(no output yet)".to_string(),
-            Ok(text) => text,
+            Ok(text) => {
+                let total = text.lines().count();
+                if total > TAIL_LINES {
+                    let tail: Vec<&str> = text.lines().skip(total - TAIL_LINES).collect();
+                    format!(
+                        "… ({} earlier lines omitted)\n{}",
+                        total - TAIL_LINES,
+                        tail.join("\n")
+                    )
+                } else {
+                    text
+                }
+            }
             Err(e) => format!("could not read output: {e}"),
         };
         self.transcript.push(TranscriptItem::Tool {
@@ -3363,6 +3408,48 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    /// Output cards show the tail of a long file, not all of it.
+    #[test]
+    fn long_task_output_is_tailed() {
+        let mut app = App::new("m", "/tmp", "s");
+        let big: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        app.show_task_output("b1", Ok(big));
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => {
+                let r = result.as_deref().unwrap();
+                assert!(
+                    r.contains("300 earlier lines omitted"),
+                    "no omission note: {r}"
+                );
+                assert!(r.contains("line 499"), "tail end missing");
+                assert!(!r.contains("line 42\n"), "head not trimmed");
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    /// Rows re-sort when states change, but the selection must keep
+    /// pointing at the same task, not the same position.
+    #[test]
+    fn selection_follows_its_task_across_a_resort() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.sync_background_tasks(vec![bg("b1", "working", "one"), bg("b2", "working", "two")]);
+        app.tasks_select(1);
+        assert_eq!(app.tasks[app.tasks_selected].agent_id, "b2");
+
+        // b1 finishes: done sorts below working, so b2 moves to index 0.
+        app.sync_background_tasks(vec![bg("b1", "done", "one"), bg("b2", "working", "two")]);
+        assert_eq!(
+            app.tasks[app.tasks_selected].agent_id, "b2",
+            "selection drifted to a different task"
+        );
+
+        // The selected task disappearing clamps instead of dangling.
+        app.tasks_select(1);
+        app.sync_background_tasks(vec![bg("b2", "working", "two")]);
+        assert!(app.tasks_selected < app.tasks.len());
     }
 
     #[test]
