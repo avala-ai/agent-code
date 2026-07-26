@@ -162,7 +162,13 @@ impl TaskExecutor for LocalAgentExecutor {
 
         // Drive the queue entry to a terminal state regardless of
         // outcome, so `/tasks` doesn't show a perpetually-running row.
+        // Persist the result first (see `TaskManager::write_output`):
+        // externally-driven kinds have no streamed stdout, so without
+        // this the queue entry reads as empty output forever.
         if let (Some(tm), Some(id)) = (ctx.task_manager.as_ref(), task_id.as_ref()) {
+            if let Ok(r) = &outcome {
+                let _ = tm.write_output(id, &r.content).await;
+            }
             let status = match &outcome {
                 Ok(r) if !r.is_error => TaskStatus::Completed,
                 Ok(_) => TaskStatus::Failed("agent reported error".into()),
