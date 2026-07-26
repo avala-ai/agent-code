@@ -200,6 +200,14 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             continue;
         }
         let unwrapped = unwrapped_argv(invocation);
+        // Assignments are collected from both views: `env -S 'FOO=bar
+        // git p'` keeps them inside one token until the wrapper is
+        // unwrapped, while a plain `env FOO=bar git p` loses them when
+        // it is.
+        let mut env_pairs = git_env_pairs(cmd, invocation);
+        if let Some(unwrapped) = unwrapped.as_deref() {
+            env_pairs.extend(git_env_pairs(cmd, unwrapped));
+        }
         for tokens in [Some(invocation.as_slice()), unwrapped.as_deref()]
             .into_iter()
             .flatten()
@@ -215,7 +223,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             // this scan cannot read. The variables reach git either as
             // a shell prefix assignment or as an `env` operand, and
             // unwrapping strips the latter, so both are collected.
-            if env_defines_opaque_git_alias(&git_env_pairs(cmd, invocation))
+            if env_defines_opaque_git_alias(&env_pairs)
                 && tokens
                     .iter()
                     .any(|t| base_name(&unquote_token(t)).to_lowercase() == "git")
@@ -495,10 +503,17 @@ fn git_env_pairs(cmd: &ParsedCommand, invocation: &[String]) -> Vec<(String, Str
         .collect();
     for token in invocation {
         let unquoted = unquote_token(token);
-        if is_env_assignment(&unquoted)
-            && let Some((name, value)) = unquoted.split_once('=')
-        {
-            pairs.push((name.to_string(), value.to_string()));
+        // A token can carry a whole argument list: `env -S 'FOO=bar
+        // git p'` holds the assignments inside one word, and the
+        // wrapper parser consumes them rather than handing them back,
+        // so neither view lists them separately. Splitting on
+        // whitespace finds them wherever they are packed.
+        for word in unquoted.split_whitespace() {
+            if is_env_assignment(word)
+                && let Some((name, value)) = word.split_once('=')
+            {
+                pairs.push((name.to_string(), unquote_token(value)));
+            }
         }
     }
     pairs
@@ -1136,6 +1151,10 @@ mod tests {
              GIT_CONFIG_VALUE_0='push --force' git p origin main",
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='alias.p' \
              GIT_CONFIG_VALUE_0='push --force' git p origin main",
+            // `env -S` keeps the assignments inside one token until
+            // the wrapper is unwrapped.
+            "env -S \"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p \
+             GIT_CONFIG_VALUE_0='push --force' git p origin main\"",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
