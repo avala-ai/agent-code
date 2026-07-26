@@ -2199,6 +2199,7 @@ impl App {
         // A task can produce arbitrarily much output; the transcript
         // card shows the tail, like watching the job finish.
         const TAIL_LINES: usize = 200;
+        let is_error = output.is_err();
         let body = match output {
             Ok(text) if text.trim().is_empty() => "(no output yet)".to_string(),
             Ok(text) => {
@@ -2221,7 +2222,7 @@ impl App {
             name: "Task output".into(),
             detail: id.to_string(),
             result: Some(body),
-            is_error: false,
+            is_error,
             live: None,
         });
         self.status_message.clear();
@@ -3469,8 +3470,11 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.show_task_output("gone", Err("Task 'gone' not found".into()));
         match app.transcript.last().expect("an item") {
-            TranscriptItem::Tool { result, .. } => {
+            TranscriptItem::Tool {
+                result, is_error, ..
+            } => {
                 assert!(result.as_deref().unwrap().contains("not found"));
+                assert!(*is_error, "read failure rendered as success");
             }
             other => panic!("unexpected item: {other:?}"),
         }
