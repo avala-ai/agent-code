@@ -192,14 +192,14 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             });
         }
         // `env git push -uf …` runs git, so the wrapper chain comes off
-        // before the cluster check can see the subcommand. The wrapper
-        // is skipped when it was only asked to describe itself.
+        // before the cluster check can see the subcommand. Nothing is
+        // checked at all when the chain was only asked to describe
+        // itself — `command env --help git push -uf` prints env's help.
         let unquoted: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
-        let unwrapped = if wrapper_only_reports(&unquoted) {
-            None
-        } else {
-            unwrapped_argv(invocation)
-        };
+        if wrapper_only_reports(&unquoted) {
+            continue;
+        }
+        let unwrapped = unwrapped_argv(invocation);
         for tokens in [Some(invocation.as_slice()), unwrapped.as_deref()]
             .into_iter()
             .flatten()
@@ -321,11 +321,25 @@ const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char])] = &[
 
 /// A destructive short flag reached through a cluster, e.g. the `f` in
 /// `git push -uf origin main`.
+///
+/// `git` is looked for at any position, the same way shell payloads
+/// are: `timeout 30 git push -uf …`, `sudo git push -uf …` and
+/// `stdbuf -oL git clean -df` all run git behind a runner that no
+/// list of wrappers will ever fully cover. A head whose operands are
+/// text keeps its arguments inert, so `echo git push -uf` is not a
+/// force push.
 fn clustered_git_flag(invocation: &[String]) -> Option<String> {
     let tokens: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
-    if base_name(tokens.first()?).to_lowercase() != "git" {
+    let head_is_data = tokens
+        .first()
+        .is_some_and(|t| DATA_COMMANDS.contains(&base_name(t).to_lowercase().as_str()));
+    let git = tokens
+        .iter()
+        .position(|token| base_name(token).to_lowercase() == "git")?;
+    if head_is_data && !in_command_position(&tokens, git) {
         return None;
     }
+    let tokens = &tokens[git..];
     // The subcommand is the first token that is not an option or one
     // of git's own `-C dir` / `-c key=value` operands.
     let mut idx = 1;
@@ -341,6 +355,12 @@ fn clustered_git_flag(invocation: &[String]) -> Option<String> {
         .iter()
         .find(|(name, _)| *name == subcommand)?;
     for token in &tokens[idx + 1..] {
+        // Past `--` everything is a pathspec, however it is spelled:
+        // `git clean -n -- -dir` is a dry run against a file named
+        // `-dir`, not a `-d` cluster.
+        if token == "--" {
+            break;
+        }
         let Some(cluster) = token.strip_prefix('-') else {
             continue;
         };
@@ -467,27 +487,47 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
 /// `command -v bash -c '…'` prints a path. The trailing words are
 /// then operands of a wrapper that never executes them.
 ///
-/// Only the option *immediately* after the wrapper counts. Later
+/// Only the option *immediately* after a wrapper counts. Later
 /// options can be operands of earlier ones — `env -u --help bash -c
 /// '…'` unsets a variable named `--help` and then runs the payload —
 /// and re-deriving which is which would mean a second copy of env's
-/// option grammar. Anything past the first token keeps the scan,
-/// which at worst over-blocks a wrapper that would have printed help.
+/// option grammar. So the walk stops at the first option it cannot
+/// attribute, keeping the scan, which at worst over-blocks a wrapper
+/// that would have printed help.
+///
+/// The whole leading wrapper chain is walked, not just its first
+/// entry: `command env --help git push -uf` runs `env`, which prints
+/// help and exits. Only the leading chain — a wrapper name later in
+/// the argv is an operand, and letting one suppress the scan would
+/// hand every command a way to opt out.
 fn wrapper_only_reports(tokens: &[String]) -> bool {
-    let Some(wrapper) = tokens.first().map(|t| base_name(t).to_lowercase()) else {
-        return false;
-    };
-    if !COMMAND_RUNNER_WRAPPERS.contains(&wrapper.as_str()) {
-        return false;
+    let mut idx = 0;
+    while let Some(wrapper) = tokens.get(idx).map(|t| base_name(t).to_lowercase()) {
+        if !COMMAND_RUNNER_WRAPPERS.contains(&wrapper.as_str()) {
+            return false;
+        }
+        let Some(next) = tokens.get(idx + 1) else {
+            return false;
+        };
+        let describes = match wrapper.as_str() {
+            // `command -v`/`-V` describe; `env -v` is verbose and
+            // still runs the command, so it must not count here.
+            "command" => next
+                .strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(['v', 'V'])),
+            _ => next == "--help" || next == "--version",
+        };
+        if describes {
+            return true;
+        }
+        if next.starts_with('-') {
+            // An option this walk cannot attribute — its operand may
+            // be the next token. Stop rather than guess.
+            return false;
+        }
+        idx += 1;
     }
-    tokens.get(1).is_some_and(|token| match wrapper.as_str() {
-        // `command -v`/`-V` describe; `env -v` is verbose and still
-        // runs the command, so it must not count here.
-        "command" => token
-            .strip_prefix('-')
-            .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(['v', 'V'])),
-        _ => token == "--help" || token == "--version",
-    })
+    false
 }
 
 /// Wrappers whose job is to run the command word after them.
@@ -659,6 +699,11 @@ mod tests {
             "nohup git clean -df",
             "command git checkout -qf main",
             "env -u PATH git push -uf origin main",
+            // Runners no wrapper list covers.
+            "timeout 30 git push -uf origin main",
+            "sudo git push -uf origin main",
+            "stdbuf -oL git clean -df",
+            "nice -n 5 git checkout -qf main",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -737,6 +782,17 @@ mod tests {
             "git log -p",
             "env git push -u origin main",
             "env --help git push -uf origin main",
+            // Past `--` a dash-prefixed word is a pathspec.
+            "git clean -n -- -dir",
+            "git checkout main -- -file",
+            // Describe-and-exit deeper in a wrapper chain.
+            "command env --help git push -uf origin main",
+            // A git token among the operands of a data command. Only
+            // spellings the historical text scan does not already
+            // refuse — `printf … git clean -df` still trips the
+            // literal `git clean -d` pattern, which predates this.
+            "echo git push -uf origin main",
+            "printf '%s\\n' git push -uf origin main",
             // Shell options and their operands are not payloads.
             "bash -O extglob -c 'ls'",
             "bash -o posix -c 'echo hi'",
