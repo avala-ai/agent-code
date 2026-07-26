@@ -531,57 +531,87 @@ const MAX_GIT_ALIAS_DEPTH: usize = 8;
 /// other, so environment questions are answered per statement rather
 /// than over the whole script.
 fn shell_statements(raw: &str) -> Vec<String> {
+    /// One level of nesting. Quoting restarts inside a substitution,
+    /// so the contexts have to stack rather than toggle: in
+    /// `"$(printf "/tmp/g;")"` the inner quote closes the inner
+    /// string, not the outer one, and the `;` is nested throughout.
+    enum Context {
+        Single,
+        Double,
+        Paren,
+        Brace,
+        Backtick,
+    }
     let mut statements = Vec::new();
     let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut depth = 0usize;
-    let mut in_backticks = false;
+    let mut stack: Vec<Context> = Vec::new();
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
-        match quote {
-            Some(open) => {
+        if matches!(stack.last(), Some(Context::Single)) {
+            current.push(c);
+            if c == '\'' {
+                stack.pop();
+            }
+            continue;
+        }
+        let in_double = matches!(stack.last(), Some(Context::Double));
+        match c {
+            '\\' => {
                 current.push(c);
-                if c == open {
-                    quote = None;
-                } else if c == '\\'
-                    && open == '"'
-                    && let Some(escaped) = chars.next()
-                {
+                if let Some(escaped) = chars.next() {
                     current.push(escaped);
                 }
             }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    current.push(c);
+            '\'' if !in_double => {
+                stack.push(Context::Single);
+                current.push(c);
+            }
+            '"' => {
+                if in_double {
+                    stack.pop();
+                } else {
+                    stack.push(Context::Double);
                 }
-                '\\' => {
-                    current.push(c);
-                    if let Some(escaped) = chars.next() {
-                        current.push(escaped);
-                    }
+                current.push(c);
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next();
+                stack.push(Context::Paren);
+                current.push('$');
+                current.push('(');
+            }
+            '`' => {
+                if matches!(stack.last(), Some(Context::Backtick)) {
+                    stack.pop();
+                } else {
+                    stack.push(Context::Backtick);
                 }
-                '`' => {
-                    in_backticks = !in_backticks;
-                    current.push(c);
+                current.push(c);
+            }
+            '(' if !in_double => {
+                stack.push(Context::Paren);
+                current.push(c);
+            }
+            '{' if !in_double => {
+                stack.push(Context::Brace);
+                current.push(c);
+            }
+            ')' if matches!(stack.last(), Some(Context::Paren)) => {
+                stack.pop();
+                current.push(c);
+            }
+            '}' if matches!(stack.last(), Some(Context::Brace)) => {
+                stack.pop();
+                current.push(c);
+            }
+            ';' | '\n' | '|' | '&' if stack.is_empty() => {
+                // Consume the second character of `&&` and `||`.
+                if (c == '|' || c == '&') && chars.peek() == Some(&c) {
+                    chars.next();
                 }
-                '(' | '{' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ')' | '}' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(c);
-                }
-                ';' | '\n' | '|' | '&' if depth == 0 && !in_backticks => {
-                    // Consume the second character of `&&` and `||`.
-                    if (c == '|' || c == '&') && chars.peek() == Some(&c) {
-                        chars.next();
-                    }
-                    statements.push(std::mem::take(&mut current));
-                }
-                _ => current.push(c),
-            },
+                statements.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
         }
     }
     statements.push(current);
@@ -1405,6 +1435,10 @@ mod tests {
             // statement, so the assignment and the command stay
             // together.
             "GIT_CONFIG_GLOBAL=$(printf /tmp/g; true) git p",
+            // Quoting nests: the inner quote closes the inner string,
+            // and the `;` is inside the substitution throughout.
+            "GIT_CONFIG_GLOBAL=\"$(printf \"/tmp/g;\")\" git p",
+            "GIT_CONFIG_GLOBAL=\"`printf \"/tmp/g;\"`\" git p",
             // A chain longer than the hop budget is unknown, not safe.
             "git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 \
              -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 \
