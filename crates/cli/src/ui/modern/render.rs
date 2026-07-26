@@ -256,8 +256,9 @@ fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     } else {
         Style::default().fg(p.accent)
     };
+    let prefix = "  find: ";
     let line = Line::from(vec![
-        Span::styled("  find: ", style.add_modifier(Modifier::BOLD)),
+        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
         Span::styled(s.query.clone(), Style::default().fg(p.text)),
         Span::styled(counter, Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -267,6 +268,15 @@ fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     ]);
     frame.render_widget(Clear, bar);
     frame.render_widget(Paragraph::new(line), bar);
+    // Typed and pasted input lands here, so the caret must too — the
+    // composer suppresses its own while the bar is open.
+    use unicode_width::UnicodeWidthStr;
+    let x = bar
+        .x
+        .saturating_add(prefix.len() as u16)
+        .saturating_add(s.query.as_str().width() as u16)
+        .min(bar.x.saturating_add(bar.width.saturating_sub(1)));
+    frame.set_cursor_position((x, bar.y));
 }
 
 fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -864,6 +874,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Apply selection highlight on the visible slice.
     let view = apply_selection_highlight(view, top, app.selection);
+    let view = apply_search_highlight(view, top, app);
 
     let title = match app.phase {
         Phase::Streaming => {
@@ -952,6 +963,36 @@ fn apply_selection_highlight(
                     .add_modifier(Modifier::BOLD),
             ));
         }
+    }
+    view
+}
+
+/// Paint the row the `2/3` counter points at, so stepping through
+/// matches is visibly anchored. Warning-on-black to stay distinct from
+/// the accent-colored mouse selection.
+fn apply_search_highlight(
+    mut view: Vec<Line<'static>>,
+    top: usize,
+    app: &App,
+) -> Vec<Line<'static>> {
+    if app.phase == Phase::Permission {
+        return view;
+    }
+    let Some(cur) = app.search.as_ref().and_then(|s| s.current_line()) else {
+        return view;
+    };
+    let Some(rel) = cur.checked_sub(top) else {
+        return view;
+    };
+    if let Some(line) = view.get_mut(rel) {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        *line = Line::from(Span::styled(
+            plain,
+            Style::default()
+                .fg(Color::Black)
+                .bg(palette().warning)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     view
 }
@@ -1215,6 +1256,11 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordere
     if body_area.width == 0 || body_area.height == 0 {
         return;
     }
+    // While the search bar is open it owns typed input, so it owns the
+    // caret too (`draw_search_bar` places it after the query).
+    if app.search_open() && app.phase != Phase::Permission {
+        return;
+    }
     let (line, col) = app.cursor_line_col();
     // Prefix "❯ " is 2 columns on line 0; continuation lines are indented 2.
     let prefix_cols: u16 = 2;
@@ -1417,6 +1463,71 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("no matches"), "buffer:\n{s}");
+    }
+
+    /// Focus follows input: while the bar is open the terminal caret must
+    /// sit after the query, not blink in the composer the keys no longer
+    /// reach.
+    #[test]
+    fn search_bar_owns_the_terminal_cursor() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let composer_cursor = term.get_cursor_position().unwrap();
+        app.open_search();
+        for c in "al".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let cur = term.get_cursor_position().unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let bar_row = s
+            .lines()
+            .position(|l| l.contains("find: al"))
+            .expect("search bar row") as u16;
+        assert_eq!(cur.y, bar_row, "caret must be on the search row:\n{s}");
+        assert_eq!(cur.x, 8 + 2, "caret must sit right after the query");
+        assert_ne!(cur.y, composer_cursor.y, "caret must leave the composer");
+    }
+
+    /// Stepping matches must visibly anchor the `n/m` counter.
+    #[test]
+    fn current_search_match_row_is_highlighted() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s
+            .lines()
+            .position(|l| l.contains("alpha auth beta"))
+            .expect("first match visible") as u16;
+        let buf = term.backend().buffer();
+        let bg = |y: u16| buf.cell((0u16, y)).unwrap().style().bg;
+        assert_ne!(
+            bg(row),
+            Some(ratatui::style::Color::Reset),
+            "current match row must carry a highlight background:\n{s}"
+        );
+        let other = s
+            .lines()
+            .position(|l| l.contains("gamma"))
+            .expect("non-match visible") as u16;
+        assert_eq!(
+            bg(other),
+            Some(ratatui::style::Color::Reset),
+            "non-match rows must stay unhighlighted:\n{s}"
+        );
     }
 
     /// The bar gets a reserved layout row; drawing it at a fixed offset

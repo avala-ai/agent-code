@@ -46,15 +46,6 @@ impl Search {
     }
 }
 
-/// True when `line` matches `query` under smart case.
-fn line_matches(line: &str, query: &str) -> bool {
-    if query.chars().any(|c| c.is_uppercase()) {
-        line.contains(query)
-    } else {
-        line.to_lowercase().contains(query)
-    }
-}
-
 impl App {
     /// Open the search bar (`Ctrl+F`).
     pub fn open_search(&mut self) {
@@ -162,18 +153,41 @@ impl App {
         let layout_rev = self.layout.revision();
         let mut matches = Vec::new();
         if !query.is_empty() {
-            let needle = if query.chars().any(|c| c.is_uppercase()) {
+            let sensitive = query.chars().any(|c| c.is_uppercase());
+            let needle = if sensitive {
                 query.clone()
             } else {
                 query.to_lowercase()
             };
-            let total = self.layout.total_lines();
-            if let Some(text) = self.layout.plain_range(0, total.saturating_sub(1)) {
-                for (i, line) in text.lines().enumerate() {
-                    if line_matches(line, &needle) {
-                        matches.push(i);
+            // Logical lines, not display rows, so a query still matches
+            // when the terminal wrapped it — folded per row to keep byte
+            // offsets aligned with the row texts being walked below.
+            for rows in self.layout.logical_rows() {
+                let folded: Vec<String> = rows
+                    .iter()
+                    .map(|(_, s)| {
+                        if sensitive {
+                            s.clone()
+                        } else {
+                            s.to_lowercase()
+                        }
+                    })
+                    .collect();
+                let Some(pos) = folded.concat().find(&needle) else {
+                    continue;
+                };
+                // Report the match at the display row its first byte
+                // falls on, so the jump lands where the text starts.
+                let mut off = 0usize;
+                let mut at = rows[0].0;
+                for ((abs, _), f) in rows.iter().zip(&folded) {
+                    if pos < off + f.len() {
+                        at = *abs;
+                        break;
                     }
+                    off += f.len();
                 }
+                matches.push(at);
             }
         }
         if let Some(s) = self.search.as_mut() {
@@ -324,6 +338,38 @@ mod tests {
         app.close_search();
         assert!(!app.search_open());
         assert_eq!(app.scroll, at_match);
+    }
+
+    /// A long identifier split across display rows by terminal wrapping
+    /// must still be findable — search runs on logical lines, not rows.
+    #[test]
+    fn a_query_crossing_a_wrap_boundary_still_matches() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        app.transcript.push(TranscriptItem::System(format!(
+            "{}needle{}",
+            "a".repeat(33),
+            "b".repeat(37)
+        )));
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 10, &expanded, None);
+        // Setup guard: the match must actually span two display rows,
+        // or this test proves nothing.
+        let total = app.layout.total_lines();
+        let rows = app.layout.plain_range(0, total - 1).unwrap();
+        assert!(
+            !rows.lines().any(|l| l.to_lowercase().contains("needle")),
+            "needle fits one row; adjust the padding: {rows:?}"
+        );
+        app.open_search();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        assert_eq!(
+            app.search.as_ref().unwrap().position(),
+            (1, 1),
+            "wrapped match not found: {rows:?}"
+        );
     }
 
     #[test]
