@@ -257,7 +257,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // command text, which is the same answer as any other
     // unresolvable input — refuse rather than read the untranslated
     // source as if it were the result.
-    if shell_text_facts(&cmd.raw).locale_quote {
+    if shell_text_facts(&cmd.raw).locale_quote && translation_can_reach_a_command(cmd) {
         findings.push(DestructiveFinding {
             level: DestructivenessLevel::Destructive,
             reason: "locale-translated string ($\"…\"); what it runs cannot be determined"
@@ -878,6 +878,53 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "XDG_CONFIG_HOME",
 ];
 
+/// True when a locale-translated string in this command could decide
+/// what runs.
+///
+/// Under a head whose operands are text — `printf '%s\n' $"hello"`,
+/// `grep $"message" log.txt` — the executable is known whatever the
+/// catalogue says, and the translation is only the data being printed
+/// or matched. That exemption does not extend to a token carrying a
+/// substitution, which runs a command of its own.
+///
+/// Anything the invocations do not account for (a heredoc delimiter,
+/// a command that did not parse) keeps the refusal, since it cannot
+/// be shown to be data.
+fn translation_can_reach_a_command(cmd: &ParsedCommand) -> bool {
+    let accounted: Vec<bool> = cmd
+        .invocations
+        .iter()
+        .map(|invocation| {
+            // A head that is itself a translation cannot vouch for
+            // anything: `$"cat" file.txt` reads as `cat` only until
+            // the catalogue says otherwise.
+            let head_is_data = invocation.first().is_some_and(|t| {
+                DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+                    && !shell_text_facts(t).locale_quote
+            });
+            let has_substitution = invocation
+                .iter()
+                .any(|token| token.contains("$(") || token.contains('`'));
+            // The parser can split `$\"…\"` into a `$` token and a
+            // string token, so the invocation is read as one piece of
+            // text rather than token by token.
+            let carries_translation = shell_text_facts(&invocation.join("")).locale_quote;
+            carries_translation && (!head_is_data || has_substitution)
+        })
+        .collect();
+    if accounted.iter().any(|reaches| *reaches) {
+        return true;
+    }
+    // No invocation's translation can reach a command. If none of
+    // them carries one at all, the translation the text pass saw lies
+    // somewhere the invocations do not cover — a heredoc delimiter, a
+    // command that did not parse — and that cannot be shown to be
+    // data.
+    !cmd.invocations
+        .iter()
+        .any(|invocation| shell_text_facts(&invocation.join("")).locale_quote)
+}
+
 /// What a quote-aware pass over the command text found.
 ///
 /// One pass answers both questions, so a construct either scanner
@@ -1071,6 +1118,17 @@ fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (String, bool, bool, u
     while let Some(&c) = text.get(i) {
         match quote {
             Some(open) => {
+                // Inside double quotes a backslash escapes the next
+                // character, so `"X\""` stays quoted through it.
+                if c == '\\' && open == '"' {
+                    word.push(c);
+                    if let Some(&escaped) = text.get(i + 1) {
+                        word.push(escaped);
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
                 if c == open {
                     quote = None;
                 }
@@ -2390,6 +2448,11 @@ mod tests {
             // delimiter, not a translation.
             "cat <<'$\"SAFE\"'\nbody\n$\"SAFE\"",
             "cat <<$'$\"SAFE\"'\nbody\n$\"SAFE\"",
+            // An escaped quote keeps the delimiter quoted through it.
+            "cat <<\"X\\\"$\"SAFE\nbody\nX\"$SAFE",
+            // A translation that is only data cannot change what runs.
+            "printf '%s\\n' $\"hello\"",
+            "grep $\"message\" log.txt",
             "cat <<EOF\n$\"cat\"\nEOF",
             // A separator inside a comment separates nothing.
             "export GIT_CONFIG_GLOBAL=/tmp/g # comment; git status",
