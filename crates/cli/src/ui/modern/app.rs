@@ -2121,10 +2121,10 @@ impl App {
     }
 
     /// Identity of the currently selected pane row, if any.
-    fn selected_task_key(&self) -> Option<(String, super::tasks::TaskSource)> {
+    fn selected_task_key(&self) -> Option<(String, super::tasks::TaskSource, Option<String>)> {
         self.tasks
             .get(self.tasks_selected)
-            .map(|t| (t.agent_id.clone(), t.source))
+            .map(|t| (t.agent_id.clone(), t.source, t.task_id.clone()))
     }
 
     /// Re-point `tasks_selected` at the same task after rows moved.
@@ -2132,16 +2132,31 @@ impl App {
     /// The list re-sorts whenever a state changes, but the selection is
     /// a positional index — without this, a task finishing above the
     /// cursor silently retargets the marker (and Enter) at a different
-    /// task.
-    fn keep_task_selection(&mut self, prev: Option<(String, super::tasks::TaskSource)>) {
-        if let Some((id, src)) = prev
-            && let Some(idx) = self
+    /// task. Manager-backed rows are matched by task id first: when a
+    /// synthesized row is absorbed into its late event row the agent_id
+    /// changes, but the backing task does not.
+    fn keep_task_selection(
+        &mut self,
+        prev: Option<(String, super::tasks::TaskSource, Option<String>)>,
+    ) {
+        if let Some((id, src, tid)) = prev {
+            if let Some(tid) = tid
+                && let Some(idx) = self
+                    .tasks
+                    .iter()
+                    .position(|t| t.task_id.as_deref() == Some(tid.as_str()))
+            {
+                self.tasks_selected = idx;
+                return;
+            }
+            if let Some(idx) = self
                 .tasks
                 .iter()
                 .position(|t| t.agent_id == id && t.source == src)
-        {
-            self.tasks_selected = idx;
-            return;
+            {
+                self.tasks_selected = idx;
+                return;
+            }
         }
         self.tasks_selected = self.tasks_selected.min(self.tasks.len().saturating_sub(1));
     }
@@ -3518,11 +3533,22 @@ mod tests {
         crate::ui::modern::tasks::upsert(&mut app.tasks, "scan-repo", "working", "[explore] scan");
         assert_eq!(app.tasks.len(), 2);
 
+        // Select the synthesized row before the absorb: the selection
+        // must follow the task (by task id) onto the event row.
+        app.tasks_selected = app
+            .tasks
+            .iter()
+            .position(|t| t.task_id.as_deref() == Some("a3"))
+            .unwrap();
         app.sync_background_tasks(vec![row("done")]);
         assert_eq!(app.tasks.len(), 1, "synthesized duplicate survived");
         assert_eq!(app.tasks[0].agent_id, "scan-repo");
         assert_eq!(app.tasks[0].state, TaskState::Done);
         assert_eq!(app.tasks[0].task_id.as_deref(), Some("a3"));
+        assert_eq!(
+            app.tasks_selected, 0,
+            "selection lost the task across the absorb"
+        );
     }
 
     /// `/tasks clear` removes manager records; rows they backed (folded
