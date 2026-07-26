@@ -105,6 +105,7 @@ impl TaskExecutor for LocalAgentExecutor {
                         subagent_kind: Some(description.clone()),
                         prompt: prompt.clone(),
                         parent_session: None,
+                        subagent_id: Some(subagent_id.clone()),
                     },
                     assigned_color,
                 )
@@ -195,6 +196,7 @@ mod tests {
             subagent_kind: None,
             prompt: "   ".into(),
             parent_session: None,
+            subagent_id: None,
         };
         let err = exec.execute(&payload, &ctx).await.unwrap_err();
         assert!(matches!(err, TaskError::InvalidPayload(_)));

@@ -65,7 +65,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 .split(chunks[1]);
             (cols[0], cols[1])
         } else {
-            let strip = 5.min(chunks[1].height.saturating_sub(3));
+            // Size the strip to what the grouped list actually renders
+            // (headings + two lines per task) — a fixed five rows hid
+            // the background group behind the agents group. Capped so
+            // the transcript keeps at least half the area; the pane
+            // shows a "+n more" line when it still cannot fit.
+            // +1 for the block title row the pane spends.
+            let needed = super::tasks::pane_rows(&app.tasks) as u16 + 1;
+            let strip = needed
+                .min(chunks[1].height / 2)
+                .min(chunks[1].height.saturating_sub(3));
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(3), Constraint::Length(strip)])
@@ -631,8 +640,17 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Tasks/agents pane: state-ordered subagent rows (plan §M8).
 fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use super::tasks::TaskState;
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(format!(" agents ({}) ", app.tasks.len()));
+    // The title consumes the top row even without a top border, so
+    // measure the real content box instead of the outer area.
+    let inner = block.inner(area);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let inner_w = area.width.saturating_sub(2) as usize;
+    // Line index of each task's last row, for the overflow count below.
+    let mut task_ends: Vec<usize> = Vec::new();
+    let inner_w = (inner.width as usize).saturating_sub(1);
     let mut last_source: Option<super::tasks::TaskSource> = None;
     for (idx, t) in app.tasks.iter().enumerate() {
         let p = palette();
@@ -669,17 +687,33 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]));
-        // Headline on its own row, truncated to the pane width.
-        let head: String = t.headline.chars().take(inner_w.max(4)).collect();
+        // Headline on its own row, truncated to the pane width. The
+        // text is model- or tool-supplied: scrub bidi overrides and
+        // zero-width characters like every other surface that shows it.
+        let head: String = crate::ui::text_safety::escape_deceptive(&t.headline)
+            .chars()
+            .take(inner_w.max(4))
+            .collect();
         lines.push(Line::from(Span::styled(
             format!("  {head}"),
             Style::default().fg(Color::Gray),
         )));
+        task_ends.push(lines.len() - 1);
     }
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(format!(" agents ({}) ", app.tasks.len()));
+    // When the area is still too short (many tasks, tiny terminal),
+    // clip to whole rows and say how many tasks are hidden rather than
+    // silently truncating mid-task.
+    let max_rows = inner.height as usize;
+    if lines.len() > max_rows && max_rows >= 2 {
+        let cut = max_rows - 1;
+        let visible = task_ends.iter().filter(|&&e| e < cut).count();
+        let hidden = app.tasks.len().saturating_sub(visible);
+        lines.truncate(cut);
+        lines.push(Line::from(Span::styled(
+            format!("… +{hidden} more"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1617,6 +1651,77 @@ mod tests {
         assert!(s.contains("agents (1)"), "pane title missing:\n{s}");
         assert!(s.contains("working"), "state word missing:\n{s}");
         assert!(s.contains("scanning crates"), "headline missing:\n{s}");
+    }
+
+    /// One agent + one background task need seven strip rows (two
+    /// headings, a gap, two lines per task); the old fixed five-row
+    /// strip clipped the background group entirely on narrow terminals.
+    #[test]
+    fn narrow_terminal_strip_shows_the_background_group() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::SubagentUpdate {
+            agent_id: "a1".into(),
+            state: "working".into(),
+            headline: "explore parser".into(),
+        });
+        app.sync_background_tasks(vec![crate::ui::modern::tasks::ManagerRow {
+            id: "b1".into(),
+            state: "working".into(),
+            headline: "cargo build --release".into(),
+            subagent_id: None,
+        }]);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("background"), "background heading missing:\n{s}");
+        assert!(
+            s.contains("cargo build"),
+            "background headline missing:\n{s}"
+        );
+    }
+
+    /// Task headlines are model-/tool-supplied text; the pane must run
+    /// them through the same deceptive-character scrub as every other
+    /// surface (zero-width chars, bidi overrides).
+    #[test]
+    fn tasks_pane_escapes_deceptive_headline_text() {
+        let backend = TestBackend::new(120, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::SubagentUpdate {
+            agent_id: "a1".into(),
+            state: "working".into(),
+            headline: "rm -\u{200B}rf tmp".into(),
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("<U+200B>"), "zero-width char not escaped:\n{s}");
+        assert!(
+            !s.contains("rm -\u{200B}rf"),
+            "raw deceptive text rendered:\n{s}"
+        );
+    }
+
+    /// When even the grown strip cannot fit every task, the pane says
+    /// how many are hidden instead of silently clipping.
+    #[test]
+    fn overflowing_tasks_pane_reports_hidden_rows() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        let rows = (0..6)
+            .map(|i| crate::ui::modern::tasks::ManagerRow {
+                id: format!("b{i}"),
+                state: "working".into(),
+                headline: format!("job {i}"),
+                subagent_id: None,
+            })
+            .collect();
+        app.sync_background_tasks(rows);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("… +"), "hidden-task indicator missing:\n{s}");
     }
 
     #[test]

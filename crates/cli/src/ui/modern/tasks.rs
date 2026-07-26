@@ -84,6 +84,42 @@ pub struct TaskEntry {
     pub state: TaskState,
     pub headline: String,
     pub source: TaskSource,
+    /// `TaskManager` id backing this row, when one exists — background
+    /// rows always, agent rows only for background (`run_in_background`)
+    /// runs. Drill-in reads output by this id; `None` means the row is
+    /// purely event-driven and has no output file to open.
+    pub task_id: Option<String>,
+}
+
+/// One record from the `TaskManager` poll, before reconciliation.
+#[derive(Debug, Clone)]
+pub struct ManagerRow {
+    pub id: String,
+    pub state: String,
+    pub headline: String,
+    /// `Some` for `LocalAgent` runs: the id the subagent's stream
+    /// events keyed their row by, so the record folds into that row
+    /// instead of listing the same agent twice.
+    pub subagent_id: Option<String>,
+}
+
+/// Pane lines the grouped list needs: a heading per source group, a
+/// blank line between groups, and two lines per task. The layout uses
+/// this to size the below-transcript strip on narrow terminals.
+pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
+    let mut rows = 0;
+    let mut last: Option<TaskSource> = None;
+    for t in tasks {
+        if last != Some(t.source) {
+            if last.is_some() {
+                rows += 1;
+            }
+            rows += 1;
+            last = Some(t.source);
+        }
+        rows += 2;
+    }
+    rows
 }
 
 /// Upsert a subagent update into `tasks`, keeping entries ordered by state
@@ -113,6 +149,7 @@ pub fn upsert_with_source(
             state,
             headline: headline.to_string(),
             source,
+            task_id: None,
         });
     }
     // Group by source, then float needs-input rows to the top within it.
@@ -175,6 +212,18 @@ mod tests {
     }
 
     use super::*;
+
+    /// Heading + gap accounting for the layout's strip sizing: agents
+    /// heading, two rows, blank, background heading, two rows = 7.
+    #[test]
+    fn pane_rows_counts_headings_gaps_and_task_lines() {
+        assert_eq!(pane_rows(&[]), 0);
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "a1", "working", "explore");
+        assert_eq!(pane_rows(&tasks), 3);
+        upsert_with_source(&mut tasks, "b1", "working", "build", TaskSource::Background);
+        assert_eq!(pane_rows(&tasks), 7);
+    }
 
     #[test]
     fn parse_states() {

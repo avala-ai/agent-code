@@ -119,6 +119,12 @@ pub enum TaskPayload {
         prompt: String,
         /// Parent session id, when one is available.
         parent_session: Option<String>,
+        /// Stable subagent id the stream events use for this run (see
+        /// `resolve_subagent_id`), so UIs can reconcile this task with
+        /// the event-driven row instead of showing the same agent
+        /// twice. `None` on legacy persisted records.
+        #[serde(default)]
+        subagent_id: Option<String>,
     },
     /// A multi-step skill / workflow execution.
     LocalWorkflow {
@@ -1163,6 +1169,7 @@ mod tests {
             subagent_kind: Some("demo".into()),
             prompt: "noop".into(),
             parent_session: None,
+            subagent_id: None,
         };
         let id = mgr
             .spawn_command(cmd, "demo", TaskKind::LocalAgent, payload, None, None)

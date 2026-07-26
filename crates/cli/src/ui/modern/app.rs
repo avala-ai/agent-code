@@ -2009,7 +2009,7 @@ impl App {
     ///
     /// Returns true when anything changed, so the caller can avoid
     /// repainting an idle screen.
-    pub fn sync_background_tasks(&mut self, rows: Vec<(String, String, String)>) -> bool {
+    pub fn sync_background_tasks(&mut self, rows: Vec<super::tasks::ManagerRow>) -> bool {
         use super::tasks::{TaskEntry, TaskSource, TaskState};
         let mut next: Vec<TaskEntry> = self
             .tasks
@@ -2017,19 +2017,46 @@ impl App {
             .filter(|t| t.source == TaskSource::Subagent)
             .cloned()
             .collect();
-        for (id, state, headline) in rows {
+        for row in rows {
+            let state = TaskState::parse(&row.state);
+            if let Some(sid) = row.subagent_id {
+                // A LocalAgent record mirrors a subagent the event
+                // stream already reported. Fold the manager's status
+                // into that row rather than listing the agent twice:
+                // the manager is the only source that sees a background
+                // run finish (the stream stops at "working"), so its
+                // state wins, while the richer event headline is kept.
+                if let Some(existing) = next.iter_mut().find(|t| t.agent_id == sid) {
+                    existing.state = state;
+                    existing.task_id = Some(row.id);
+                } else {
+                    // No event row — e.g. a task adopted after restart.
+                    next.push(TaskEntry {
+                        agent_id: sid,
+                        state,
+                        headline: row.headline,
+                        source: TaskSource::Subagent,
+                        task_id: Some(row.id),
+                    });
+                }
+                continue;
+            }
             next.push(TaskEntry {
-                agent_id: id,
-                state: TaskState::parse(&state),
-                headline,
+                agent_id: row.id.clone(),
+                state,
+                headline: row.headline,
                 source: TaskSource::Background,
+                task_id: Some(row.id),
             });
         }
         next.sort_by_key(|t| (t.source.heading(), t.state.order()));
 
         let changed = next.len() != self.tasks.len()
             || next.iter().zip(self.tasks.iter()).any(|(a, b)| {
-                a.agent_id != b.agent_id || a.state != b.state || a.headline != b.headline
+                a.agent_id != b.agent_id
+                    || a.state != b.state
+                    || a.headline != b.headline
+                    || a.task_id != b.task_id
             });
         if changed {
             self.tasks = next;
@@ -2050,20 +2077,20 @@ impl App {
 
     /// Ask the run loop for the selected task's output (D4-27 drill-in).
     ///
-    /// Only rows the `TaskManager` owns have output to show. A subagent
-    /// row's id is a subagent *type*, not a task id, so there is nothing
-    /// to read for it — say so rather than opening an empty pane.
+    /// Only rows backed by a `TaskManager` id have output to show —
+    /// background rows always, agent rows when the run went through the
+    /// manager (`run_in_background`). An inline subagent row has no
+    /// output file — say so rather than opening an empty pane.
     pub fn drill_into_selected_task(&mut self) {
-        use super::tasks::TaskSource;
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
-        match row.source {
-            TaskSource::Background => {
-                self.pending_task_output = Some(row.agent_id.clone());
-                self.status_message = format!("loading output for {}…", row.agent_id);
+        match &row.task_id {
+            Some(id) => {
+                self.pending_task_output = Some(id.clone());
+                self.status_message = format!("loading output for {id}…");
             }
-            TaskSource::Subagent => {
+            None => {
                 self.status_message =
                     "inline subagents have no separate output to open".to_string();
             }
@@ -3245,6 +3272,15 @@ mod tests {
         );
     }
 
+    fn bg(id: &str, state: &str, headline: &str) -> crate::ui::modern::tasks::ManagerRow {
+        crate::ui::modern::tasks::ManagerRow {
+            id: id.into(),
+            state: state.into(),
+            headline: headline.into(),
+            subagent_id: None,
+        }
+    }
+
     #[test]
     fn task_selection_wraps_and_clamps() {
         let mut app = App::new("m", "/tmp", "s");
@@ -3252,10 +3288,7 @@ mod tests {
         app.tasks_select(1);
         assert_eq!(app.tasks_selected, 0);
 
-        app.sync_background_tasks(vec![
-            ("b1".into(), "working".into(), "one".into()),
-            ("b2".into(), "working".into(), "two".into()),
-        ]);
+        app.sync_background_tasks(vec![bg("b1", "working", "one"), bg("b2", "working", "two")]);
         app.tasks_select(1);
         assert_eq!(app.tasks_selected, 1);
         app.tasks_select(1);
@@ -3269,9 +3302,27 @@ mod tests {
     #[test]
     fn drilling_into_a_background_row_requests_its_output() {
         let mut app = App::new("m", "/tmp", "s");
-        app.sync_background_tasks(vec![("b7".into(), "working".into(), "build".into())]);
+        app.sync_background_tasks(vec![bg("b7", "working", "build")]);
         app.drill_into_selected_task();
         assert_eq!(app.pending_task_output.as_deref(), Some("b7"));
+    }
+
+    /// A background Agent run folds into its subagent row but keeps the
+    /// manager task id, so its captured output can still be opened.
+    #[test]
+    fn drilling_into_a_folded_agent_row_uses_the_manager_task_id() {
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "explore-1", "working", "[explore] scan");
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a3".into(),
+            state: "working".into(),
+            headline: "scan".into(),
+            subagent_id: Some("explore-1".into()),
+        }]);
+        assert_eq!(app.tasks.len(), 1);
+        app.drill_into_selected_task();
+        assert_eq!(app.pending_task_output.as_deref(), Some("a3"));
     }
 
     /// A subagent row's id is a subagent *type*, not a task id, so there
@@ -3319,7 +3370,7 @@ mod tests {
         use crate::ui::modern::tasks::TaskSource;
         let mut app = App::new("m", "/tmp", "s");
         crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
-        app.sync_background_tasks(vec![("b1".into(), "working".into(), "cargo build".into())]);
+        app.sync_background_tasks(vec![bg("b1", "working", "cargo build")]);
         assert_eq!(app.tasks.len(), 2);
 
         // A manager that no longer reports b1 must drop it, while the
@@ -3335,14 +3386,13 @@ mod tests {
     #[test]
     fn an_unchanged_background_sync_does_not_repaint() {
         let mut app = App::new("m", "/tmp", "s");
-        let rows = vec![("b1".to_string(), "working".to_string(), "build".to_string())];
         assert!(
-            app.sync_background_tasks(rows.clone()),
+            app.sync_background_tasks(vec![bg("b1", "working", "build")]),
             "first sync adds a row"
         );
         app.dirty = false;
         assert!(
-            !app.sync_background_tasks(rows),
+            !app.sync_background_tasks(vec![bg("b1", "working", "build")]),
             "an identical sync reported a change"
         );
         assert!(!app.dirty, "an identical sync marked the frame dirty");
@@ -3351,10 +3401,52 @@ mod tests {
     #[test]
     fn a_background_state_change_repaints() {
         let mut app = App::new("m", "/tmp", "s");
-        app.sync_background_tasks(vec![("b1".into(), "working".into(), "build".into())]);
+        app.sync_background_tasks(vec![bg("b1", "working", "build")]);
         app.dirty = false;
-        assert!(app.sync_background_tasks(vec![("b1".into(), "done".into(), "build".into())]));
+        assert!(app.sync_background_tasks(vec![bg("b1", "done", "build")]));
         assert!(app.dirty);
+    }
+
+    /// A background Agent run is reported twice — once by the stream
+    /// (`SubagentUpdate`, stuck at "working" once the tool returns) and
+    /// once by the manager as a LocalAgent task. The manager record must
+    /// fold into the event row: one row, manager state, event headline.
+    #[test]
+    fn a_local_agent_record_folds_into_its_event_row() {
+        use crate::ui::modern::tasks::{ManagerRow, TaskSource, TaskState};
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "explore-1", "working", "[explore] scan");
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a3".into(),
+            state: "done".into(),
+            headline: "scan".into(),
+            subagent_id: Some("explore-1".into()),
+        }]);
+        assert_eq!(app.tasks.len(), 1, "duplicated the agent row");
+        assert_eq!(app.tasks[0].source, TaskSource::Subagent);
+        assert_eq!(
+            app.tasks[0].state,
+            TaskState::Done,
+            "manager state must win"
+        );
+        assert_eq!(app.tasks[0].headline, "[explore] scan");
+    }
+
+    /// A LocalAgent task with no live event row (adopted after a
+    /// restart) still shows — under the agents group, not background.
+    #[test]
+    fn an_adopted_agent_task_lists_under_agents() {
+        use crate::ui::modern::tasks::{ManagerRow, TaskSource};
+        let mut app = App::new("m", "/tmp", "s");
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a7".into(),
+            state: "working".into(),
+            headline: "summarize repo".into(),
+            subagent_id: Some("a7".into()),
+        }]);
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].source, TaskSource::Subagent);
+        assert_eq!(app.tasks[0].agent_id, "a7");
     }
 
     #[test]

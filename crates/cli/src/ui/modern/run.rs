@@ -595,6 +595,13 @@ pub(super) async fn event_loop(
                 {
                     app.apply_engine(EngineEvent::Error(e.to_string()));
                 }
+                // Final manager sync. A task registered moments before
+                // the turn ended (or a cancelled turn) could otherwise
+                // leave `app.tasks` empty with `live` false — and the
+                // guarded tick below would never poll again, hiding the
+                // task until some later turn.
+                let rows = manager_rows(&task_manager).await;
+                app.sync_background_tasks(rows);
                 // Refresh cost/tokens from engine state.
                 {
                     let engine_arc = session.engine();
@@ -777,20 +784,7 @@ pub(super) async fn event_loop(
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             _ = tasks_tick.tick(), if live || !app.tasks.is_empty() => {
-                let rows = task_manager
-                    .list()
-                    .await
-                    .into_iter()
-                    .map(|t| {
-                        let state = match &t.status {
-                            agent_code_lib::services::background::TaskStatus::Running => "working",
-                            agent_code_lib::services::background::TaskStatus::Completed => "done",
-                            agent_code_lib::services::background::TaskStatus::Failed(_) => "failed",
-                            agent_code_lib::services::background::TaskStatus::Killed => "failed",
-                        };
-                        (t.id.to_string(), state.to_string(), t.description.clone())
-                    })
-                    .collect();
+                let rows = manager_rows(&task_manager).await;
                 app.sync_background_tasks(rows);
             }
             // Micro-animations: spinner, action-required blink, toast decay.
@@ -820,6 +814,40 @@ pub(super) async fn event_loop(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Snapshot the shared `TaskManager` as tasks-pane rows.
+async fn manager_rows(
+    tm: &std::sync::Arc<agent_code_lib::services::background::TaskManager>,
+) -> Vec<super::tasks::ManagerRow> {
+    use agent_code_lib::services::background::{TaskKind, TaskPayload, TaskStatus};
+    tm.list()
+        .await
+        .into_iter()
+        .map(|t| {
+            let state = match &t.status {
+                TaskStatus::Running => "working",
+                TaskStatus::Completed => "done",
+                TaskStatus::Failed(_) | TaskStatus::Killed => "failed",
+            };
+            // LocalAgent runs reconcile with their event-driven pane row
+            // via the payload's subagent id. A legacy record without one
+            // still lists under the agents group, keyed by its task id.
+            let subagent_id = (t.kind == TaskKind::LocalAgent).then(|| match &t.payload {
+                Some(TaskPayload::LocalAgent {
+                    subagent_id: Some(sid),
+                    ..
+                }) => sid.clone(),
+                _ => t.id.to_string(),
+            });
+            super::tasks::ManagerRow {
+                id: t.id.to_string(),
+                state: state.to_string(),
+                headline: t.description.clone(),
+                subagent_id,
+            }
+        })
+        .collect()
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
@@ -1560,6 +1588,43 @@ fn apply_mode_to_engine(
 mod tests {
     use super::*;
     use crate::ui::modern::app::Phase;
+
+    /// LocalAgent manager records must carry their stream subagent id so
+    /// the pane folds them into the event-driven row; every other kind
+    /// maps to a plain background row.
+    #[tokio::test]
+    async fn manager_rows_link_local_agent_records_to_their_subagent_id() {
+        use agent_code_lib::services::background::{TaskKind, TaskManager, TaskPayload};
+        let tm = std::sync::Arc::new(TaskManager::new());
+        tm.register(
+            "scan crates",
+            TaskKind::LocalAgent,
+            TaskPayload::LocalAgent {
+                subagent_kind: Some("explore".into()),
+                prompt: "scan".into(),
+                parent_session: None,
+                subagent_id: Some("explore-1".into()),
+            },
+        )
+        .await;
+        tm.register(
+            "cargo build",
+            TaskKind::LocalShell,
+            TaskPayload::LocalShell {
+                command: "cargo build".into(),
+                cwd: std::path::PathBuf::from("/tmp"),
+            },
+        )
+        .await;
+
+        let rows = manager_rows(&tm).await;
+        assert_eq!(rows.len(), 2);
+        let agent = rows.iter().find(|r| r.headline == "scan crates").unwrap();
+        assert_eq!(agent.subagent_id.as_deref(), Some("explore-1"));
+        let shell = rows.iter().find(|r| r.headline == "cargo build").unwrap();
+        assert_eq!(shell.subagent_id, None);
+        assert_eq!(shell.state, "working");
+    }
 
     #[test]
     fn sanitize_osc_title_strips_control_breakouts() {
