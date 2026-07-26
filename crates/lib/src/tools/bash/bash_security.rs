@@ -251,6 +251,20 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         }
     }
 
+    // `$"…"` is not just double quoting: bash translates the string
+    // through the locale catalogue first, so `$"cat"` can arrive as
+    // any other command entirely. What runs is decided outside the
+    // command text, which is the same answer as any other
+    // unresolvable input — refuse rather than read the untranslated
+    // source as if it were the result.
+    if has_locale_translation(&cmd.raw) {
+        findings.push(DestructiveFinding {
+            level: DestructivenessLevel::Destructive,
+            reason: "locale-translated string ($\"…\"); what it runs cannot be determined"
+                .to_string(),
+        });
+    }
+
     // Git configuration handed over through the environment never
     // appears in the argv, so an alias defined there turns the command
     // word into something this scan cannot read. Done per statement:
@@ -819,6 +833,39 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "HOME",
     "XDG_CONFIG_HOME",
 ];
+
+/// True when the command contains a locale-translated string, whose
+/// content the catalogue decides rather than the command text. Inside
+/// quotes `$"` is ordinary characters, so only an unquoted one counts.
+fn has_locale_translation(raw: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    chars.next();
+                }
+                '$' if chars.peek() == Some(&'"') => return true,
+                _ => {}
+            },
+        }
+    }
+    false
+}
 
 /// True when `&&`, `||` or a heredoc appears as an actual shell
 /// construct rather than inside quoted data or a comment: `printf
@@ -2017,6 +2064,9 @@ mod tests {
             // rather than quoted.
             "psql -c DROP\\ TABLE\\ users",
             "mysql -e DELETE\\ FROM\\ users",
+            // The locale catalogue decides what a `$\"…\"` string is,
+            // so even an innocuous-looking one is unknown.
+            "$\"cat\" file.txt",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
@@ -2081,6 +2131,10 @@ mod tests {
             "grep $'\\t' notes.txt",
             "printf $'%s\\n' one two",
             "echo \"$100 reward\"",
+            // A `$\"` inside quotes is ordinary text, not a
+            // translation.
+            "echo \"$\"",
+            "echo '$\"cat\"'",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
