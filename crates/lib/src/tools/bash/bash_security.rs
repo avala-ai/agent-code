@@ -391,9 +391,17 @@ fn destructive_git_subcommand(after_git: &[String]) -> Option<String> {
                 // `--force` need not sit next to the subcommand.
                 // `--no-force` turns it back off, so only the
                 // affirmative spelling counts.
+                //
+                // Git accepts any unambiguous abbreviation, so
+                // `--force-w` is `--force-with-lease`. A written name
+                // that merely *starts* a destructive option counts;
+                // when the abbreviation is ambiguous git refuses the
+                // command outright, so flagging it costs nothing.
                 let name = long.split('=').next().unwrap_or(long).to_lowercase();
-                if longs.contains(&name.as_str()) {
-                    return Some(format!("git {subcommand} with '--{name}'"));
+                if !name.is_empty()
+                    && let Some(full) = longs.iter().find(|full| full.starts_with(&name))
+                {
+                    return Some(format!("git {subcommand} with '--{full}'"));
                 }
                 continue;
             }
@@ -443,8 +451,12 @@ fn expand_inline_aliases(tokens: &[String]) -> Vec<String> {
     }
     let mut out = Vec::with_capacity(tokens.len());
     for token in tokens {
+        // Git takes the last `-c` value for a repeated key, so the
+        // search runs backwards: `-c alias.p=status -c 'alias.p=push
+        // --force'` defines `p` as the force push.
         match aliases
             .iter()
+            .rev()
             .find(|(name, _)| *name == token.to_lowercase())
         {
             Some((_, expansion)) => out.extend(expansion.iter().cloned()),
@@ -792,6 +804,11 @@ mod tests {
             // Aliases defined in the same command.
             "git -c alias.p=push p -uf origin main",
             "git -c alias.p='push --force' p origin main",
+            // Git takes the last value for a repeated key.
+            "git -c alias.p=status -c 'alias.p=push --force' p origin main",
+            // Unambiguous abbreviations of a long option.
+            "git push --quiet --force-w origin main",
+            "git push --quiet --forc origin main",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
