@@ -868,6 +868,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.close_model_picker();
         // Reverts the live preview rather than leaving a browsed theme on.
         app.theme_picker_cancel();
+        // Restores the reader's place; a hidden search bar must not swallow
+        // the modal's answer keys.
+        app.cancel_search();
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
@@ -1754,6 +1757,31 @@ mod tests {
         // y must reach the modal, not the palette filter.
         handle_key(&mut app, key(KeyCode::Char('y')));
         assert!(!app.command_palette_open());
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    #[test]
+    fn permission_phase_closes_search_and_takes_keys() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        assert!(app.search_open());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        app.force_hitl_answers_ready();
+        // y must reach the modal, not the search query — the bar is not
+        // even drawn during Permission, so a swallowed key looks dead.
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(!app.search_open());
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
     }
 
