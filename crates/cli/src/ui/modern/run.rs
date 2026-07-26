@@ -797,7 +797,9 @@ pub(super) async fn event_loop(
                     let tm = task_manager.clone();
                     let tx = task_out_tx.clone();
                     tokio::spawn(async move {
-                        let out = tm.read_output(&id).await;
+                        // Bounded: the card shows a tail anyway, so never
+                        // materialize an arbitrarily large output file.
+                        let out = tm.read_output_tail(&id, 256 * 1024).await;
                         let _ = tx.send((id, out));
                     });
                 }

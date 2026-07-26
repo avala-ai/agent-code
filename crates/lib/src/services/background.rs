@@ -479,6 +479,49 @@ impl TaskManager {
             .map_err(|e| format!("Failed to read output: {e}"))
     }
 
+    /// Read at most the last `max_bytes` of a task's captured output.
+    ///
+    /// Long builds routinely produce output far larger than any viewer
+    /// shows; materializing the whole file just to display a tail can
+    /// exhaust memory. This seeks to the tail instead, prefixing a note
+    /// when earlier bytes were skipped.
+    pub async fn read_output_tail(&self, id: &str, max_bytes: u64) -> Result<String, String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let output_file = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?
+                .output_file
+                .clone()
+        };
+        let mut f = tokio::fs::File::open(&output_file)
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?;
+        let len = f
+            .metadata()
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?
+            .len();
+        let skipped = len.saturating_sub(max_bytes);
+        if skipped > 0 {
+            f.seek(std::io::SeekFrom::Start(skipped))
+                .await
+                .map_err(|e| format!("Failed to read output: {e}"))?;
+        }
+        let mut buf = Vec::new();
+        f.take(max_bytes)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if skipped > 0 {
+            Ok(format!("… ({skipped} earlier bytes omitted)\n{text}"))
+        } else {
+            Ok(text)
+        }
+    }
+
     /// Persist `content` as a task's captured output.
     ///
     /// Externally-driven kinds (e.g. `LocalAgent` / `LocalWorkflow`,
@@ -1000,6 +1043,31 @@ mod tests {
             command: cmd.to_string(),
             cwd: PathBuf::from("."),
         }
+    }
+
+    /// Viewers show a tail; the read must be bounded rather than
+    /// materializing an arbitrarily large output file first.
+    #[tokio::test]
+    async fn read_output_tail_skips_the_head_of_large_output() {
+        let mgr = TaskManager::new();
+        let id = mgr
+            .register("big", TaskKind::LocalShell, shell_payload("noop"))
+            .await;
+        let big = format!("{}\nTHE-END", "x".repeat(100));
+        mgr.write_output(&id, &big).await.unwrap();
+
+        let tail = mgr.read_output_tail(&id, 16).await.unwrap();
+        assert!(tail.contains("THE-END"), "tail lost the end: {tail}");
+        assert!(
+            tail.contains("earlier bytes omitted"),
+            "no omission note: {tail}"
+        );
+        assert!(!tail.contains(&"x".repeat(20)), "head not skipped: {tail}");
+
+        // A file smaller than the bound round-trips untouched.
+        let all = mgr.read_output_tail(&id, 1_000_000).await.unwrap();
+        assert!(!all.contains("omitted"));
+        assert!(all.starts_with("xxx"));
     }
 
     #[cfg(unix)]
