@@ -768,6 +768,13 @@ pub(super) async fn event_loop(
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
             }
+            // Drill-in: fetch the selected task's output off the UI path.
+            _ = std::future::ready(()), if app.pending_task_output.is_some() => {
+                if let Some(id) = app.pending_task_output.take() {
+                    let out = task_manager.read_output(&id).await;
+                    app.show_task_output(&id, out);
+                }
+            }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             _ = tasks_tick.tick(), if live || !app.tasks.is_empty() => {
                 let rows = task_manager
@@ -1147,6 +1154,22 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_queue_pane();
+        }
+        // When the tasks pane is open (and the queue pane is not, which
+        // owns the same keys), arrows move the selection and Enter opens
+        // the selected task's output.
+        (_, KeyCode::Up) if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() => {
+            app.tasks_select(-1);
+        }
+        (_, KeyCode::Down)
+            if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() =>
+        {
+            app.tasks_select(1);
+        }
+        (_, KeyCode::Enter)
+            if app.tasks_visible() && !app.show_queue_pane && app.input.is_empty() =>
+        {
+            app.drill_into_selected_task();
         }
         // When the queue pane is open, arrows and Enter drive it.
         (_, KeyCode::Up) if app.show_queue_pane && !app.queue.is_empty() => {

@@ -415,6 +415,10 @@ pub struct App {
     pub show_queue_pane: bool,
     /// Selected row in the queue pane (0 = head).
     pub queue_selected: usize,
+    /// Selected row in the tasks pane, for drill-in.
+    pub tasks_selected: usize,
+    /// Task id whose output the run loop should fetch and show.
+    pub pending_task_output: Option<String>,
     /// Ctrl+P command palette (slash command picker).
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
@@ -581,6 +585,8 @@ impl App {
             queue: std::collections::VecDeque::new(),
             show_queue_pane: false,
             queue_selected: 0,
+            tasks_selected: 0,
+            pending_task_output: None,
             command_palette: None,
             model_picker: None,
             theme_picker: None,
@@ -2032,6 +2038,59 @@ impl App {
         changed
     }
 
+    /// Move the tasks-pane selection, clamped to the row count.
+    pub fn tasks_select(&mut self, delta: i32) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        let n = self.tasks.len() as i32;
+        self.tasks_selected = (self.tasks_selected as i32 + delta).rem_euclid(n) as usize;
+        self.dirty = true;
+    }
+
+    /// Ask the run loop for the selected task's output (D4-27 drill-in).
+    ///
+    /// Only rows the `TaskManager` owns have output to show. A subagent
+    /// row's id is a subagent *type*, not a task id, so there is nothing
+    /// to read for it — say so rather than opening an empty pane.
+    pub fn drill_into_selected_task(&mut self) {
+        use super::tasks::TaskSource;
+        let Some(row) = self.tasks.get(self.tasks_selected) else {
+            return;
+        };
+        match row.source {
+            TaskSource::Background => {
+                self.pending_task_output = Some(row.agent_id.clone());
+                self.status_message = format!("loading output for {}…", row.agent_id);
+            }
+            TaskSource::Subagent => {
+                self.status_message =
+                    "inline subagents have no separate output to open".to_string();
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Show a task's output in the transcript.
+    pub fn show_task_output(&mut self, id: &str, output: Result<String, String>) {
+        let body = match output {
+            Ok(text) if text.trim().is_empty() => "(no output yet)".to_string(),
+            Ok(text) => text,
+            Err(e) => format!("could not read output: {e}"),
+        };
+        self.transcript.push(TranscriptItem::Tool {
+            call_id: format!("task-{id}"),
+            name: "Task output".into(),
+            detail: id.to_string(),
+            result: Some(body),
+            is_error: false,
+            live: None,
+        });
+        self.status_message.clear();
+        self.scroll_to_bottom();
+        self.dirty = true;
+    }
+
     pub fn toggle_tasks(&mut self) {
         self.show_tasks = !self.show_tasks;
         self.dirty = true;
@@ -3184,6 +3243,75 @@ mod tests {
             app.pending_submit.is_none(),
             "opening a picker is not a turn"
         );
+    }
+
+    #[test]
+    fn task_selection_wraps_and_clamps() {
+        let mut app = App::new("m", "/tmp", "s");
+        // Empty pane: selecting must not panic or move.
+        app.tasks_select(1);
+        assert_eq!(app.tasks_selected, 0);
+
+        app.sync_background_tasks(vec![
+            ("b1".into(), "working".into(), "one".into()),
+            ("b2".into(), "working".into(), "two".into()),
+        ]);
+        app.tasks_select(1);
+        assert_eq!(app.tasks_selected, 1);
+        app.tasks_select(1);
+        assert_eq!(app.tasks_selected, 0, "selection did not wrap");
+        app.tasks_select(-1);
+        assert_eq!(app.tasks_selected, 1, "backwards did not wrap");
+    }
+
+    /// Drill-in asks the run loop for output rather than reading it on
+    /// the UI path, so the request is what the test can observe.
+    #[test]
+    fn drilling_into_a_background_row_requests_its_output() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.sync_background_tasks(vec![("b7".into(), "working".into(), "build".into())]);
+        app.drill_into_selected_task();
+        assert_eq!(app.pending_task_output.as_deref(), Some("b7"));
+    }
+
+    /// A subagent row's id is a subagent *type*, not a task id, so there
+    /// is nothing to read. Saying so beats opening an empty pane.
+    #[test]
+    fn drilling_into_a_subagent_row_explains_there_is_no_output() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "explorer", "working", "look");
+        app.drill_into_selected_task();
+        assert!(
+            app.pending_task_output.is_none(),
+            "asked for output that cannot exist"
+        );
+        assert!(app.status_message.contains("no separate output"));
+    }
+
+    #[test]
+    fn task_output_lands_in_the_transcript() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_task_output("b7", Ok("built ok\n".into()));
+        let last = app.transcript.last().expect("an item");
+        match last {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "b7");
+                assert_eq!(result.as_deref(), Some("built ok\n"));
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_task_reports_the_error_instead_of_looking_empty() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_task_output("gone", Err("Task 'gone' not found".into()));
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => {
+                assert!(result.as_deref().unwrap().contains("not found"));
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
     }
 
     #[test]

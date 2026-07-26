@@ -634,8 +634,9 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let inner_w = area.width.saturating_sub(2) as usize;
     let mut last_source: Option<super::tasks::TaskSource> = None;
-    for t in &app.tasks {
+    for (idx, t) in app.tasks.iter().enumerate() {
         let p = palette();
+        let selected = idx == app.tasks_selected;
         // Group header when the source changes. Subagents and background
         // jobs arrive from different places but read as one list, so they
         // share the pane with a heading to tell them apart.
@@ -658,6 +659,10 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             TaskState::Failed => p.error,
         };
         lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "❯" } else { " " }.to_string(),
+                Style::default().fg(p.accent),
+            ),
             Span::styled(format!("{} ", t.state.glyph()), Style::default().fg(color)),
             Span::styled(
                 format!("{} ", t.state.word()),

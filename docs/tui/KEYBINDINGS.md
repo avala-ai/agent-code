@@ -13,6 +13,8 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+C` (also `Cmd+C` / Super+C) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit · **not** `Ctrl+Shift+C` (that is copy) |
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
+| `↑`/`↓` | Move the tasks-pane selection (pane open, empty composer) |
+| `Enter` | Open the selected background task's output (pane open, empty composer) |
 | `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
