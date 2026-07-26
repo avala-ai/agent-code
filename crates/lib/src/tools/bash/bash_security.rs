@@ -700,8 +700,22 @@ fn shell_statements(raw: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut stack: Vec<Context> = Vec::new();
+    let mut at_word_start = true;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
+        let word_start = at_word_start;
+        at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(');
+        // A separator inside a comment separates nothing: bash reads
+        // to the end of the line and forgets it.
+        if word_start
+            && c == '#'
+            && !matches!(stack.last(), Some(Context::Single | Context::Double))
+        {
+            while chars.peek().is_some_and(|next| *next != '\n') {
+                chars.next();
+            }
+            continue;
+        }
         if matches!(stack.last(), Some(Context::Single)) {
             current.push(c);
             if c == '\'' {
@@ -854,7 +868,8 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     enum Context {
         Single,
         Double,
-        /// `$( … )`, whose result joins the surrounding word.
+        /// `$( … )` and `<( … )`, whose result joins the surrounding
+        /// word.
         Substitution,
         /// `( … )`, a compound command that ends the word.
         Subshell,
@@ -865,26 +880,28 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
         control_operator: false,
         locale_quote: false,
     };
+    let text: Vec<char> = raw.chars().collect();
     let mut stack: Vec<Context> = Vec::new();
     let mut at_word_start = true;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i];
         let word_start = at_word_start;
-        // A closing `)` does not end the word: bash joins what follows
-        // onto it, so the `#` in `echo $(true)#x` is a literal
-        // character rather than the start of a comment.
+        // A closing `)` does not end the word when it closes a
+        // substitution: bash joins what follows onto it, so the `#` in
+        // `echo $(true)#x` is a literal character.
         at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(');
+        let peek = text.get(i + 1).copied();
         if matches!(stack.last(), Some(Context::Single)) {
             if c == '\'' {
                 stack.pop();
             }
+            i += 1;
             continue;
         }
         let in_double = matches!(stack.last(), Some(Context::Double));
         match c {
-            '\\' => {
-                chars.next();
-            }
+            '\\' => i += 1,
             '\'' if !in_double => stack.push(Context::Single),
             '"' => {
                 if in_double {
@@ -896,9 +913,9 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             // `$(` restarts quoting inside the substitution; `$"`
             // opens a translated string, but only where a `$` is
             // special — inside double quotes it is literal text.
-            '$' => match chars.peek() {
+            '$' => match peek {
                 Some('(') => {
-                    chars.next();
+                    i += 1;
                     stack.push(Context::Substitution);
                 }
                 Some('"') if !in_double => facts.locale_quote = true,
@@ -911,11 +928,19 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                     stack.push(Context::Backtick);
                 }
             }
+            // A heredoc body is data the shell hands to a command, not
+            // syntax: nothing in it is translated or executed, so it
+            // is skipped whole.
+            '<' if !in_double && peek == Some('<') => {
+                facts.control_operator = true;
+                i = skip_heredoc_body(&text, i + 2);
+                at_word_start = true;
+            }
             // `<( … )` and `>( … )` are process substitutions: the
             // result is a pathname that joins the surrounding word,
             // exactly as `$( … )` does.
-            '<' | '>' if !in_double && chars.peek() == Some(&'(') => {
-                chars.next();
+            '<' | '>' if !in_double && peek == Some('(') => {
+                i += 1;
                 stack.push(Context::Substitution);
             }
             '(' if !in_double => stack.push(Context::Subshell),
@@ -937,18 +962,63 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                 stack.pop();
             }
             '#' if word_start && !in_double => {
-                while chars.peek().is_some_and(|next| *next != '\n') {
-                    chars.next();
+                while text.get(i + 1).is_some_and(|next| *next != '\n') {
+                    i += 1;
                 }
             }
-            '&' | '|' | '<' if !in_double && chars.peek() == Some(&c) => {
+            '&' | '|' if !in_double && peek == Some(c) => {
                 facts.control_operator = true;
-                chars.next();
+                i += 1;
             }
             _ => {}
         }
+        i += 1;
     }
     facts
+}
+
+/// Skip a heredoc body, given the index just past its `<<`. Returns
+/// the index of the last character consumed.
+fn skip_heredoc_body(text: &[char], mut i: usize) -> usize {
+    if text.get(i) == Some(&'-') {
+        i += 1;
+    }
+    while text.get(i).is_some_and(|c| c.is_whitespace() && *c != '\n') {
+        i += 1;
+    }
+    let mut delimiter = String::new();
+    while let Some(&c) = text.get(i) {
+        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')') {
+            break;
+        }
+        if !matches!(c, '\'' | '"' | '\\') {
+            delimiter.push(c);
+        }
+        i += 1;
+    }
+    if delimiter.is_empty() {
+        return i.saturating_sub(1);
+    }
+    // The body starts on the next line and ends at a line holding the
+    // delimiter alone.
+    while text.get(i).is_some_and(|c| *c != '\n') {
+        i += 1;
+    }
+    while i < text.len() {
+        i += 1;
+        let line_start = i;
+        while text.get(i).is_some_and(|c| *c != '\n') {
+            i += 1;
+        }
+        let line: String = text[line_start..i.min(text.len())].iter().collect();
+        if line.trim() == delimiter {
+            return i.saturating_sub(1);
+        }
+        if i >= text.len() {
+            break;
+        }
+    }
+    text.len()
 }
 
 /// True when the command does something the statement walk cannot
@@ -2188,6 +2258,11 @@ mod tests {
             // A subshell's `)` ends the word, so this `#` does start
             // a comment.
             "(true)# $\"cat\"",
+            // A heredoc body is data: nothing in it is translated.
+            "cat <<'EOF'\n$\"cat\"\nEOF",
+            "cat <<EOF\n$\"cat\"\nEOF",
+            // A separator inside a comment separates nothing.
+            "export GIT_CONFIG_GLOBAL=/tmp/g # comment; git status",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
