@@ -197,9 +197,12 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // TABLE\ users` is one token that runs a whole statement.
         // Scanning each token on its own asks it without letting a
         // pattern span two arguments.
+        // Decoded whitespace is whitespace: `$'DROP\tTABLE users'`
+        // reaches the database as a statement with a tab where the
+        // pattern has a space, so runs of it read as one space.
         let per_token: Vec<String> = invocation
             .iter()
-            .map(|t| unquote_token(t).to_lowercase())
+            .map(|t| canonical_whitespace(&unquote_token(t)).to_lowercase())
             .collect();
         for pattern in DESTRUCTIVE_PATTERNS {
             if normalized.contains(pattern) || per_token.iter().any(|t| t.contains(pattern)) {
@@ -337,6 +340,10 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // payload is one token here, so tokens are searched word by
         // word rather than whole.
         let runs_git = parsed.invocations.iter().any(|invocation| {
+            // `env printf …` prints as `printf …` does, so the wrapper
+            // comes off before the head decides.
+            let unwrapped = unwrapped_argv(invocation);
+            let invocation = unwrapped.as_ref().unwrap_or(invocation);
             // A head whose operands are text runs nothing they name:
             // `GIT_CONFIG_GLOBAL=… printf '%s\n' git` prints the word.
             let head_is_data = invocation.first().is_some_and(|t| {
@@ -877,6 +884,25 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "HOME",
     "XDG_CONFIG_HOME",
 ];
+
+/// Every run of whitespace as a single space, so a decoded tab or
+/// newline reads the way the patterns are written.
+fn canonical_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
 
 /// True when a locale-translated string in this command could decide
 /// what runs.
@@ -2371,6 +2397,9 @@ mod tests {
             // rather than quoted.
             "psql -c DROP\\ TABLE\\ users",
             "mysql -e DELETE\\ FROM\\ users",
+            // Decoded whitespace is whitespace to the database.
+            "psql -c $'DROP\\tTABLE users'",
+            "mysql -e $'DELETE\\nFROM users'",
             // The locale catalogue decides what a `$\"…\"` string is,
             // so even an innocuous-looking one is unknown.
             "$\"cat\" file.txt",
@@ -2559,6 +2588,7 @@ mod tests {
             // A prefix-scoped assignment on a data command: the `git`
             // here is a word to print, not a command.
             "GIT_CONFIG_GLOBAL=/tmp/g printf '%s\\n' git",
+            "GIT_CONFIG_GLOBAL=/tmp/g env printf '%s\\n' git",
             // A wrapped data command still only prints.
             "env printf '%s\\n' 'git' push --force",
             "command echo 'git' push --force",
