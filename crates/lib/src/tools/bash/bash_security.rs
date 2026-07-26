@@ -164,6 +164,11 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // prints four words. The raw scan still reads those invocations,
     // so this only declines to *add* a match the text does not have.
     for invocation in &cmd.invocations {
+        // `env printf …` prints just as `printf …` does, so the
+        // wrapper comes off before the head is read — and the
+        // wrapper's own view is not scanned as executable operands.
+        let unwrapped = unwrapped_argv(invocation);
+        let invocation = unwrapped.as_ref().unwrap_or(invocation);
         let head_is_data = invocation.first().is_some_and(|t| {
             DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
         });
@@ -211,11 +216,12 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         if wrapper_only_reports(&unquoted) {
             continue;
         }
+        // When the chain resolves, the wrapped view is the only
+        // accurate one: with `env` as the head, `env printf … git push
+        // --force` would read a printed word as a command.
         let unwrapped = unwrapped_argv(invocation);
-        for tokens in [Some(invocation.as_slice()), unwrapped.as_deref()]
-            .into_iter()
-            .flatten()
         {
+            let tokens = unwrapped.as_deref().unwrap_or(invocation.as_slice());
             if let Some(reason) = clustered_git_flag(tokens) {
                 findings.push(DestructiveFinding {
                     level: DestructivenessLevel::Destructive,
@@ -752,6 +758,45 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "XDG_CONFIG_HOME",
 ];
 
+/// True when `&&`, `||` or a heredoc appears as an actual shell
+/// construct rather than inside quoted data or a comment: `printf
+/// '%s\n' 'a && b'` branches nowhere.
+fn has_unquoted_operator(raw: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    chars.next();
+                }
+                // A comment runs to the end of the line.
+                '#' => {
+                    while chars.peek().is_some_and(|next| *next != '\n') {
+                        chars.next();
+                    }
+                }
+                '&' | '|' | '<' if chars.peek() == Some(&c) => return true,
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 /// True when the command does something the statement walk cannot
 /// follow: a branch whose statements may not run, a heredoc whose body
 /// is data rather than statements, or a `set` carrying operands whose
@@ -761,7 +806,7 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
 /// [`carries_git_config`]'s question, so an ordinary `git status &&
 /// git log` is untouched.
 fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
-    if raw.contains("&&") || raw.contains("||") || raw.contains("<<") {
+    if has_unquoted_operator(raw) {
         return true;
     }
     statements.iter().any(|statement| {
@@ -2014,6 +2059,12 @@ mod tests {
             // A prefix-scoped assignment on a data command: the `git`
             // here is a word to print, not a command.
             "GIT_CONFIG_GLOBAL=/tmp/g printf '%s\\n' git",
+            // A wrapped data command still only prints.
+            "env printf '%s\\n' 'git' push --force",
+            "command echo 'git' push --force",
+            // An operator inside quoted data branches nowhere.
+            "export GIT_CONFIG_GLOBAL=/dev/null; printf '%s\\n' 'a && b'; git status",
+            "export GIT_CONFIG_GLOBAL=/dev/null; echo '<<EOF'; git status",
             // A key that merely contains `alias.` does not define one.
             "GIT_CONFIG_PARAMETERS=\"'user.alias.foo'='x'\" git status",
             // `command -v` describes the builtin, it does not run it.
