@@ -237,6 +237,14 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // payload is one token here, so tokens are searched word by
         // word rather than whole.
         let runs_git = parsed.invocations.iter().any(|invocation| {
+            // A head whose operands are text runs nothing they name:
+            // `GIT_CONFIG_GLOBAL=… printf '%s\n' git` prints the word.
+            let head_is_data = invocation.first().is_some_and(|t| {
+                DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+            });
+            if head_is_data {
+                return false;
+            }
             [
                 Some(invocation.as_slice()),
                 unwrapped_argv(invocation).as_deref(),
@@ -654,7 +662,9 @@ fn exported_env_pairs(statement: &str, parsed: &ParsedCommand) -> Vec<(String, S
         invocation
             .iter()
             .map(|t| base_name(&unquote_token(t)))
-            .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()))
+            // A wrapper's own options (`command -p export …`, `command
+            // -- export …`) sit between it and the command it runs.
+            .find(|word| !BUILTIN_PREFIXES.contains(&word.as_str()) && !word.starts_with('-'))
             .is_some_and(|word| EXPORTING_BUILTINS.contains(&word.as_str()))
     });
     if exports_via_builtin {
@@ -825,7 +835,11 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         let dynamic_value = value.contains('$') || value.contains('`');
         let names_an_alias = value.to_lowercase().starts_with("alias.");
         if name == "GIT_CONFIG_PARAMETERS" {
-            return dynamic_value || value.to_lowercase().contains("alias.");
+            let value = value.to_lowercase();
+            return dynamic_value
+                || ["alias.", "include.", "includeif."]
+                    .iter()
+                    .any(|prefix| value.contains(prefix));
         }
         // A config *file* can define aliases too, and its contents are
         // not in the command at all. `/dev/null` and an empty path are
@@ -844,18 +858,24 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         }
         match name.strip_prefix("GIT_CONFIG_KEY_") {
             Some(index) if index.chars().all(|c| c.is_ascii_digit()) => {
-                // An include directive pulls in a file whose contents
-                // are not in the command either, and that file can
-                // define aliases just as a config file can.
-                let value = value.to_lowercase();
-                dynamic_value
-                    || names_an_alias
-                    || value.starts_with("include.")
-                    || value.starts_with("includeif.")
+                dynamic_value || names_an_alias || config_key_is_opaque(value)
             }
             _ => false,
         }
     })
+}
+
+/// Config keys that can make git run something the command text does
+/// not show: an alias *is* a command, and an include names a file that
+/// can define one. Every carrier — `-c`, `--config-env`,
+/// `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_PARAMETERS` — is asked this one
+/// question, so a new carrier cannot be given a weaker rule by
+/// accident.
+fn config_key_is_opaque(key: &str) -> bool {
+    let key = key.trim_matches(|c| c == '\'' || c == '"').to_lowercase();
+    ["alias.", "include.", "includeif."]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 /// The alias name a config key defines, if it defines one:
@@ -1009,6 +1029,11 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
             if definition.contains(['$', '`']) {
                 return Some(AliasExpansion::Unresolved);
             }
+            // An include names a file that can define any alias, so
+            // which command word it binds to is unknowable here.
+            if config_key_is_opaque(definition) && alias_key_name(definition).is_none() {
+                return Some(AliasExpansion::Unresolved);
+            }
             if let Some(name) = alias_key_name(definition) {
                 opaque.push(name);
             }
@@ -1016,6 +1041,11 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
         // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
         // as one.
         let body = token.strip_prefix("-c").unwrap_or(token);
+        // An include supplied the same way pulls in aliases this scan
+        // cannot read.
+        if config_key_is_opaque(body) && alias_key_name(body).is_none() {
+            return Some(AliasExpansion::Unresolved);
+        }
         // Git config section and key names are case-insensitive, so
         // `Alias.p` defines the same alias as `alias.p`.
         const PREFIX: &str = "alias.";
@@ -1544,6 +1574,13 @@ mod tests {
             // aliases.
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path \
              GIT_CONFIG_VALUE_0=/tmp/g git p",
+            // A wrapper's own options do not stop the export.
+            "command -p export GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            "command -- export GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // Every carrier of an include gets the same answer.
+            "git -c include.path=/tmp/g p",
+            "git --config-env=include.path=VAR p",
+            "GIT_CONFIG_PARAMETERS=\"'include.path'='/tmp/g'\" git p",
             // An interpreter that can run a command does not make its
             // operands data.
             "awk 'BEGIN{system(ARGV[1] \" \" ARGV[2] \" \" ARGV[3]); exit}' git push -uf",
@@ -1662,6 +1699,9 @@ mod tests {
             // A prefix assignment belongs to the statement it
             // introduces, not to a later one.
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true; git status",
+            // A prefix-scoped assignment on a data command: the `git`
+            // here is a word to print, not a command.
+            "GIT_CONFIG_GLOBAL=/tmp/g printf '%s\\n' git",
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true && git log -p",
             // An assignment-looking operand of a command that sets
             // nothing is data.
