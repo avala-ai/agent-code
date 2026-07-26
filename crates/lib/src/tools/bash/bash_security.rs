@@ -352,10 +352,19 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             .into_iter()
             .flatten()
             .any(|tokens| {
-                tokens.iter().any(|token| {
+                tokens.iter().enumerate().any(|(index, token)| {
                     split_alias_value(&unquote_token(token))
                         .iter()
                         .any(|word| base_name(word).to_lowercase() == "git")
+                        // `git --version` prints and exits without
+                        // dispatching anything, so no alias of any
+                        // origin can run.
+                        && !dispatches_no_subcommand(
+                            &tokens[index + 1..]
+                                .iter()
+                                .map(|t| unquote_token(t))
+                                .collect::<Vec<_>>(),
+                        )
                 })
             })
         });
@@ -693,7 +702,10 @@ fn shell_statements(raw: &str) -> Vec<String> {
     enum Context {
         Single,
         Double,
-        Paren,
+        /// `$( … )` / `<( … )`: the result joins the word around it.
+        Substitution,
+        /// `( … )`: a compound command whose `)` ends the word.
+        Subshell,
         Brace,
         Backtick,
     }
@@ -745,7 +757,7 @@ fn shell_statements(raw: &str) -> Vec<String> {
             }
             '$' if chars.peek() == Some(&'(') => {
                 chars.next();
-                stack.push(Context::Paren);
+                stack.push(Context::Substitution);
                 current.push('$');
                 current.push('(');
             }
@@ -757,16 +769,31 @@ fn shell_statements(raw: &str) -> Vec<String> {
                 }
                 current.push(c);
             }
+            '<' | '>' if !in_double && chars.peek() == Some(&'(') => {
+                chars.next();
+                stack.push(Context::Substitution);
+                current.push(c);
+                current.push('(');
+            }
             '(' if !in_double => {
-                stack.push(Context::Paren);
+                stack.push(Context::Subshell);
                 current.push(c);
             }
             '{' if !in_double => {
                 stack.push(Context::Brace);
                 current.push(c);
             }
-            ')' if matches!(stack.last(), Some(Context::Paren)) => {
-                stack.pop();
+            ')' if matches!(
+                stack.last(),
+                Some(Context::Substitution | Context::Subshell)
+            ) =>
+            {
+                // A subshell's `)` ends the word, so a `#` after it
+                // starts a comment; a substitution's result joins the
+                // word and does not.
+                if matches!(stack.pop(), Some(Context::Subshell)) {
+                    at_word_start = true;
+                }
                 current.push(c);
             }
             '}' if matches!(stack.last(), Some(Context::Brace)) => {
@@ -883,9 +910,22 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     let text: Vec<char> = raw.chars().collect();
     let mut stack: Vec<Context> = Vec::new();
     let mut at_word_start = true;
+    // Heredocs declared on the current line, in the order their
+    // bodies will follow it.
+    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
     let mut i = 0;
     while i < text.len() {
         let c = text[i];
+        // The line has ended and a heredoc was declared on it: its
+        // body is data the command receives, so it is skipped whole.
+        if c == '\n' && !pending_heredocs.is_empty() {
+            for (delimiter, strip_tabs) in std::mem::take(&mut pending_heredocs) {
+                i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+            }
+            at_word_start = true;
+            i += 1;
+            continue;
+        }
         let word_start = at_word_start;
         // A closing `)` does not end the word when it closes a
         // substitution: bash joins what follows onto it, so the `#` in
@@ -931,10 +971,29 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             // A heredoc body is data the shell hands to a command, not
             // syntax: nothing in it is translated or executed, so it
             // is skipped whole.
+            // A heredoc: `<<` but not `<<<`, which is a here-string
+            // with no body at all. The declaration line keeps being
+            // scanned — commands can follow the redirect — and only
+            // the body, which is data rather than syntax, is skipped
+            // when the line ends.
             '<' if !in_double && peek == Some('<') => {
-                facts.control_operator = true;
-                i = skip_heredoc_body(&text, i + 2);
-                at_word_start = true;
+                // The whole run of `<` is consumed at once, or the
+                // tail of `<<<` would be read as another `<<`.
+                let mut run = 0;
+                while text.get(i + run) == Some(&'<') {
+                    run += 1;
+                }
+                if run == 2 {
+                    facts.control_operator = true;
+                    let (delimiter, strip_tabs, next) = read_heredoc_delimiter(&text, i + run);
+                    if let Some(delimiter) = delimiter {
+                        pending_heredocs.push((delimiter, strip_tabs));
+                    }
+                    i = next.saturating_sub(1);
+                } else {
+                    // `<<<` is a here-string: one line, no body.
+                    i += run - 1;
+                }
             }
             // `<( … )` and `>( … )` are process substitutions: the
             // result is a pathname that joins the surrounding word,
@@ -977,18 +1036,21 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     facts
 }
 
-/// Skip a heredoc body, given the index just past its `<<`. Returns
-/// the index of the last character consumed.
-fn skip_heredoc_body(text: &[char], mut i: usize) -> usize {
-    if text.get(i) == Some(&'-') {
+/// Read a heredoc's delimiter, given the index just past its `<<`.
+/// Returns the delimiter (quoting removed), whether the operator was
+/// `<<-` (which strips leading tabs from the terminator), and the
+/// index just past the delimiter word.
+fn read_heredoc_delimiter(text: &[char], mut i: usize) -> (Option<String>, bool, usize) {
+    let strip_tabs = text.get(i) == Some(&'-');
+    if strip_tabs {
         i += 1;
     }
-    while text.get(i).is_some_and(|c| c.is_whitespace() && *c != '\n') {
+    while text.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
         i += 1;
     }
     let mut delimiter = String::new();
     while let Some(&c) = text.get(i) {
-        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')') {
+        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '<' | '>') {
             break;
         }
         if !matches!(c, '\'' | '"' | '\\') {
@@ -996,27 +1058,38 @@ fn skip_heredoc_body(text: &[char], mut i: usize) -> usize {
         }
         i += 1;
     }
-    if delimiter.is_empty() {
-        return i.saturating_sub(1);
-    }
-    // The body starts on the next line and ends at a line holding the
-    // delimiter alone.
-    while text.get(i).is_some_and(|c| *c != '\n') {
-        i += 1;
-    }
+    ((!delimiter.is_empty()).then_some(delimiter), strip_tabs, i)
+}
+
+/// Skip a heredoc body, given the index of the newline that ends its
+/// declaration line. Returns the index of the newline ending the
+/// terminator line, or the last index when the body is unterminated.
+///
+/// The terminator is a line holding the delimiter and nothing else;
+/// `<<-` allows leading *tabs* before it, and nothing else does — so
+/// an indented line is body text.
+fn skip_heredoc_body(text: &[char], mut i: usize, delimiter: &str, strip_tabs: bool) -> usize {
     while i < text.len() {
-        i += 1;
-        let line_start = i;
-        while text.get(i).is_some_and(|c| *c != '\n') {
-            i += 1;
+        let line_start = i + 1;
+        let mut line_end = line_start;
+        while text.get(line_end).is_some_and(|c| *c != '\n') {
+            line_end += 1;
         }
-        let line: String = text[line_start..i.min(text.len())].iter().collect();
-        if line.trim() == delimiter {
-            return i.saturating_sub(1);
+        let line: String = text[line_start.min(text.len())..line_end.min(text.len())]
+            .iter()
+            .collect();
+        let candidate = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if candidate == delimiter {
+            return line_end.saturating_sub(1);
         }
-        if i >= text.len() {
-            break;
+        if line_end >= text.len() {
+            return text.len();
         }
+        i = line_end;
     }
     text.len()
 }
@@ -1072,7 +1145,6 @@ fn carries_git_config(statements: &[String]) -> bool {
             push_assignment(&mut assigned, word);
         }
         assigned.iter().any(|(name, _)| {
-            let name = name.to_ascii_uppercase();
             GIT_CONFIG_SELECTORS.contains(&name.as_str()) || name.starts_with("GIT_CONFIG")
         })
     })
@@ -1354,7 +1426,9 @@ fn split_string_payload(token: &str, next: Option<&String>) -> Option<String> {
 /// (`GIT_CONFIG_KEY_0=user.name`) says nothing about what runs.
 fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
     assignments.iter().any(|(name, value)| {
-        let name = name.to_ascii_uppercase();
+        // Environment names are case-sensitive: `home=/tmp/h` sets an
+        // unrelated variable that git never reads.
+        let name = name.clone();
         let dynamic_value = value.contains('$') || value.contains('`');
         let names_an_alias = value.to_lowercase().starts_with("alias.");
         // A name the shell still has to expand could be any variable,
@@ -2185,6 +2259,8 @@ mod tests {
             // A process substitution's pathname joins the word too.
             "true <(true)#x; $\"cat\"",
             "true >(true)#x; $\"cat\"",
+            // A command after the heredoc redirect still runs.
+            "cat <<EOF; $\"safe\"\nbody\nEOF",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
@@ -2263,6 +2339,17 @@ mod tests {
             "cat <<EOF\n$\"cat\"\nEOF",
             // A separator inside a comment separates nothing.
             "export GIT_CONFIG_GLOBAL=/tmp/g # comment; git status",
+            "export GIT_CONFIG_GLOBAL=/tmp/g; (true)# comment; git status",
+            // A here-string has no body and no ambiguity.
+            "export GIT_CONFIG_GLOBAL=/dev/null; cat <<< x",
+            // Indentation makes a line body text, not the terminator.
+            "cat <<'EOF'\n  EOF\n$\"cat\"\nEOF",
+            // Environment names are case-sensitive.
+            "home=/tmp/h git status",
+            "git_config_global=/tmp/g git status",
+            // A report-only git call dispatches nothing.
+            "GIT_CONFIG_GLOBAL=/tmp/g git --version",
+            "HOME=/tmp git --html-path",
             "echo $HOME",
             // `\c3` is control byte 0x13, not `s` — this only prints a
             // control character and must not read as `shutdown`.
