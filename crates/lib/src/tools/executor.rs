@@ -255,8 +255,16 @@ async fn execute_single_tool(
             // adjacent to it. Reached only from `Ask`, so it can never
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
-            let sandbox_active = ctx.sandbox.as_ref().is_some_and(|s| s.is_active());
-            let grant_key = persistent_grant_key(&call.name, &call.input, sandbox_active);
+            // "none" when nothing actively isolates subprocesses (no
+            // sandbox, disabled, or degraded open); otherwise a
+            // fingerprint of the effective policy, so a grant recorded
+            // under one isolation regime stops matching when the regime
+            // weakens between sessions.
+            let sandbox_state = match ctx.sandbox {
+                Some(ref s) if s.is_active() => s.isolation_fingerprint(),
+                _ => "none".to_string(),
+            };
+            let grant_key = persistent_grant_key(&call.name, &call.input, &sandbox_state);
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
                 None => false,
@@ -307,15 +315,28 @@ async fn execute_single_tool(
                         }
                     }
                     super::PermissionResponse::AllowAlways => {
-                        // Remember for this session regardless, so the
-                        // answer holds even if the disk write fails.
-                        if let Some(ref allows) = ctx.session_allows {
-                            allows.lock().await.insert(allow_key.clone());
-                        }
-                        if let Some(ref grants) = ctx.persistent_grants
-                            && let Err(e) = grants.lock().await.insert(&grant_key, &description)
-                        {
-                            tracing::warn!("could not persist permission grant: {e}");
+                        match ctx.persistent_grants {
+                            // Record ONLY the exact key. Routing "always"
+                            // through the session-allow store would widen
+                            // it for the rest of this session (that store
+                            // reduces writes to their path) and would
+                            // survive `/permissions clear`. The grant
+                            // store covers the current session too, and
+                            // keeps the answer in memory if the disk
+                            // write fails.
+                            Some(ref grants) => {
+                                if let Err(e) = grants.lock().await.insert(&grant_key, &description)
+                                {
+                                    tracing::warn!("could not persist permission grant: {e}");
+                                }
+                            }
+                            // Feature disabled by the host: degrade to
+                            // session scope, the documented fallback.
+                            None => {
+                                if let Some(ref allows) = ctx.session_allows {
+                                    allows.lock().await.insert(allow_key.clone());
+                                }
+                            }
                         }
                     }
                     super::PermissionResponse::Deny => {
@@ -433,10 +454,11 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 ///   what an approval *means*: the sandbox-bypass flag, the background
 ///   flag (background runs skip the sandbox wrapper), the normalized
 ///   effective timeout (a longer timeout lets later side effects of the
-///   same command run), and `sandbox_active` — whether the session's
-///   sandbox is actually wrapping subprocesses. A grant recorded under
-///   isolation must not authorize the same command running bare on the
-///   host in a later session where the sandbox is off or degraded open.
+///   same command run), and `sandbox_state` — a fingerprint of the
+///   effective isolation policy ("none" when nothing isolates). A grant
+///   recorded under isolation must not authorize the same command when
+///   the sandbox is off, degraded open, or merely *weaker* (network
+///   enabled, write paths widened) in a later session.
 ///   Only `description` is advisory and excluded.
 /// - `WebFetch`: the URL is the side effect.
 /// - Everything else, including every write tool, keys on the full input:
@@ -444,7 +466,7 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 ///   so the string is canonical, and SHA-256 pins the payload — this is
 ///   an authorization boundary, so the digest must be collision-resistant
 ///   against adversarially chosen payloads, not merely collision-sparse.
-pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_active: bool) -> String {
+pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_state: &str) -> String {
     let shape = match tool {
         "Bash" | "PowerShell" => {
             let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -461,7 +483,7 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_activ
             // budget re-prompts.
             let timeout = crate::tools::bash::effective_timeout_ms(input);
             format!(
-                "cmd:{command}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_active}"
+                "cmd:{command}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}"
             )
         }
         "WebFetch" => input
@@ -491,10 +513,10 @@ pub fn persistent_grant_key(tool: &str, input: &serde_json::Value, sandbox_activ
 mod session_allow_tests {
     use super::*;
 
-    /// `persistent_grant_key` with the sandbox inactive — the common
-    /// fixture for properties that do not concern isolation state.
+    /// `persistent_grant_key` with no active isolation — the common
+    /// fixture for properties that do not concern the sandbox state.
     fn pkey(tool: &str, input: &serde_json::Value) -> String {
-        persistent_grant_key(tool, input, false)
+        persistent_grant_key(tool, input, "none")
     }
 
     /// The property that makes exact-key grants safe: appending to an
@@ -608,14 +630,21 @@ mod session_allow_tests {
     /// The *session's* effective isolation is part of the key: a grant
     /// recorded while the sandbox actively wraps commands must not
     /// authorize the same command running bare on the host after the
-    /// sandbox is disabled or degrades open.
+    /// sandbox is disabled, degrades open, or merely weakens (a policy
+    /// change produces a different fingerprint).
     #[test]
     fn a_bash_grant_key_is_bound_to_the_effective_sandbox_state() {
         let input = serde_json::json!({"command": "make"});
+        let isolated = persistent_grant_key("Bash", &input, "fp-strict-policy");
         assert_ne!(
-            persistent_grant_key("Bash", &input, true),
-            persistent_grant_key("Bash", &input, false),
+            isolated,
+            persistent_grant_key("Bash", &input, "none"),
             "a grant crossed between isolated and unisolated sessions"
+        );
+        assert_ne!(
+            isolated,
+            persistent_grant_key("Bash", &input, "fp-weaker-policy"),
+            "a grant survived an isolation-policy change"
         );
     }
 

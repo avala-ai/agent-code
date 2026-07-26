@@ -58,6 +58,10 @@ pub struct GrantStore {
     project: String,
     keys: HashSet<String>,
     labels: Vec<(String, String)>,
+    /// Exact keys the user answered "always" to that could not be
+    /// written to disk. Honored for this process only, and held apart
+    /// from `keys` so a refresh cannot mistake them for on-disk state.
+    session_fallback: HashSet<String>,
 }
 
 impl GrantStore {
@@ -72,6 +76,7 @@ impl GrantStore {
             path,
             project,
             keys: HashSet::new(),
+            session_fallback: HashSet::new(),
             labels: Vec::new(),
         };
         let Some(ref p) = store.path else {
@@ -97,6 +102,7 @@ impl GrantStore {
             path: None,
             project: String::new(),
             keys: HashSet::new(),
+            session_fallback: HashSet::new(),
             labels: Vec::new(),
         }
     }
@@ -109,7 +115,7 @@ impl GrantStore {
     /// for calls that would otherwise prompt a human.
     pub fn contains(&mut self, key: &str) -> bool {
         self.refresh();
-        self.keys.contains(key)
+        self.keys.contains(key) || self.session_fallback.contains(key)
     }
 
     /// Replace the cached view with the file as it exists on disk.
@@ -134,13 +140,13 @@ impl GrantStore {
     }
 
     /// Record a grant and persist it. Returns whether anything was
-    /// written — a repeat grant is a no-op.
+    /// recorded — a repeat grant is a no-op.
     ///
-    /// A write failure is reported to the caller; the answer the user
-    /// just gave is not lost because the executor also records every
-    /// "always" in the session-allow store. (This store's cached view
-    /// tracks the *file* — see [`Self::contains`] — so it cannot promise
-    /// to remember what the file could not.)
+    /// On a write failure the error is reported but the exact key is
+    /// kept in a session-only fallback set: the user said "always", and
+    /// losing the file must not also lose the answer they just gave —
+    /// while staying exact and revocable via [`Self::clear`], which a
+    /// broader session-allow entry would not be.
     ///
     /// The write is serialized against other live sessions: under an
     /// exclusive file lock the current file is re-read and only this one
@@ -148,15 +154,27 @@ impl GrantStore {
     /// instead would resurrect every grant another session cleared after
     /// we loaded — a stale process must never widen what is on disk.
     pub fn insert(&mut self, key: &str, label: &str) -> Result<bool, String> {
-        if !self.keys.insert(key.to_string()) {
+        if self.keys.contains(key) || self.session_fallback.contains(key) {
             return Ok(false);
         }
-        self.labels.push((key.to_string(), label.to_string()));
         let Some(path) = self.path.clone() else {
+            // Ephemeral store: memory is the whole store.
+            self.keys.insert(key.to_string());
+            self.labels.push((key.to_string(), label.to_string()));
             return Ok(true);
         };
-        let _lock = lock_grant_file(&path)?;
-        let mut disk = read_grant_file(&path);
+        match self.insert_durable(&path, key, label) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.session_fallback.insert(key.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    fn insert_durable(&mut self, path: &Path, key: &str, label: &str) -> Result<(), String> {
+        let _lock = lock_grant_file(path)?;
+        let mut disk = read_grant_file(path);
         if !disk.grants.iter().any(|g| g.key == key) {
             disk.grants.push(GrantEntry {
                 key: key.to_string(),
@@ -165,16 +183,14 @@ impl GrantStore {
         }
         // Adopt the merged view: what is on disk now, plus this grant.
         // In-memory grants another session cleared stop applying here
-        // too — the clear wins. This session's own past answers are
-        // unaffected: they also live in the session-allow store.
+        // too — the clear wins.
         self.keys = disk.grants.iter().map(|g| g.key.clone()).collect();
         self.labels = disk
             .grants
             .iter()
             .map(|g| (g.key.clone(), g.label.clone()))
             .collect();
-        self.write_locked(&path, &disk)?;
-        Ok(true)
+        self.write_locked(path, &disk)
     }
 
     /// Drop every grant for this project and persist the empty file.
@@ -184,6 +200,9 @@ impl GrantStore {
     pub fn clear(&mut self) -> Result<(), String> {
         self.keys.clear();
         self.labels.clear();
+        // Session-only fallback grants are revoked too — `clear` means
+        // every recorded approval, wherever it lives.
+        self.session_fallback.clear();
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -544,6 +563,40 @@ mod tests {
         assert!(
             !session_b.contains("Bash\0cargo run"),
             "a cleared grant kept suppressing prompts in a live session"
+        );
+    }
+
+    /// A failed disk write must not lose the answer the user just gave —
+    /// the exact key stays honored for this process — but it must stay
+    /// revocable: `/permissions clear` removes it even when the file is
+    /// unwritable.
+    #[test]
+    fn a_failed_write_still_honors_the_answer_and_stays_revocable() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        // Occupy the grants directory's path with a regular file so
+        // every lock/write attempt fails.
+        let path = grant_file_path(project.path()).unwrap();
+        let grants_dir = path.parent().unwrap();
+        std::fs::create_dir_all(grants_dir.parent().unwrap()).unwrap();
+        std::fs::write(grants_dir, b"not a directory").unwrap();
+
+        let mut store = GrantStore::load(project.path());
+        assert!(
+            store.insert("Bash\0ls", "Bash: ls").is_err(),
+            "precondition: the write must fail"
+        );
+        assert!(
+            store.contains("Bash\0ls"),
+            "a failed write lost the user's answer for this session"
+        );
+        // Clear revokes the fallback too, even though persisting the
+        // empty file also fails.
+        let _ = store.clear();
+        assert!(
+            !store.contains("Bash\0ls"),
+            "clear left a session-fallback grant alive"
         );
     }
 
