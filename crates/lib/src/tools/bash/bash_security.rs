@@ -217,6 +217,32 @@ mod tests {
         }
     }
 
+    /// ANSI-C (`$'…'`) and locale (`$"…"`) quoting are decoded by bash
+    /// before the command runs: `$'git' push --force` executes `git
+    /// push --force`. `unquote_token` used to keep the `$`, so the
+    /// normalized scan compared against `$git push --force` and every
+    /// one of these walked past `BashTool::validate_input`.
+    #[test]
+    fn ansi_c_quoting_cannot_hide_a_destructive_command() {
+        for cmd in [
+            "$'git' push --force",
+            "$\"git\" push --force",
+            "$'rm' -rf /tmp/x",
+            "$'r\\x6d' -rf /tmp/x",
+            "$'ch'mod 777 /etc",
+            "$'sh'utdown -h now",
+            "env $'git' push --force",
+            "nohup $'rm' -rf /tmp/x",
+        ] {
+            let parsed = parse_bash(cmd).expect("parses");
+            assert_eq!(
+                classify_destructive(&parsed),
+                DestructivenessLevel::Destructive,
+                "re-spelling hid a destructive command: {cmd}"
+            );
+        }
+    }
+
     /// Known limitation, pre-dating this change: the scan cannot tell a
     /// command from a string that merely mentions one, so searching for a
     /// dangerous pattern is refused. Pinned here so the behaviour is
@@ -250,6 +276,12 @@ mod tests {
             "cargo build",
             "chmod 644 file.txt",
             "echo hi | grep h",
+            // Legitimate ANSI-C quoting must not trip the decode.
+            "echo $'hello\\nworld'",
+            "grep $'\\t' notes.txt",
+            "printf $'%s\\n' one two",
+            "echo \"$100 reward\"",
+            "echo $HOME",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(

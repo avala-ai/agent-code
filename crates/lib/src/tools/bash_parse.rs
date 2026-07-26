@@ -186,7 +186,10 @@ fn command_argv(node: Node, source: &[u8]) -> Vec<String> {
 /// `-dele\te`.
 ///
 /// Follows shell rules closely enough for matching: inside single
-/// quotes a backslash is literal; elsewhere `\x` yields `x`.
+/// quotes a backslash is literal; elsewhere `\x` yields `x`. ANSI-C
+/// quoting is decoded too — bash hands `$'git'` to the kernel as
+/// `git`, so leaving the `$` in place would let that spelling walk
+/// past every scan that matches on the unquoted token.
 pub fn unquote_token(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -219,9 +222,30 @@ pub fn unquote_token(raw: &str) -> String {
                 },
                 _ => out.push(c),
             },
-            Some(_) => unreachable!("only ' and \" open a quote"),
+            // ANSI-C string body: `$'…'`, tracked as `Some('$')`.
+            Some('$') => match c {
+                '\'' => quote = None,
+                '\\' => push_ansi_c_escape(&mut chars, &mut out),
+                _ => out.push(c),
+            },
+            Some(_) => unreachable!("only ', \" and $' open a quote"),
             None => match c {
                 '\'' | '"' => quote = Some(c),
+                '$' => match chars.peek() {
+                    // ANSI-C quoting: bash decodes the escapes and the
+                    // command sees only the result, so `$'git' push
+                    // --force` executes `git push --force`.
+                    Some('\'') => {
+                        chars.next();
+                        quote = Some('$');
+                    }
+                    // Locale translation `$"…"` behaves like `"…"`.
+                    Some('"') => {
+                        chars.next();
+                        quote = Some('"');
+                    }
+                    _ => out.push('$'),
+                },
                 '\\' => match chars.next() {
                     Some('\n') | None => {}
                     Some(next) => out.push(next),
@@ -231,6 +255,85 @@ pub fn unquote_token(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Decode one backslash escape inside an ANSI-C `$'…'` string,
+/// pushing what bash would hand to the command. `$'r\x6d'` is `rm`,
+/// so numeric escapes must decode to their character or the pattern
+/// scans compare against the wrong text. Escapes bash leaves alone
+/// are kept literally.
+fn push_ansi_c_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    fn radix_value(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max_digits: u32,
+        seed: u32,
+    ) -> u32 {
+        let mut value = seed;
+        let mut taken = 0;
+        while taken < max_digits {
+            match chars.peek().and_then(|c| c.to_digit(radix)) {
+                Some(d) => {
+                    chars.next();
+                    value = value * radix + d;
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+        value
+    }
+    let Some(esc) = chars.next() else {
+        out.push('\\');
+        return;
+    };
+    match esc {
+        'a' => out.push('\x07'),
+        'b' => out.push('\x08'),
+        'e' | 'E' => out.push('\x1b'),
+        'f' => out.push('\x0c'),
+        'n' => out.push('\n'),
+        'r' => out.push('\r'),
+        't' => out.push('\t'),
+        'v' => out.push('\x0b'),
+        '\\' | '\'' | '"' | '?' => out.push(esc),
+        'x' => match chars.peek().and_then(|c| c.to_digit(16)) {
+            Some(_) => out.push(char::from(radix_value(chars, 16, 2, 0) as u8)),
+            None => out.push_str("\\x"),
+        },
+        'u' | 'U' => {
+            let max = if esc == 'u' { 4 } else { 8 };
+            match chars.peek().and_then(|c| c.to_digit(16)) {
+                // An invalid code point can never be pattern text; the
+                // replacement character keeps the scan conservative.
+                Some(_) => {
+                    out.push(char::from_u32(radix_value(chars, 16, max, 0)).unwrap_or('\u{fffd}'))
+                }
+                None => {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+        }
+        d @ '0'..='7' => {
+            // Octal, up to three digits counting this one; bash keeps
+            // the low eight bits.
+            let value = radix_value(chars, 8, 2, d.to_digit(8).unwrap_or(0));
+            out.push(char::from((value & 0xff) as u8));
+        }
+        'c' => match chars.next() {
+            // `\cX` is Ctrl-X — a control byte, never pattern text.
+            Some(ctl) if ctl.is_ascii() => {
+                out.push(char::from((ctl.to_ascii_uppercase() as u8) ^ 0x40));
+            }
+            Some(other) => out.push(other),
+            None => out.push_str("\\c"),
+        },
+        other => {
+            out.push('\\');
+            out.push(other);
+        }
+    }
 }
 
 /// Strip a leading path from an already-unquoted command name.
@@ -778,6 +881,20 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_ansi_c_quoted_dangerous_command() {
+        // `$'rm'` executes `rm`; the ANSI-C decode in `unquote_token`
+        // must reach the AST head check as well.
+        for cmd in ["$'rm' -rf /", "$'r\\x6d' -rf /", "env $'rm' -rf /"] {
+            let parsed = parse_bash(cmd).unwrap();
+            let violations = check_parsed_security(&parsed);
+            assert!(
+                violations.iter().any(|v| v.contains("rm")),
+                "ANSI-C quoting hid the command head: {cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn test_invocations_capture_arguments() {
         let parsed = parse_bash("git push origin main").unwrap();
         assert_eq!(
@@ -837,6 +954,32 @@ mod tests {
         assert_eq!(unquote_token("plain"), "plain");
         // A backslash inside single quotes stays literal, as in a shell.
         assert_eq!(unquote_token("'-dele\\te'"), "-dele\\te");
+    }
+
+    /// ANSI-C (`$'…'`) and locale (`$"…"`) quoting decode to what bash
+    /// hands the command — `$'git' push --force` runs `git push
+    /// --force`, so the unquoted token must read `git`, not `$git`.
+    #[test]
+    fn test_unquote_token_ansi_c() {
+        assert_eq!(unquote_token("$'git'"), "git");
+        assert_eq!(unquote_token("$'rm'"), "rm");
+        assert_eq!(unquote_token("$'ch'mod"), "chmod");
+        assert_eq!(unquote_token("$\"git\""), "git");
+        // Numeric escapes decode to their character.
+        assert_eq!(unquote_token("$'\\x67it'"), "git");
+        assert_eq!(unquote_token("$'r\\x6d'"), "rm");
+        assert_eq!(unquote_token("$'\\147it'"), "git");
+        assert_eq!(unquote_token("$'\\u0067it'"), "git");
+        assert_eq!(unquote_token("$'a\\tb'"), "a\tb");
+        // Escapes bash leaves alone stay literal.
+        assert_eq!(unquote_token("$'\\q'"), "\\q");
+        // A `$` that does not open a quoted string is untouched.
+        assert_eq!(unquote_token("$HOME"), "$HOME");
+        assert_eq!(unquote_token("a$b"), "a$b");
+        assert_eq!(unquote_token("$"), "$");
+        // `$'` is not special inside double or single quotes.
+        assert_eq!(unquote_token("\"$'x'\""), "$'x'");
+        assert_eq!(unquote_token("'$'"), "$");
     }
 
     #[test]
