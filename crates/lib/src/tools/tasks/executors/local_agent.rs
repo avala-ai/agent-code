@@ -166,8 +166,15 @@ impl TaskExecutor for LocalAgentExecutor {
         // externally-driven kinds have no streamed stdout, so without
         // this the queue entry reads as empty output forever.
         if let (Some(tm), Some(id)) = (ctx.task_manager.as_ref(), task_id.as_ref()) {
-            if let Ok(r) = &outcome {
-                let _ = tm.write_output(id, &r.content).await;
+            match &outcome {
+                Ok(r) => {
+                    let _ = tm.write_output(id, &r.content).await;
+                }
+                // Persist the failure too: a Failed row whose output
+                // reads "(no output yet)" hides why it failed.
+                Err(e) => {
+                    let _ = tm.write_output(id, &e.to_string()).await;
+                }
             }
             let status = match &outcome {
                 Ok(r) if !r.is_error => TaskStatus::Completed,
