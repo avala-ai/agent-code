@@ -191,8 +191,18 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
+        // The masking above answers "is this one argument or several".
+        // A multi-word pattern living *inside* one argument is the
+        // other question, and it needs its spaces: `psql -c DROP\
+        // TABLE\ users` is one token that runs a whole statement.
+        // Scanning each token on its own asks it without letting a
+        // pattern span two arguments.
+        let per_token: Vec<String> = invocation
+            .iter()
+            .map(|t| unquote_token(t).to_lowercase())
+            .collect();
         for pattern in DESTRUCTIVE_PATTERNS {
-            if normalized.contains(pattern) {
+            if normalized.contains(pattern) || per_token.iter().any(|t| t.contains(pattern)) {
                 findings.push(DestructiveFinding {
                     level: DestructivenessLevel::Destructive,
                     reason: format!("contains '{pattern}'"),
@@ -2003,6 +2013,10 @@ mod tests {
             "git --no-pager reset --hard HEAD~1",
             "git -c core.foo=bar reset --hard HEAD~1",
             "git --git-dir .git stash clear",
+            // A whole statement inside one token, its spaces escaped
+            // rather than quoted.
+            "psql -c DROP\\ TABLE\\ users",
+            "mysql -e DELETE\\ FROM\\ users",
             // An assignment name the shell has still to expand could
             // be any variable at all.
             "env \"$K=/tmp/g\" git p",
