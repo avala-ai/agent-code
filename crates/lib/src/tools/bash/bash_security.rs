@@ -289,9 +289,13 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
 /// command string just as readily, and an interpreter that is present
 /// on the host is a usable one.
 const SHELL_LAUNCHERS: &[&str] = &[
-    "bash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "pdksh", "yash", "busybox", "fish", "csh",
-    "tcsh",
+    "bash", "rbash", "sh", "zsh", "dash", "ash", "ksh", "mksh", "pdksh", "yash", "busybox", "fish",
+    "csh", "tcsh",
 ];
+
+/// Builtins that run the command word after them, so a builtin behind
+/// one is still in command position.
+const BUILTIN_PREFIXES: &[&str] = &["command", "builtin", "exec", "nohup", "setsid", "time"];
 
 /// The literal command strings an invocation may hand to another
 /// shell.
@@ -321,7 +325,10 @@ const SHELL_LAUNCHERS: &[&str] = &[
 /// can only over-block.
 ///
 /// `eval` instead concatenates everything after it, which is how bash
-/// evaluates it.
+/// evaluates it — but only in command position. It is a builtin, so
+/// unlike an external shell no runner can launch it, and an `eval`
+/// sitting in argv data (`echo eval "'git' push --force"`) evaluates
+/// nothing.
 ///
 /// `exec` is deliberately not a launcher: it replaces the shell with
 /// whatever it is given, so `exec bash -c '…'` is already covered by
@@ -340,24 +347,40 @@ fn shell_payloads(tokens: &[String]) -> Vec<String> {
                 // drops it. Hand over the operand on its own too.
                 payloads.extend(rest.iter().filter_map(|t| inline_operand(t)));
             }
-        } else if base == "eval" && !rest.is_empty() {
+        } else if base == "eval" && !rest.is_empty() && in_command_position(tokens, i) {
             payloads.push(rest.join(" "));
         }
     }
     payloads
 }
 
+/// True when nothing before `i` can turn the token into plain data:
+/// every earlier token is an option, an assignment, or a builtin that
+/// runs the word after it.
+fn in_command_position(tokens: &[String], i: usize) -> bool {
+    tokens[..i].iter().all(|t| {
+        t.starts_with('-')
+            || t.contains('=')
+            || BUILTIN_PREFIXES.contains(&base_name(t).to_lowercase().as_str())
+    })
+}
+
 /// True for an option that makes a shell read its commands from an
-/// operand: `-c`, a cluster containing it (`-lc`, `-ec`), and fish's
-/// `--command`/`--command=…` spelling.
+/// operand: `-c`, a cluster containing it (`-lc`, `-ec`), and the long
+/// spellings `--command` and fish's `--init-command`. Fish's `-C` is
+/// the same thing with an upper-case letter, so clusters are matched
+/// case-insensitively.
 fn takes_command_string(token: &str) -> bool {
     match token.strip_prefix("--") {
         Some(long) => long.split('=').next().is_some_and(|name| {
-            !name.is_empty() && "command".starts_with(name) && name.starts_with('c')
+            !name.is_empty()
+                && ["command", "init-command"]
+                    .iter()
+                    .any(|full| full.starts_with(name))
         }),
         None => token
             .strip_prefix('-')
-            .is_some_and(|cluster| cluster.contains('c')),
+            .is_some_and(|cluster| cluster.contains(['c', 'C'])),
     }
 }
 
@@ -459,6 +482,15 @@ mod tests {
             // fish's long spelling of `-c`.
             "fish --command \"'git' push --force\"",
             "fish --command=\"'git' push --force\"",
+            // `rbash` is restricted bash, and still takes `-c`.
+            "rbash -c \"'git' push --force\"",
+            // fish runs `-C` / `--init-command` during startup.
+            "fish -C \"'git' push --force\" /dev/null",
+            "fish --init-command=\"'rm' -rf /tmp/x\" /dev/null",
+            // `eval` in command position, including behind a builtin
+            // that runs the word after it.
+            "eval \"'rm' -rf /tmp/x\"",
+            "command eval \"'git' push --force\"",
             // Out of scan budget with a shell payload still in hand:
             // unknown, so refused rather than allowed.
             "bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'ls'\\\\\\\"\\\"\"",
@@ -544,6 +576,10 @@ mod tests {
             // shell to interpret anything.
             "printf '%s\\n' bash \"'git' push --force\"",
             "echo sh zsh fish",
+            // `eval` as argv data evaluates nothing — it is a builtin,
+            // so no runner can launch it from there.
+            "echo eval \"'git' push --force\"",
+            "printf '%s\\n' eval \"'rm' -rf /tmp/x\"",
         ] {
             let parsed = parse_bash(cmd).expect("parses");
             assert_eq!(
