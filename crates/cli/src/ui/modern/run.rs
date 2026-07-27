@@ -492,15 +492,16 @@ pub(super) async fn event_loop(
                     // theme picker should treat as current.
                     let configured = eng.state().config.ui.theme.clone();
                     app.sync_theme_from_config(&configured);
-                    // `/resume` and the session picker swap the whole
-                    // conversation. The checklist is cached in the App,
-                    // so rebuild it from whatever messages are now in
-                    // play — otherwise the pane keeps showing the
-                    // previous session's plan. Reading the messages back
-                    // (rather than just clearing) also means a *failed*
-                    // resume leaves the current checklist intact, since
-                    // the messages it reads are still the current ones.
-                    if crate::commands::slash_replaces_conversation(&slash) {
+                    // `/resume`, the session picker, `/rewind` and
+                    // `/snip` all replace or rewrite the message history.
+                    // The checklist is cached in the App, so rebuild it
+                    // from whatever messages are now in play — otherwise
+                    // the pane keeps describing a plan the history no
+                    // longer contains. Reading the messages back (rather
+                    // than just clearing) also means a *failed* resume
+                    // leaves the current checklist intact, since the
+                    // messages it reads are still the current ones.
+                    if crate::commands::slash_rewrites_conversation(&slash) {
                         app.todos = super::tasks::todos_from_messages(&eng.state().messages);
                     }
                     if interactive {

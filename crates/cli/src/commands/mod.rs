@@ -667,16 +667,27 @@ fn resolve_slash_name(cmd: &str) -> String {
         .unwrap_or(head)
 }
 
-/// True when a slash built-in swaps the engine conversation for a
-/// different one, rather than adding to the current one.
+/// True when a slash built-in replaces or rewrites the engine's message
+/// history, rather than only adding to it.
 ///
 /// The TUI caches per-conversation state (the model's checklist), so it
-/// has to rebuild that state after these run — nothing else tells it the
-/// messages underneath were replaced wholesale.
-pub fn slash_replaces_conversation(cmd: &str) -> bool {
+/// must rebuild that state after these run — nothing else tells it the
+/// messages underneath changed. **Add new history-rewriting commands
+/// here**, or the pane will keep describing a plan the history no longer
+/// contains.
+///
+/// `/compact` is deliberately absent. It rewrites history too, but as a
+/// lossy compression that preserves intent: the model is still working
+/// the same plan afterwards, so dropping the checklist because the
+/// originating call was summarized away would lose live information
+/// rather than stale information.
+pub fn slash_rewrites_conversation(cmd: &str) -> bool {
     matches!(
         resolve_slash_name(cmd).as_str(),
+        // Whole-conversation swaps.
         "resume" | "session" | "pick-session"
+        // Truncation and deletion (`/undo` resolves to `rewind`).
+        | "rewind" | "snip"
     )
 }
 
@@ -862,14 +873,36 @@ mod slash_lookup_tests {
         assert!(!is_interactive_slash("/resume"));
         // Conversation-replacing commands, which the TUI must notice so
         // its cached checklist does not outlive the session it describes.
-        assert!(slash_replaces_conversation("/resume abc123"));
-        assert!(slash_replaces_conversation("/session"));
-        assert!(slash_replaces_conversation("/pick-session"));
-        // Commands that add to the current conversation, not replace it.
-        for cmd in ["/sessions", "/clear", "/compact", "/model", "/cd /tmp"] {
+        for cmd in [
+            "/resume abc123",
+            "/session",
+            "/pick-session",
+            // Truncation and deletion rewrite history just as wholly.
+            "/rewind",
+            "/rewind 3",
+            "/undo",
+            "/snip 3-7",
+        ] {
             assert!(
-                !slash_replaces_conversation(cmd),
-                "{cmd} should not count as replacing the conversation"
+                slash_rewrites_conversation(cmd),
+                "{cmd} rewrites history and must refresh the checklist"
+            );
+        }
+        // Commands that add to the current conversation, or leave it
+        // alone entirely. `/compact` rewrites history but preserves
+        // intent -- see `slash_rewrites_conversation`.
+        for cmd in [
+            "/sessions",
+            "/clear",
+            "/compact",
+            "/model",
+            "/cd /tmp",
+            "/fork",
+            "/help",
+        ] {
+            assert!(
+                !slash_rewrites_conversation(cmd),
+                "{cmd} should not count as rewriting the conversation"
             );
         }
         assert!(!is_interactive_slash("/help"));
