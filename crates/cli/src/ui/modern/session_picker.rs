@@ -464,6 +464,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Adopt the restored conversation's checklist.
+    ///
+    /// A resume rewrites history exactly as `/rewind` and `/snip` do, so
+    /// it uses the same seam: bump the epoch, which disowns anything the
+    /// previous conversation still has in flight, then rebuild the pane
+    /// from the messages actually restored. Skipping it leaves the pane
+    /// showing the discarded session's work.
+    pub fn adopt_restored_todos(&mut self, messages: &[agent_code_lib::llm::message::Message]) {
+        self.new_conversation();
+        self.todos = super::tasks::todos_from_messages(messages);
+    }
+
     /// Replace the visible transcript with a restored conversation.
     pub fn restore_transcript(&mut self, items: Vec<TranscriptItem>, id: &str, turns: usize) {
         self.transcript = items;
@@ -1255,6 +1267,60 @@ mod tests {
         assert!(
             app.effort.is_none(),
             "the badge still claims an effort the restored session never chose"
+        );
+    }
+
+    /// A resume rewrites history, so the checklist pane must follow the
+    /// restored conversation rather than keep describing the discarded
+    /// one. Same seam `/rewind` and `/snip` use.
+    #[test]
+    fn resuming_rebuilds_the_checklist_from_the_restored_conversation() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.todos = super::super::tasks::todos_from_messages(&[
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "old".into(),
+                    name: "TodoWrite".into(),
+                    input: serde_json::json!({
+                        "todos": [{ "id": "1", "content": "the discarded plan", "status": "in_progress" }]
+                    }),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+            Message::Assistant(AssistantMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "old".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    extra_content: Vec::new(),
+                }],
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            }),
+        ]);
+        assert_eq!(app.todos.len(), 1, "fixture did not build a checklist");
+        let epoch_before = app.conversation_epoch;
+
+        // The restored session never called TodoWrite.
+        app.adopt_restored_todos(&[user("just a question")]);
+
+        assert!(
+            app.todos.is_empty(),
+            "the pane still shows the discarded session's checklist: {:?}",
+            app.todos
+        );
+        assert_ne!(
+            app.conversation_epoch, epoch_before,
+            "in-flight work from the old conversation was not disowned"
         );
     }
 

@@ -23,6 +23,12 @@ pub struct Palette {
     pub inactive: Color,
     pub text: Color,
     pub plan: Color,
+    /// The theme's own background. Not painted directly — badge
+    /// foregrounds are chosen against it by [`on_fill`].
+    pub bg: Color,
+    /// Inline-code / code-block foreground and background.
+    pub code_fg: Color,
+    pub code_bg: Color,
     // Diff rendering (inline edit cards).
     pub diff_add: Color,
     pub diff_remove: Color,
@@ -50,6 +56,9 @@ pub fn palette() -> Palette {
         inactive: theme_to_ratatui(t.inactive),
         text: theme_to_ratatui(t.text),
         plan: theme_to_ratatui(t.plan_mode),
+        bg: theme_to_ratatui(t.bg),
+        code_fg: theme_to_ratatui(t.code_fg),
+        code_bg: theme_to_ratatui(t.code_bg),
         diff_add: theme_to_ratatui(t.diff_add),
         diff_remove: theme_to_ratatui(t.diff_remove),
         diff_add_dim: theme_to_ratatui(t.diff_added_dimmed),
@@ -62,10 +71,232 @@ pub fn palette() -> Palette {
     }
 }
 
+/// Foreground for text drawn on a solid `fill` bar — the permission
+/// badge, the mouse selection, the current search match, the code-block
+/// language pill.
+///
+/// Picks whichever of the theme's background and text colours contrasts
+/// better with the fill, falling back to black or white when neither
+/// clears the readability floor. A fixed choice cannot work: within one
+/// theme the accent, warning and error fills sit at different
+/// luminances, and across themes the same slot flips from light to
+/// dark. Hardcoding black was wrong on light themes; so is always using
+/// the theme background — on `solarized-light` that is cream on
+/// `#b58900`, about 3:1.
+///
+/// Named and indexed fills are decoded to RGB first, so the ANSI-16
+/// themes and the 256-colour downgrade get a real decision rather than a
+/// default. `Reset` is the only colour left with no luminance, and it is
+/// what `NO_COLOR` produces: every candidate is `Reset` too, so the fill
+/// and its text collapse together and the row stays readable.
+pub fn on_fill(fill: Color) -> Color {
+    let p = palette();
+    let Some(fill_l) = luminance(fill) else {
+        return p.bg;
+    };
+
+    // Prefer the theme's own colours, so a badge keeps the theme's
+    // character wherever they are legible.
+    let best = [p.bg, p.text]
+        .into_iter()
+        .filter_map(|c| luminance(c).map(|l| (contrast(fill_l, l), c)))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((ratio, c)) = best
+        && ratio >= theme::MIN_TEXT_CONTRAST
+    {
+        return c;
+    }
+
+    // Neither reaches the floor — `solarized-light`'s warning fill is
+    // the worked example, where cream manages 3:1 and the mid-grey text
+    // slot is worse still. Fall back to the achromatic pole, which
+    // always maximizes contrast, and take the same adaptation hop as
+    // every other colour so `NO_COLOR` still strips it.
+    if contrast(fill_l, 0.0) >= contrast(fill_l, 1.0) {
+        adapt_rgb(0, 0, 0)
+    } else {
+        adapt_rgb(255, 255, 255)
+    }
+}
+
+/// WCAG contrast ratio between two relative luminances.
+pub(super) fn contrast(a: f32, b: f32) -> f32 {
+    theme::contrast_ratio(a, b)
+}
+
+/// WCAG relative luminance, or `None` when the colour carries no
+/// inspectable RGB value.
+pub(super) fn luminance(c: Color) -> Option<f32> {
+    let (r, g, b) = rgb_of(c)?;
+    Some(theme::relative_luminance(r, g, b))
+}
+
+/// Approximate RGB for a ratatui colour. The named ANSI slots use the
+/// canonical xterm values, so the ANSI-16 accessibility themes — whose
+/// palettes are named rather than RGB — still get a real contrast
+/// decision instead of the fallback.
+///
+/// Indexed values matter just as much: on Apple Terminal, `screen` and
+/// `tmux` the 256-colour downgrade turns *every* slot into an index, so
+/// treating those as unknowable would silently disable the contrast
+/// pick on exactly the terminals that cannot show the intended colour
+/// in the first place.
+fn rgb_of(c: Color) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => crate::ui::color_emit::ansi256_to_rgb(i),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (127, 127, 127),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (92, 92, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        _ => return None,
+    })
+}
+
+/// Adapt a colour that did **not** come from the theme — the syntax
+/// highlighter ships its own palette — to the terminal's colour depth.
+///
+/// Highlighted code is still colour, and it is the one place in the UI
+/// that never passes through a theme slot, so it cannot reach
+/// `adapt_for_emit`. Without this hop a syntax-highlighted code block
+/// keeps emitting 24-bit RGB under `NO_COLOR`.
+pub fn syntax_color(r: u8, g: u8, b: u8) -> Color {
+    adapt_rgb(r, g, b)
+}
+
+/// Put a literal RGB triple through the emit-mode adaptation every
+/// palette slot goes through, so it downgrades and disappears with the
+/// rest of the UI instead of being pinned to 24-bit colour.
+fn adapt_rgb(r: u8, g: u8, b: u8) -> Color {
+    theme_to_ratatui(crate::ui::color_emit::adapt(
+        crate::ui::color_emit::current(),
+        crossterm::style::Color::Rgb { r, g, b },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::style::Color as CtColor;
+
+    /// Every filled badge has to stay readable on every built-in theme.
+    ///
+    /// Both of the fixed choices this replaced fail here: black text is
+    /// unreadable on the dark fills a light theme uses, and the theme
+    /// background is unreadable on `solarized-light`'s warning fill
+    /// (about 3:1, against 6.5:1 for its text colour).
+    #[test]
+    fn filled_badges_stay_readable_on_every_theme() {
+        let _g = crate::ui::theme::test_lock();
+        for name in theme::Theme::all_names() {
+            crate::ui::theme::init(&name);
+            let p = palette();
+            for (slot, fill) in [
+                ("accent", p.accent),
+                ("warning", p.warning),
+                ("error", p.error),
+                ("tool", p.tool),
+            ] {
+                let fg = on_fill(fill);
+                let (Some(a), Some(b)) = (luminance(fg), luminance(fill)) else {
+                    continue;
+                };
+                let ratio = contrast(a, b);
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: {slot} badge only reaches {ratio:.2}:1 \
+                     (fg {fg:?} on fill {fill:?})"
+                );
+            }
+        }
+        crate::ui::theme::init("one-dark");
+    }
+
+    /// The specific regression the contrast pick exists to prevent. On
+    /// `solarized-light` *both* theme candidates fail against the warning
+    /// fill — cream reaches about 3:1 and the mid-grey text slot is
+    /// worse — so the badge must take the achromatic fallback rather
+    /// than settle for the better of two unreadable options.
+    #[test]
+    fn light_theme_warning_badge_does_not_use_the_page_background() {
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("solarized-light");
+        let p = palette();
+        let fg = on_fill(p.warning);
+        assert_ne!(
+            fg, p.bg,
+            "cream on #b58900 is the low-contrast pairing this avoids"
+        );
+        let ratio = contrast(luminance(fg).unwrap(), luminance(p.warning).unwrap());
+        assert!(ratio >= 4.5, "warning badge only reaches {ratio:.2}:1");
+        crate::ui::theme::init("one-dark");
+    }
+
+    /// Themes whose own colours *do* clear the floor keep them — the
+    /// fallback is a floor, not a replacement for the palette.
+    #[test]
+    fn dark_theme_badge_keeps_the_theme_background() {
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let p = palette();
+        assert_eq!(on_fill(p.warning), p.bg);
+    }
+
+    /// The 256-colour downgrade — Apple Terminal, `screen`, `tmux`, or
+    /// an explicit `AGENT_CODE_COLOR_MODE=ansi256` — replaces every slot
+    /// with an index. If those read as unmeasurable the badge silently
+    /// falls back to the theme background, which is the low-contrast
+    /// pairing this whole helper exists to avoid, on the terminals least
+    /// able to render around it.
+    #[test]
+    fn badges_stay_readable_after_the_256_colour_downgrade() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        let _g = crate::ui::theme::test_lock();
+        let _mode = pin_mode(EmitMode::Ansi256);
+        for name in ["solarized-light", "one-dark", "light-colorblind"] {
+            crate::ui::theme::init(name);
+            let p = palette();
+            for (slot, fill) in [("accent", p.accent), ("warning", p.warning)] {
+                assert!(
+                    matches!(fill, Color::Indexed(_)),
+                    "{name}: {slot} should be indexed in ansi256 mode, got {fill:?}"
+                );
+                let fg = on_fill(fill);
+                let ratio = contrast(
+                    luminance(fg).expect("decoded fg"),
+                    luminance(fill).expect("decoded fill"),
+                );
+                assert!(
+                    ratio >= theme::MIN_TEXT_CONTRAST,
+                    "{name}: {slot} badge only reaches {ratio:.2}:1 after downgrade"
+                );
+            }
+        }
+        crate::ui::theme::init("one-dark");
+    }
+
+    /// Under `NO_COLOR` there is nothing to contrast against; the fill
+    /// and its text both collapse to the terminal default.
+    #[test]
+    fn on_fill_is_uncoloured_in_mono() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+        assert_eq!(on_fill(palette().warning), Color::Reset);
+    }
 
     #[test]
     fn palette_reflects_active_theme_accent() {
