@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branch filter: a PR stacked on another feature branch is still a
+  # PR that must pass the gate. Restricting this to `main` meant stacked
+  # PRs reported "no checks reported" — indistinguishable from passing in
+  # every UI that shows a green tick, and in `gh pr checks`, which reports
+  # no failures because there is nothing to fail.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
