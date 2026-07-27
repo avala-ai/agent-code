@@ -612,16 +612,25 @@ impl App {
         self.dirty = true;
     }
 
-    /// Snapshot the current session's view before switching away.
+    /// Snapshot the outgoing session's view before switching away,
+    /// *consuming* what is on screen.
+    ///
+    /// Called only from [`Self::restore_transcript`], which overwrites
+    /// the transcript and the expansion set on every path immediately
+    /// afterwards — so the outgoing state is moved, not copied. Copying
+    /// would matter: resume deliberately supports conversations that run
+    /// to megabytes of strings, and duplicating one on the event-loop
+    /// thread stalls input and repaint for as long as the copy takes,
+    /// putting back the pause that loading off-thread removed.
     ///
     /// A session with nothing on screen is not stored — see
     /// [`super::session_views::SessionViews::save`].
     pub fn stash_current_view(&mut self) {
         let id = self.session_id.clone();
         let view = super::session_views::SessionView {
-            transcript: self.transcript.clone(),
+            transcript: std::mem::take(&mut self.transcript),
             scroll: self.scroll,
-            expanded: self.expanded.clone(),
+            expanded: std::mem::take(&mut self.expanded),
             selected_item: self.selected_item,
         };
         self.session_views.save(&id, view);
