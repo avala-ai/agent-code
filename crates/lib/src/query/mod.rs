@@ -769,8 +769,11 @@ impl QueryEngine {
         // megabytes they actually add to every later request. Bound what
         // history retains here instead, once the new turn's own images are
         // in and counted as the most recent.
-        let dropped =
-            compact::evict_old_images(&mut self.state.messages, compact::MAX_RETAINED_IMAGE_BYTES);
+        let dropped = compact::evict_old_images(
+            &mut self.state.messages,
+            compact::MAX_RETAINED_IMAGE_BYTES,
+            compact::MAX_RETAINED_IMAGES,
+        );
         if dropped > 0 {
             tracing::debug!(
                 dropped,

@@ -319,13 +319,26 @@ pub fn estimate_compactable_tokens(messages: &[Message], keep_recent: usize) -> 
 /// the session can carry.
 pub const MAX_RETAINED_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 
+/// Image blocks kept in history, newest first.
+///
+/// Bytes are not the only limit: providers also cap how many images one
+/// request may carry (Anthropic accepts 100), and a session that attaches
+/// small thumbnails every turn reaches that count long before it reaches
+/// any byte budget. 32 leaves generous headroom under the provider cap.
+pub const MAX_RETAINED_IMAGES: usize = 32;
+
 /// Drop image payloads once history holds more than
-/// [`MAX_RETAINED_IMAGE_BYTES`] of them, oldest first.
+/// [`MAX_RETAINED_IMAGE_BYTES`] or [`MAX_RETAINED_IMAGES`] of them,
+/// oldest first.
 ///
 /// The block is replaced by text naming what was dropped, so the model
 /// still knows an image was there and the conversation stays valid;
 /// only the bytes go. Returns the number of images dropped.
-pub fn evict_old_images(messages: &mut [Message], budget_bytes: usize) -> usize {
+pub fn evict_old_images(
+    messages: &mut [Message],
+    budget_bytes: usize,
+    budget_count: usize,
+) -> usize {
     // Newest first: recent images are the ones still being talked about.
     let mut sites: Vec<(usize, usize, usize, String)> = Vec::new();
     for (msg_idx, msg) in messages.iter().enumerate() {
@@ -343,9 +356,11 @@ pub fn evict_old_images(messages: &mut [Message], budget_bytes: usize) -> usize 
 
     let mut kept = 0usize;
     let mut evicted = 0usize;
+    let mut kept_count = 0usize;
     for (msg_idx, block_idx, len, media_type) in sites.into_iter().rev() {
-        if kept + len <= budget_bytes {
+        if kept + len <= budget_bytes && kept_count < budget_count {
             kept += len;
+            kept_count += 1;
             continue;
         }
         let placeholder = ContentBlock::Text {
@@ -782,7 +797,7 @@ mod tests {
             assistant_text("second"),
             user_with_image(600),
         ];
-        let evicted = evict_old_images(&mut messages, budget);
+        let evicted = evict_old_images(&mut messages, budget, 100);
         assert_eq!(evicted, 2, "older images were kept");
         assert!(
             image_payload_bytes(&messages) <= budget,
@@ -804,7 +819,7 @@ mod tests {
     #[test]
     fn an_evicted_image_leaves_a_note_in_its_place() {
         let mut messages = vec![user_with_image(500), user_with_image(500)];
-        assert_eq!(evict_old_images(&mut messages, 600), 1);
+        assert_eq!(evict_old_images(&mut messages, 600, 100), 1);
         let Message::User(u) = &messages[0] else {
             panic!("expected a user message");
         };
@@ -821,7 +836,7 @@ mod tests {
     fn images_within_the_budget_are_untouched() {
         let mut messages = vec![user_with_image(100), user_with_image(100)];
         let before = image_payload_bytes(&messages);
-        assert_eq!(evict_old_images(&mut messages, 1000), 0);
+        assert_eq!(evict_old_images(&mut messages, 1000, 100), 0);
         assert_eq!(image_payload_bytes(&messages), before);
     }
 
@@ -830,8 +845,28 @@ mod tests {
     #[test]
     fn eviction_is_idempotent() {
         let mut messages = vec![user_with_image(600), user_with_image(600)];
-        assert_eq!(evict_old_images(&mut messages, 1000), 1);
-        assert_eq!(evict_old_images(&mut messages, 1000), 0);
+        assert_eq!(evict_old_images(&mut messages, 1000, 100), 1);
+        assert_eq!(evict_old_images(&mut messages, 1000, 100), 0);
+    }
+
+    /// Providers cap how many images a request may carry, so a session of
+    /// small thumbnails hits that limit long before any byte budget.
+    #[test]
+    fn the_retained_image_count_is_bounded_too() {
+        let mut messages: Vec<Message> = (0..10).map(|_| user_with_image(10)).collect();
+        let evicted = evict_old_images(&mut messages, 1_000_000, 4);
+        assert_eq!(evicted, 6, "count budget was not enforced");
+        let remaining = messages
+            .iter()
+            .filter(|m| match m {
+                Message::User(u) => u
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. })),
+                _ => false,
+            })
+            .count();
+        assert_eq!(remaining, 4, "more images retained than the count budget");
     }
 
     /// A single image larger than the whole budget is still dropped —
@@ -839,7 +874,7 @@ mod tests {
     #[test]
     fn an_image_larger_than_the_budget_is_evicted() {
         let mut messages = vec![user_with_image(2000)];
-        assert_eq!(evict_old_images(&mut messages, 1000), 1);
+        assert_eq!(evict_old_images(&mut messages, 1000, 100), 1);
         assert_eq!(image_payload_bytes(&messages), 0);
     }
 
