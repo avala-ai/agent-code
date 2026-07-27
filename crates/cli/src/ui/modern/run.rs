@@ -570,17 +570,36 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
-            // Hand this turn's images to the engine. They were read and
-            // encoded during mention expansion, while the path was still
-            // the one that had just been validated — nothing is opened
-            // here, so there is no second chance to point them elsewhere.
+            // Encode this turn's images. The descriptors were opened when
+            // their mentions were validated, so nothing is resolved here —
+            // and the read runs on the blocking pool, because a workspace
+            // on a slow mount would otherwise stall the event loop (and
+            // with it redraws and cancellation) for the whole read.
             let images = std::mem::take(&mut app.pending_images);
+            let restore = images.clone();
+            let blocks = if images.is_empty() {
+                Vec::new()
+            } else {
+                let (blocks, notes) = match tokio::task::spawn_blocking(move || {
+                    super::mentions::encode_staged_images(images)
+                })
+                .await
+                {
+                    Ok(out) => out,
+                    Err(e) => (Vec::new(), vec![format!("could not attach images: {e}")]),
+                };
+                for note in notes {
+                    app.transcript
+                        .push(super::app::TranscriptItem::System(note));
+                }
+                blocks
+            };
             // Set unconditionally, awaiting the lock rather than skipping on
             // contention: an empty set clears anything a previous attempt
             // staged, so no turn can inherit another turn's attachment.
             {
                 let engine = session.engine();
-                engine.lock().await.set_pending_attachments(images.clone());
+                engine.lock().await.set_pending_attachments(blocks);
             }
             let sink = ChannelSink::new(eng_tx.clone());
             match session.spawn_turn(prompt.clone(), sink).await {
@@ -593,7 +612,7 @@ pub(super) async fn event_loop(
                     // and its attachments back so the next idle loop retries
                     // them together.
                     app.pending_submit = Some(prompt);
-                    app.pending_images = images;
+                    app.pending_images = restore;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
                 }

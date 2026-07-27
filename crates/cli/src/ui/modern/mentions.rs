@@ -181,18 +181,17 @@ pub struct MentionExpansion {
     pub prompt: String,
     /// Short human-readable notes about anything skipped or truncated.
     pub notes: Vec<String>,
-    /// Images to attach to the turn as content blocks. An image cannot be
-    /// inlined as text, so `@shot.png` used to report "binary, skipped" —
-    /// which is never what the user meant by mentioning one.
+    /// Images to attach to the turn, held open. An image cannot be inlined
+    /// as text, so `@shot.png` used to report "binary, skipped" — which is
+    /// never what the user meant by mentioning one.
     ///
-    /// Encoded here, not at turn start. Carrying paths meant re-opening
-    /// them after an unbounded delay, and nothing about a path survives
-    /// that wait: swapping the file (or any ancestor directory) for a
-    /// symlink pointed the later `open` at a file outside the workspace
-    /// that had never been validated. Reading the bytes while the path is
-    /// still the one `resolve_mention` just checked is the same discipline
-    /// the text mentions above follow, and it leaves nothing to re-check.
-    pub images: Vec<agent_code_lib::llm::message::ContentBlock>,
+    /// Descriptors, not paths. A path handed to the turn would be resolved
+    /// a second time, and swapping the file — or any ancestor directory —
+    /// for a symlink in between pointed that second lookup at a file
+    /// outside the workspace which had never been validated. Opening while
+    /// the mention is being checked leaves nothing to look up again; the
+    /// bytes are read later, off the UI thread, from these descriptors.
+    pub images: Vec<StagedImage>,
 }
 
 /// Inline the contents of every `@path` mention in `text`.
@@ -209,7 +208,7 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut body = String::new();
     let mut notes: Vec<String> = Vec::new();
-    let mut images: Vec<agent_code_lib::llm::message::ContentBlock> = Vec::new();
+    let mut images: Vec<StagedImage> = Vec::new();
     let mut used = 0usize;
     let mut image_bytes = 0usize;
     let mut over_budget = 0usize;
@@ -237,20 +236,11 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
                 over_image_budget += 1;
                 continue;
             }
-            if image_bytes >= MAX_TOTAL_IMAGE_BYTES {
-                over_image_budget += 1;
-                continue;
-            }
-            match read_image_capped(path, MAX_IMAGE_BYTES) {
-                // Checked after the read, so the note distinguishes "this
-                // one is too big" from "the prompt is full"; the read is
-                // capped either way, so the peak stays bounded.
-                Ok(data) if image_bytes + data.len() <= MAX_TOTAL_IMAGE_BYTES => {
-                    image_bytes += data.len();
+            match stage_image(cwd, path) {
+                Ok((staged, len)) if image_bytes + len <= MAX_TOTAL_IMAGE_BYTES => {
+                    image_bytes += len;
                     notes.push(format!("@{raw} — attached as an image"));
-                    images.push(agent_code_lib::llm::message::image_block_from_bytes(
-                        path, &data,
-                    ));
+                    images.push(staged);
                 }
                 Ok(_) => over_image_budget += 1,
                 Err(reason) => notes.push(format!("@{raw} — {reason}")),
@@ -374,20 +364,124 @@ fn is_image(path: &Path) -> bool {
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 
-/// Open a path that `resolve_mention` just validated, without trusting the
-/// name to still mean the same file.
+/// A validated image, held open until the turn that carries it starts.
 ///
-/// `O_NOFOLLOW` refuses a symlink swapped in since the check, `O_NONBLOCK`
-/// keeps `open` from hanging on a FIFO, and the `fstat` on the descriptor
-/// is what finally decides — it describes the file that was actually
-/// opened rather than whatever the name points at now.
-fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
+/// The descriptor *is* the validation result. Handing the turn a path
+/// would mean resolving that name a second time, and a name resolved
+/// twice can mean two different files — the whole point of opening here.
+#[derive(Debug, Clone)]
+pub struct StagedImage {
+    /// Kept for the media type and for error messages only; never
+    /// re-opened.
+    pub path: PathBuf,
+    pub file: std::sync::Arc<std::fs::File>,
+}
+
+/// Open `path` without letting any component of it be redirected.
+///
+/// `path` must already be canonical and inside `root`. Each component is
+/// opened relative to the descriptor of the one before it, refusing
+/// symlinks — so replacing an ancestor directory (or the file itself)
+/// between validation and this open cannot walk the read outside the
+/// workspace. Resolving the pathname again instead would re-run the whole
+/// lookup against a tree the attacker has had time to rearrange.
+///
+/// The final `fstat` is on the descriptor, so it describes the file that
+/// was actually opened rather than whatever the name means afterwards.
+#[cfg(unix)]
+fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| "outside the workspace".to_string())?;
+
+    // The workspace root is the trust anchor: it is the directory the
+    // session was started in, not something a mention chose.
+    let mut dir = std::fs::File::open(root).map_err(|e| format!("unreadable ({})", e.kind()))?;
+
+    let components: Vec<_> = rel.components().collect();
+    let Some((last, parents)) = components.split_last() else {
+        return Err("not a regular file".into());
+    };
+    for component in components.iter() {
+        // A canonical path relative to its own prefix has only normal
+        // components; anything else means the assumption broke.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err("not a usable path".into());
+        }
+    }
+
+    for component in parents {
+        let name = CString::new(component.as_os_str().as_bytes())
+            .map_err(|_| "not a usable path".to_string())?;
+        // SAFETY: `dir` is an open directory descriptor and `name` is a
+        // valid NUL-terminated path for the duration of the call.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "unreadable ({})",
+                std::io::Error::last_os_error().kind()
+            ));
+        }
+        // SAFETY: `fd` was just returned by `openat` and is owned here.
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+
+    let name =
+        CString::new(last.as_os_str().as_bytes()).map_err(|_| "not a usable path".to_string())?;
+    // SAFETY: as above; `O_NONBLOCK` additionally keeps a FIFO swapped in
+    // for the file from blocking this call until a writer appears.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "unreadable ({})",
+            std::io::Error::last_os_error().kind()
+        ));
+    }
+    // SAFETY: `fd` was just returned by `openat` and is owned here.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file
+        .metadata()
+        .map_err(|e| format!("unreadable ({})", e.kind()))?
+        .is_file()
+    {
+        return Err("not a regular file".into());
+    }
+    Ok(file)
+}
+
+/// Windows has no `openat`; `FILE_FLAG_OPEN_REPARSE_POINT` opens a
+/// swapped-in symlink or junction *as* the reparse point, which then fails
+/// the regular-file check below rather than redirecting the read. Creating
+/// a symlink there needs a privilege ordinary accounts lack, so the
+/// remaining ancestor race is not reachable without one.
+#[cfg(not(unix))]
+fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    if !path.starts_with(root) {
+        return Err("outside the workspace".into());
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
         .open(path)
@@ -402,24 +496,92 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Read an image, refusing one larger than `cap` rather than truncating it.
-///
-/// `take(cap + 1)` so exceeding the cap is *observed*: a half-read image
-/// would otherwise be attached as a corrupt payload. The cap is what keeps
-/// an oversized file from being held and base64-encoded on the UI thread.
-fn read_image_capped(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
-    let file = open_regular_file(path)?;
-    let mut data = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut data)
-        .map_err(|e| format!("unreadable ({})", e.kind()))?;
-    if data.len() > cap {
+/// Stage a validated image: open it now, and measure it from the
+/// descriptor so an oversized file is refused before anything is read.
+fn stage_image(cwd: &Path, path: &Path) -> Result<(StagedImage, usize), String> {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let file = open_beneath(&root, path)?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("unreadable ({})", e.kind()))?
+        .len();
+    let len = usize::try_from(len).map_err(|_| "image too large".to_string())?;
+    if len > MAX_IMAGE_BYTES {
         return Err(format!(
-            "image too large (over {} MiB)",
-            cap / (1024 * 1024)
+            "image too large ({:.1} MiB, max {} MiB)",
+            len as f64 / (1024.0 * 1024.0),
+            MAX_IMAGE_BYTES / (1024 * 1024)
         ));
     }
-    Ok(data)
+    Ok((
+        StagedImage {
+            path: path.to_path_buf(),
+            file: std::sync::Arc::new(file),
+        },
+        len,
+    ))
+}
+
+/// Read and encode staged images from the descriptors already held.
+///
+/// Blocking work — call it off the UI thread. No path is resolved here:
+/// the files were opened when their mentions were validated, so this reads
+/// the bytes of those files and nothing else, however the workspace has
+/// been rearranged since.
+pub fn encode_staged_images(
+    images: Vec<StagedImage>,
+) -> (Vec<agent_code_lib::llm::message::ContentBlock>, Vec<String>) {
+    use std::io::{Seek, SeekFrom};
+
+    let mut blocks = Vec::new();
+    let mut notes = Vec::new();
+    let mut total = 0usize;
+    for image in images.into_iter().take(MAX_IMAGES) {
+        let name = image.path.display();
+        let mut handle: &std::fs::File = &image.file;
+        // Rewind: a turn that failed to spawn is retried with the same
+        // descriptors, and a spent offset would re-encode an empty file.
+        if let Err(e) = handle.seek(SeekFrom::Start(0)) {
+            notes.push(format!(
+                "could not attach {name}: unreadable ({})",
+                e.kind()
+            ));
+            continue;
+        }
+        let mut data = Vec::new();
+        // Capped again: the file can still grow after it was measured, and
+        // this is the read that would actually hold the bytes.
+        if let Err(e) = handle
+            .take(MAX_IMAGE_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+        {
+            notes.push(format!(
+                "could not attach {name}: unreadable ({})",
+                e.kind()
+            ));
+            continue;
+        }
+        if data.len() > MAX_IMAGE_BYTES {
+            notes.push(format!(
+                "could not attach {name}: image too large (over {} MiB)",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
+            continue;
+        }
+        if total + data.len() > MAX_TOTAL_IMAGE_BYTES {
+            notes.push(format!(
+                "could not attach {name}: {} MiB total image limit reached",
+                MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+            ));
+            continue;
+        }
+        total += data.len();
+        blocks.push(agent_code_lib::llm::message::image_block_from_bytes(
+            &image.path,
+            &data,
+        ));
+    }
+    (blocks, notes)
 }
 
 /// True when `path` resolves inside `cwd`. Both sides are canonicalized.
@@ -811,8 +973,10 @@ mod tests {
             "image was not attached: {:?}",
             out.notes
         );
-        let ContentBlock::Image { media_type, data } = &out.images[0] else {
-            panic!("expected an image block");
+        assert!(out.images[0].path.ends_with("shot.png"));
+        let (blocks, notes) = encode_staged_images(out.images);
+        let ContentBlock::Image { media_type, data } = &blocks[0] else {
+            panic!("expected an image block: {notes:?}");
         };
         assert_eq!(media_type, "image/png");
         assert!(!data.is_empty(), "image was attached with an empty payload");
@@ -903,8 +1067,9 @@ mod tests {
         fs::write(dir.path().join("shot.png"), [0x89, b'P', b'N', b'G']).unwrap();
         let out = expand_mentions("@shot.png", dir.path()).expect("expanded");
         assert_eq!(out.images.len(), 1, "{:?}", out.notes);
-        let ContentBlock::Image { media_type, data } = &out.images[0] else {
-            panic!("expected an image block");
+        let (blocks, notes) = encode_staged_images(out.images);
+        let ContentBlock::Image { media_type, data } = &blocks[0] else {
+            panic!("expected an image block: {notes:?}");
         };
         assert_eq!(media_type, "image/png");
         assert_eq!(data, "iVBORw==");
@@ -964,7 +1129,7 @@ mod tests {
         // SAFETY: `c` is a valid NUL-terminated path for the call.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
         assert_eq!(
-            open_regular_file(&path).unwrap_err(),
+            open_beneath(dir.path(), &path).unwrap_err(),
             "not a regular file",
             "a FIFO must never be opened for attachment"
         );
@@ -982,8 +1147,53 @@ mod tests {
         let link = dir.path().join("link.png");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(
-            open_regular_file(&link).is_err(),
+            open_beneath(dir.path(), &link).is_err(),
             "open followed a symlink out of the workspace"
+        );
+    }
+
+    /// The attack the descriptors exist for: swap an *ancestor directory*
+    /// of a staged image for a symlink pointing outside the workspace
+    /// before the turn starts. `O_NOFOLLOW` on the final component alone
+    /// would not have caught this; the read must still see the file that
+    /// was validated, not the one the name now reaches.
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_image_survives_its_directory_being_swapped() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("shot.png"), b"exfiltrate me").unwrap();
+
+        let dir = fixture();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/shot.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let out = expand_mentions("@sub/shot.png", dir.path()).expect("expanded");
+        assert_eq!(out.images.len(), 1, "{:?}", out.notes);
+
+        // The turn has not started yet; the whole directory is replaced.
+        fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+
+        let (blocks, notes) = encode_staged_images(out.images);
+        let ContentBlock::Image { data, .. } = &blocks[0] else {
+            panic!("expected an image block: {notes:?}");
+        };
+        assert_eq!(
+            data, "iVBORw==",
+            "read the swapped-in file, not the staged one"
+        );
+    }
+
+    /// And the open itself refuses to walk through a symlinked ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn opening_refuses_a_symlinked_ancestor_directory() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("shot.png"), b"exfiltrate me").unwrap();
+        let dir = fixture();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert!(
+            open_beneath(dir.path(), &dir.path().join("sub/shot.png")).is_err(),
+            "open walked through a symlinked ancestor"
         );
     }
 
@@ -993,7 +1203,7 @@ mod tests {
     fn an_unreadable_image_is_refused() {
         let dir = fixture();
         let missing = dir.path().join("gone.png");
-        assert!(read_image_capped(&missing, MAX_IMAGE_BYTES).is_err());
+        assert!(stage_image(dir.path(), &missing).is_err());
     }
 
     /// A non-image binary still reports why it was skipped, rather than

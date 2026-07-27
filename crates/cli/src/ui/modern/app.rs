@@ -423,10 +423,10 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
-    /// Images mentioned in the prompt, attached to the next turn. Already
-    /// encoded: they are read while the mention is being validated, so no
-    /// path has to be trusted a second time when the turn starts.
-    pub pending_images: Vec<agent_code_lib::llm::message::ContentBlock>,
+    /// Images mentioned in the prompt, attached to the next turn. Held as
+    /// open descriptors from the moment their mention was validated, so
+    /// starting the turn needs no second look at any path.
+    pub pending_images: Vec<super::mentions::StagedImage>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
