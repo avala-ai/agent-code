@@ -53,8 +53,8 @@ hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
 == legend ==
 a fg=Rgb(38, 139, 210) bg=Reset mods=BOLD
 b fg=Reset bg=Reset mods=NONE
-c fg=DarkGray bg=Reset mods=NONE
-d fg=Gray bg=Reset mods=NONE
+c fg=Rgb(147, 161, 161) bg=Reset mods=NONE
+d fg=Rgb(129, 146, 149) bg=Reset mods=NONE
 e fg=Rgb(133, 153, 0) bg=Reset mods=BOLD
 f fg=Rgb(38, 139, 210) bg=Rgb(227, 233, 225) mods=BOLD
 g fg=Rgb(101, 123, 131) bg=Rgb(227, 233, 225) mods=NONE

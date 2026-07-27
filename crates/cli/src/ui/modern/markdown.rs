@@ -132,7 +132,7 @@ impl Builder {
             p.push(Span::styled(
                 "▎ ",
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette().muted)
                     .add_modifier(Modifier::ITALIC),
             ));
         }
@@ -196,7 +196,7 @@ impl Builder {
                 self.finish_line();
                 self.lines.push(Line::from(Span::styled(
                     "─".repeat(24),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette().muted),
                 )));
             }
             Event::TaskListMarker(done) => {
@@ -277,10 +277,10 @@ impl Builder {
                         .fg(palette().accent)
                         .add_modifier(Modifier::BOLD),
                     Some(HeadingLevel::H3) => Style::default()
-                        .fg(Color::Gray)
+                        .fg(palette().inactive)
                         .add_modifier(Modifier::BOLD),
                     Some(_) => Style::default()
-                        .fg(Color::Gray)
+                        .fg(palette().inactive)
                         .add_modifier(Modifier::BOLD),
                     None => Style::default().add_modifier(Modifier::BOLD),
                 };
@@ -299,7 +299,7 @@ impl Builder {
                         .max(3);
                     self.lines.push(Line::from(Span::styled(
                         "─".repeat(w),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette().muted),
                     )));
                 }
                 self.blank_line();
@@ -318,7 +318,7 @@ impl Builder {
                         .join(" │ ");
                     self.lines.push(Line::from(Span::styled(
                         format!(" {line} "),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(palette().inactive),
                     )));
                     self.table_row.clear();
                 }
@@ -361,7 +361,7 @@ impl Builder {
 
     fn emit_code_block(&mut self, lang: &str, content: &str) {
         let accent = palette().accent;
-        let muted = Color::DarkGray;
+        let muted = palette().muted;
         let gutter = Style::default().fg(muted);
         let body_bg = Color::Rgb(24, 24, 32);
         let tag = if lang.is_empty() {
@@ -429,7 +429,7 @@ impl Builder {
                 }
                 Err(_) => spans.push(Span::styled(
                     line.trim_end_matches('\n').to_string(),
-                    Style::default().fg(Color::Gray).bg(body_bg),
+                    Style::default().fg(palette().inactive).bg(body_bg),
                 )),
             }
             self.lines.push(Line::from(spans));
