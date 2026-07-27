@@ -288,6 +288,7 @@ mod frames {
                 description: "Bash: run `cargo test`".into(),
                 origin: None,
                 input_preview: Some("{\n  \"command\": \"cargo test\"\n}".into()),
+                suggested_prefix: None,
                 respond,
             }));
         });

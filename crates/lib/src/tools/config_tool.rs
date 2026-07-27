@@ -792,6 +792,7 @@ mod tests {
             _description: &str,
             input_preview: Option<&str>,
             _origin: Option<&str>,
+            _suggested_prefix: Option<&str>,
         ) -> super::super::PermissionResponse {
             self.calls
                 .lock()

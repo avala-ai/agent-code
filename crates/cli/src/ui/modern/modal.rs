@@ -20,6 +20,8 @@ pub struct PendingPermission {
     /// line rather than folded into `description`.
     pub origin: Option<String>,
     pub input_preview: Option<String>,
+    /// Prefix offered for a durable grant, when one is safe to offer.
+    pub suggested_prefix: Option<String>,
     pub respond: std::sync::mpsc::Sender<PermissionResponse>,
 }
 
@@ -102,6 +104,14 @@ impl App {
 
     /// Answer the front permission ask and advance the modal queue. No-op if
     /// the front modal is not a permission ask (so a mixed queue is safe).
+    /// The prefix the front permission modal offers, if any.
+    pub fn suggested_prefix(&self) -> Option<String> {
+        match self.modals.front() {
+            Some(Modal::Permission(p)) => p.suggested_prefix.clone(),
+            _ => None,
+        }
+    }
+
     pub fn resolve_permission(&mut self, resp: PermissionResponse) {
         if !matches!(self.modals.front(), Some(Modal::Permission(_))) {
             return;
@@ -116,6 +126,9 @@ impl App {
             // executor and may fail (read-only config dir, full disk) —
             // the modal must not assert storage it cannot observe.
             // `/permissions` lists what actually persisted.
+            PermissionResponse::AllowAlwaysPrefix { ref prefix } => {
+                format!("always allowing commands starting with `{prefix}` (saved)")
+            }
             PermissionResponse::AllowAlways => {
                 format!("always allowing this exact {} call", p.name)
             }

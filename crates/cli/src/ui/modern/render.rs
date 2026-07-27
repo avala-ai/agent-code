@@ -988,7 +988,14 @@ fn draw_permission_modal(
         // Keep ≤ 40 cols so min-width modals still show every binding —
         // the deny action must never be the one that gets clipped.
         // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
-        Some(key_hint_line("[y] once [a] session [A] always [n] deny")),
+        Some(key_hint_line(&match pending.suggested_prefix.as_deref() {
+            // Name the prefix in the hint. "[P] prefix" would make the
+            // user guess what they are about to approve.
+            Some(prefix) => {
+                format!("[y] once [a] session [A] always [P] always `{prefix}` [n] deny")
+            }
+            None => "[y] once [a] session [A] always [n] deny".to_string(),
+        })),
     );
 }
 
@@ -1574,6 +1581,7 @@ mod tests {
                     description: format!("Bash: run `{attack}`"),
                     origin: None,
                     input_preview: Some(format!("{{\n  \"command\": \"{attack}\"\n}}")),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -1603,6 +1611,7 @@ mod tests {
                     description: "run plugin".into(),
                     origin: None,
                     input_preview: None,
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2172,6 +2181,7 @@ mod tests {
                     description: "Bash: run `cargo publish`".into(),
                     origin: Some("subagent-2".into()),
                     input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2208,6 +2218,7 @@ mod tests {
                     description: "big input".into(),
                     origin: None,
                     input_preview: Some(preview),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2264,6 +2275,7 @@ mod tests {
                         "Bash: run a long pipeline that wraps across many columns and rows".into(),
                     origin: None,
                     input_preview: Some(preview),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2355,6 +2367,7 @@ mod tests {
                         description: format!("{name} ask"),
                         origin: None,
                         input_preview: None,
+                        suggested_prefix: None,
                         respond,
                     },
                 ));

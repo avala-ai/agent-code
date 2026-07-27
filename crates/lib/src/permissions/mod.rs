@@ -451,7 +451,7 @@ fn matches_input_pattern(
 ///
 /// The asymmetry is the safety property: a wrapper or an extra segment
 /// can only ever cost you permissions, never grant them.
-fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
+pub(crate) fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
     let parsed = crate::tools::bash_parse::parse_bash(command);
 
     if !widening {

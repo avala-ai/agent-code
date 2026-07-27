@@ -282,8 +282,26 @@ async fn execute_single_tool(
                 }
                 None => false,
             };
+            // The context a prefix grant for this call would carry, if
+            // this is a shell call at all.
+            let prefix_context =
+                bash_prefix_context(&call.name, &call.input, &sandbox_state, &ctx.cwd);
             let granted = match ctx.persistent_grants {
-                Some(ref grants) => grants.lock().await.contains(&grant_key),
+                Some(ref grants) => {
+                    let mut store = grants.lock().await;
+                    let exact = store.contains(&grant_key);
+                    // A prefix grant is consulted only for shell calls,
+                    // and only in the context it was made under.
+                    let by_prefix = !exact
+                        && match (
+                            &prefix_context,
+                            call.input.get("command").and_then(|v| v.as_str()),
+                        ) {
+                            (Some(cx), Some(cmd)) => store.allows_prefix(cmd, cx),
+                            _ => false,
+                        };
+                    exact || by_prefix
+                }
                 None => false,
             };
             if session_allowed || granted {
@@ -303,12 +321,22 @@ async fn execute_single_tool(
                     // block_in_place is a no-op choice on current-thread
                     // runtimes (it would panic), where blocking is the
                     // caller's contract anyway.
+                    // Only offer a prefix when the gate could reason
+                    // about the command; otherwise the UI would propose a
+                    // durable grant it cannot honour safely.
+                    let suggested_prefix = prefix_context.as_ref().and_then(|_| {
+                        call.input
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .and_then(crate::permissions::grants::derive_prefix)
+                    });
                     let ask = || {
                         prompter.ask(
                             &call.name,
                             &description,
                             input_preview.as_deref(),
                             ctx.agent_origin.as_deref(),
+                            suggested_prefix.as_deref(),
                         )
                     };
                     match tokio::runtime::Handle::current().runtime_flavor() {
@@ -364,6 +392,30 @@ async fn execute_single_tool(
                             // Losing durability is the documented cost of
                             // the opt-out; losing exactness is not.
                             None => {
+                                if let Some(ref allows) = ctx.session_allows {
+                                    allows.lock().await.insert(exact_entry);
+                                }
+                            }
+                        }
+                    }
+                    super::PermissionResponse::AllowAlwaysPrefix { ref prefix } => {
+                        match (ctx.persistent_grants.as_ref(), &prefix_context) {
+                            (Some(grants), Some(cx)) => {
+                                // The label is the prefix itself, which is
+                                // short and user-chosen — unlike the
+                                // description, which embeds the whole
+                                // command line and may carry credentials.
+                                let label = format!("commands starting with `{prefix}`");
+                                if let Err(e) =
+                                    grants.lock().await.insert_prefix(prefix, cx, &label)
+                                {
+                                    tracing::warn!("could not persist prefix grant: {e}");
+                                }
+                            }
+                            // No grant store, or not a shell call: fall
+                            // back to session scope for this exact call
+                            // rather than silently widening anything.
+                            _ => {
                                 if let Some(ref allows) = ctx.session_allows {
                                     allows.lock().await.insert(exact_entry);
                                 }
@@ -593,6 +645,56 @@ pub fn sandbox_grant_state(sandbox: Option<&crate::sandbox::SandboxExecutor>) ->
 /// this key is persisted into the config directory, where secrets must
 /// never be written. Equality matching needs nothing more than the
 /// digest.
+/// The non-command half of a shell grant key: everything that changes
+/// what the command would actually do.
+///
+/// Shared with prefix grants, which match the command by parsing but
+/// must still be bound to the same context — a prefix approved with the
+/// sandbox disabled, or in another project, must not silently apply
+/// where those differ.
+fn bash_grant_context(
+    unsandboxed: bool,
+    background: bool,
+    timeout: u64,
+    sandbox_state: &str,
+    cwd_digest: &str,
+) -> String {
+    format!(
+        "nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}\0cwd-sha256:{cwd_digest}"
+    )
+}
+
+/// The context a prefix grant for this call would be bound to, or `None`
+/// when the tool is not a shell (prefix grants are shell-only).
+pub fn bash_prefix_context(
+    tool: &str,
+    input: &serde_json::Value,
+    sandbox_state: &str,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    if tool != "Bash" && tool != "PowerShell" {
+        return None;
+    }
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd_digest = sha256_hex(&crate::config::os_path_bytes(&canonical));
+    let unsandboxed = input
+        .get("dangerouslyDisableSandbox")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let background = input
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let timeout = crate::tools::bash::effective_timeout_ms(input);
+    Some(bash_grant_context(
+        unsandboxed,
+        background,
+        timeout,
+        sandbox_state,
+        &cwd_digest,
+    ))
+}
+
 pub fn persistent_grant_key(
     tool: &str,
     input: &serde_json::Value,
@@ -623,8 +725,9 @@ pub fn persistent_grant_key(
             // budget re-prompts.
             let timeout = crate::tools::bash::effective_timeout_ms(input);
             format!(
-                "cmd-sha256:{}\0nosandbox:{unsandboxed}\0bg:{background}\0timeout:{timeout}\0isolated:{sandbox_state}\0cwd-sha256:{cwd_digest}",
-                sha256_hex(command.as_bytes())
+                "cmd-sha256:{}\0{}",
+                sha256_hex(command.as_bytes()),
+                bash_grant_context(unsandboxed, background, timeout, sandbox_state, &cwd_digest)
             )
         }
         "WebFetch" => {
@@ -1595,6 +1698,7 @@ mod parallel_batch_tests {
             _description: &str,
             _input_preview: Option<&str>,
             _origin: Option<&str>,
+            _suggested_prefix: Option<&str>,
         ) -> PermissionResponse {
             self.asked.fetch_add(1, Ordering::SeqCst);
             PermissionResponse::Deny
@@ -1663,6 +1767,7 @@ mod parallel_batch_tests {
             _description: &str,
             _input_preview: Option<&str>,
             _origin: Option<&str>,
+            _suggested_prefix: Option<&str>,
         ) -> PermissionResponse {
             if let Some(ref next) = self.swap_to {
                 *self.digest.lock().unwrap() = next.clone();
@@ -1769,6 +1874,7 @@ mod parallel_batch_tests {
             _description: &str,
             _input_preview: Option<&str>,
             _origin: Option<&str>,
+            _suggested_prefix: Option<&str>,
         ) -> PermissionResponse {
             self.asked.fetch_add(1, Ordering::SeqCst);
             PermissionResponse::AllowAlways
@@ -1841,6 +1947,7 @@ mod parallel_batch_tests {
             _description: &str,
             _input_preview: Option<&str>,
             _origin: Option<&str>,
+            _suggested_prefix: Option<&str>,
         ) -> PermissionResponse {
             self.asked.fetch_add(1, Ordering::SeqCst);
             PermissionResponse::AllowSession
