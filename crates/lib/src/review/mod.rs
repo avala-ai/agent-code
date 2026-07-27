@@ -197,9 +197,15 @@ fn validate_commit(cwd: &Path, sha: &str) -> Result<String, InvalidTarget> {
     })
 }
 
+/// Untracked files get their own instruction on purpose: they are
+/// outside the index, so `git diff` and `git diff --staged` both skip
+/// them and `git status` lists only their paths. A brand-new file is
+/// exactly the kind of code a review should not miss.
 const UNCOMMITTED_PROMPT: &str = "Review the current uncommitted changes — staged, unstaged and \
-     untracked. Use `git status` and `git diff` (including `--staged`) to see them, then read the \
-     surrounding code as needed. Report prioritized, actionable findings.";
+     untracked. Run `git status`, then `git diff` and `git diff --staged` for edits to tracked \
+     files. Untracked files appear in neither diff, so list them with `git ls-files --others \
+     --exclude-standard` and read each one in full. Then read the surrounding code as needed. \
+     Report prioritized, actionable findings.";
 
 fn hint_for(target: &ReviewTarget) -> String {
     match target {
@@ -365,6 +371,27 @@ mod tests {
         assert!(r.prompt.contains(&head), "prompt: {}", r.prompt);
         assert!(r.prompt.contains("fix the parser"));
         assert!(r.hint.contains("fix the parser"));
+    }
+
+    /// A bare `/review` promises untracked files, but no diff shows
+    /// them: they are outside the index, and `git status` prints only
+    /// their paths. Without an explicit instruction a whole new file
+    /// gets a clean review from a reviewer that never opened it.
+    #[test]
+    fn the_uncommitted_prompt_says_how_to_read_untracked_files() {
+        let cwd = std::env::current_dir().unwrap();
+        let r = resolve(ReviewTarget::Uncommitted, &cwd).expect("the working tree always resolves");
+        assert!(
+            r.prompt
+                .contains("git ls-files --others --exclude-standard"),
+            "no way to enumerate untracked files: {}",
+            r.prompt
+        );
+        assert!(
+            r.prompt.contains("read each one"),
+            "untracked files are listed but never opened: {}",
+            r.prompt
+        );
     }
 
     /// Every value here is interpolated into a command the reviewer is
