@@ -88,15 +88,20 @@ pub fn resolve(target: ReviewTarget, cwd: &Path) -> ResolvedReview {
     let prompt = match &target {
         ReviewTarget::Uncommitted => UNCOMMITTED_PROMPT.to_string(),
         ReviewTarget::BaseBranch { base } => match merge_base(cwd, base) {
+            // Two-commit form on purpose. `git diff <merge-base>` diffs
+            // the base against the *working tree*, so uncommitted work
+            // would be reviewed as if the branch added it.
             Some(sha) => format!(
                 "Review the changes this branch adds on top of '{base}'. The merge base is \
-                 {sha}. Run `git diff {sha}` to see exactly what would merge into {base}, then \
-                 read the surrounding code as needed. Report prioritized, actionable findings."
+                 {sha}. Run `git diff {sha} HEAD` to see exactly what would merge into {base}, \
+                 then read the surrounding code as needed. Report prioritized, actionable \
+                 findings."
             ),
             None => format!(
                 "Review the changes this branch adds on top of '{base}'. Find the merge base \
-                 yourself (`git merge-base HEAD {base}`), diff against it, then read the \
-                 surrounding code as needed. Report prioritized, actionable findings."
+                 yourself (`git merge-base HEAD {base}`) and diff it against HEAD (`git diff \
+                 <merge-base> HEAD`), then read the surrounding code as needed. Report \
+                 prioritized, actionable findings."
             ),
         },
         ReviewTarget::Commit { sha, title } => {
@@ -318,6 +323,48 @@ mod tests {
             r.prompt.contains(&head),
             "merge base was not resolved into the prompt: {}",
             r.prompt
+        );
+    }
+
+    /// `git diff <merge-base>` is the one-commit form: it compares the
+    /// base to the **working tree**, so staged and unstaged edits get
+    /// reviewed as if the branch introduced them. A base-branch review
+    /// has to name two commits.
+    #[test]
+    fn a_base_review_diffs_the_merge_base_against_head() {
+        let cwd = std::env::current_dir().unwrap();
+        if let Some(head) = run_git(&cwd, &["rev-parse", "HEAD"]) {
+            let r = resolve(
+                ReviewTarget::BaseBranch {
+                    base: "HEAD".into(),
+                },
+                &cwd,
+            );
+            assert!(
+                r.prompt.contains(&format!("git diff {head} HEAD")),
+                "resolved base prompt lost the two-commit diff: {}",
+                r.prompt
+            );
+            assert!(
+                !r.prompt.contains(&format!("git diff {head}`")),
+                "one-commit form pulls the working tree into the review: {}",
+                r.prompt
+            );
+        }
+
+        // The degraded path tells the reviewer to find the merge base
+        // itself; it must ask for the same two-commit diff.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = resolve(
+            ReviewTarget::BaseBranch {
+                base: "nonexistent-branch-xyz".into(),
+            },
+            tmp.path(),
+        );
+        assert!(
+            d.prompt.contains("<merge-base> HEAD"),
+            "degraded base prompt lost the two-commit diff: {}",
+            d.prompt
         );
     }
 
