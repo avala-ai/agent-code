@@ -395,6 +395,20 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .fg(palette().accent)
             .add_modifier(Modifier::BOLD),
     )));
+    // Roster summary: how many sessions there are and how many you have
+    // been in. Answers "where am I in all this" before you read a row.
+    let visited_here = p
+        .entries
+        .iter()
+        .filter(|s| p.visited.contains(&s.id) || s.id == p.current_id)
+        .count();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} session(s) · {visited_here} open here   ● current  ◆ visited",
+            p.entries.len()
+        ),
+        Style::default().fg(palette().muted),
+    )));
     lines.push(Line::from(""));
 
     let filtered = p.filtered();
@@ -419,8 +433,19 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 Style::default().fg(palette().text)
             };
+            // Roster markers: `●` is the session you are in, `◆` one you
+            // have already visited and can return to without a rebuild.
+            // Without these the list cannot answer "which of these am I
+            // in", which is the first thing you ask of it.
+            let badge = if s.id == p.current_id {
+                "● "
+            } else if p.visited.contains(&s.id) {
+                "◆ "
+            } else {
+                "  "
+            };
             lines.push(Line::from(Span::styled(
-                format!("{marker} {}", summary_line(s)),
+                format!("{marker} {badge}{}", summary_line(s)),
                 style,
             )));
         }
@@ -2278,6 +2303,68 @@ mod tests {
         assert!(
             normal.contains("▪ hello"),
             "normal mode is indistinguishable from insert:\n{normal}"
+        );
+    }
+
+    /// The roster's whole job: say which session you are in and which
+    /// you can go back to. A list that cannot answer that is just a list.
+    #[test]
+    fn the_session_picker_marks_current_and_visited_sessions() {
+        use agent_code_lib::services::session::SessionSummary;
+        let mk = |id: &str, label: &str| SessionSummary {
+            id: id.to_string(),
+            cwd: "/home/u/api".into(),
+            model: "test-model".into(),
+            turn_count: 1,
+            message_count: 2,
+            updated_at: "2026-07-27T10:00:00Z".into(),
+            label: Some(label.to_string()),
+            tags: Vec::new(),
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "sess-current");
+        // A session visited earlier in this process.
+        app.session_views.save(
+            "sess-visited",
+            crate::ui::modern::session_views::SessionView {
+                transcript: vec![TranscriptItem::User("earlier".into())],
+                scroll: Default::default(),
+                expanded: Default::default(),
+                selected_item: None,
+            },
+        );
+        app.open_session_picker(vec![
+            mk("sess-current", "the one I am in"),
+            mk("sess-visited", "been here"),
+            mk("sess-fresh", "never opened"),
+        ]);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+
+        assert!(s.contains("3 session(s)"), "buffer:\n{s}");
+        assert!(
+            s.contains("2 open here"),
+            "current + visited should count as open here:\n{s}"
+        );
+        // The glyphs must reach the rows, not just the legend.
+        let current_row = s
+            .lines()
+            .find(|l| l.contains("the one I am in"))
+            .unwrap_or("");
+        assert!(
+            current_row.contains('●'),
+            "no current marker: {current_row}"
+        );
+        let visited_row = s.lines().find(|l| l.contains("been here")).unwrap_or("");
+        assert!(
+            visited_row.contains('◆'),
+            "no visited marker: {visited_row}"
+        );
+        let fresh_row = s.lines().find(|l| l.contains("never opened")).unwrap_or("");
+        assert!(
+            !fresh_row.contains('●') && !fresh_row.contains('◆'),
+            "an unvisited session was marked: {fresh_row}"
         );
     }
 

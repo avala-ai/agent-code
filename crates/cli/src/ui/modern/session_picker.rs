@@ -18,6 +18,12 @@ use super::mode::SessionMode;
 /// Overlay state for the session picker.
 #[derive(Debug, Clone)]
 pub struct SessionPicker {
+    /// The session the user is in right now. Marked in the list so
+    /// "resume" never looks like it might land somewhere else.
+    pub current_id: String,
+    /// Sessions with a cached view — returning to one of these keeps
+    /// where you were instead of rebuilding from the conversation.
+    pub visited: std::collections::HashSet<String>,
     /// Filter over id, label, cwd and model.
     pub query: String,
     /// Highlighted row into the filtered list.
@@ -282,6 +288,8 @@ impl App {
         self.command_palette = None;
         self.show_shortcuts = false;
         self.session_picker = Some(SessionPicker {
+            current_id: self.session_id.clone(),
+            visited: self.session_views.visited().map(str::to_string).collect(),
             query: String::new(),
             selected: 0,
             entries,
@@ -548,6 +556,15 @@ impl App {
             return;
         };
         self.close_session_picker();
+        // Selecting the session you are already in is a no-op, not a
+        // reload. Going through the resume path would cancel pending
+        // work and rebuild the transcript to arrive exactly where it
+        // started — the user would lose queued prompts for nothing.
+        if id == self.session_id {
+            self.status_message = "already in this session".to_string();
+            self.dirty = true;
+            return;
+        }
         // Work already staged against the conversation we are leaving is
         // resolved here, at the moment of the decision. Left alone the
         // resume gates would merely *hold* it, and it would then land on
@@ -690,6 +707,28 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    /// Picking the session you are already in must do nothing. Routing
+    /// it through the resume path would cancel queued work and rebuild
+    /// the transcript to land exactly where it started.
+    #[test]
+    fn resuming_the_current_session_is_a_no_op() {
+        let mut app = App::new("m", "/tmp", "sess-a");
+        app.queue.push_back("a queued prompt".into());
+        app.open_session_picker(vec![summary("sess-a", Some("current"), "/a")]);
+        app.session_picker_accept();
+
+        assert!(
+            app.pending_resume.is_none(),
+            "scheduled a resume of the session already in front"
+        );
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "queued work was cancelled for a no-op resume"
+        );
+        assert!(app.status_message.contains("already in this session"));
+    }
+
     /// Switching away and back must land where you left. Rebuilding is
     /// correct but loses position and expansions, which makes moving
     /// between sessions cost more than it saves.
@@ -798,6 +837,8 @@ mod tests {
     #[test]
     fn filtering_matches_id_label_cwd_and_model() {
         let picker = SessionPicker {
+            current_id: String::new(),
+            visited: Default::default(),
             query: String::new(),
             selected: 0,
             entries: vec![
