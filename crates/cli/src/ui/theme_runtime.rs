@@ -296,7 +296,12 @@ pub fn init_with_options(theme_name: &str, configured_name: &str, inherit_fg: bo
     }
     if let Ok(mut guard) = ACTIVE_OPTIONS.write() {
         *guard = ActiveOptions {
-            auto: configured_name == "auto",
+            // Only *detected* auto counts: a user `themes/auto.toml`
+            // is an explicit palette that happens to own the id, and
+            // `inherit_fg` must not rewrite its `text` slot. Same
+            // predicate the resolution path uses, so the two cannot
+            // disagree about what "auto" meant.
+            auto: auto_detection_applies(configured_name, || legacy::user_palette_exists("auto")),
             inherit_fg,
         };
     }
@@ -429,6 +434,15 @@ mod tests {
             assert!(!super::auto_detection_applies(name, || false), "{name}");
             assert!(!super::auto_detection_applies(name, || true), "{name}");
         }
+
+        // A shadowing palette makes `auto` an explicit choice, which is
+        // what `init_with_options` keys `ActiveOptions::auto` on — so a
+        // custom auto palette keeps its own `text` slot under
+        // `inherit_fg` instead of being treated as detected.
+        assert!(
+            !super::auto_detection_applies("auto", || true),
+            "a user auto palette must not be treated as detected"
+        );
 
         // The ownership check must not run for a name that cannot be
         // shadowed — it scans the user themes directory, and the picker
