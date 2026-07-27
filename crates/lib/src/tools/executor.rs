@@ -311,6 +311,18 @@ async fn execute_single_tool(
                 let description = format!("{}: {}", call.name, prompt);
                 let input_preview = serde_json::to_string_pretty(&call.input).ok();
 
+                // Only offer a prefix when the gate could reason about the
+                // command; otherwise the UI would propose a durable grant
+                // it cannot honour safely. Derived once, before the ask, so
+                // the answer can be checked against what was actually
+                // offered rather than trusted as it comes back.
+                let suggested_prefix = prefix_context.as_ref().and_then(|_| {
+                    call.input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::permissions::grants::derive_prefix)
+                });
+
                 let response = if let Some(ref prompter) = ctx.permission_prompter {
                     // `ask` blocks synchronously until the human answers —
                     // potentially minutes. Announce the block so the runtime
@@ -321,15 +333,6 @@ async fn execute_single_tool(
                     // block_in_place is a no-op choice on current-thread
                     // runtimes (it would panic), where blocking is the
                     // caller's contract anyway.
-                    // Only offer a prefix when the gate could reason
-                    // about the command; otherwise the UI would propose a
-                    // durable grant it cannot honour safely.
-                    let suggested_prefix = prefix_context.as_ref().and_then(|_| {
-                        call.input
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .and_then(crate::permissions::grants::derive_prefix)
-                    });
                     let ask = || {
                         prompter.ask(
                             &call.name,
@@ -399,8 +402,16 @@ async fn execute_single_tool(
                         }
                     }
                     super::PermissionResponse::AllowAlwaysPrefix { ref prefix } => {
-                        match (ctx.persistent_grants.as_ref(), &prefix_context) {
-                            (Some(grants), Some(cx)) => {
+                        // The durable grant is bound to the operation that
+                        // was actually offered. The answer carries the
+                        // prefix text back from the UI, and persisting it
+                        // unchecked would make the grant only as narrow as
+                        // whatever came over that boundary. Re-derived
+                        // above from this call's own command; anything
+                        // else is not the approval the user was shown.
+                        let as_offered = suggested_prefix.as_deref() == Some(prefix.as_str());
+                        match (ctx.persistent_grants.as_ref(), &prefix_context, as_offered) {
+                            (Some(grants), Some(cx), true) => {
                                 // The label is the prefix itself, which is
                                 // short and user-chosen — unlike the
                                 // description, which embeds the whole
@@ -412,9 +423,11 @@ async fn execute_single_tool(
                                     tracing::warn!("could not persist prefix grant: {e}");
                                 }
                             }
-                            // No grant store, or not a shell call: fall
-                            // back to session scope for this exact call
-                            // rather than silently widening anything.
+                            // No grant store, not a shell call, or a
+                            // prefix that is not the one this call
+                            // offered: fall back to session scope for
+                            // this exact call rather than silently
+                            // widening anything.
                             _ => {
                                 if let Some(ref allows) = ctx.session_allows {
                                     allows.lock().await.insert(exact_entry);
@@ -1874,6 +1887,190 @@ mod parallel_batch_tests {
         let (results, ran) = run_shifting(None).await;
         assert_eq!(ran, 1, "a stable binding must still run");
         assert!(!results[0].result.is_error);
+    }
+
+    /// Stands in for the shell tool: prefix grants key off the tool
+    /// *name*, so the name is what matters here.
+    struct BashLikeTool {
+        ran: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for BashLikeTool {
+        fn name(&self) -> &'static str {
+            "Bash"
+        }
+        fn description(&self) -> &'static str {
+            "test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        async fn check_permissions(
+            &self,
+            _input: &serde_json::Value,
+            _checker: &crate::permissions::PermissionChecker,
+        ) -> PermissionDecision {
+            PermissionDecision::Ask("running".into())
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("ok".to_string()))
+        }
+    }
+
+    /// Answers with whatever prefix it is told to, regardless of what the
+    /// call actually offered.
+    struct PrefixPrompter {
+        asked: Arc<AtomicUsize>,
+        answer: Option<String>,
+        offered: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+    impl PermissionPrompter for PrefixPrompter {
+        fn ask(
+            &self,
+            _tool_name: &str,
+            _description: &str,
+            _input_preview: Option<&str>,
+            _origin: Option<&str>,
+            suggested_prefix: Option<&str>,
+        ) -> PermissionResponse {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.offered
+                .lock()
+                .unwrap()
+                .push(suggested_prefix.map(str::to_string));
+            // `None` means "echo back whatever was offered".
+            let prefix = match self.answer {
+                Some(ref p) => p.clone(),
+                None => suggested_prefix.unwrap_or_default().to_string(),
+            };
+            PermissionResponse::AllowAlwaysPrefix { prefix }
+        }
+    }
+
+    async fn run_prefix_answer(answer: Option<&str>) -> (usize, Vec<Option<String>>) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BashLikeTool { ran: ran.clone() })];
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.permission_prompter = Some(Arc::new(PrefixPrompter {
+            asked: asked.clone(),
+            answer: answer.map(str::to_string),
+            offered: offered.clone(),
+        }));
+        ctx.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::permissions::grants::GrantStore::ephemeral(),
+        )));
+        ctx.session_allows = Some(Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )));
+        let checker = crate::permissions::PermissionChecker::allow_all();
+
+        let bash = |id: &str, command: &str| PendingToolCall {
+            id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": command}),
+        };
+
+        // The call that gets approved, then the one a widened grant
+        // would silently cover.
+        execute_tool_calls(
+            &[bash("c1", "git status --porcelain")],
+            &tools,
+            &ctx,
+            &checker,
+        )
+        .await;
+        execute_tool_calls(&[bash("c2", "git push --force")], &tools, &ctx, &checker).await;
+        let seen = offered.lock().unwrap().clone();
+        (asked.load(Ordering::SeqCst), seen)
+    }
+
+    /// The answer carries the prefix text back from the UI. Persisting it
+    /// unchecked would make the durable grant only as narrow as whatever
+    /// crossed that boundary — an answer naming `git` would authorize
+    /// `git push --force` for good. The grant has to be the prefix this
+    /// call actually offered.
+    #[tokio::test]
+    async fn a_prefix_answer_that_was_not_offered_does_not_persist() {
+        let (asked, offered) = run_prefix_answer(Some("git")).await;
+        assert_eq!(
+            offered.first().cloned().flatten().as_deref(),
+            Some("git status"),
+            "precondition: the call offered the narrow prefix"
+        );
+        assert_eq!(
+            asked, 2,
+            "a prefix the call never offered was persisted and suppressed the next prompt"
+        );
+    }
+
+    /// The offered prefix itself still works, or the feature would do
+    /// nothing at all.
+    #[tokio::test]
+    async fn the_offered_prefix_is_persisted_and_honored() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BashLikeTool { ran: ran.clone() })];
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.permission_prompter = Some(Arc::new(PrefixPrompter {
+            asked: asked.clone(),
+            answer: None,
+            offered,
+        }));
+        ctx.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::permissions::grants::GrantStore::ephemeral(),
+        )));
+        ctx.session_allows = Some(Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )));
+        let checker = crate::permissions::PermissionChecker::allow_all();
+        let bash = |id: &str, command: &str| PendingToolCall {
+            id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": command}),
+        };
+
+        execute_tool_calls(
+            &[bash("c1", "git status --porcelain")],
+            &tools,
+            &ctx,
+            &checker,
+        )
+        .await;
+        // Covered by the `git status` prefix that was offered and echoed.
+        execute_tool_calls(&[bash("c2", "git status --short")], &tools, &ctx, &checker).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the granted prefix re-prompted"
+        );
+
+        // Not covered: a different subcommand.
+        execute_tool_calls(&[bash("c3", "git push --force")], &tools, &ctx, &checker).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "the prefix grant widened past its subcommand"
+        );
     }
 
     /// A write tool, so the session-allow key reduces to `file_path`
