@@ -105,6 +105,7 @@ impl TaskExecutor for LocalAgentExecutor {
                         subagent_kind: Some(description.clone()),
                         prompt: prompt.clone(),
                         parent_session: None,
+                        subagent_id: Some(subagent_id.clone()),
                     },
                     assigned_color,
                 )
@@ -161,7 +162,20 @@ impl TaskExecutor for LocalAgentExecutor {
 
         // Drive the queue entry to a terminal state regardless of
         // outcome, so `/tasks` doesn't show a perpetually-running row.
+        // Persist the result first (see `TaskManager::write_output`):
+        // externally-driven kinds have no streamed stdout, so without
+        // this the queue entry reads as empty output forever.
         if let (Some(tm), Some(id)) = (ctx.task_manager.as_ref(), task_id.as_ref()) {
+            match &outcome {
+                Ok(r) => {
+                    let _ = tm.write_output(id, &r.content).await;
+                }
+                // Persist the failure too: a Failed row whose output
+                // reads "(no output yet)" hides why it failed.
+                Err(e) => {
+                    let _ = tm.write_output(id, &e.to_string()).await;
+                }
+            }
             let status = match &outcome {
                 Ok(r) if !r.is_error => TaskStatus::Completed,
                 Ok(_) => TaskStatus::Failed("agent reported error".into()),
@@ -195,6 +209,7 @@ mod tests {
             subagent_kind: None,
             prompt: "   ".into(),
             parent_session: None,
+            subagent_id: None,
         };
         let err = exec.execute(&payload, &ctx).await.unwrap_err();
         assert!(matches!(err, TaskError::InvalidPayload(_)));

@@ -119,6 +119,12 @@ pub enum TaskPayload {
         prompt: String,
         /// Parent session id, when one is available.
         parent_session: Option<String>,
+        /// Stable subagent id the stream events use for this run (see
+        /// `resolve_subagent_id`), so UIs can reconcile this task with
+        /// the event-driven row instead of showing the same agent
+        /// twice. `None` on legacy persisted records.
+        #[serde(default)]
+        subagent_id: Option<String>,
     },
     /// A multi-step skill / workflow execution.
     LocalWorkflow {
@@ -301,6 +307,12 @@ impl TaskManager {
         if let Some(parent) = output_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Truncate up front: ids and cache paths recur across process
+        // starts, so a reader must never see a previous run's output —
+        // and reading before this run finishes means "empty", not ENOENT.
+        if let Err(e) = tokio::fs::File::create(&output_file).await {
+            debug!("could not pre-create task output {output_file:?}: {e}");
+        }
 
         let info = TaskInfo {
             id: id.clone(),
@@ -408,6 +420,12 @@ impl TaskManager {
         if let Some(parent) = output_file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Truncate up front: ids and cache paths recur across process
+        // starts, so a reader must never see a previous run's output —
+        // and reading before this run finishes means "empty", not ENOENT.
+        if let Err(e) = tokio::fs::File::create(&output_file).await {
+            debug!("could not pre-create task output {output_file:?}: {e}");
+        }
 
         let info = TaskInfo {
             id: id.clone(),
@@ -457,12 +475,63 @@ impl TaskManager {
 
     /// Read the output of a completed task.
     pub async fn read_output(&self, id: &str) -> Result<String, String> {
-        let tasks = self.tasks.lock().await;
-        let info = tasks
-            .get(id)
-            .ok_or_else(|| format!("Task '{id}' not found"))?;
-        std::fs::read_to_string(&info.output_file)
+        // Clone the path out before touching the filesystem: a sync read
+        // under the map lock would stall every other manager call (and
+        // the caller's runtime thread) for the duration of the read.
+        let output_file = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?
+                .output_file
+                .clone()
+        };
+        tokio::fs::read_to_string(&output_file)
+            .await
             .map_err(|e| format!("Failed to read output: {e}"))
+    }
+
+    /// Read at most the last `max_bytes` of a task's captured output.
+    ///
+    /// Long builds routinely produce output far larger than any viewer
+    /// shows; materializing the whole file just to display a tail can
+    /// exhaust memory. This seeks to the tail instead, prefixing a note
+    /// when earlier bytes were skipped.
+    pub async fn read_output_tail(&self, id: &str, max_bytes: u64) -> Result<String, String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let output_file = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(id)
+                .ok_or_else(|| format!("Task '{id}' not found"))?
+                .output_file
+                .clone()
+        };
+        let mut f = tokio::fs::File::open(&output_file)
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?;
+        let len = f
+            .metadata()
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?
+            .len();
+        let skipped = len.saturating_sub(max_bytes);
+        if skipped > 0 {
+            f.seek(std::io::SeekFrom::Start(skipped))
+                .await
+                .map_err(|e| format!("Failed to read output: {e}"))?;
+        }
+        let mut buf = Vec::new();
+        f.take(max_bytes)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read output: {e}"))?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if skipped > 0 {
+            Ok(format!("… ({skipped} earlier bytes omitted)\n{text}"))
+        } else {
+            Ok(text)
+        }
     }
 
     /// Persist `content` as a task's captured output.
@@ -988,6 +1057,70 @@ mod tests {
         }
     }
 
+    /// A still-running task must read as empty output, not ENOENT — and
+    /// never as a previous run's leftovers under a recycled id/path.
+    #[tokio::test]
+    async fn registering_truncates_any_stale_output_file() {
+        // Dream kind ('d' ids): the other tests in this module churn the
+        // shared 'a'/'b' output paths concurrently.
+        let payload = || TaskPayload::Dream { note: None };
+        let mgr = TaskManager::new();
+        let id = mgr.register("first", TaskKind::Dream, payload()).await;
+        assert_eq!(
+            mgr.read_output(&id).await.unwrap(),
+            "",
+            "running task did not read as empty"
+        );
+        mgr.write_output(&id, "stale from a previous run")
+            .await
+            .unwrap();
+
+        // Simulate an id recycled by a later process start: registering
+        // over the same output path must truncate it.
+        let mgr2 = TaskManager::new();
+        let id2 = mgr2.register("second", TaskKind::Dream, payload()).await;
+        assert_eq!(id2, id, "test premise: ids recycle across managers");
+        assert_eq!(
+            mgr2.read_output(&id2).await.unwrap(),
+            "",
+            "stale output survived re-registration"
+        );
+    }
+
+    /// Viewers show a tail; the read must be bounded rather than
+    /// materializing an arbitrarily large output file first.
+    #[tokio::test]
+    async fn read_output_tail_skips_the_head_of_large_output() {
+        // RemoteAgent kind ('r' ids): shell tests churn the shared 'b'
+        // output paths concurrently, and registering truncates them.
+        let mgr = TaskManager::new();
+        let id = mgr
+            .register(
+                "big",
+                TaskKind::RemoteAgent,
+                TaskPayload::RemoteAgent {
+                    routine_id: "noop".into(),
+                    timeout: None,
+                },
+            )
+            .await;
+        let big = format!("{}\nTHE-END", "x".repeat(100));
+        mgr.write_output(&id, &big).await.unwrap();
+
+        let tail = mgr.read_output_tail(&id, 16).await.unwrap();
+        assert!(tail.contains("THE-END"), "tail lost the end: {tail}");
+        assert!(
+            tail.contains("earlier bytes omitted"),
+            "no omission note: {tail}"
+        );
+        assert!(!tail.contains(&"x".repeat(20)), "head not skipped: {tail}");
+
+        // A file smaller than the bound round-trips untouched.
+        let all = mgr.read_output_tail(&id, 1_000_000).await.unwrap();
+        assert!(!all.contains("omitted"));
+        assert!(all.starts_with("xxx"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_shell_completes_and_surfaces_exactly_once() {
@@ -1163,6 +1296,7 @@ mod tests {
             subagent_kind: Some("demo".into()),
             prompt: "noop".into(),
             parent_session: None,
+            subagent_id: None,
         };
         let id = mgr
             .spawn_command(cmd, "demo", TaskKind::LocalAgent, payload, None, None)

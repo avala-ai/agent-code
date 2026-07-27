@@ -23,6 +23,7 @@ fn agent_payload() -> TaskPayload {
         subagent_kind: Some("test".into()),
         prompt: "noop".into(),
         parent_session: None,
+        subagent_id: None,
     }
 }
 

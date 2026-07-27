@@ -74,6 +74,9 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
     let session = Session::new(engine);
     let mut app = App::new_with_security(model, cwd, session_id, disable_skill_shell);
+    // Constructors install defaults only; the user's file is read once
+    // here so tests building Apps stay independent of machine config.
+    app.keybindings = std::sync::Arc::new(crate::ui::keybindings::KeybindingRegistry::load());
     // The picker previews by mutating the global theme, so the App has to
     // remember what the user actually configured in order to revert.
     app.theme_name = configured.clone();
@@ -315,6 +318,24 @@ pub(super) async fn event_loop(
     anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut flush_tick = tokio::time::interval(super::stream_buffer::FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Background tasks live in the shared `TaskManager`, which emits no
+    // events, so the pane has to ask. Polled only while a turn is live or
+    // rows already exist, so an idle session still never wakes — and the
+    // sync only marks the frame dirty when something actually changed.
+    let mut tasks_tick = tokio::time::interval(Duration::from_millis(750));
+    tasks_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let task_manager = {
+        let engine_arc = session.engine();
+        let eng = engine_arc.lock().await;
+        eng.state().task_manager.clone()
+    };
+    // Drill-in output reads run detached (see the select arm) and land
+    // back here, so a slow filesystem never blocks the event loop.
+    let (task_out_tx, mut task_out_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
+    // Seed the pane once so tasks adopted from a previous process show
+    // before the first turn arms the periodic poll.
+    app.sync_background_tasks(manager_rows(&task_manager).await);
 
     // Sync SessionMode with the engine when it changes.
     let mut last_mode = app.mode;
@@ -470,6 +491,13 @@ pub(super) async fn event_loop(
                         app.force_full_redraw = true;
                     }
                     app.dirty = true;
+                    drop(eng);
+                    // The command may have mutated the TaskManager
+                    // (`/tasks kill`, `/tasks clear`): refresh the pane
+                    // now, because the gated poll can be parked when
+                    // every listed task is already terminal.
+                    let rows = manager_rows(&task_manager).await;
+                    app.sync_background_tasks(rows);
                 }
                 Err(_) => {
                     // Turn holds the lock — retry next loop.
@@ -584,6 +612,13 @@ pub(super) async fn event_loop(
                 {
                     app.apply_engine(EngineEvent::Error(e.to_string()));
                 }
+                // Final manager sync. A task registered moments before
+                // the turn ended (or a cancelled turn) could otherwise
+                // leave `app.tasks` empty with `live` false — and the
+                // guarded tick below would never poll again, hiding the
+                // task until some later turn.
+                let rows = manager_rows(&task_manager).await;
+                app.sync_background_tasks(rows);
                 // Refresh cost/tokens from engine state.
                 {
                     let engine_arc = session.engine();
@@ -757,6 +792,32 @@ pub(super) async fn event_loop(
             _ = flush_tick.tick(), if app.stream_buf.has_pending() => {
                 app.flush_stream();
             }
+            // Drill-in: kick the read off to its own task so a large or
+            // slow output file never stalls input handling; the result
+            // comes back through the channel arm below.
+            _ = std::future::ready(()), if app.pending_task_output.is_some() => {
+                if let Some(id) = app.pending_task_output.take() {
+                    let tm = task_manager.clone();
+                    let tx = task_out_tx.clone();
+                    tokio::spawn(async move {
+                        // Bounded: the card shows a tail anyway, so never
+                        // materialize an arbitrarily large output file.
+                        let out = tm.read_output_tail(&id, 256 * 1024).await;
+                        let _ = tx.send((id, out));
+                    });
+                }
+            }
+            Some((id, out)) = task_out_rx.recv() => {
+                app.show_task_output(&id, out);
+            }
+            // Background-task rows (`&` shell jobs, workflows, monitors).
+            // Gated on work that can still change: polling while any
+            // rows exist at all would tick forever once a subagent row
+            // (which persists for the session) appears.
+            _ = tasks_tick.tick(), if live || app.has_live_manager_tasks() => {
+                let rows = manager_rows(&task_manager).await;
+                app.sync_background_tasks(rows);
+            }
             // Micro-animations: spinner, action-required blink, toast decay.
             _ = anim_tick.tick(), if live || app.needs_anim_tick() => {
                 if app.needs_anim_tick() {
@@ -784,6 +845,56 @@ pub(super) async fn event_loop(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Snapshot the shared `TaskManager` as tasks-pane rows.
+async fn manager_rows(
+    tm: &std::sync::Arc<agent_code_lib::services::background::TaskManager>,
+) -> Vec<super::tasks::ManagerRow> {
+    use agent_code_lib::services::background::{TaskKind, TaskPayload, TaskStatus};
+    let mut rows: Vec<super::tasks::ManagerRow> = tm
+        .list()
+        .await
+        .into_iter()
+        .map(|t| {
+            let state = match &t.status {
+                TaskStatus::Running => "working",
+                TaskStatus::Completed => "done",
+                TaskStatus::Failed(_) | TaskStatus::Killed => "failed",
+            };
+            // LocalAgent runs reconcile with their event-driven pane row
+            // via the payload's subagent id. A legacy record without one
+            // still lists under the agents group, keyed by its task id.
+            let subagent_id = (t.kind == TaskKind::LocalAgent).then(|| match &t.payload {
+                Some(TaskPayload::LocalAgent {
+                    subagent_id: Some(sid),
+                    ..
+                }) => sid.clone(),
+                _ => t.id.to_string(),
+            });
+            super::tasks::ManagerRow {
+                id: t.id.to_string(),
+                state: state.to_string(),
+                headline: t.description.clone(),
+                subagent_id,
+            }
+        })
+        .collect();
+    // The manager's map iterates in arbitrary order; sort by the id's
+    // numeric sequence so reconciliation (which record folds into an
+    // event row) is stable and chronological. The sequence is unpadded
+    // ("a9", "a10"), so a lexical sort would misorder digit boundaries.
+    fn task_seq(id: &str) -> u64 {
+        id.trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .unwrap_or(u64::MAX)
+    }
+    rows.sort_by(|a, b| {
+        task_seq(&a.id)
+            .cmp(&task_seq(&b.id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
@@ -868,6 +979,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.close_model_picker();
         // Reverts the live preview rather than leaving a browsed theme on.
         app.theme_picker_cancel();
+        // Restores the reader's place; a hidden search bar must not swallow
+        // the modal's answer keys.
+        app.cancel_search();
     }
 
     // Shortcuts overlay steals keys only when no HITL modal is up.
@@ -884,6 +998,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.show_shortcuts = false;
             app.dirty = true;
         }
+        return;
+    }
+
+    // Search captures input when open (and no HITL modal is up).
+    if app.search_open() {
+        handle_search_key(app, key);
         return;
     }
 
@@ -1075,6 +1195,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // A user chord from `keybindings.json` wins over the built-in
+    // dispatch below, which is the point of customization. Reserved
+    // chords (Ctrl+C, Esc) are filtered out inside `action_for`, and
+    // they are handled above this line anyway.
+    if apply_user_keybinding(app, &key) {
+        return;
+    }
+
     match (key.modifiers, key.code) {
         (m, KeyCode::Char('d') | KeyCode::Char('D'))
             if m.contains(KeyModifiers::CONTROL) && app.input.is_empty() =>
@@ -1097,6 +1225,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.request_full_redraw();
         }
         // Command palette (Ctrl+P / ?).
+        // Ctrl+F opens in-transcript search.
+        (m, KeyCode::Char('f') | KeyCode::Char('F')) if m.contains(KeyModifiers::CONTROL) => {
+            app.open_search();
+        }
         (m, KeyCode::Char('p') | KeyCode::Char('P')) if m.contains(KeyModifiers::CONTROL) => {
             app.open_command_palette();
         }
@@ -1118,6 +1250,39 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_queue_pane();
+        }
+        // When the tasks pane is open (and the queue pane is not, which
+        // owns the same keys), plain arrows move the selection and plain
+        // Enter opens the selected task's output. Modified presses fall
+        // through so global bindings (Ctrl+Enter interject, Alt+Enter
+        // newline) stay reachable while the pane is open.
+        (m, KeyCode::Up)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
+        {
+            app.tasks_select(-1);
+        }
+        (m, KeyCode::Down)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
+        {
+            app.tasks_select(1);
+        }
+        // Retained prompts win the empty Enter: after an aborted turn the
+        // UI promises "press Enter to send", so drill-in only claims the
+        // key when no queued prompt is waiting for dispatch.
+        (m, KeyCode::Enter)
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.queue.is_empty()
+                && app.input.is_empty() =>
+        {
+            app.drill_into_selected_task();
         }
         // When the queue pane is open, arrows and Enter drive it.
         (_, KeyCode::Up) if app.show_queue_pane && !app.queue.is_empty() => {
@@ -1277,6 +1442,12 @@ fn handle_paste(app: &mut App, text: &str) {
     if app.phase == super::app::Phase::Permission {
         return;
     }
+    // The search bar owns typed input while open, so it owns pasted input
+    // too — otherwise the paste silently edits the composer behind it.
+    if app.search_open() {
+        app.search_insert_str(text);
+        return;
+    }
     app.insert_str(text);
 }
 
@@ -1309,6 +1480,43 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    // Esc restores the reader's position; Ctrl+C is the cancel chord
+    // everywhere else, so it behaves like Esc here.
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.cancel_search();
+        return;
+    }
+    match key.code {
+        // Enter accepts: close the bar and stay on the match, so the
+        // composer is usable again at the spot that was searched for.
+        KeyCode::Enter => app.close_search(),
+        KeyCode::Down => app.search_next(),
+        KeyCode::Up => app.search_prev(),
+        // Ctrl+N / Ctrl+P mirror ↓/↑. Bare letters stay ordinary
+        // characters — `N` must be typable in a smart-case query
+        // like `API_NAME`.
+        KeyCode::Char('n') | KeyCode::Char('N')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.search_next();
+        }
+        KeyCode::Char('p') | KeyCode::Char('P')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.search_prev();
+        }
+        KeyCode::Backspace => app.search_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.search_insert_char(c);
+        }
+        _ => {}
+    }
+}
+
 fn handle_theme_picker_key(app: &mut App, key: KeyEvent) {
     // Esc / Ctrl+C revert to the theme that was active on open — a
     // browse must never be able to leave a theme behind.
@@ -1329,6 +1537,79 @@ fn handle_theme_picker_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Dispatch a user-defined keybinding. Returns true when one fired.
+///
+/// Only chords the user actually wrote are dispatched: the built-in
+/// defaults in the registry describe chords the hardcoded handler
+/// already owns, so routing those through here would run them twice.
+fn apply_user_keybinding(app: &mut App, key: &KeyEvent) -> bool {
+    use crate::ui::keybindings::{KeyAction, chord_string};
+
+    // A held key emits Repeat events; dispatching a binding on each one
+    // would queue a duplicate turn per repeat from a single hold. Only
+    // the initial press fires — built-in handlers below keep their own
+    // repeat behavior (held Ctrl+C must still count).
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    let Some(chord) = chord_string(key.code, key.modifiers) else {
+        return false;
+    };
+    if !app.keybindings.is_user_defined(&chord) {
+        return false;
+    }
+    let registry = app.keybindings.clone();
+    let Some(action) = registry.action_for(key.code, key.modifiers) else {
+        return false;
+    };
+    // Bound actions submit their own text, never the composer's draft —
+    // stash the draft so opening the tasks pane (or any binding) does not
+    // silently discard what the user was writing.
+    let draft = std::mem::take(&mut app.input);
+    let draft_cursor = app.cursor;
+    app.cursor = 0;
+    match action {
+        // Both go through the normal submit path so slash dispatch,
+        // queueing and mid-turn behaviour are identical to typing it.
+        KeyAction::Command { command } => {
+            app.input = format!("/{}", command.trim_start_matches('/'));
+            app.cursor = app.input.len();
+            app.submit();
+        }
+        KeyAction::Prompt { prompt } => {
+            app.input = prompt.clone();
+            app.cursor = app.input.len();
+            app.submit();
+        }
+        KeyAction::Toggle { setting } => {
+            // Toggles map onto the slash commands that own each setting
+            // rather than reaching into state directly.
+            let cmd = match setting.as_str() {
+                "tasks" => Some("/tasks"),
+                "queue" => Some("/queue"),
+                "minimal" => Some("/minimal"),
+                "fullscreen" => Some("/fullscreen"),
+                _ => None,
+            };
+            match cmd {
+                Some(c) => {
+                    app.input = c.to_string();
+                    app.cursor = app.input.len();
+                    app.submit();
+                }
+                None => {
+                    app.status_message = format!("keybinding: unknown toggle `{setting}`");
+                    app.dirty = true;
+                }
+            }
+        }
+    }
+    app.input = draft;
+    app.cursor = draft_cursor;
+    app.dirty = true;
+    true
 }
 
 fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
@@ -1509,6 +1790,86 @@ mod tests {
     use super::*;
     use crate::ui::modern::app::Phase;
 
+    /// The tasks-pane keys claim only unmodified presses: Ctrl+Enter must
+    /// still reach the global interject binding, not open task output.
+    #[test]
+    fn modified_enter_is_not_captured_by_the_tasks_pane() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.show_tasks = true;
+        assert!(app.tasks_visible());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(
+            app.pending_task_output.is_none() && !app.status_message.contains("output"),
+            "Ctrl+Enter was swallowed by the pane"
+        );
+
+        // Plain Enter still drives the pane (subagent row → explanation).
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.status_message.contains("no separate output"));
+    }
+
+    /// After an aborted turn the UI says "queued prompts kept — press
+    /// Enter to send"; a visible tasks pane must not swallow that Enter.
+    #[test]
+    fn queued_prompts_take_enter_before_task_drill_in() {
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.show_tasks = true;
+        app.queue.push_back("retained prompt".into());
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.pending_task_output.is_none() && !app.status_message.contains("output"),
+            "drill-in stole the queue-dispatch Enter"
+        );
+        assert!(
+            app.queue.is_empty() && app.pending_submit.is_some(),
+            "queued prompt was not dispatched"
+        );
+    }
+
+    /// LocalAgent manager records must carry their stream subagent id so
+    /// the pane folds them into the event-driven row; every other kind
+    /// maps to a plain background row.
+    #[tokio::test]
+    async fn manager_rows_link_local_agent_records_to_their_subagent_id() {
+        use agent_code_lib::services::background::{TaskKind, TaskManager, TaskPayload};
+        let tm = std::sync::Arc::new(TaskManager::new());
+        tm.register(
+            "scan crates",
+            TaskKind::LocalAgent,
+            TaskPayload::LocalAgent {
+                subagent_kind: Some("explore".into()),
+                prompt: "scan".into(),
+                parent_session: None,
+                subagent_id: Some("explore-1".into()),
+            },
+        )
+        .await;
+        tm.register(
+            "cargo build",
+            TaskKind::LocalShell,
+            TaskPayload::LocalShell {
+                command: "cargo build".into(),
+                cwd: std::path::PathBuf::from("/tmp"),
+            },
+        )
+        .await;
+
+        let rows = manager_rows(&tm).await;
+        assert_eq!(rows.len(), 2);
+        let agent = rows.iter().find(|r| r.headline == "scan crates").unwrap();
+        assert_eq!(agent.subagent_id.as_deref(), Some("explore-1"));
+        let shell = rows.iter().find(|r| r.headline == "cargo build").unwrap();
+        assert_eq!(shell.subagent_id, None);
+        assert_eq!(shell.state, "working");
+    }
+
     #[test]
     fn sanitize_osc_title_strips_control_breakouts() {
         // Malicious model name trying to terminate OSC early and inject CSI.
@@ -1537,6 +1898,171 @@ mod tests {
 
     fn super_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER)
+    }
+
+    /// Build an App whose registry has one user binding.
+    fn app_with_binding(chord: &str, action: crate::ui::keybindings::KeyAction) -> App {
+        use crate::ui::keybindings::{Keybinding, KeybindingRegistry};
+        let mut app = App::new("m", "/tmp", "s");
+        app.keybindings =
+            std::sync::Arc::new(KeybindingRegistry::from_user_bindings(vec![Keybinding {
+                key: chord.to_string(),
+                action,
+                description: None,
+            }]));
+        app
+    }
+
+    /// The registry was loaded and listed by `/keybindings`, but nothing
+    /// ever consulted it on a keypress — a user could see their binding
+    /// listed and have it do nothing.
+    #[test]
+    fn a_user_bound_chord_runs_its_command() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "ctrl+k",
+            KeyAction::Command {
+                command: "tasks".into(),
+            },
+        );
+        // Assert on the effect of `/tasks`, not on the composer being
+        // empty — the composer is empty whether or not the binding fires,
+        // which would make this test pass for the wrong reason.
+        let before = app.show_tasks;
+        handle_key(&mut app, ctrl('k'));
+        assert_ne!(
+            app.show_tasks, before,
+            "the bound command did not reach slash dispatch"
+        );
+        assert!(app.input.is_empty(), "the chord left text in the composer");
+    }
+
+    #[test]
+    fn a_user_bound_chord_submits_a_prompt() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "alt+r",
+            KeyAction::Prompt {
+                prompt: "run the tests".into(),
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("run the tests"),
+            "the bound prompt was not submitted"
+        );
+    }
+
+    /// A held chord emits Repeat events; each must not re-fire the
+    /// binding — one hold of a prompt binding would otherwise queue a
+    /// duplicate turn (and a duplicate model call) per repeat.
+    #[test]
+    fn a_held_chord_repeat_does_not_refire_the_binding() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "alt+r",
+            KeyAction::Prompt {
+                prompt: "run the tests".into(),
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("run the tests"),
+            "the initial press did not fire"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('r'), KeyModifiers::ALT, KeyEventKind::Repeat),
+        );
+        assert!(
+            app.queue.is_empty(),
+            "a key repeat queued a duplicate prompt"
+        );
+    }
+
+    /// A binding fired mid-composition must not eat the draft: the bound
+    /// action submits its own text, the user's half-written prompt stays.
+    #[test]
+    fn a_bound_command_keeps_the_composer_draft() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "ctrl+k",
+            KeyAction::Command {
+                command: "tasks".into(),
+            },
+        );
+        app.input = "half a thought".to_string();
+        app.cursor = 4;
+        let before = app.show_tasks;
+        handle_key(&mut app, ctrl('k'));
+        assert_ne!(app.show_tasks, before, "the bound command did not run");
+        assert_eq!(app.input, "half a thought", "the binding ate the draft");
+        assert_eq!(app.cursor, 4, "the binding moved the cursor");
+    }
+
+    #[test]
+    fn a_bound_prompt_keeps_the_composer_draft() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "alt+r",
+            KeyAction::Prompt {
+                prompt: "run the tests".into(),
+            },
+        );
+        app.input = "half a thought".to_string();
+        app.cursor = 3;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("run the tests"),
+            "the bound prompt was not submitted"
+        );
+        assert_eq!(app.input, "half a thought", "the binding ate the draft");
+        assert_eq!(app.cursor, 3, "the binding moved the cursor");
+    }
+
+    /// An unbound chord must still reach the built-in handler.
+    #[test]
+    fn an_unbound_chord_falls_through_to_the_built_in() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "ctrl+k",
+            KeyAction::Command {
+                command: "tasks".into(),
+            },
+        );
+        handle_key(&mut app, ctrl('p'));
+        assert!(
+            app.command_palette_open(),
+            "Ctrl+P stopped opening the palette"
+        );
+    }
+
+    /// Rebinding Ctrl+C must not take away the way out.
+    #[test]
+    fn a_binding_cannot_steal_ctrl_c() {
+        use crate::ui::keybindings::KeyAction;
+        let mut app = app_with_binding(
+            "ctrl+c",
+            KeyAction::Prompt {
+                prompt: "hijacked".into(),
+            },
+        );
+        app.phase = Phase::Streaming;
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.cancel_requested, "Ctrl+C no longer cancels");
+        assert!(app.pending_submit.is_none(), "Ctrl+C submitted a prompt");
     }
 
     #[test]
@@ -1720,6 +2246,101 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('y')));
         assert!(!app.command_palette_open());
         assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    #[test]
+    fn permission_phase_closes_search_and_takes_keys() {
+        use agent_code_lib::tools::PermissionResponse;
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        assert!(app.search_open());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.modals.push_back(super::super::app::Modal::Permission(
+            super::super::app::PendingPermission {
+                name: "Bash".into(),
+                description: "run".into(),
+                origin: None,
+                input_preview: None,
+                respond: tx,
+            },
+        ));
+        app.phase = Phase::Permission;
+        app.force_hitl_answers_ready();
+        // y must reach the modal, not the search query — the bar is not
+        // even drawn during Permission, so a swallowed key looks dead.
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert!(!app.search_open());
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::AllowOnce)));
+    }
+
+    /// Bare letters are query characters, full stop — `N` must be typable
+    /// in a smart-case query like `API_NAME`.
+    #[test]
+    fn search_uppercase_n_edits_the_query_instead_of_navigating() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        for c in "API_N".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search.as_ref().unwrap().query, "API_N");
+    }
+
+    /// Enter is the exit that stays at the found match; Esc is the one
+    /// that goes back. Without the former the bar had to stay open to
+    /// keep the position it found.
+    #[test]
+    fn search_enter_closes_the_bar_and_stays_put() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        for t in ["auth one", "filler", "auth two"] {
+            app.transcript
+                .push(super::super::app::TranscriptItem::System(t.into()));
+        }
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 80, &expanded, None);
+        app.scroll_to_top();
+        handle_key(&mut app, ctrl('f'));
+        for c in "auth".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let at_match = app.scroll;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.search_open(), "Enter must close the bar");
+        assert_eq!(app.scroll, at_match, "Enter must keep the match position");
+        assert!(app.pending_submit.is_none(), "Enter must not submit a turn");
+    }
+
+    #[test]
+    fn search_ctrl_n_and_ctrl_p_step_matches() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.viewport_h = 10;
+        for t in ["auth one", "filler", "auth two"] {
+            app.transcript
+                .push(super::super::app::TranscriptItem::System(t.into()));
+        }
+        let expanded = app.expanded.clone();
+        app.layout.sync(&app.transcript, 80, &expanded, None);
+        handle_key(&mut app, ctrl('f'));
+        for c in "auth".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search.as_ref().unwrap().position(), (1, 2));
+        handle_key(&mut app, ctrl('n'));
+        assert_eq!(app.search.as_ref().unwrap().position(), (2, 2));
+        handle_key(&mut app, ctrl('p'));
+        assert_eq!(app.search.as_ref().unwrap().position(), (1, 2));
+    }
+
+    #[test]
+    fn paste_lands_in_the_open_search_query_not_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        handle_key(&mut app, ctrl('f'));
+        handle_paste(&mut app, "auth token");
+        assert_eq!(app.search.as_ref().unwrap().query, "auth token");
+        assert!(
+            app.input.is_empty(),
+            "paste must not leak into the composer behind the bar"
+        );
     }
 
     #[test]

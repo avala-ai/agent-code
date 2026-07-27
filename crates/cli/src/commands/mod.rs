@@ -8304,6 +8304,7 @@ mod tests {
                     subagent_kind: Some("agent-one".into()),
                     prompt: "do thing 1".into(),
                     parent_session: None,
+                    subagent_id: None,
                 },
                 Some(c1),
             )
@@ -8316,6 +8317,7 @@ mod tests {
                     subagent_kind: Some("agent-two".into()),
                     prompt: "do thing 2".into(),
                     parent_session: None,
+                    subagent_id: None,
                 },
                 Some(c2),
             )

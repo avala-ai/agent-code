@@ -40,6 +40,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         0
     };
+    // The search bar gets its own row so it never overdraws the composer
+    // border (or transcript rows in minimal mode).
+    let search_h = if app.search_open() && app.phase != Phase::Permission {
+        1
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -48,6 +55,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),            // status
             Constraint::Length(chips_h),      // queue chips
             Constraint::Length(queue_pane_h), // queue pane
+            Constraint::Length(search_h),     // search bar
             Constraint::Length(prompt_h),     // input
         ])
         .split(area);
@@ -65,7 +73,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 .split(chunks[1]);
             (cols[0], cols[1])
         } else {
-            let strip = 5.min(chunks[1].height.saturating_sub(3));
+            // Size the strip to what the grouped list actually renders
+            // (headings + two lines per task) — a fixed five rows hid
+            // the background group behind the agents group. Capped so
+            // the transcript keeps at least half the area; the pane
+            // shows a "+n more" line when it still cannot fit.
+            // +1 for the block title row the pane spends.
+            let needed = super::tasks::pane_rows(&app.tasks) as u16 + 1;
+            let strip = needed
+                .min(chunks[1].height / 2)
+                .min(chunks[1].height.saturating_sub(3));
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(3), Constraint::Length(strip)])
@@ -84,7 +101,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if queue_pane_h > 0 {
         draw_queue_pane(frame, chunks[4], app);
     }
-    draw_input(frame, chunks[5], app);
+    if search_h > 0 {
+        draw_search_bar(frame, chunks[5], app);
+    }
+    draw_input(frame, chunks[6], app);
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()
@@ -222,6 +242,73 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "[↑↓] move   [Enter/Tab] select   [Esc] close   type to filter",
         )),
     );
+}
+
+/// One-line search bar in its own reserved row above the prompt, with
+/// the match counter. A modal box would cover the transcript the user is
+/// trying to look at, which defeats the purpose.
+fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
+    let Some(s) = app.search.as_ref() else {
+        return;
+    };
+    let (pos, total) = s.position();
+    let counter = if s.query.is_empty() {
+        String::new()
+    } else if total == 0 {
+        "  no matches".to_string()
+    } else {
+        format!("  {pos}/{total}")
+    };
+    let p = palette();
+    let style = if total == 0 && !s.query.is_empty() {
+        Style::default().fg(p.error)
+    } else {
+        Style::default().fg(p.accent)
+    };
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let prefix = "  find: ";
+    // Editing happens at the end of the query, so when it outgrows the
+    // row show a horizontally scrolled tail with a leading ellipsis —
+    // clipping the right edge would hide exactly the part being edited.
+    let avail = (bar.width as usize).saturating_sub(prefix.len() + 1);
+    let qw = s.query.as_str().width();
+    let (shown, shown_w) = if qw <= avail {
+        (s.query.clone(), qw)
+    } else {
+        let target = avail.saturating_sub(1);
+        let mut w = 0usize;
+        let mut kept: Vec<&str> = Vec::new();
+        for g in s.query.as_str().graphemes(true).rev() {
+            let gw = g.width().max(1);
+            if w + gw > target {
+                break;
+            }
+            w += gw;
+            kept.push(g);
+        }
+        let tail: String = kept.iter().rev().copied().collect();
+        (format!("…{tail}"), w + 1)
+    };
+    let line = Line::from(vec![
+        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+        Span::styled(shown, Style::default().fg(p.text)),
+        Span::styled(counter, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "   [↓/↑] next/prev  [Enter] keep  [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Clear, bar);
+    frame.render_widget(Paragraph::new(line), bar);
+    // Typed and pasted input lands here, so the caret must too — the
+    // composer suppresses its own while the bar is open.
+    let x = bar
+        .x
+        .saturating_add(prefix.len() as u16)
+        .saturating_add(shown_w as u16)
+        .min(bar.x.saturating_add(bar.width.saturating_sub(1)));
+    frame.set_cursor_position((x, bar.y));
 }
 
 fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -631,10 +718,36 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Tasks/agents pane: state-ordered subagent rows (plan §M8).
 fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use super::tasks::TaskState;
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(format!(" agents ({}) ", app.tasks.len()));
+    // The title consumes the top row even without a top border, so
+    // measure the real content box instead of the outer area.
+    let inner = block.inner(area);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let inner_w = area.width.saturating_sub(2) as usize;
-    for t in &app.tasks {
+    // Line index of each task's last row, for the overflow count below.
+    let mut task_ends: Vec<usize> = Vec::new();
+    let inner_w = (inner.width as usize).saturating_sub(1);
+    let mut last_source: Option<super::tasks::TaskSource> = None;
+    for (idx, t) in app.tasks.iter().enumerate() {
         let p = palette();
+        let selected = idx == app.tasks_selected;
+        // Group header when the source changes. Subagents and background
+        // jobs arrive from different places but read as one list, so they
+        // share the pane with a heading to tell them apart.
+        if last_source != Some(t.source) {
+            if last_source.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                t.source.heading().to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            last_source = Some(t.source);
+        }
         let color = match t.state {
             TaskState::Working => Color::Blue,
             TaskState::NeedsInput => p.warning,
@@ -642,23 +755,64 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             TaskState::Failed => p.error,
         };
         lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "❯" } else { " " }.to_string(),
+                Style::default().fg(p.accent),
+            ),
             Span::styled(format!("{} ", t.state.glyph()), Style::default().fg(color)),
             Span::styled(
                 format!("{} ", t.state.word()),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]));
-        // Headline on its own row, truncated to the pane width.
-        let head: String = t.headline.chars().take(inner_w.max(4)).collect();
+        // Headline on its own row, truncated to the pane width. The
+        // text is model- or tool-supplied: scrub bidi overrides and
+        // zero-width characters like every other surface that shows it.
+        let head: String = crate::ui::text_safety::escape_deceptive(&t.headline)
+            .chars()
+            .take(inner_w.max(4))
+            .collect();
         lines.push(Line::from(Span::styled(
             format!("  {head}"),
             Style::default().fg(Color::Gray),
         )));
+        task_ends.push(lines.len() - 1);
     }
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(format!(" agents ({}) ", app.tasks.len()));
+    // When the area is still too short (many tasks, tiny terminal),
+    // window the rows around the selection — Up/Down cycles the whole
+    // list, so the marked task must stay on screen — and say how many
+    // tasks are hidden rather than silently truncating mid-task.
+    let max_rows = inner.height as usize;
+    if lines.len() > max_rows && max_rows > 0 {
+        let sel_end = task_ends.get(app.tasks_selected).copied().unwrap_or(0);
+        // The status row (with the ❯ marker) sits directly above the
+        // headline row; when space is too tight for both, the marker
+        // row is the one that must survive.
+        let sel_start = sel_end.saturating_sub(1);
+        if max_rows == 1 {
+            let row = lines
+                .into_iter()
+                .nth(sel_start)
+                .unwrap_or_else(|| Line::from("…"));
+            lines = vec![row];
+        } else {
+            let visible_h = max_rows - 1;
+            let anchor = if visible_h >= 2 { sel_end } else { sel_start };
+            let offset = anchor
+                .saturating_sub(visible_h - 1)
+                .min(lines.len() - visible_h);
+            let shown = task_ends
+                .iter()
+                .filter(|&&e| e >= offset && e < offset + visible_h)
+                .count();
+            let hidden = app.tasks.len().saturating_sub(shown);
+            lines = lines.into_iter().skip(offset).take(visible_h).collect();
+            lines.push(Line::from(Span::styled(
+                format!("… +{hidden} more (↑/↓)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -801,6 +955,16 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         app.selected_item,
     );
     app.viewport_h = height;
+    // The transcript may have grown since the query was typed, so the
+    // line indices behind the match list can go stale. Recompute without
+    // resetting the selection, so streaming output does not yank the
+    // reader off the match they are on. Gated on the layout revision:
+    // spinner frames repaint every ~80ms and an O(transcript) rescan per
+    // frame would make long sessions crawl.
+    if app.search_open() && app.search.as_ref().map(|s| s.layout_rev) != Some(app.layout.revision())
+    {
+        app.recompute_search(false);
+    }
     // Record the bottom screen row for mouse hit-testing (jump pill).
     app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
     let total = app.layout.total_lines();
@@ -809,6 +973,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Apply selection highlight on the visible slice.
     let view = apply_selection_highlight(view, top, app.selection);
+    let view = apply_search_highlight(view, top, app);
 
     let title = match app.phase {
         Phase::Streaming => {
@@ -897,6 +1062,36 @@ fn apply_selection_highlight(
                     .add_modifier(Modifier::BOLD),
             ));
         }
+    }
+    view
+}
+
+/// Paint the row the `2/3` counter points at, so stepping through
+/// matches is visibly anchored. Warning-on-black to stay distinct from
+/// the accent-colored mouse selection.
+fn apply_search_highlight(
+    mut view: Vec<Line<'static>>,
+    top: usize,
+    app: &App,
+) -> Vec<Line<'static>> {
+    if app.phase == Phase::Permission {
+        return view;
+    }
+    let Some(cur) = app.search.as_ref().and_then(|s| s.current_line()) else {
+        return view;
+    };
+    let Some(rel) = cur.checked_sub(top) else {
+        return view;
+    };
+    if let Some(line) = view.get_mut(rel) {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        *line = Line::from(Span::styled(
+            plain,
+            Style::default()
+                .fg(Color::Black)
+                .bg(palette().warning)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     view
 }
@@ -1160,6 +1355,11 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, body_area: Rect, app: &App, _bordere
     if body_area.width == 0 || body_area.height == 0 {
         return;
     }
+    // While the search bar is open it owns typed input, so it owns the
+    // caret too (`draw_search_bar` places it after the query).
+    if app.search_open() && app.phase != Phase::Permission {
+        return;
+    }
     let (line, col) = app.cursor_line_col();
     // Prefix "❯ " is 2 columns on line 0; continuation lines are indented 2.
     let prefix_cols: u16 = 2;
@@ -1325,6 +1525,159 @@ mod tests {
         assert!(
             s.contains("deploy<U+202E>hsilbup<U+202C>"),
             "override in the title not surfaced:\n{s}"
+        );
+    }
+
+    #[test]
+    fn search_bar_shows_the_query_and_match_count() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        // One frame to populate the layout the search reads.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert!(s.contains("1/2"), "match counter missing:\n{s}");
+    }
+
+    #[test]
+    fn search_bar_says_so_when_nothing_matches() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "zzz".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("no matches"), "buffer:\n{s}");
+    }
+
+    /// Focus follows input: while the bar is open the terminal caret must
+    /// sit after the query, not blink in the composer the keys no longer
+    /// reach.
+    #[test]
+    fn search_bar_owns_the_terminal_cursor() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let composer_cursor = term.get_cursor_position().unwrap();
+        app.open_search();
+        for c in "al".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let cur = term.get_cursor_position().unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let bar_row = s
+            .lines()
+            .position(|l| l.contains("find: al"))
+            .expect("search bar row") as u16;
+        assert_eq!(cur.y, bar_row, "caret must be on the search row:\n{s}");
+        assert_eq!(cur.x, 8 + 2, "caret must sit right after the query");
+        assert_ne!(cur.y, composer_cursor.y, "caret must leave the composer");
+    }
+
+    /// A query wider than the row scrolls horizontally so the tail being
+    /// edited stays visible next to the caret.
+    #[test]
+    fn long_query_keeps_its_editable_tail_visible() {
+        let backend = TestBackend::new(40, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::System("alpha".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "prefix_that_is_much_longer_than_the_row_tail".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s.lines().find(|l| l.contains("find:")).expect("bar row");
+        assert!(
+            row.contains("_tail"),
+            "the end of the query must stay visible: {row:?}"
+        );
+        assert!(row.contains('…'), "scrolled query must be marked: {row:?}");
+        let cur = term.get_cursor_position().unwrap();
+        assert_eq!(cur.x, 39, "caret must sit at the visible end");
+    }
+
+    /// Stepping matches must visibly anchor the `n/m` counter.
+    #[test]
+    fn current_search_match_row_is_highlighted() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        for t in ["alpha auth beta", "gamma", "delta auth"] {
+            app.transcript.push(TranscriptItem::System(t.into()));
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let row = s
+            .lines()
+            .position(|l| l.contains("alpha auth beta"))
+            .expect("first match visible") as u16;
+        let buf = term.backend().buffer();
+        let bg = |y: u16| buf.cell((0u16, y)).unwrap().style().bg;
+        assert_ne!(
+            bg(row),
+            Some(ratatui::style::Color::Reset),
+            "current match row must carry a highlight background:\n{s}"
+        );
+        let other = s
+            .lines()
+            .position(|l| l.contains("gamma"))
+            .expect("non-match visible") as u16;
+        assert_eq!(
+            bg(other),
+            Some(ratatui::style::Color::Reset),
+            "non-match rows must stay unhighlighted:\n{s}"
+        );
+    }
+
+    /// The bar gets a reserved layout row; drawing it at a fixed offset
+    /// used to overwrite the composer's top border.
+    #[test]
+    fn search_bar_does_not_overdraw_the_composer_border() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript
+            .push(TranscriptItem::System("alpha auth".into()));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let corners_before = buffer_to_string(term.backend().buffer())
+            .matches('╭')
+            .count();
+        app.open_search();
+        for c in "auth".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("find: auth"), "buffer:\n{s}");
+        assert_eq!(
+            s.matches('╭').count(),
+            corners_before,
+            "search bar must not eat a border row:\n{s}"
         );
     }
 
@@ -1596,6 +1949,102 @@ mod tests {
         assert!(s.contains("agents (1)"), "pane title missing:\n{s}");
         assert!(s.contains("working"), "state word missing:\n{s}");
         assert!(s.contains("scanning crates"), "headline missing:\n{s}");
+    }
+
+    /// One agent + one background task need seven strip rows (two
+    /// headings, a gap, two lines per task); the old fixed five-row
+    /// strip clipped the background group entirely on narrow terminals.
+    #[test]
+    fn narrow_terminal_strip_shows_the_background_group() {
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::SubagentUpdate {
+            agent_id: "a1".into(),
+            state: "working".into(),
+            headline: "explore parser".into(),
+        });
+        app.sync_background_tasks(vec![crate::ui::modern::tasks::ManagerRow {
+            id: "b1".into(),
+            state: "working".into(),
+            headline: "cargo build --release".into(),
+            subagent_id: None,
+        }]);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("background"), "background heading missing:\n{s}");
+        assert!(
+            s.contains("cargo build"),
+            "background headline missing:\n{s}"
+        );
+    }
+
+    /// Task headlines are model-/tool-supplied text; the pane must run
+    /// them through the same deceptive-character scrub as every other
+    /// surface (zero-width chars, bidi overrides).
+    #[test]
+    fn tasks_pane_escapes_deceptive_headline_text() {
+        let backend = TestBackend::new(120, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::SubagentUpdate {
+            agent_id: "a1".into(),
+            state: "working".into(),
+            headline: "rm -\u{200B}rf tmp".into(),
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("<U+200B>"), "zero-width char not escaped:\n{s}");
+        assert!(
+            !s.contains("rm -\u{200B}rf"),
+            "raw deceptive text rendered:\n{s}"
+        );
+    }
+
+    /// When even the grown strip cannot fit every task, the pane says
+    /// how many are hidden instead of silently clipping.
+    #[test]
+    fn overflowing_tasks_pane_reports_hidden_rows() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        let rows = (0..6)
+            .map(|i| crate::ui::modern::tasks::ManagerRow {
+                id: format!("b{i}"),
+                state: "working".into(),
+                headline: format!("job {i}"),
+                subagent_id: None,
+            })
+            .collect();
+        app.sync_background_tasks(rows);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("… +"), "hidden-task indicator missing:\n{s}");
+    }
+
+    /// Up/Down cycles through every task, so the window must scroll to
+    /// keep the marked task on screen instead of clipping a fixed prefix.
+    #[test]
+    fn overflow_window_follows_the_selection() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        let rows = (0..6)
+            .map(|i| crate::ui::modern::tasks::ManagerRow {
+                id: format!("b{i}"),
+                state: "working".into(),
+                headline: format!("job number {i}"),
+                subagent_id: None,
+            })
+            .collect();
+        app.sync_background_tasks(rows);
+        app.tasks_selected = 5;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            s.contains("job number 5"),
+            "selected task scrolled out of view:\n{s}"
+        );
     }
 
     #[test]
