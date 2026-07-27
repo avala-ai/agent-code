@@ -73,6 +73,43 @@ const ACK_HEAD: &str = "Agent (";
 const ACK_DISPATCH: &str = ") started in the background as task ";
 const ACK_TAIL: &str = "Its result surfaces automatically when it completes — do not wait on it.";
 
+/// Flatten a value interpolated into the acknowledgement onto one line.
+///
+/// `description` (and the `subagent_id` derived from it) is model-authored
+/// and nothing in the schema forbids a newline. The acknowledgement is
+/// defined to be a single line — that is what lets
+/// [`is_background_launch_ack`] reject a foreground result before
+/// inspecting it — so the fields are flattened when it is built rather
+/// than the check being loosened.
+fn one_line(value: &str) -> String {
+    value
+        .replace(['\n', '\r'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The acknowledgement returned when a background task is dispatched.
+///
+/// The single builder both the tool and the tests go through, so the
+/// emitted wording and [`is_background_launch_ack`] cannot diverge.
+/// Every interpolated field is flattened — `description` is
+/// model-authored and the schema does not forbid a newline in it.
+fn background_launch_ack(
+    description: &str,
+    subagent_type: &str,
+    task_id: &str,
+    subagent_id: &str,
+) -> String {
+    format!(
+        "{ACK_HEAD}{}, type={}{ACK_DISPATCH}{} (subagent_id={}). {ACK_TAIL}",
+        one_line(description),
+        one_line(subagent_type),
+        one_line(task_id),
+        one_line(subagent_id),
+    )
+}
+
 /// Whether an Agent tool call asked to be run in the background.
 ///
 /// The structured request, read from the call input. Whether the launch
@@ -287,9 +324,11 @@ impl Tool for AgentTool {
                 &endpoint,
             )
             .await;
-            return Ok(ToolResult::success(format!(
-                "{ACK_HEAD}{description}, type={subagent_type}{ACK_DISPATCH}{id} \
-                 (subagent_id={subagent_id}). {ACK_TAIL}"
+            return Ok(ToolResult::success(background_launch_ack(
+                description,
+                subagent_type,
+                &id.to_string(),
+                &subagent_id,
             )));
         }
 
@@ -1087,7 +1126,7 @@ mod tests {
 
 #[cfg(test)]
 mod background_ack_tests {
-    use super::{is_background_launch_ack, requested_background};
+    use super::{background_launch_ack, is_background_launch_ack, one_line, requested_background};
     use serde_json::json;
 
     /// Pinned by hand rather than rebuilt from the segment constants, so
@@ -1147,6 +1186,52 @@ mod background_ack_tests {
         assert!(!is_background_launch_ack(
             "Agent (sweep, type=general-purpose, subagent_id=sweep) completed.\n\n"
         ));
+    }
+
+    /// `description` is model-authored and the schema does not forbid a
+    /// newline in it. Interpolated verbatim it would split the
+    /// acknowledgement across lines, and a genuinely dispatched agent
+    /// would then be reported `done` with its acknowledgement shown as
+    /// the agent's output. The fields are flattened at construction, so
+    /// the acknowledgement the tool actually emits still matches.
+    #[test]
+    fn an_acknowledgement_built_from_multiline_fields_still_matches() {
+        let ack = background_launch_ack(
+            "audit auth\nand report back",
+            "general-purpose",
+            "bg-7",
+            "audit auth\nand report",
+        );
+        assert!(
+            !ack.contains('\n'),
+            "the acknowledgement spans lines: {ack}"
+        );
+        assert!(
+            is_background_launch_ack(&ack),
+            "a real dispatch was not recognised: {ack}"
+        );
+    }
+
+    /// The builder is the single source for the wording, so the pinned
+    /// literal above must be exactly what it produces.
+    #[test]
+    fn the_builder_produces_the_pinned_wording() {
+        assert_eq!(
+            background_launch_ack(
+                "sweep the repo",
+                "general-purpose",
+                "bg-7",
+                "sweep the repo"
+            ),
+            REAL_ACK
+        );
+    }
+
+    #[test]
+    fn one_line_collapses_every_break() {
+        assert_eq!(one_line("a\nb\r\nc"), "a b c");
+        assert_eq!(one_line("  padded \n words  "), "padded words");
+        assert_eq!(one_line("plain"), "plain");
     }
 
     #[test]

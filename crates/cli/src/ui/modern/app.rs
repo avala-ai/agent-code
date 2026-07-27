@@ -2148,8 +2148,21 @@ impl App {
         let mut next: Vec<TaskEntry> = next
             .into_iter()
             .zip(claimed)
-            .filter(|(t, c)| *c || t.task_id.is_none())
-            .map(|(t, _)| t)
+            .filter_map(|(mut t, c)| {
+                if c || t.task_id.is_none() {
+                    return Some(t);
+                }
+                // The manager record behind this row is gone. A row that
+                // also captured an inline result still has something to
+                // open — a description-derived id can fold a manager-backed
+                // run and an inline one onto one row — so keep it and drop
+                // only the dead file reference.
+                if t.outputs.is_empty() {
+                    return None;
+                }
+                t.task_id = None;
+                Some(t)
+            })
             .collect();
         next.sort_by_key(|t| (t.source.heading(), t.state.order()));
 
@@ -2261,21 +2274,30 @@ impl App {
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
-        match &row.task_id {
+        // A row can hold both kinds of output: `agent_id` is derived from
+        // the call description, so a manager-backed run and an inline one
+        // can fold onto a single row. Show what is already in hand *and*
+        // still ask for the file, so neither source is hidden behind the
+        // other.
+        let captured = (!row.outputs.is_empty())
+            .then(|| (row.agent_id.clone(), Self::captured_body(&row.outputs)));
+        let task_id = row.task_id.clone();
+        let had_captured = captured.is_some();
+        // Inline results were captured when the subagent finished,
+        // because an inline run has no output file to read.
+        if let Some((id, body)) = captured {
+            self.show_task_output(&id, Ok(body));
+        }
+        match task_id {
             // Backed by a TaskManager task: read the file on the run loop.
             Some(id) => {
-                self.pending_task_output = Some(id.clone());
                 self.status_message = format!("loading output for {id}…");
+                self.pending_task_output = Some(id);
             }
-            // Inline subagent: its result was captured when it finished,
-            // because it has no output file to read.
-            None if row.outputs.is_empty() => {
+            None if !had_captured => {
                 self.status_message = "this agent has not produced output yet".to_string();
             }
-            None => {
-                let (id, body) = (row.agent_id.clone(), Self::captured_body(&row.outputs));
-                self.show_task_output(&id, Ok(body));
-            }
+            None => {}
         }
         self.dirty = true;
     }
@@ -3601,6 +3623,97 @@ mod tests {
                     "second result lost: {body}"
                 );
                 assert!(body.contains("call-a") && body.contains("call-b"));
+            }
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+    }
+
+    /// A manager-backed run and an inline one can fold onto one row when
+    /// their descriptions share a prefix. Drill-in used to prefer the
+    /// task file and never show the captured inline result, making it
+    /// unreachable. Both are offered now.
+    #[test]
+    fn a_row_backed_by_both_shows_the_inline_result_and_asks_for_the_file() {
+        use crate::ui::modern::sink::EngineEvent;
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "working".into(),
+            headline: "audit".into(),
+        });
+        // A manager record folds into that row, giving it a task_id.
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a9".into(),
+            state: "working".into(),
+            headline: "audit".into(),
+            subagent_id: Some(shared.into()),
+        }]);
+        assert_eq!(app.tasks[0].task_id.as_deref(), Some("a9"));
+        // A later inline call resolves to the same description-derived id.
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-inline".into(),
+            output: "the inline agent found a bug".into(),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => assert!(
+                result.as_deref().unwrap().contains("found a bug"),
+                "the captured inline result was hidden behind the task file"
+            ),
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+        assert_eq!(
+            app.pending_task_output.as_deref(),
+            Some("a9"),
+            "the manager-backed output was dropped instead of also being requested"
+        );
+    }
+
+    /// Clearing the manager record used to drop such a row wholesale,
+    /// taking the captured inline result with it. The row survives with
+    /// its dead file reference removed.
+    #[test]
+    fn clearing_the_manager_record_keeps_a_row_that_captured_a_result() {
+        use crate::ui::modern::sink::EngineEvent;
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "working".into(),
+            headline: "audit".into(),
+        });
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a9".into(),
+            state: "working".into(),
+            headline: "audit".into(),
+            subagent_id: Some(shared.into()),
+        }]);
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-inline".into(),
+            output: "the inline agent found a bug".into(),
+        });
+
+        app.sync_background_tasks(Vec::new());
+
+        assert_eq!(app.tasks.len(), 1, "the row was dropped with its result");
+        assert!(
+            app.tasks[0].task_id.is_none(),
+            "a dead task file reference was kept"
+        );
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+        assert!(app.pending_task_output.is_none());
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => {
+                assert!(result.as_deref().unwrap().contains("found a bug"))
             }
             other => panic!("expected a tool card, got {other:?}"),
         }
