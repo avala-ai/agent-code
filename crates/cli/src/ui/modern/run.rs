@@ -148,6 +148,29 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
+/// Read the destination project's config without committing to it.
+///
+/// `Config::load` layers from the *process* working directory, and this
+/// has to answer "would this project's settings parse" before anything
+/// moves — a destination whose settings are broken must fail the resume
+/// while refusing is still free, not after the session has been adopted.
+/// So the directory is entered briefly and left again.
+///
+/// Safe at this one call site and nowhere else: the restore only runs
+/// with no turn in flight, so nothing is resolving a relative path
+/// underneath it. A `Config::load_from(&Path)` in the library would make
+/// that structural rather than situational; this is the smaller change.
+fn load_project_config(dir: &str) -> Result<agent_code_lib::config::Config, String> {
+    let previous = std::env::current_dir().map_err(|e| e.to_string())?;
+    std::env::set_current_dir(dir).map_err(|e| e.to_string())?;
+    let loaded = agent_code_lib::config::Config::load().map_err(|e| e.to_string());
+    // Restore before reporting either way: leaving the process in the
+    // destination after refusing the resume is the exact mismatch this
+    // whole path exists to avoid.
+    std::env::set_current_dir(&previous).map_err(|e| e.to_string())?;
+    loaded
+}
+
 /// Whether a restored session's directory can be entered, without
 /// entering it.
 ///
@@ -188,23 +211,20 @@ async fn finish_cwd_adoption(
     eng: &mut agent_code_lib::query::QueryEngine,
     dir: &std::path::Path,
     previous_cwd: &str,
+    cfg: agent_code_lib::config::Config,
 ) {
     let cwd = dir.display().to_string();
     eng.state_mut().cwd = cwd.clone();
     eng.reset_system_prompt_cache();
-    // Everything project-scoped moves together: grants, the checker's
-    // root, its *rules*, and the hook registry. Moving a subset left the
-    // destination's deny rules unapplied and the source project's hooks
-    // still firing — including the lifecycle hooks fired just below.
-    // Reported rather than fatal: the session has already been restored
-    // by this point, and refusing here would strand it.
-    if let Err(e) = eng.adopt_project(dir) {
-        app.transcript
-            .push(super::app::TranscriptItem::System(format!(
-                "resumed, but this project's configuration could not be read ({e}) — \
-             permission rules and hooks are still the previous project's"
-            )));
-    }
+    // Everything project-scoped moves together — grants, permission root,
+    // rules, tool visibility, sandbox and bypass policy, hooks — from the
+    // config the caller read before any of this began. Moving a subset
+    // left part of the policy answering for the project we left.
+    eng.adopt_project(dir, cfg.clone());
+    // The TUI keeps its own copy of one policy bit, consulted on every
+    // submit: left at the value the process started with, a project that
+    // forbids shell-executing skills inherits one that allows it.
+    app.disable_skill_shell = cfg.security.disable_skill_shell_execution;
     app.cwd = cwd;
     let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
@@ -581,6 +601,31 @@ pub(super) async fn event_loop(
                         // cwd — the wrong-tree hazard this restore exists
                         // to prevent. Refuse the whole resume instead.
                         let previous_cwd = session.engine().lock().await.state().cwd.clone();
+                        // Phase A — everything that can fail, before
+                        // anything is touched. A directory that cannot be
+                        // entered and settings that will not parse are
+                        // both reasons to refuse the resume while
+                        // refusing is still free.
+                        let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
+                            None
+                        } else {
+                            match load_project_config(&data.cwd) {
+                                Ok(cfg) => Some(cfg),
+                                Err(e) => {
+                                    app.status_message.clear();
+                                    app.transcript.push(super::app::TranscriptItem::Error(
+                                        format!(
+                                            "could not resume {id}: its project settings could \
+                                             not be read ({e}) — staying in {previous_cwd}"
+                                        ),
+                                    ));
+                                    app.cancel_deferred_resume_work();
+                                    app.pending_resume = None;
+                                    app.dirty = true;
+                                    continue;
+                                }
+                            }
+                        };
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
                             Ok(dir) => dir,
                             Err(e) => {
@@ -629,7 +674,12 @@ pub(super) async fn event_loop(
                             // cwd, so running it after the move fired
                             // project A's teardown inside project B while
                             // its context still named project A.
-                            eng.reset_for_session_swap().await;
+                            // Only the notification here: shell hooks
+                            // inherit the process cwd, so watchers have to
+                            // hear about the dropped `/add-dir` paths
+                            // before the move. Clearing the state waits
+                            // until the move has actually succeeded.
+                            eng.notify_working_set_dropped().await;
                         }
                         // Only now move. Shell hooks inherit the process
                         // directory, so entering the destination before
@@ -670,6 +720,14 @@ pub(super) async fn event_loop(
                         }
                         let engine_arc = session.engine();
                         let mut eng = engine_arc.lock().await;
+                        // Phase D — committed. The move succeeded, so the
+                        // departing session's conversation-scoped state
+                        // can go: grants, `/add-dir` paths, the prompt
+                        // cache, the extraction cursor, the denial
+                        // tracker. Doing this before the move meant a
+                        // failed move left the session the user keeps
+                        // already torn down.
+                        eng.reset_for_session_swap().await;
                         // A mode toggled after the session was picked but
                         // before it loaded is the user's newest explicit
                         // instruction, so it is replayed on top of the
@@ -763,8 +821,10 @@ pub(super) async fn event_loop(
                         // in, and says so. Claiming a directory we did not
                         // move to is what would resolve paths against the
                         // wrong tree.
-                        if let Some(dir) = entered.as_deref() {
-                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd).await;
+                        if let Some(dir) = entered.as_deref()
+                            && let Some(cfg) = destination_cfg.clone()
+                        {
+                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
                         }
                         app.pending_resume = None;
                         drop(eng);

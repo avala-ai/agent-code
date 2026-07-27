@@ -367,18 +367,31 @@ impl QueryEngine {
         // --clear` is, and external watchers and indexers subscribe to
         // it. Silently dropping the paths would leave them tracking
         // directories this engine no longer has in scope.
-        if dropped_dirs {
-            let cwd = self.state.cwd.clone();
-            // A scope of its own, never the turn's. A swap happens
-            // between turns, and after an aborted one `self.cancel` stays
-            // cancelled until the next `begin_turn` — passing it would
-            // have `run_hooks` reject every hook before it started, so
-            // watchers would silently never hear about the dropped
-            // directories.
-            let swap_cancel = CancellationToken::new();
-            self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
-                .await;
+        let _ = dropped_dirs;
+    }
+
+    /// Tell watchers the `/add-dir` working set is going away.
+    ///
+    /// Separate from [`Self::reset_for_session_swap`] because the two
+    /// have opposite timing constraints: these are shell hooks, and they
+    /// inherit the process working directory, so they must run *before* a
+    /// resume moves it — otherwise the departing session's teardown fires
+    /// inside the project being entered. Clearing the state must happen
+    /// *after* the move succeeds, so a failed move leaves the session the
+    /// user keeps still intact.
+    pub async fn notify_working_set_dropped(&mut self) {
+        if self.state.additional_dirs.is_empty() {
+            return;
         }
+        let cwd = self.state.cwd.clone();
+        // A scope of its own, never the turn's. A swap happens between
+        // turns, and after an aborted one `self.cancel` stays cancelled
+        // until the next `begin_turn` — passing it would have `run_hooks`
+        // reject every hook before it started, so watchers would silently
+        // never hear about the dropped directories.
+        let swap_cancel = CancellationToken::new();
+        self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
+            .await;
     }
 
     /// Set plan mode for the next permission / executor check without
@@ -459,24 +472,38 @@ impl QueryEngine {
     /// firing in a tree they were not written for. Resuming a session
     /// from another project is the case that needs this.
     ///
-    /// Rules and hooks come from the config layers of the *process
-    /// working directory*, so the caller must have moved there first.
+    /// Takes an already-loaded config so the caller can read it *before*
+    /// anything is touched: a destination whose settings will not parse
+    /// must fail the resume while it is still cheap to refuse, not after
+    /// the session has moved.
+    ///
     /// Only policy is taken from that config: the model, modes and the
     /// rest of the runtime state belong to the session being restored,
     /// not to the directory it lives in.
-    pub fn adopt_project(
-        &mut self,
-        project_root: &std::path::Path,
-    ) -> Result<(), crate::error::ConfigError> {
+    pub fn adopt_project(&mut self, project_root: &std::path::Path, cfg: crate::config::Config) {
         self.rescope_persistent_grants(project_root);
         self.permissions
             .set_project_root(project_root.to_path_buf());
-        let cfg = crate::config::Config::load()?;
         self.permissions.set_rules(cfg.permissions.rules.clone());
         self.hooks.replace(cfg.hooks.clone());
+        // Tool visibility is policy too: `allowed_tools` /
+        // `disallowed_tools` decide what the model is even shown, and the
+        // filter installed at startup belongs to the project we left.
+        self.tools
+            .set_visibility(crate::tools::registry::ToolVisibilityFilter::new(
+                cfg.permissions.allowed_tools.clone(),
+                cfg.permissions.disallowed_tools.clone(),
+            ));
+        // Sandbox and bypass policy are read from `state.config` on every
+        // turn, so leaving the old project's values here would let a
+        // project that forbids bypassing permissions inherit one that
+        // allows it.
+        self.state.config.security = cfg.security;
+        self.state.config.sandbox = cfg.sandbox;
         self.state.config.permissions.rules = cfg.permissions.rules;
+        self.state.config.permissions.allowed_tools = cfg.permissions.allowed_tools;
+        self.state.config.permissions.disallowed_tools = cfg.permissions.disallowed_tools;
         self.state.config.hooks = cfg.hooks;
-        Ok(())
     }
 
     /// Re-scope persistent grants to a new project root. Must be called
@@ -3982,6 +4009,11 @@ mod tests {
         // The previous turn was cancelled and no new one has begun.
         engine.cancel.cancel();
 
+        // The notification is its own step now — it must run before a
+        // resume moves the process, while the state clearing must run
+        // after it. The guarantee here is unchanged: watchers hear about
+        // the dropped directories even after an aborted turn.
+        engine.notify_working_set_dropped().await;
         engine.reset_for_session_swap().await;
 
         assert!(
