@@ -49,6 +49,18 @@ impl App {
         self.vi_pending_d = false;
     }
 
+    /// Pull the cursor back onto a character. Normal mode has no
+    /// position after the last one; parked there, `x` and `D` have
+    /// nothing to act on.
+    pub fn clamp_cursor_to_normal_mode(&mut self) {
+        let (start, end) = line_bounds(&self.input, self.cursor);
+        let last = line_last(&self.input, start, end);
+        if self.cursor > last {
+            self.cursor = last;
+            self.dirty = true;
+        }
+    }
+
     pub fn vi_enter_insert(&mut self) {
         self.composer_mode = ComposerMode::Insert;
         self.dirty = true;

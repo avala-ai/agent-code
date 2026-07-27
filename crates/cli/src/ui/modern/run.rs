@@ -995,6 +995,19 @@ fn sync_edit_mode(app: &mut App, edit_mode: &str) {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    handle_key_inner(app, key);
+    // Normal mode has no cursor position after the last character, but
+    // the keys that fall through to the composer — arrows, Home/End, a
+    // user binding — move with insert-mode semantics and can park there,
+    // where `x` and `D` find nothing. Clamp once, centrally, rather than
+    // at each of those call sites. A key that switched to insert mode is
+    // left alone: `A` parks past the last character on purpose.
+    if app.in_normal_mode() {
+        app.clamp_cursor_to_normal_mode();
+    }
+}
+
+fn handle_key_inner(app: &mut App, key: KeyEvent) {
     // Ignore key release on platforms that emit them. Accept Repeat so a
     // held Ctrl+C still counts (double-tap quit / cancel).
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
@@ -2296,6 +2309,42 @@ mod tests {
         assert!(!app.vi_pending_d, "Esc left the operator armed");
         assert_eq!(app.input, "hello", "Esc cleared the draft mid-operator");
         assert!(!app.quit_armed, "aborting an operator armed quit");
+    }
+
+    /// Keys that fall through to the composer move with insert-mode
+    /// semantics, so in normal mode they could park the cursor after the
+    /// last character — where `x` and `D` silently do nothing.
+    #[test]
+    fn fallthrough_navigation_stays_on_a_character_in_normal_mode() {
+        for nav in [KeyCode::Right, KeyCode::End] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.vi_mode = true;
+            app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+            app.input = "abc".into();
+            app.cursor = 2;
+            handle_key(&mut app, key(nav));
+            assert_eq!(app.cursor, 2, "{nav:?} ran past the last character");
+            handle_key(&mut app, key(KeyCode::Char('x')));
+            assert_eq!(app.input, "ab", "x had nothing under the cursor");
+        }
+
+        // Right must not park on a newline either.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "ab\ncd".into();
+        app.cursor = 1;
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.cursor, 1, "Right stepped onto the newline");
+
+        // Insert mode keeps its past-the-end position: `A` needs it.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 2;
+        handle_key(&mut app, key(KeyCode::Char('A')));
+        assert_eq!(app.cursor, 3, "A must still append after the last char");
     }
 
     /// `/emacs` must not advertise composer bindings that do not exist.
