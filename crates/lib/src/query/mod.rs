@@ -141,6 +141,14 @@ pub trait StreamSink: Send + Sync {
     /// Background / typed subagent lifecycle update.
     fn on_subagent_update(&self, _agent_id: &str, _state: &str, _headline: &str) {}
 
+    /// A finished subagent's full output.
+    ///
+    /// Separate from [`Self::on_subagent_update`], which carries only a
+    /// one-line headline: a UI that lets the user open a subagent needs
+    /// the body, and the completion path already has it in hand.
+    /// Defaulted so existing sinks are unaffected.
+    fn on_subagent_output(&self, _agent_id: &str, _output: &str) {}
+
     /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
     /// `turn` is session-cumulative, matching [`Self::on_turn_start`].
     fn on_turn_outcome(&self, _turn: usize, _outcome: &str) {}
@@ -1986,6 +1994,12 @@ fn emit_agent_result_update(
         })
         .unwrap_or_else(|| "agent".into());
     sink.on_subagent_update(&agent_id, state, &headline);
+    // The result body is discarded above in favour of a headline; hand it
+    // over intact so a UI can open the subagent's own output instead of
+    // showing a row that leads nowhere.
+    if state != "working" && !result.content.trim().is_empty() {
+        sink.on_subagent_output(&agent_id, &result.content);
+    }
 }
 
 /// Look up a tool call by its use-id and return every path it mutated.

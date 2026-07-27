@@ -1808,9 +1808,14 @@ mod tests {
             "Ctrl+Enter was swallowed by the pane"
         );
 
-        // Plain Enter still drives the pane (subagent row → explanation).
+        // Plain Enter still drives the pane. A running inline subagent
+        // has captured no output yet, so it says so.
         handle_key(&mut app, key(KeyCode::Enter));
-        assert!(app.status_message.contains("no separate output"));
+        assert!(
+            app.status_message.contains("not produced output yet"),
+            "pane did not act on Enter: {}",
+            app.status_message
+        );
     }
 
     /// After an aborted turn the UI says "queued prompts kept — press

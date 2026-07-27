@@ -89,6 +89,10 @@ pub struct TaskEntry {
     /// runs. Drill-in reads output by this id; `None` means the row is
     /// purely event-driven and has no output file to open.
     pub task_id: Option<String>,
+    /// Captured output for a row with no `task_id` — an inline subagent,
+    /// whose result never reaches the `TaskManager` and so has no file
+    /// to read. Filled when the subagent finishes.
+    pub output: Option<String>,
 }
 
 /// One record from the `TaskManager` poll, before reconciliation.
@@ -128,6 +132,24 @@ pub fn upsert(tasks: &mut Vec<TaskEntry>, agent_id: &str, state: &str, headline:
     upsert_with_source(tasks, agent_id, state, headline, TaskSource::Subagent);
 }
 
+/// Record a finished inline subagent's output on its row.
+///
+/// Inline subagents never reach the `TaskManager`, so they have no
+/// `task_id` and nothing on disk to open. Without this the pane shows a
+/// finished agent whose result cannot be read anywhere.
+pub fn set_output(tasks: &mut [TaskEntry], agent_id: &str, output: &str) -> bool {
+    match tasks
+        .iter_mut()
+        .find(|t| t.agent_id == agent_id && t.source == TaskSource::Subagent)
+    {
+        Some(row) => {
+            row.output = Some(output.to_string());
+            true
+        }
+        None => false,
+    }
+}
+
 /// Upsert a row from a specific source. Background rows are replaced
 /// wholesale on each poll, so their state always reflects the manager.
 pub fn upsert_with_source(
@@ -157,6 +179,7 @@ pub fn upsert_with_source(
             headline: headline.to_string(),
             source,
             task_id: None,
+            output: None,
         });
     }
     // Group by source, then float needs-input rows to the top within it.
@@ -166,6 +189,58 @@ pub fn upsert_with_source(
 
 #[cfg(test)]
 mod tests {
+    /// The drill-in dead end this closes: an inline subagent finishes,
+    /// has no `task_id` because it never reached the TaskManager, and so
+    /// there is nothing to open. Its result is captured on the row.
+    #[test]
+    fn a_finished_inline_subagent_keeps_its_output() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look around");
+        assert!(tasks[0].output.is_none());
+        assert!(tasks[0].task_id.is_none(), "inline rows have no task id");
+
+        assert!(set_output(&mut tasks, "explorer", "found three things"));
+        assert_eq!(tasks[0].output.as_deref(), Some("found three things"));
+    }
+
+    /// Background rows read their output from the TaskManager by id, so
+    /// captured output must not be attached to them — it would shadow
+    /// the live file.
+    #[test]
+    fn output_is_not_attached_to_background_rows() {
+        let mut tasks = Vec::new();
+        upsert_with_source(&mut tasks, "b1", "done", "build", TaskSource::Background);
+        assert!(
+            !set_output(&mut tasks, "b1", "stale"),
+            "captured output was attached to a manager-backed row"
+        );
+        assert!(tasks[0].output.is_none());
+    }
+
+    #[test]
+    fn output_for_an_unknown_agent_is_ignored() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look");
+        assert!(!set_output(&mut tasks, "someone-else", "hi"));
+        assert!(tasks[0].output.is_none());
+    }
+
+    /// A later status update must not wipe the captured result — the
+    /// upsert path rewrites state and headline, and output has to
+    /// survive that.
+    #[test]
+    fn a_later_update_does_not_drop_captured_output() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look");
+        set_output(&mut tasks, "explorer", "the answer");
+        upsert(&mut tasks, "explorer", "done", "finished");
+        assert_eq!(
+            tasks[0].output.as_deref(),
+            Some("the answer"),
+            "a status update discarded the captured output"
+        );
+    }
+
     /// The pane was fed only by `EngineEvent::SubagentUpdate`, so a
     /// background job (`&` shell, workflow, monitor) never appeared in it
     /// at all — the user had to run `/tasks list` to see one.

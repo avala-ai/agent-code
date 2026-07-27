@@ -25,6 +25,11 @@ pub struct UiQuestion {
 pub enum EngineEvent {
     Text(String),
     Thinking(String),
+    /// A finished subagent's full output, for pane drill-in.
+    SubagentOutput {
+        agent_id: String,
+        output: String,
+    },
     ToolStart {
         /// Stable engine tool-call id, used to correlate the result card.
         /// Empty only if the engine emitted the legacy id-less callback.
@@ -284,6 +289,17 @@ impl StreamSink for ChannelSink {
 
     fn on_context_usage(&self, used: u64, max: u64) {
         self.send(EngineEvent::ContextUsage { used, max });
+    }
+
+    fn on_subagent_output(&self, agent_id: &str, output: &str) {
+        // Bounded: a runaway subagent should not be able to push an
+        // unbounded body through the UI channel.
+        const MAX: usize = 64 * 1024;
+        let body: String = output.chars().take(MAX).collect();
+        self.send(EngineEvent::SubagentOutput {
+            agent_id: agent_id.to_string(),
+            output: body,
+        });
     }
 
     fn on_subagent_update(&self, agent_id: &str, state: &str, headline: &str) {

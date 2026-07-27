@@ -726,6 +726,11 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
+            EngineEvent::SubagentOutput { agent_id, output } => {
+                if super::tasks::set_output(&mut self.tasks, &agent_id, &output) {
+                    self.dirty = true;
+                }
+            }
             EngineEvent::ToolStart {
                 call_id,
                 name,
@@ -2117,6 +2122,7 @@ impl App {
                         headline: row.headline,
                         source: TaskSource::Subagent,
                         task_id: Some(row.id),
+                        output: None,
                     });
                     claimed.push(true);
                 }
@@ -2129,6 +2135,7 @@ impl App {
                 headline: row.headline,
                 source: TaskSource::Background,
                 task_id: Some(row.id),
+                output: None,
             });
         }
         // A manager-backed agent row whose record vanished (e.g.
@@ -2232,14 +2239,20 @@ impl App {
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
-        match &row.task_id {
-            Some(id) => {
+        match (&row.task_id, &row.output) {
+            // Backed by a TaskManager task: read the file on the run loop.
+            (Some(id), _) => {
                 self.pending_task_output = Some(id.clone());
                 self.status_message = format!("loading output for {id}…");
             }
-            None => {
-                self.status_message =
-                    "inline subagents have no separate output to open".to_string();
+            // Inline subagent: its result was captured when it finished,
+            // because it has no output file to read.
+            (None, Some(output)) => {
+                let (id, body) = (row.agent_id.clone(), output.clone());
+                self.show_task_output(&id, Ok(body));
+            }
+            (None, None) => {
+                self.status_message = "this agent has not produced output yet".to_string();
             }
         }
         self.dirty = true;
@@ -3495,6 +3508,58 @@ mod tests {
 
     /// Drill-in asks the run loop for output rather than reading it on
     /// the UI path, so the request is what the test can observe.
+    /// End to end: the engine reports a finished inline subagent's
+    /// output, and drilling into its row opens it. Before this the row
+    /// said "no separate output to open" and led nowhere.
+    #[test]
+    fn drilling_into_a_finished_inline_subagent_shows_its_output() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "explorer".into(),
+            state: "done".into(),
+            headline: "[general-purpose] look around".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: "explorer".into(),
+            output: "found the bug in auth.rs".into(),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "explorer");
+                assert!(
+                    result.as_deref().unwrap().contains("found the bug"),
+                    "the subagent's output was not opened: {result:?}"
+                );
+            }
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+        assert!(
+            app.pending_task_output.is_none(),
+            "an inline subagent has no task file to read"
+        );
+    }
+
+    /// A subagent still running has nothing to show yet, and must say so
+    /// rather than opening an empty card.
+    #[test]
+    fn drilling_into_a_running_inline_subagent_says_there_is_nothing_yet() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "explorer".into(),
+            state: "working".into(),
+            headline: "looking".into(),
+        });
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+        assert!(app.status_message.contains("not produced output yet"));
+    }
+
     #[test]
     fn drilling_into_a_background_row_requests_its_output() {
         let mut app = App::new("m", "/tmp", "s");
@@ -3521,18 +3586,20 @@ mod tests {
         assert_eq!(app.pending_task_output.as_deref(), Some("a3"));
     }
 
-    /// A subagent row's id is a subagent *type*, not a task id, so there
-    /// is nothing to read. Saying so beats opening an empty pane.
+    /// Superseded behaviour, kept as a pin. This used to assert that an
+    /// inline subagent row "has no separate output to open" — true when
+    /// nothing captured the result. The engine now reports it, so the
+    /// row leads somewhere; what remains true is that no TaskManager
+    /// file is read for one.
     #[test]
-    fn drilling_into_a_subagent_row_explains_there_is_no_output() {
+    fn an_inline_subagent_row_never_reads_a_task_file() {
         let mut app = App::new("m", "/tmp", "s");
         crate::ui::modern::tasks::upsert(&mut app.tasks, "explorer", "working", "look");
         app.drill_into_selected_task();
         assert!(
             app.pending_task_output.is_none(),
-            "asked for output that cannot exist"
+            "asked the TaskManager for output that cannot exist there"
         );
-        assert!(app.status_message.contains("no separate output"));
     }
 
     #[test]
