@@ -386,9 +386,30 @@ pub fn base_name(name: &str) -> String {
     name.rsplit('/').next().unwrap_or(name).to_string()
 }
 
+/// Commands whose operands are text to print, match or transform —
+/// never a program to run. A shell name among *their* arguments is
+/// data: `printf '%s\n' bash -c "'git' push --force"` prints four
+/// words.
+///
+/// Only this direction is listed. An unrecognised head keeps counting
+/// as a possible runner, so `firejail bash -c '…'` and every other
+/// runner nobody enumerated still recurse.
+/// Interpreters that can run a command are deliberately absent, even
+/// though their operands look like text: `awk 'BEGIN{system(ARGV[1] …
+/// )}' git push -uf` executes what follows, and `sed`'s `e` and the
+/// pagers' shell escapes do the same. Their arguments are not data.
+pub(crate) const DATA_COMMANDS: &[&str] = &[
+    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "tr", "cut", "paste",
+    "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq", "yq", "strings",
+    "logger",
+];
+
 /// Commands whose job is to run the command that follows them, so the
 /// wrapper name says nothing about what actually executes.
-const COMMAND_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid"];
+/// `exec` is here because it replaces the shell with what follows, so
+/// `exec env -S '…'` runs whatever that `env` resolves to; leaving it
+/// out stopped the walk at `exec` and reported nothing wrapped.
+const COMMAND_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid", "exec"];
 
 /// True when `tok` is a `NAME=value` environment assignment.
 pub fn is_env_assignment(tok: &str) -> bool {
@@ -477,7 +498,11 @@ fn strip_wrapper(tokens: &[String]) -> Unwrap {
             }
         };
     }
-    let is_env = base_name(reject_unless!(tokens.first())) == "env";
+    let head = base_name(reject_unless!(tokens.first()));
+    let is_env = head == "env";
+    // `exec -a NAME cmd` renames argv[0]: the name is the option's
+    // operand, not the command being run.
+    let is_exec = head == "exec";
     let rest = &tokens[1..];
     let mut i = 0;
     while i < rest.len() {
@@ -519,6 +544,17 @@ fn strip_wrapper(tokens: &[String]) -> Unwrap {
             continue;
         }
         if let Some(cluster) = tok.strip_prefix('-') {
+            if is_exec && !cluster.is_empty() {
+                match cluster.find('a') {
+                    // `-a NAME` and `-aNAME`, clustered or not.
+                    Some(pos) if cluster[pos + 1..].is_empty() => {
+                        reject_unless!(rest.get(i + 1));
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+                continue;
+            }
             if !is_env || cluster.is_empty() {
                 // Bare `-` is env's shorthand for `-i`; non-env
                 // wrappers have no operand-taking options to consume.
@@ -812,13 +848,30 @@ pub fn unwrapped_argv(argv: &[String]) -> Option<Vec<String>> {
 /// must fail closed rather than treat the invocation as "nothing
 /// wrapped".
 pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
-    parsed
-        .invocations
-        .iter()
-        .find_map(|argv| match unwrapped_tokens(argv) {
+    parsed.invocations.iter().find_map(|argv| {
+        // A head whose operands are text runs nothing they name, so a
+        // wrapper word among them is data: `printf '%s\n' env -S
+        // '${CMD}'` prints it. Being wrong about this list can only
+        // report an unknown that is not one, which is the safe way to
+        // be wrong.
+        let head_is_data = argv.first().is_some_and(|t| {
+            DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        if head_is_data {
+            return None;
+        }
+        // Resolve from every word, not only the first. What precedes a
+        // wrapper decides nothing about whether that wrapper resolves,
+        // and the name in front need not be one this list knows —
+        // `exec env -S '${CMD}'`, `stdbuf -o0 env -S '${CMD}'` and
+        // `sudo env -S '${CMD}'` are each the same unknown as `env -S
+        // '${CMD}'` alone. Starting only at the head made every name
+        // nobody enumerated a way to hide one.
+        (0..argv.len()).find_map(|start| match unwrapped_tokens(&argv[start..]) {
             Unwrap::Unresolved(reason) => Some(reason),
             _ => None,
         })
+    })
 }
 
 /// Check a parsed command against security rules.
@@ -1334,6 +1387,37 @@ mod tests {
         // An option env itself rejects is not dynamic: nothing runs.
         let rejected = parse_bash("env --frobnicate git status").unwrap();
         assert_eq!(unresolved_wrapper(&rejected), None);
+        // What stands in front of the `env` decides nothing about
+        // whether it resolves, so none of these names has to be known
+        // for the unknown behind it to be reported. `firejail` is here
+        // deliberately: it is in no list, and that is the point.
+        for cmd in [
+            "exec env -S '${CMD} -rf /tmp/x'",
+            "exec -a foo env -S '${CMD} -rf /tmp/x'",
+            "exec -la foo env -S '${CMD} -rf /tmp/x'",
+            "stdbuf -o0 env -S '${CMD} -rf /tmp/x'",
+            "sudo env -S '${CMD} -rf /tmp/x'",
+            "time env -S '${CMD} -rf /tmp/x'",
+            "xargs env -S '${CMD} -rf /tmp/x'",
+            "firejail env -S '${CMD} -rf /tmp/x'",
+        ] {
+            let parsed = parse_bash(cmd).unwrap();
+            assert_eq!(
+                unresolved_wrapper(&parsed),
+                Some(Unresolved::Expansion),
+                "exec hid a dynamic wrapper: {cmd}"
+            );
+        }
+        // And a command `exec` names is the one that runs.
+        let execed = parse_bash("exec env rm -rf /tmp/x").unwrap();
+        assert_eq!(
+            unwrapped_argv(&execed.invocations[0]),
+            Some(vec![
+                "rm".to_string(),
+                "-rf".to_string(),
+                "/tmp/x".to_string()
+            ])
+        );
     }
 
     /// A chain as long as the budget allows still resolves: the head is
@@ -1398,6 +1482,13 @@ mod tests {
             "nohup setsid env command ls -la",
             "env env env env env env env env git status",
             "env -S 'git status'",
+            "exec ls -la",
+            "exec -a foo git status",
+            "exec env git status",
+            // A head whose operands are text runs nothing they name,
+            // so a wrapper word among them is the data it looks like.
+            "printf '%s\\n' env -S '${CMD} -rf /tmp/x'",
+            "echo env -S '${CMD}'",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             assert_eq!(unresolved_wrapper(&parsed), None, "over-blocked: {cmd}");

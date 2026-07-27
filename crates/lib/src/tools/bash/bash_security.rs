@@ -10,8 +10,8 @@
 //! invocations are blocked.
 
 use crate::tools::bash_parse::{
-    ParsedCommand, base_name, env_split_string, is_env_assignment, parse_bash, unquote_token,
-    unwrapped_argv,
+    DATA_COMMANDS, ParsedCommand, base_name, env_split_string, is_env_assignment, parse_bash,
+    unquote_token, unwrapped_argv,
 };
 
 /// Severity of a destructive-command finding.
@@ -2074,17 +2074,21 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
     })
 }
 
-/// Names that select where git reads its config *and* that a shell
-/// ordinarily inherits already exported. Assigning one bare keeps the
-/// attribute it came with, so it reaches git without the command ever
-/// spelling an export: `HOME=/tmp/h; git p` reads `/tmp/h/.gitconfig`.
+/// Names that select where git reads its config *and* arrive already
+/// exported, so assigning one bare keeps the attribute it came with and
+/// reaches git without the command ever spelling an export:
+/// `HOME=/tmp/h; git p` reads `/tmp/h/.gitconfig`.
 ///
-/// The `GIT_CONFIG…` names are deliberately absent. A shell does not
-/// come with them set, so a bare assignment to one makes a shell
-/// variable that no child sees — which is why `GIT_CONFIG_GLOBAL=/tmp/g;
+/// Every shell has `HOME`. `XDG_CONFIG_HOME` is often unset, and then a
+/// bare assignment makes a shell variable no child sees, so it counts
+/// only where this process was actually given it — the same environment
+/// the command is about to run in.
+///
+/// The `GIT_CONFIG…` names are absent for that same reason: a shell
+/// does not come with them set, which is why `GIT_CONFIG_GLOBAL=/tmp/g;
 /// git status` runs an ordinary status.
 fn inherits_export_for_git_config(name: &str) -> bool {
-    matches!(name, "HOME" | "XDG_CONFIG_HOME")
+    name == "HOME" || (name == "XDG_CONFIG_HOME" && std::env::var_os(name).is_some())
 }
 
 /// Config keys that can make git run something the command text does
@@ -2383,24 +2387,6 @@ const SHELL_LAUNCHERS: &[&str] = &[
 /// Builtins that run the command word after them, so a builtin behind
 /// one is still in command position.
 const BUILTIN_PREFIXES: &[&str] = &["command", "builtin", "exec", "nohup", "setsid", "time"];
-
-/// Commands whose operands are text to print, match or transform —
-/// never a program to run. A shell name among *their* arguments is
-/// data: `printf '%s\n' bash -c "'git' push --force"` prints four
-/// words.
-///
-/// Only this direction is listed. An unrecognised head keeps counting
-/// as a possible runner, so `firejail bash -c '…'` and every other
-/// runner nobody enumerated still recurse.
-/// Interpreters that can run a command are deliberately absent, even
-/// though their operands look like text: `awk 'BEGIN{system(ARGV[1] …
-/// )}' git push -uf` executes what follows, and `sed`'s `e` and the
-/// pagers' shell escapes do the same. Their arguments are not data.
-const DATA_COMMANDS: &[&str] = &[
-    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "tr", "cut", "paste",
-    "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq", "yq", "strings",
-    "logger",
-];
 
 /// The literal command strings an invocation may hand to another
 /// shell.
@@ -2866,11 +2852,13 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
-            // A shell inherits these already exported, so a bare
+            // A shell inherits `HOME` already exported, so a bare
             // assignment keeps that attribute and still reaches a git
             // in a later statement — no `export` need be spelled.
+            // `XDG_CONFIG_HOME` is not pinned here: whether a bare
+            // assignment carries depends on the environment this runs
+            // in, and only the prefix spelling above always does.
             "HOME=/tmp/h; git p",
-            "XDG_CONFIG_HOME=/tmp/h; git p",
             // A `<<` in arithmetic shifts, so it opens no heredoc and
             // holds no following line back: reading one as a heredoc
             // would skip to the line naming its delimiter and hide the
