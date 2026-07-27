@@ -2005,12 +2005,14 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("vim") => {
             engine.state_mut().config.ui.edit_mode = "vi".to_string();
-            println!("Editing mode set to vi. Takes effect on next session.");
+            println!("Editing mode set to vi (Esc for normal mode).");
             CommandResult::Handled
         }
         Some("emacs") => {
+            // Emacs bindings are the composer's default: Ctrl+A/E/K/U/W
+            // already work, so this only turns vi bindings back off.
             engine.state_mut().config.ui.edit_mode = "emacs".to_string();
-            println!("Editing mode set to emacs. Takes effect on next session.");
+            println!("Editing mode set to emacs (the default bindings).");
             CommandResult::Handled
         }
         Some("version") => {

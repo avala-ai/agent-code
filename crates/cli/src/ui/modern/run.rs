@@ -52,6 +52,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let notifier_config = engine.state().config.notifier.clone();
 
     // Apply theme so any shared color helpers still resolve.
+    let engine_edit_mode = engine.state().config.ui.edit_mode.clone();
     let configured = engine.state().config.ui.theme.clone();
     let inherit_fg = engine.state().config.ui.inherit_fg;
     let theme_name = crate::ui::theme::resolve_theme(&configured);
@@ -79,6 +80,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     app.keybindings = std::sync::Arc::new(crate::ui::keybindings::KeybindingRegistry::load());
     // The picker previews by mutating the global theme, so the App has to
     // remember what the user actually configured in order to revert.
+    app.vi_mode = engine_edit_mode == "vi";
     app.theme_name = configured.clone();
     app.inherit_fg = inherit_fg;
     app.show_thinking_blocks = show_thinking_blocks;
@@ -400,6 +402,20 @@ pub(super) async fn event_loop(
                     }
                 }
                 Err(_) => app.pending_theme = Some(theme_id),
+            }
+        }
+
+        // `/vim` and `/emacs` change config through the command bridge,
+        // so the composer picks the change up here rather than only at
+        // startup — "takes effect next session" was the old lie.
+        if let Ok(eng) = session.engine().try_lock() {
+            let wants_vi = eng.state().config.ui.edit_mode == "vi";
+            if wants_vi != app.vi_mode {
+                app.vi_mode = wants_vi;
+                // Turning vi off must not strand the composer in a mode
+                // that no longer accepts typing.
+                app.composer_mode = super::app::ComposerMode::Insert;
+                app.dirty = true;
             }
         }
 
@@ -1145,6 +1161,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let was_armed = app.quit_armed;
     app.quit_armed = false;
 
+    // In vi mode Esc leaves insert mode. Only when already in normal
+    // mode does it fall through to the quit-arming path, so the way out
+    // stays reachable.
+    if app.vi_mode
+        && is_esc(&key)
+        && app.composer_mode == super::app::ComposerMode::Insert
+        && app.front_modal().is_none()
+    {
+        app.vi_enter_normal();
+        return;
+    }
+
     // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
     if is_esc(&key) {
         if app.selection.is_some() {
@@ -1193,6 +1221,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             ));
         }
         return;
+    }
+
+    // Vi normal mode owns bare characters: they are motions, not text.
+    // Placed before the global chord match so `t`, `p` and friends edit
+    // rather than firing a shortcut.
+    if app.in_normal_mode() {
+        match key.code {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.vi_normal_key(c);
+                return;
+            }
+            // Enter still submits from normal mode; anything else falls
+            // through so Ctrl chords, arrows and Backspace keep working.
+            _ => {}
+        }
     }
 
     // A user chord from `keybindings.json` wins over the built-in
@@ -2063,6 +2109,63 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.cancel_requested, "Ctrl+C no longer cancels");
         assert!(app.pending_submit.is_none(), "Ctrl+C submitted a prompt");
+    }
+
+    /// The bug this closes: `ui.edit_mode = "vi"` was read by nothing,
+    /// so Esc did not leave insert mode and `h`/`l` typed letters.
+    #[test]
+    fn vi_mode_routes_keys_through_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.input = "hello".into();
+        app.cursor = 5;
+
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            app.composer_mode,
+            crate::ui::modern::app::ComposerMode::Normal,
+            "Esc did not leave insert mode"
+        );
+        assert!(!app.quit_armed, "Esc armed quit instead of entering normal");
+
+        handle_key(&mut app, key(KeyCode::Char('0')));
+        assert_eq!(app.cursor, 0);
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.input, "ello", "x did not delete under the cursor");
+        // A motion key must not be typed into the composer.
+        assert!(!app.input.contains('0'));
+
+        handle_key(&mut app, key(KeyCode::Char('A')));
+        assert_eq!(
+            app.composer_mode,
+            crate::ui::modern::app::ComposerMode::Insert
+        );
+        handle_key(&mut app, key(KeyCode::Char('!')));
+        assert_eq!(app.input, "ello!", "insert mode stopped accepting text");
+    }
+
+    /// Normal mode must swallow bare characters that are global chords,
+    /// or editing would fire shortcuts.
+    #[test]
+    fn normal_mode_does_not_fire_global_chords() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        assert!(
+            !app.command_palette_open(),
+            "`?` opened the palette while editing in normal mode"
+        );
+    }
+
+    /// With vi off, every key must behave exactly as before.
+    #[test]
+    fn without_vi_mode_esc_still_arms_quit() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.vi_mode);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.quit_armed, "Esc stopped arming quit for non-vi users");
     }
 
     #[test]

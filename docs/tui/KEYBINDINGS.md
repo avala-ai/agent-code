@@ -172,3 +172,18 @@ binding that runs never discards the prompt you were composing.
 
 The file is read once at startup; `/keybindings` lists the bindings active in
 the current session — after editing the file, restart to apply.
+
+## Vi mode
+
+`/vim` (or `edit_mode = "vi"` in config) gives the composer vi bindings.
+`Esc` leaves insert mode; the prompt marker changes from `❯` to `▪` so the
+mode is always visible.
+
+Normal mode: `h` `l` `0` `$` `w` `b` move · `i` `a` `I` `A` insert ·
+`x` delete a character · `D` delete to end · `C` change to end · `dd` clear
+the line · `Enter` submits. Unrecognised keys do nothing rather than firing
+a global shortcut.
+
+`Esc` in normal mode falls through to the usual behaviour, so the
+double-press quit is still reachable. `/emacs` returns to the default
+bindings (`Ctrl+A`/`E`/`K`/`U`/`W`), which are always active.
