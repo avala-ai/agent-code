@@ -1124,7 +1124,9 @@ pub(super) async fn event_loop(
                             // never arrived, and releasing it would run it
                             // against the conversation the user was trying
                             // to leave.
-                            app.cancel_deferred_resume_work();
+                            app.cancel_deferred_resume_work(
+                                "cancelled — held for the session that failed to load:",
+                            );
                             app.pending_resume = None;
                             app.dirty = true;
                         }

@@ -369,7 +369,7 @@ impl App {
     /// for never arrived. None of it may run against the conversation the
     /// user was trying to leave — a prompt or `!cmd` would take real tool
     /// and filesystem side effects there — so it is cancelled and shown.
-    pub fn cancel_deferred_resume_work(&mut self) {
+    pub fn cancel_deferred_resume_work(&mut self, header: &str) {
         // Notices carried from the accept are already on the transcript,
         // and the swap they were waiting for is never going to happen.
         // Left here they would surface again — stale and attributed to
@@ -377,10 +377,12 @@ impl App {
         self.resume_notices.clear();
         // Terminal path: no restore follows, so nothing needs to survive
         // a transcript swap that will not happen.
-        self.cancel_pending_session_work(
-            "cancelled — held for the session that failed to load:",
-            false,
-        );
+        //
+        // The header is the caller's, because the *reason* differs and
+        // the user is reading it: a load that failed and a resume the
+        // user chose to abandon both end here, and reporting the second
+        // as the first blames a session that was never unhealthy.
+        self.cancel_pending_session_work(header, false);
     }
 
     /// Session-scoped work staged against a conversation that is being
@@ -568,7 +570,7 @@ impl App {
                 // outstanding, so releasing the gate without releasing
                 // that work lets the run loop apply a `/clear` meant for
                 // a session we are no longer going to.
-                self.cancel_deferred_resume_work();
+                self.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
                 "already in this session — cancelled the resume in progress".to_string()
             } else {
                 "already in this session".to_string()
@@ -1203,7 +1205,7 @@ mod tests {
         app.pending_shell = Some("rm -rf build".into());
         app.pending_submit = Some("keep going".into());
 
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
 
         assert!(!app.pending_clear, "/clear would run on the old session");
         assert!(
@@ -1528,7 +1530,7 @@ mod tests {
         assert!(!app.resume_notices.is_empty(), "nothing was carried");
 
         // The chosen session turns out to be missing or corrupt.
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
         assert!(app.resume_notices.is_empty());
 
         // A later, unrelated resume must not replay it.
@@ -1713,7 +1715,7 @@ mod tests {
         );
 
         // The load fails: the clear is cancelled and the history stands.
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
         assert!(!app.pending_clear);
         assert!(
             app.transcript
@@ -2001,6 +2003,26 @@ work",
         assert!(
             app.resume_notices.is_empty(),
             "notices for a swap that never happens would resurface on the next one"
+        );
+        // The user cancelled; the session they were heading to may be
+        // perfectly healthy. Blaming it for a load failure is a lie
+        // about why their /clear did not run.
+        let reported = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !reported.contains("failed to load"),
+            "a user-cancelled resume was reported as a load failure: {reported}"
+        );
+        assert!(
+            reported.contains("resume you cancelled"),
+            "the cancellation was not attributed to the user: {reported}"
         );
     }
 }
