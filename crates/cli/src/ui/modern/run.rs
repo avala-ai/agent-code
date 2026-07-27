@@ -148,6 +148,44 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
+/// Move the process, the engine and the UI into a restored session's
+/// directory, the same way `/cd` does: process cwd, engine state, prompt
+/// cache (the cwd is baked into it) and persistent grants (they are
+/// per-project, so approvals from the old one must stop applying).
+///
+/// All or nothing. If the directory cannot be entered, nothing claims to
+/// have moved — the engine keeps the cwd the process is actually in and
+/// the user is told. A state naming a directory the process is not in is
+/// what would resolve `@path` mentions and tool calls against the wrong
+/// tree, which is the failure this exists to prevent.
+async fn adopt_session_cwd(
+    app: &mut App,
+    eng: &mut agent_code_lib::query::QueryEngine,
+    restored_cwd: &str,
+    previous_cwd: &str,
+) {
+    if restored_cwd.is_empty() || restored_cwd == previous_cwd {
+        return;
+    }
+    let dir = std::path::PathBuf::from(restored_cwd);
+    match std::env::set_current_dir(&dir) {
+        Ok(()) => {
+            eng.state_mut().cwd = restored_cwd.to_string();
+            eng.reset_system_prompt_cache();
+            eng.rescope_persistent_grants(&dir);
+            app.cwd = restored_cwd.to_string();
+            let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
+        }
+        Err(e) => {
+            app.transcript
+                .push(super::app::TranscriptItem::System(format!(
+                    "this session was saved in {restored_cwd}, which cannot be entered \
+                 ({e}) — staying in {previous_cwd}"
+                )));
+        }
+    }
+}
+
 fn probe_caps() -> TerminalCaps {
     let enhancement = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     TerminalCaps::detect(|k| std::env::var(k).ok(), enhancement)
@@ -545,6 +583,13 @@ pub(super) async fn event_loop(
                         let user_mode =
                             (app.mode_chosen || app.mode != last_mode).then_some(app.mode);
                         let turns = data.turn_count;
+                        // The conversation's directory belongs to it. Left
+                        // behind, the restored session describes one project
+                        // while `@path` mentions and every tool call still
+                        // resolve against the project being left — which can
+                        // edit the wrong repository.
+                        let restored_cwd = data.cwd.clone();
+                        let previous_cwd = eng.state().cwd.clone();
                         {
                             let st = eng.state_mut();
                             // Identity moves with the conversation. Left alone,
@@ -623,6 +668,17 @@ pub(super) async fn event_loop(
                         let hint = mode.permission_hint().unwrap_or(base_permission_mode);
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
+                        // Move with it, the same way `/cd` does: process
+                        // cwd, engine state, prompt cache (the cwd is baked
+                        // in), and persistent grants (they are per-project,
+                        // so approvals from the old one must stop applying).
+                        //
+                        // All or nothing: if the directory cannot be entered
+                        // the engine keeps the cwd the process is actually
+                        // in, and says so. Claiming a directory we did not
+                        // move to is what would resolve paths against the
+                        // wrong tree.
+                        adopt_session_cwd(app, &mut eng, &restored_cwd, &previous_cwd).await;
                         app.pending_resume = None;
                         drop(eng);
                         // SessionStart for the session just restored, now
@@ -4092,6 +4148,54 @@ mod tests {
         assert!(
             !text.contains('\u{1b}'),
             "escape sequences reached the transcript: {text:?}"
+        );
+    }
+
+    /// A saved directory that no longer exists must not be adopted in
+    /// name only. If the engine claimed a cwd the process is not in,
+    /// every `@path` mention and tool call would resolve against the
+    /// wrong tree — the exact failure restoring the cwd is meant to fix.
+    ///
+    /// Only the refusal is covered: the success path calls
+    /// `set_current_dir`, which is process-global, and a test that moved
+    /// the whole test binary's cwd would flake every other test running
+    /// beside it.
+    #[tokio::test]
+    async fn a_missing_session_directory_is_refused_not_half_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("no-such-project");
+        let harness = crate::ui::modern::fake_engine::harness(
+            crate::ui::modern::fake_engine::ScriptedProvider::new(Vec::new()),
+            tmp.path(),
+        );
+        let engine_arc = harness.session.engine();
+        let mut eng = engine_arc.lock().await;
+        let before_engine = eng.state().cwd.clone();
+        let mut app = App::new("m", "/tmp/original", "s");
+        let before_app = app.cwd.clone();
+
+        adopt_session_cwd(
+            &mut app,
+            &mut eng,
+            &gone.display().to_string(),
+            &before_engine,
+        )
+        .await;
+
+        assert_eq!(eng.state().cwd, before_engine, "engine moved anyway");
+        assert_eq!(app.cwd, before_app, "the UI moved anyway");
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                crate::ui::modern::app::TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("cannot be entered"),
+            "the user was not told the directory was unavailable: {said}"
         );
     }
 }
