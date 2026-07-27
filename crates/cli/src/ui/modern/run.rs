@@ -803,6 +803,7 @@ pub(super) async fn event_loop(
             && app.pending_resume.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
+            app.pending_submit_display = None;
             let sink = ChannelSink::new(eng_tx.clone(), app.conversation_epoch);
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {

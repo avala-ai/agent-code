@@ -399,8 +399,14 @@ pub struct App {
     pub status_message: String,
 
     pub should_quit: bool,
-    /// Prompt waiting to be started as a turn by the runtime.
+    /// Prompt waiting to be started as a turn by the runtime. This is
+    /// the *engine* payload: `@path` mentions and skill bodies are
+    /// already expanded into it.
     pub pending_submit: Option<String>,
+    /// The line the user actually typed for `pending_submit`, kept so a
+    /// submission handed back during a resume returns as their words
+    /// rather than as an inlined file or skill body.
+    pub pending_submit_display: Option<String>,
     /// `/model` action waiting for the run loop (needs the engine lock).
     pub pending_model: Option<PendingModelAction>,
     /// `/clear` also clears the ENGINE conversation; applied by the run
@@ -621,6 +627,7 @@ impl App {
             status_message: String::new(),
             should_quit: false,
             pending_submit: None,
+            pending_submit_display: None,
             pending_model: None,
             pending_clear: false,
             pending_slash: None,
@@ -1317,17 +1324,24 @@ impl App {
             return;
         }
         if text == "/clear" {
-            self.clear_transcript_view();
+            // Normally the view clears at once. Not while a resume is
+            // outstanding: the engine clear is deferred behind it and is
+            // cancelled outright if the load fails, which would leave a
+            // blank screen in front of a conversation that is still
+            // there. The deferred handler clears the view when it runs.
+            // (`ctx_meter` is cleared by `clear_transcript_view`.)
+            if self.pending_resume.is_none() {
+                self.clear_transcript_view();
+                // The checklist belongs to the conversation being
+                // discarded; keeping it would hold the pane open on work
+                // that no longer exists. Bumping the epoch also disowns
+                // anything the still-running turn writes from here on.
+                self.new_conversation();
+            }
             // Also clear the ENGINE conversation (classic parity): clearing
             // only the view silently kept paying for the entire prior
             // context. The run loop applies this under try_lock.
             self.pending_clear = true;
-            // The checklist belongs to the conversation being discarded;
-            // keeping it would hold the pane open on work that no longer
-            // exists. Bumping the epoch also disowns anything the
-            // still-running turn writes from here on.
-            // (`ctx_meter` is cleared by `clear_transcript_view` above.)
-            self.new_conversation();
             self.input.clear();
             self.cursor = 0;
             return;
@@ -1817,6 +1831,7 @@ impl App {
                 }
             };
         self.push_prompt_history(&display);
+        self.pending_submit_display = Some(display.clone());
         self.transcript.push(TranscriptItem::User(display));
         if !mention_notes.is_empty() {
             self.transcript.push(TranscriptItem::System(format!(

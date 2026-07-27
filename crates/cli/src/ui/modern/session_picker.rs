@@ -284,6 +284,33 @@ impl App {
         self.open_session_picker(entries);
     }
 
+    /// Remove the transcript row a staged submission already drew.
+    ///
+    /// `submit` echoes the line the moment it is accepted, so a
+    /// submission cancelled or handed back during a resume would
+    /// otherwise stay on screen looking like it had been sent.
+    fn remove_staged_row(&mut self, display: &str) {
+        let Some(idx) = self
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, TranscriptItem::User(t) if t == display))
+        else {
+            return;
+        };
+        // `@mentions:` notes are drawn immediately after the row.
+        if matches!(
+            self.transcript.get(idx + 1),
+            Some(TranscriptItem::System(t)) if t.starts_with("@mentions:")
+        ) {
+            self.transcript.remove(idx + 1);
+        }
+        self.transcript.remove(idx);
+        self.expanded.clear();
+        self.selected_item = None;
+        self.layout.invalidate();
+        self.dirty = true;
+    }
+
     /// The visible half of `/clear`.
     ///
     /// Split out because a `/clear` held back for a resume has to run it
@@ -341,7 +368,9 @@ impl App {
             cancelled.push(slash);
         }
         if let Some(cmd) = self.pending_shell.take() {
-            cancelled.push(format!("!{cmd}"));
+            let row = format!("!{cmd}");
+            self.remove_staged_row(&row);
+            cancelled.push(row);
         }
         self.reclaim_staged_prompts("not sent:", &mut cancelled);
         if !cancelled.is_empty() {
@@ -364,7 +393,15 @@ impl App {
     fn reclaim_staged_prompts(&mut self, header: &str, spill: &mut Vec<String>) {
         let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
-        if let Some(text) = self.pending_submit.take() {
+        if let Some(payload) = self.pending_submit.take() {
+            // The line the user typed, not the engine payload: that has
+            // `@path` mentions and skill bodies already inlined, and
+            // handing it back would drop a whole file into the composer
+            // and expand the mention a second time on resubmission.
+            let text = self.pending_submit_display.take().unwrap_or(payload);
+            // The row `submit` drew is a claim this was sent. It never
+            // ran, so it goes with the prompt.
+            self.remove_staged_row(&text);
             if self.input.trim().is_empty() {
                 self.cursor = text.len();
                 self.input = text;
@@ -1349,6 +1386,91 @@ mod tests {
             app.conversation_epoch, epoch_before,
             "in-flight work from the old conversation was not disowned"
         );
+    }
+
+    /// `/clear` submitted during a load must not blank the screen: the
+    /// engine clear is deferred and is cancelled if the load fails,
+    /// which would leave an empty transcript in front of a conversation
+    /// that is still there.
+    #[test]
+    fn clear_during_a_resume_holds_its_visible_half() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::User("earlier".into()));
+        app.pending_resume = Some("abcdef123456".into());
+
+        app.input = "/clear".into();
+        app.cursor = app.input.len();
+        app.submit();
+
+        assert!(app.pending_clear, "the engine clear was not staged");
+        assert!(
+            !app.transcript.is_empty(),
+            "the screen was blanked before the resume was known to succeed"
+        );
+
+        // The load fails: the clear is cancelled and the history stands.
+        app.cancel_deferred_resume_work();
+        assert!(!app.pending_clear);
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "earlier")),
+            "history was lost to a clear that never ran"
+        );
+    }
+
+    /// `submit` echoes the line immediately; a prompt handed back during
+    /// a resume never ran, so the row must not stay on screen claiming
+    /// it was sent.
+    #[test]
+    fn reclaiming_removes_the_row_the_submission_drew() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("abcdef123456".into());
+        app.input = "check the parser".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "check the parser")),
+            "fixture did not draw the row"
+        );
+
+        app.adopt_restored_session(&restored());
+
+        assert_eq!(
+            app.input, "check the parser",
+            "the prompt was not handed back"
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "check the parser")),
+            "the row still claims the prompt was sent: {:?}",
+            app.transcript
+        );
+    }
+
+    /// `pending_submit` holds the engine payload, with `@path` mentions
+    /// and skill bodies inlined. Handing *that* back would drop a whole
+    /// file into the composer and expand the mention again on resend.
+    #[test]
+    fn reclaiming_returns_the_typed_line_not_the_expanded_payload() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_submit = Some(
+            "look at @src/main.rs
+<file>…thousands of lines…</file>"
+                .into(),
+        );
+        app.pending_submit_display = Some("look at @src/main.rs".into());
+
+        app.adopt_restored_session(&restored());
+
+        assert_eq!(
+            app.input, "look at @src/main.rs",
+            "the expanded payload was pasted into the composer"
+        );
+        assert!(app.pending_submit_display.is_none());
     }
 
     /// Ids come from session filenames, so an imported or hand-renamed
