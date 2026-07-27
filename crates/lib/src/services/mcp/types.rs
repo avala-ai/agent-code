@@ -43,7 +43,7 @@ impl McpServerConfig {
     /// Resolution uses the *child's* effective `PATH`: `connect_stdio`
     /// applies `env` to the `Command` before spawning, so a server that
     /// sets `env.PATH` is looked up along that, not along the agent's own
-    /// `PATH`. Same for `PATHEXT` on Windows.
+    /// `PATH`.
     ///
     /// The resolved path is canonicalized, so flipping the symlink an
     /// entry like `/usr/bin/npx` points at also re-prompts — including a
@@ -136,7 +136,12 @@ fn resolve_executable(
         Some(p) => std::ffi::OsString::from(p),
         None => std::env::var_os("PATH")?,
     };
-    for dir in std::env::split_paths(&path_var) {
+    // Windows resolves a bare name against the working directory before
+    // walking PATH; Unix `execvp` never does.
+    let search_dirs = std::env::split_paths(&path_var);
+    #[cfg(windows)]
+    let search_dirs = std::iter::once(launch_cwd.to_path_buf()).chain(search_dirs);
+    for dir in search_dirs {
         // A relative `PATH` entry resolves against the launch directory,
         // exactly as the child's own lookup would.
         let dir = if dir.is_absolute() {
@@ -144,7 +149,7 @@ fn resolve_executable(
         } else {
             launch_cwd.join(dir)
         };
-        for candidate in executable_candidates(&dir, command, env) {
+        for candidate in executable_candidates(&dir, command) {
             if is_executable_file(&candidate) {
                 return candidate.canonicalize().ok();
             }
@@ -153,32 +158,24 @@ fn resolve_executable(
     None
 }
 
-/// Filenames a bare `command` can match in one directory. On Windows the
-/// loader appends each `PATHEXT` suffix, so `foo` finds `foo.exe` — and
-/// a configured `env.PATHEXT` overrides the inherited one, same as PATH.
-fn executable_candidates(
-    dir: &std::path::Path,
-    command: &str,
-    env: &std::collections::HashMap<String, String>,
-) -> Vec<std::path::PathBuf> {
+/// Filenames a bare `command` can match in one directory.
+///
+/// Windows mirrors `std::process::Command`, which appends **only** `.exe`
+/// to an extensionless program — it does not walk `PATHEXT`. Honoring
+/// `PATHEXT` here would bind the fingerprint to a `.cmd` or `.com` that
+/// the spawn never reaches, leaving the real `.exe` free to be swapped
+/// under an unchanged grant.
+fn executable_candidates(dir: &std::path::Path, command: &str) -> Vec<std::path::PathBuf> {
     let exact = dir.join(command);
     #[cfg(windows)]
     {
-        let mut out = vec![exact];
-        let pathext = env
-            .get("PATHEXT")
-            .cloned()
-            .or_else(|| std::env::var("PATHEXT").ok())
-            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
-            .to_ascii_lowercase();
-        for ext in pathext.split(';').filter(|e| !e.is_empty()) {
-            out.push(dir.join(format!("{command}{ext}")));
+        if std::path::Path::new(command).extension().is_none() {
+            return vec![exact, dir.join(format!("{command}.exe"))];
         }
-        out
+        vec![exact]
     }
     #[cfg(not(windows))]
     {
-        let _ = env;
         vec![exact]
     }
 }
@@ -509,6 +506,50 @@ mod binding_tests {
             before,
             cfg.binding_fingerprint(Path::new("/")),
             "a swapped symlink inside env.PATH kept the old binding"
+        );
+    }
+
+    /// `std::process::Command` on Windows appends only `.exe` to an
+    /// extensionless program — it does not walk `PATHEXT`. Binding to a
+    /// `.cmd`/`.com` the spawn never reaches would leave the real `.exe`
+    /// free to be swapped under an unchanged grant, so a configured
+    /// `PATHEXT` must not steer the resolution.
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_ignores_pathext() {
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("srv.cmd"), "echo cmd").unwrap();
+        std::fs::write(bin.path().join("srv.exe"), "MZ").unwrap();
+
+        let mut cfg = stdio("srv", &[]);
+        cfg.env
+            .insert("PATH".to_string(), bin.path().to_str().unwrap().to_string());
+        // `.cmd` first would win if PATHEXT were honored.
+        cfg.env
+            .insert("PATHEXT".to_string(), ".CMD;.EXE".to_string());
+
+        let resolved = resolve_executable("srv", Path::new("/"), &cfg.env).unwrap();
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            std::ffi::OsStr::new("srv.exe"),
+            "PATHEXT steered the binding away from what Command spawns"
+        );
+    }
+
+    /// A program that already carries an extension is taken as-is.
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_keeps_an_explicit_extension() {
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("srv.cmd"), "echo cmd").unwrap();
+        let mut cfg = stdio("srv.cmd", &[]);
+        cfg.env
+            .insert("PATH".to_string(), bin.path().to_str().unwrap().to_string());
+
+        let resolved = resolve_executable("srv.cmd", Path::new("/"), &cfg.env).unwrap();
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            std::ffi::OsStr::new("srv.cmd")
         );
     }
 

@@ -79,7 +79,7 @@ impl Tool for McpProxyTool {
         false // MCP servers may have internal state.
     }
 
-    fn grant_binding(&self) -> Option<GrantBinding> {
+    fn grant_binding(&self, _input: &serde_json::Value) -> Option<GrantBinding> {
         Some(self.binding.clone())
     }
 
@@ -204,9 +204,12 @@ mod tests {
         let tool = proxy(&original);
         assert_eq!(tool.name(), "mcp__foo__query");
         assert_eq!(
-            tool.grant_binding().map(|b| b.digest),
+            tool.grant_binding(&serde_json::json!({})).map(|b| b.digest),
             Some(original.clone())
         );
-        assert_ne!(proxy(&swapped).grant_binding(), tool.grant_binding());
+        assert_ne!(
+            proxy(&swapped).grant_binding(&serde_json::json!({})),
+            tool.grant_binding(&serde_json::json!({}))
+        );
     }
 }

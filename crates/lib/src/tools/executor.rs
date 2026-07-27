@@ -256,7 +256,7 @@ async fn execute_single_tool(
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
             let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
-            let binding = tool.grant_binding();
+            let binding = tool.grant_binding(&call.input);
             let destinations = tool.grant_destinations(&call.input);
             let grant_key = persistent_grant_key(
                 &call.name,

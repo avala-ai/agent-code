@@ -124,8 +124,9 @@ pub trait Tool: Send + Sync {
     /// matching once the same tool name resolves somewhere else. `None`
     /// for built-in tools, whose name *is* the implementation; MCP
     /// proxies return a fingerprint of their server's transport
-    /// configuration, which is mutable between sessions.
-    fn grant_binding(&self) -> Option<GrantBinding> {
+    /// configuration, and id-addressed tools a fingerprint of the record
+    /// the id currently names — both mutable between sessions.
+    fn grant_binding(&self, _input: &serde_json::Value) -> Option<GrantBinding> {
         None
     }
 

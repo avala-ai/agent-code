@@ -58,6 +58,64 @@ pub struct Schedule {
     pub webhook_secret: Option<String>,
 }
 
+impl Schedule {
+    /// Digest of everything that decides *what this routine does* when
+    /// fired: the schedule, the prompt, where it runs, and the limits
+    /// and overrides it runs under.
+    ///
+    /// Durable permission grants for id-addressed tools (`RemoteTrigger`,
+    /// `CronDelete`) embed this. An id is a mutable handle — `save`
+    /// creates *or updates* the record under the same name — so without
+    /// it an approval for `{"id":"daily"}` would carry over to a routine
+    /// that has since been given a different prompt, cwd, model or
+    /// permission mode, and fire it without asking again.
+    ///
+    /// `created_at` is included so deleting and recreating a routine
+    /// under the same id also invalidates the grant. The run bookkeeping
+    /// (`last_run_at`, `last_result`) is excluded: it changes on every
+    /// execution, and folding it in would re-prompt after each run.
+    ///
+    /// A digest, not the values: prompts and webhook secrets are
+    /// sensitive, and grant keys are persisted into the config directory.
+    pub fn binding_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut part = |bytes: &[u8]| {
+            // Length-prefix every field so adjacent values cannot blur
+            // into each other ("ab"+"c" vs "a"+"bc").
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        };
+        part(self.name.as_bytes());
+        part(self.cron.as_bytes());
+        part(self.prompt.as_bytes());
+        part(self.cwd.as_bytes());
+        part(&[u8::from(self.enabled)]);
+        part(b"|model|");
+        part(self.model.as_deref().unwrap_or("").as_bytes());
+        part(b"|mode|");
+        part(self.permission_mode.as_deref().unwrap_or("").as_bytes());
+        part(b"|limits|");
+        part(
+            self.max_cost_usd
+                .map(|v| v.to_bits().to_le_bytes())
+                .unwrap_or_default()
+                .as_slice(),
+        );
+        part(
+            self.max_turns
+                .map(|v| (v as u64).to_le_bytes())
+                .unwrap_or_default()
+                .as_slice(),
+        );
+        part(b"|created|");
+        part(self.created_at.to_rfc3339().as_bytes());
+        part(b"|secret|");
+        part(self.webhook_secret.as_deref().unwrap_or("").as_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
