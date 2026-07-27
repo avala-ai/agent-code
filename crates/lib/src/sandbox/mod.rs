@@ -192,6 +192,41 @@ impl SandboxExecutor {
         self.allow_bypass
     }
 
+    /// Stable fingerprint of the *effective* isolation: the strategy plus
+    /// every policy field that decides what a sandboxed command can
+    /// reach, and whether per-call bypass is honored. Durable permission
+    /// grants embed this, so an approval given under one isolation
+    /// regime stops matching the moment the regime weakens (network
+    /// enabled, write paths widened, bypass allowed, strategy changed) —
+    /// the user is re-asked instead.
+    pub fn isolation_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut part = |bytes: &[u8]| {
+            // Length-prefix every field so adjacent values cannot blur
+            // into each other ("ab"+"c" vs "a"+"bc").
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        };
+        part(self.strategy.name().as_bytes());
+        // Raw path bytes, not lossy strings: paths differing only in
+        // invalid UTF-8 must not collapse into one fingerprint.
+        part(&crate::config::os_path_bytes(&self.policy.project_dir));
+        for p in &self.policy.allowed_write_paths {
+            part(&crate::config::os_path_bytes(p));
+        }
+        part(b"|forbidden|");
+        for p in &self.policy.forbidden_paths {
+            part(&crate::config::os_path_bytes(p));
+        }
+        part(&[
+            u8::from(self.policy.allow_network),
+            u8::from(self.allow_bypass),
+        ]);
+        let digest = h.finalize();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Wrap `cmd` with the active strategy, reapplying piped stdio.
     ///
     /// If the executor is disabled or the strategy is a no-op, returns
@@ -332,6 +367,67 @@ mod tests {
     #[test]
     fn pick_strategy_none_is_noop() {
         assert_eq!(pick_strategy("none").name(), "noop");
+    }
+
+    /// Durable permission grants embed this fingerprint, so any change
+    /// that could weaken isolation must change it — and identical
+    /// configurations must agree across runs.
+    #[test]
+    fn isolation_fingerprint_tracks_policy_changes() {
+        let project = Path::new("/proj");
+        let base = SandboxExecutor::from_config(&sample_config(true, "none"), project);
+        assert_eq!(
+            base.isolation_fingerprint(),
+            SandboxExecutor::from_config(&sample_config(true, "none"), project)
+                .isolation_fingerprint(),
+            "same config must fingerprint identically"
+        );
+
+        let mut network = sample_config(true, "none");
+        network.allow_network = true;
+        assert_ne!(
+            base.isolation_fingerprint(),
+            SandboxExecutor::from_config(&network, project).isolation_fingerprint(),
+            "enabling network must invalidate isolation-bound grants"
+        );
+
+        let mut writes = sample_config(true, "none");
+        writes.allowed_write_paths = vec!["/tmp".to_string()];
+        assert_ne!(
+            base.isolation_fingerprint(),
+            SandboxExecutor::from_config(&writes, project).isolation_fingerprint(),
+            "widening write paths must invalidate isolation-bound grants"
+        );
+
+        assert_ne!(
+            base.isolation_fingerprint(),
+            SandboxExecutor::from_config(&sample_config(true, "none"), Path::new("/other"))
+                .isolation_fingerprint(),
+            "a different project dir is a different regime"
+        );
+    }
+
+    /// Policy paths that differ only in invalid UTF-8 bytes render to
+    /// the same lossy string; the fingerprint must hash raw bytes and
+    /// keep them distinct.
+    #[cfg(unix)]
+    #[test]
+    fn isolation_fingerprint_distinguishes_invalid_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let a = PathBuf::from(OsStr::from_bytes(b"/proj-\xff\xfe"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/proj-\xfe\xff"));
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "precondition: lossy renderings collide"
+        );
+        let cfg = sample_config(true, "none");
+        assert_ne!(
+            SandboxExecutor::from_config(&cfg, &a).isolation_fingerprint(),
+            SandboxExecutor::from_config(&cfg, &b).isolation_fingerprint(),
+            "two different policies collapsed into one fingerprint"
+        );
     }
 
     #[test]

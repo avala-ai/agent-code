@@ -937,6 +937,15 @@ mod slash_lookup_tests {
     }
 }
 
+pub(crate) const VI_EDIT_MODE_MSG: &str = "Editing mode set to vi (Esc for normal mode).";
+
+/// `/emacs` only turns the vi bindings off — the composer has no Emacs
+/// chords of its own (Ctrl+E and Ctrl+U are transcript controls, and
+/// Ctrl+A/K/W are unbound), so the message must not promise any. If
+/// composer chords are ever added, say so here and in
+/// `docs/tui/KEYBINDINGS.md`.
+pub(crate) const EMACS_EDIT_MODE_MSG: &str = "Editing mode set to emacs (vi bindings off).";
+
 pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
     let input = input.trim_start_matches('/');
     let (cmd, args) = input
@@ -1374,11 +1383,29 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
-        Some("review") => CommandResult::Prompt(
-            "Review the current git diff. Look for bugs, security issues, \
-                 code quality problems, and suggest improvements."
-                .to_string(),
-        ),
+        Some("review") => {
+            // The target decides how the reviewer finds the change, and
+            // the rubric decides what counts as a finding. Both beat the
+            // single sentence this used to send.
+            use agent_code_lib::review;
+            let target = review::parse_target(args);
+            let cwd = std::path::PathBuf::from(&engine.state().cwd);
+            match review::resolve(target, &cwd) {
+                Ok(resolved) => {
+                    println!("Reviewing {}…", resolved.hint);
+                    CommandResult::Prompt(format!("{}\n\n{}", review::RUBRIC, resolved.prompt))
+                }
+                // Spending a turn reviewing the wrong thing is worse than
+                // saying no: report and stop.
+                Err(invalid) => {
+                    println!("Cannot review '{}': {}", invalid.input, invalid.reason);
+                    println!(
+                        "Usage: /review [uncommitted | base <branch> | commit <sha> | <instructions>]"
+                    );
+                    CommandResult::Handled
+                }
+            }
+        }
         Some("doctor") => {
             // Run the full async diagnostics synchronously via a blocking call.
             let cwd = std::path::Path::new(&engine.state().cwd).to_path_buf();
@@ -1794,6 +1821,51 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             if engine.state().plan_mode {
                 println!("Plan mode: ACTIVE (read-only tools only)");
             }
+            // Persisted "always allow" grants. Listed here rather than
+            // hidden in a file, because an approval the user cannot see
+            // is one they cannot revoke.
+            if let Some(store) = engine.persistent_grants_handle() {
+                let rt = tokio::runtime::Handle::current();
+                let clearing = args == Some("clear");
+                // Scratch thread for the same reason `/tasks` uses one:
+                // `execute` runs inside the REPL runtime, where a nested
+                // `block_on` would panic.
+                let report = std::thread::spawn(move || {
+                    rt.block_on(async move {
+                        let mut guard = store.lock().await;
+                        // Re-read the file so the listing (and the count
+                        // in the clear message) reflects what other live
+                        // sessions have saved or cleared since load.
+                        guard.refresh();
+                        if clearing {
+                            let n = guard.len();
+                            match guard.clear() {
+                                Ok(()) => format!("Cleared {n} always-allow grant(s)."),
+                                Err(e) => format!("Could not clear always-allow grants: {e}"),
+                            }
+                        } else if guard.is_empty() {
+                            "Always-allow grants: none".to_string()
+                        } else {
+                            // "Always-allow", not "Saved": the listing also
+                            // covers grants that could not be written to
+                            // disk and live only in this process. They
+                            // suppress prompts all the same, so the user
+                            // has to be able to see them.
+                            let mut out = format!(
+                                "Always-allow grants: {} — `/permissions clear` to forget them",
+                                guard.len()
+                            );
+                            for label in guard.labels() {
+                                out.push_str(&format!("\n  {label}"));
+                            }
+                            out
+                        }
+                    })
+                })
+                .join()
+                .unwrap_or_else(|_| "grant worker thread panicked".to_string());
+                println!("{report}");
+            }
             CommandResult::Handled
         }
         Some("theme") => {
@@ -2071,12 +2143,12 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("vim") => {
             engine.state_mut().config.ui.edit_mode = "vi".to_string();
-            println!("Editing mode set to vi. Takes effect on next session.");
+            println!("{VI_EDIT_MODE_MSG}");
             CommandResult::Handled
         }
         Some("emacs") => {
             engine.state_mut().config.ui.edit_mode = "emacs".to_string();
-            println!("Editing mode set to emacs. Takes effect on next session.");
+            println!("{EMACS_EDIT_MODE_MSG}");
             CommandResult::Handled
         }
         Some("version") => {
@@ -3456,6 +3528,10 @@ fn execute_cd(args: Option<&str>, engine: &mut QueryEngine) {
     // Invalidate the system-prompt cache — the cwd is baked in and
     // the agent would otherwise keep believing it's in the old dir.
     engine.reset_system_prompt_cache();
+    // Persistent grants are per-project: re-scope so approvals from the
+    // old project stop suppressing prompts here, and new ones land in
+    // the new project's grant file.
+    engine.rescope_persistent_grants(&canonical);
 
     // Fire CwdChanged so file-indexer / repo-watcher hooks can retune
     // without re-polling state. Use block_on to bridge the sync

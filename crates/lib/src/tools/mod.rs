@@ -117,6 +117,42 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// The external binding this tool dispatches to, when the tool name
+    /// alone does not pin that down.
+    ///
+    /// Durable permission grants include it, so an approval stops
+    /// matching once the same tool name resolves somewhere else. `None`
+    /// for built-in tools, whose name *is* the implementation; MCP
+    /// proxies return a fingerprint of their server's transport
+    /// configuration, and id-addressed tools a fingerprint of the record
+    /// the id currently names — both mutable between sessions.
+    ///
+    /// `input` is passed because the indirection is not always in the
+    /// tool name: an argument naming a record (a routine id, a
+    /// `subagent_type`) selects something mutable, and the binding has to
+    /// describe that record *as it stands now*. `ctx` comes with it
+    /// because resolving the record can depend on the session — the
+    /// directory a project-local agent definition is loaded from, or the
+    /// configured endpoint defaults a subagent inherits.
+    fn grant_binding(
+        &self,
+        _input: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Option<GrantBinding> {
+        None
+    }
+
+    /// Every filesystem destination this call would write to.
+    ///
+    /// Durable grants bind to the *resolved* target, so an approval stops
+    /// matching once the path is repointed at another file. Defaults to
+    /// [`Tool::get_path`]; tools that touch several files in one call
+    /// (`ApplyPatch`) must return all of them, or the unlisted ones stay
+    /// covered by a grant that never described them.
+    fn grant_destinations(&self, input: &serde_json::Value) -> Vec<PathBuf> {
+        self.get_path(input).into_iter().collect()
+    }
+
     /// Maximum result size in characters before truncation.
     fn max_result_size_chars(&self) -> usize {
         100_000
@@ -167,11 +203,37 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// What a tool dispatches to, when its name does not pin that down.
+///
+/// Carried into the durable grant key by
+/// [`crate::tools::executor::persistent_grant_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantBinding {
+    /// Digest of the external target. Never the values themselves —
+    /// commands, urls and environments carry credentials, and grant keys
+    /// are persisted into the config directory.
+    pub digest: String,
+    /// Whether the working directory changes what this binding reaches.
+    ///
+    /// True for a local subprocess, which resolves bare commands and
+    /// relative paths against the directory it inherits. False for a
+    /// remote endpoint: the same call means the same thing from any
+    /// directory, so binding it to the cwd would only re-prompt after a
+    /// `/cd` inside one project.
+    pub cwd_sensitive: bool,
+}
+
 /// Permission prompt response from the UI layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResponse {
     AllowOnce,
     AllowSession,
+    /// Approve and remember across sessions. Recorded by exact key over
+    /// the full normalized operation
+    /// ([`crate::tools::executor::persistent_grant_key`]), so it covers
+    /// this call and nothing adjacent to it — see
+    /// [`crate::permissions::grants`].
+    AllowAlways,
     Deny,
 }
 
@@ -253,6 +315,10 @@ pub struct ToolContext {
     pub subagent_colors: Option<Arc<crate::services::subagent_colors::SubagentColorManager>>,
     /// Tools allowed for the rest of the session (via "Allow for session" prompt).
     pub session_allows: Option<Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Grants that outlive the session (via "always allow"). Separate
+    /// from `session_allows` because these are written to disk and must
+    /// survive a restart; `None` disables the feature entirely.
+    pub persistent_grants: Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>>,
     /// Permission prompter for interactive approval.
     pub permission_prompter: Option<Arc<dyn PermissionPrompter>>,
     /// Multi-choice question asker (modern modal / tests). When `None`,
@@ -329,6 +395,7 @@ impl ToolContext {
             task_manager: None,
             subagent_colors: None,
             session_allows: None,
+            persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
             agent_origin: None,
@@ -375,6 +442,7 @@ impl ToolContext {
             task_manager: self.task_manager.clone(),
             subagent_colors: self.subagent_colors.clone(),
             session_allows: self.session_allows.clone(),
+            persistent_grants: self.persistent_grants.clone(),
             permission_prompter: self.permission_prompter.clone(),
             question_asker: self.question_asker.clone(),
             agent_origin: self.agent_origin.clone(),

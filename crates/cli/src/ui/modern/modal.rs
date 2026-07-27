@@ -112,6 +112,13 @@ impl App {
         let note = match resp {
             PermissionResponse::AllowOnce => format!("allowed {} once", p.name),
             PermissionResponse::AllowSession => format!("allowed {} for this session", p.name),
+            // No "(saved)" claim: the disk write happens later in the
+            // executor and may fail (read-only config dir, full disk) —
+            // the modal must not assert storage it cannot observe.
+            // `/permissions` lists what actually persisted.
+            PermissionResponse::AllowAlways => {
+                format!("always allowing this exact {} call", p.name)
+            }
             PermissionResponse::Deny => format!("denied {}", p.name),
         };
         let _ = p.respond.send(resp);

@@ -370,6 +370,32 @@ pub fn agent_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("agent-code"))
 }
 
+/// Raw bytes of a path for hashing, without lossy UTF-8 conversion.
+///
+/// `to_string_lossy` maps every invalid byte to U+FFFD, which collapses
+/// paths that differ only in invalid bytes into one hash input. Anything
+/// security-scoped that fingerprints a path (grant filenames, sandbox
+/// policy fingerprints) must use this instead.
+pub(crate) fn os_path_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 /// Walk up from the current directory to find `.agent/settings.toml`.
 pub fn find_project_config() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;

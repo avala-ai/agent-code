@@ -11,6 +11,7 @@
 //! `Bash` for `git *` commands, deny `FileWrite` outside the project).
 
 pub mod auto;
+pub mod grants;
 pub mod tracking;
 
 use std::path::{Path, PathBuf};

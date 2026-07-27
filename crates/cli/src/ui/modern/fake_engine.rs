@@ -468,6 +468,66 @@ mod tests {
         assert!(app.queue.is_empty());
     }
 
+    /// `/vim` must bind on the very next keystroke. The mode sync used to
+    /// run earlier in the loop body than the slash bridge that sets
+    /// `ui.edit_mode`, so the first key after `/vim` was still routed
+    /// with the old bindings — Esc armed quit instead of entering normal
+    /// mode, right after the command said vi was on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vim_command_binds_before_the_next_key() {
+        let provider = ScriptedProvider::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let h = harness(provider, tmp.path());
+
+        let mut script = type_str("/vim", ms(1));
+        script.push((ms(2), key(KeyCode::Enter)));
+        // The next key the user presses, with no loop iteration to spare.
+        script.push((ms(50), key(KeyCode::Esc)));
+        script.push((ms(300), key(KeyCode::Char(' '))));
+
+        let (app, _frames) = run_script(h, script).await;
+
+        assert!(app.vi_mode, "/vim did not turn the composer's vi mode on");
+        assert_eq!(
+            app.composer_mode,
+            crate::ui::modern::app::ComposerMode::Normal,
+            "Esc straight after /vim did not enter normal mode"
+        );
+        assert!(
+            !app.quit_armed,
+            "Esc straight after /vim armed quit — the stale mode was used"
+        );
+    }
+
+    /// The mirror of the above: `/emacs` must release the composer before
+    /// the next key, or normal mode would swallow it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emacs_command_releases_the_composer_before_the_next_key() {
+        let provider = ScriptedProvider::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut h = harness(provider, tmp.path());
+        h.app.vi_mode = true;
+        h.session
+            .engine()
+            .try_lock()
+            .expect("engine free before the loop starts")
+            .state_mut()
+            .config
+            .ui
+            .edit_mode = "vi".into();
+
+        let mut script = type_str("/emacs", ms(1));
+        script.push((ms(2), key(KeyCode::Enter)));
+        // `x` would delete a character if normal mode were still active.
+        script.push((ms(50), key(KeyCode::Char('x'))));
+        script.push((ms(300), key(KeyCode::Char('y'))));
+
+        let (app, _frames) = run_script(h, script).await;
+
+        assert!(!app.vi_mode, "/emacs left vi mode on");
+        assert_eq!(app.input, "xy", "keys after /emacs were not typed as text");
+    }
+
     /// Ctrl+C mid-turn skips a 60s provider stall: only a cancel that
     /// actually reaches the provider stream lets this test finish in
     /// seconds instead of a minute (#400 analogue at the UI layer).

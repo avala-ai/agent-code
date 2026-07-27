@@ -58,6 +58,90 @@ pub struct Schedule {
     pub webhook_secret: Option<String>,
 }
 
+impl Schedule {
+    /// Digest of everything that decides *what this routine does* when
+    /// fired: the schedule, the prompt, where it runs, and the limits
+    /// and overrides it runs under.
+    ///
+    /// Durable permission grants for id-addressed tools (`RemoteTrigger`,
+    /// `CronDelete`) embed this. An id is a mutable handle — `save`
+    /// creates *or updates* the record under the same name — so without
+    /// it an approval for `{"id":"daily"}` would carry over to a routine
+    /// that has since been given a different prompt, cwd, model or
+    /// permission mode, and fire it without asking again.
+    ///
+    /// `created_at` is included so deleting and recreating a routine
+    /// under the same id also invalidates the grant. The run bookkeeping
+    /// (`last_run_at`, `last_result`) is excluded: it changes on every
+    /// execution, and folding it in would re-prompt after each run.
+    ///
+    /// A digest, not the values: prompts and webhook secrets are
+    /// sensitive, and grant keys are persisted into the config directory.
+    pub fn binding_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        // Length-prefix every field so adjacent values cannot blur into
+        // each other ("ab"+"c" vs "a"+"bc").
+        fn part(h: &mut Sha256, bytes: &[u8]) {
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        // Absent and "present but empty/zero" are different routines to
+        // the executor — `max_turns: None` becomes the 25-turn default
+        // while `Some(0)` permits none — so presence is hashed as its
+        // own byte. Folding an absent value to a default (`""`, zero
+        // bytes) made the two indistinguishable, and a grant approved
+        // for one then covered the other.
+        fn opt(h: &mut Sha256, present: bool, bytes: &[u8]) {
+            part(h, &[u8::from(present)]);
+            part(h, bytes);
+        }
+        part(&mut h, self.name.as_bytes());
+        part(&mut h, self.cron.as_bytes());
+        part(&mut h, self.prompt.as_bytes());
+        part(&mut h, self.cwd.as_bytes());
+        part(&mut h, &[u8::from(self.enabled)]);
+        part(&mut h, b"|model|");
+        opt(
+            &mut h,
+            self.model.is_some(),
+            self.model.as_deref().unwrap_or("").as_bytes(),
+        );
+        part(&mut h, b"|mode|");
+        opt(
+            &mut h,
+            self.permission_mode.is_some(),
+            self.permission_mode.as_deref().unwrap_or("").as_bytes(),
+        );
+        part(&mut h, b"|limits|");
+        opt(
+            &mut h,
+            self.max_cost_usd.is_some(),
+            self.max_cost_usd
+                .map(|v| v.to_bits().to_le_bytes())
+                .unwrap_or_default()
+                .as_slice(),
+        );
+        opt(
+            &mut h,
+            self.max_turns.is_some(),
+            self.max_turns
+                .map(|v| (v as u64).to_le_bytes())
+                .unwrap_or_default()
+                .as_slice(),
+        );
+        part(&mut h, b"|created|");
+        part(&mut h, self.created_at.to_rfc3339().as_bytes());
+        part(&mut h, b"|secret|");
+        opt(
+            &mut h,
+            self.webhook_secret.is_some(),
+            self.webhook_secret.as_deref().unwrap_or("").as_bytes(),
+        );
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -340,6 +424,51 @@ mod tests {
             last_result: None,
             webhook_secret: None,
         }
+    }
+
+    /// Absent and "present but zero/empty" are different routines to the
+    /// executor (`max_turns: None` becomes the 25-turn default, `Some(0)`
+    /// permits none), so they must not share a grant fingerprint.
+    #[test]
+    fn absent_and_zero_optionals_fingerprint_differently() {
+        let base = test_schedule("routine");
+        let mut zero_turns = base.clone();
+        zero_turns.max_turns = Some(0);
+        assert_ne!(
+            base.binding_fingerprint(),
+            zero_turns.binding_fingerprint(),
+            "max_turns None vs Some(0) collided"
+        );
+
+        let mut zero_cost = base.clone();
+        zero_cost.max_cost_usd = Some(0.0);
+        assert_ne!(
+            base.binding_fingerprint(),
+            zero_cost.binding_fingerprint(),
+            "max_cost_usd None vs Some(0.0) collided"
+        );
+
+        // The same hole existed for every optional string: an absent
+        // value hashed exactly like a present empty one.
+        for mutate in [
+            (|s: &mut Schedule| s.model = Some(String::new())) as fn(&mut Schedule),
+            |s: &mut Schedule| s.permission_mode = Some(String::new()),
+            |s: &mut Schedule| s.webhook_secret = Some(String::new()),
+        ] {
+            let mut empty = base.clone();
+            mutate(&mut empty);
+            assert_ne!(
+                base.binding_fingerprint(),
+                empty.binding_fingerprint(),
+                "an absent optional collided with a present empty one"
+            );
+        }
+
+        // Unchanged input still yields a stable key.
+        assert_eq!(
+            base.binding_fingerprint(),
+            base.clone().binding_fingerprint()
+        );
     }
 
     #[test]
