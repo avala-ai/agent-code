@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use agent_code_lib::llm::message::Usage;
 use agent_code_lib::query::StreamSink;
+use agent_code_lib::services::output_store::TRUNCATION_NOTICE_PREFIX;
 use agent_code_lib::tools::{
     PermissionPrompter, PermissionResponse, QuestionAsker, ToolResult, UserQuestion,
 };
@@ -292,13 +293,9 @@ impl StreamSink for ChannelSink {
     }
 
     fn on_subagent_output(&self, agent_id: &str, output: &str) {
-        // Bounded: a runaway subagent should not be able to push an
-        // unbounded body through the UI channel.
-        const MAX: usize = 64 * 1024;
-        let body: String = output.chars().take(MAX).collect();
         self.send(EngineEvent::SubagentOutput {
             agent_id: agent_id.to_string(),
-            output: body,
+            output: bound_subagent_output(output, SUBAGENT_OUTPUT_MAX_CHARS),
         });
     }
 
@@ -316,6 +313,42 @@ impl StreamSink for ChannelSink {
             path: path.map(str::to_string),
         });
     }
+}
+
+/// Ceiling on a captured subagent body pushed through the UI channel, so
+/// a runaway subagent cannot flood it.
+const SUBAGENT_OUTPUT_MAX_CHARS: usize = 64 * 1024;
+
+/// Bound a captured subagent body for the UI, keeping its truncation
+/// notice.
+///
+/// The engine may already have replaced a large result with a preview
+/// plus an `(Output truncated … saved to <path>)` notice, and that notice
+/// is the only pointer to the full result. A plain prefix bound cuts the
+/// suffix off — for an ASCII body the preview alone already fills the
+/// budget — leaving drill-in showing an incomplete body with no way to
+/// reach the rest. Trim the preview instead and keep the notice.
+fn bound_subagent_output(output: &str, max: usize) -> String {
+    if output.chars().count() <= max {
+        return output.to_string();
+    }
+    let notice = output
+        .rfind(TRUNCATION_NOTICE_PREFIX)
+        .map(|idx| &output[idx..])
+        .unwrap_or_default();
+    let mut bounded: String = output[..output.len() - notice.len()]
+        .chars()
+        .take(max.saturating_sub(notice.chars().count()))
+        .collect();
+    if notice.is_empty() {
+        bounded.push_str(&format!(
+            "\n\n(Output truncated for display: {} characters total)",
+            output.chars().count()
+        ));
+    } else {
+        bounded.push_str(notice);
+    }
+    bounded
 }
 
 fn tool_detail(name: &str, input: &serde_json::Value) -> String {
@@ -357,6 +390,73 @@ mod tests {
         sink.on_text("hello");
         match rx.try_recv().unwrap() {
             EngineEvent::Text(t) => assert_eq!(t, "hello"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The bug: the engine persists an oversized result as a 64 KiB
+    /// preview plus a notice naming the file holding the whole thing.
+    /// Bounding the body to exactly that budget dropped the notice, so
+    /// drill-in showed a clipped prefix and no route to the rest.
+    #[test]
+    fn bounding_keeps_the_engine_truncation_notice() {
+        let notice =
+            format!("{TRUNCATION_NOTICE_PREFIX}. Full result (999999 bytes) saved to /t/x.txt)");
+        let engine_result = format!("{}{notice}", "a".repeat(SUBAGENT_OUTPUT_MAX_CHARS));
+
+        let bounded = bound_subagent_output(&engine_result, SUBAGENT_OUTPUT_MAX_CHARS);
+
+        assert!(
+            bounded.ends_with(&notice),
+            "the truncation notice was cut off, losing the path to the full result"
+        );
+        assert!(
+            bounded.chars().count() <= SUBAGENT_OUTPUT_MAX_CHARS,
+            "bound exceeded: {} chars",
+            bounded.chars().count()
+        );
+        assert!(bounded.starts_with("aaa"), "the preview itself was dropped");
+    }
+
+    #[test]
+    fn bounding_leaves_a_body_within_budget_untouched() {
+        let body = "found the bug in auth.rs";
+        assert_eq!(bound_subagent_output(body, SUBAGENT_OUTPUT_MAX_CHARS), body);
+    }
+
+    /// Nothing upstream truncated, but the body still overflows the UI
+    /// budget: say so rather than clipping silently.
+    #[test]
+    fn bounding_an_unmarked_overflow_marks_it() {
+        let bounded = bound_subagent_output(&"b".repeat(200), 100);
+        assert!(bounded.starts_with(&"b".repeat(100)));
+        assert!(bounded.contains("truncated for display"));
+        assert!(bounded.contains("200 characters total"));
+    }
+
+    /// Degenerate budget: the notice is what matters, so it survives even
+    /// when nothing of the preview can.
+    #[test]
+    fn a_tiny_budget_still_keeps_the_notice() {
+        let notice = format!("{TRUNCATION_NOTICE_PREFIX}: 999999 bytes total)");
+        let bounded = bound_subagent_output(&format!("{}{notice}", "c".repeat(50)), 4);
+        assert_eq!(bounded, notice);
+    }
+
+    #[test]
+    fn subagent_output_reaches_the_ui_with_its_notice() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let notice = format!("{TRUNCATION_NOTICE_PREFIX}: 999999 bytes total)");
+        sink.on_subagent_output(
+            "explorer",
+            &format!("{}{notice}", "d".repeat(SUBAGENT_OUTPUT_MAX_CHARS)),
+        );
+        match rx.try_recv().unwrap() {
+            EngineEvent::SubagentOutput { agent_id, output } => {
+                assert_eq!(agent_id, "explorer");
+                assert!(output.ends_with(&notice));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

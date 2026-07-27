@@ -60,6 +60,34 @@ pub fn resolve_subagent_id(input: &serde_json::Value) -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Phrase the tool emits when it really did dispatch a background task.
+///
+/// Shared with the query loop so the two cannot drift. It confirms a
+/// dispatch that the call's `run_in_background` flag already claimed —
+/// it is never the sole evidence, because a subagent's own answer can
+/// contain any phrase at all.
+pub(crate) const BACKGROUND_LAUNCH_PHRASE: &str = "started in the background";
+
+/// Whether an Agent tool call asked to be run in the background.
+///
+/// The structured request, read from the call input. Whether the launch
+/// actually happened is a separate question: without a `TaskManager` the
+/// tool falls through to a foreground run.
+pub fn requested_background(input: &serde_json::Value) -> bool {
+    input
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether a result body is the tool's own background-dispatch
+/// acknowledgement rather than a subagent's answer.
+///
+/// Only meaningful for a call whose input [`requested_background`].
+pub fn is_background_launch_ack(content: &str) -> bool {
+    content.contains(BACKGROUND_LAUNCH_PHRASE)
+}
+
 pub struct AgentTool;
 
 #[async_trait]
@@ -214,10 +242,7 @@ impl Tool for AgentTool {
         // output is captured to the task's output file and surfaced when
         // it finishes (see `services::task_surface`). Requires a task
         // manager; without one we fall through to synchronous mode.
-        let run_in_background = input
-            .get("run_in_background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let run_in_background = requested_background(&input);
         let endpoint = resolve_subagent_endpoint(
             model_override,
             Some(&definition),
@@ -239,9 +264,9 @@ impl Tool for AgentTool {
             )
             .await;
             return Ok(ToolResult::success(format!(
-                "Agent ({description}, type={subagent_type}) started in the background as task {id} \
-                 (subagent_id={subagent_id}). Its result surfaces automatically when it completes — \
-                 do not wait on it."
+                "Agent ({description}, type={subagent_type}) {BACKGROUND_LAUNCH_PHRASE} as task \
+                 {id} (subagent_id={subagent_id}). Its result surfaces automatically when it \
+                 completes — do not wait on it."
             )));
         }
 

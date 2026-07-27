@@ -11,6 +11,13 @@ use crate::services::secret_masker;
 /// Maximum inline output size (64KB). Larger results are persisted.
 const INLINE_THRESHOLD: usize = 64 * 1024;
 
+/// Leading text of the notice appended to a truncated result.
+///
+/// Exported so consumers that re-bound a result for display can find the
+/// notice and keep it: it carries the full byte count and the path to the
+/// persisted copy, which is the only way back to the untruncated output.
+pub const TRUNCATION_NOTICE_PREFIX: &str = "\n\n(Output truncated";
+
 /// Persist large output to disk and return a summary reference.
 ///
 /// If the content is under the threshold, returns it unchanged.
@@ -46,7 +53,7 @@ pub(crate) fn persist_if_large_in(
         Ok(()) => {
             let preview = &content[..INLINE_THRESHOLD.min(content.len())];
             format!(
-                "{preview}\n\n(Output truncated. Full result ({} bytes) saved to {})",
+                "{preview}{TRUNCATION_NOTICE_PREFIX}. Full result ({} bytes) saved to {})",
                 content.len(),
                 path.display()
             )
@@ -55,7 +62,7 @@ pub(crate) fn persist_if_large_in(
             // Can't persist — truncate inline.
             let preview = &content[..INLINE_THRESHOLD.min(content.len())];
             format!(
-                "{preview}\n\n(Output truncated: {} bytes total)",
+                "{preview}{TRUNCATION_NOTICE_PREFIX}: {} bytes total)",
                 content.len()
             )
         }

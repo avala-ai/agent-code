@@ -1964,18 +1964,28 @@ fn emit_agent_result_update(
     tool_calls: &[crate::tools::executor::PendingToolCall],
     tool_use_id: &str,
 ) {
+    let call = tool_calls
+        .iter()
+        .find(|c| c.id == tool_use_id && c.name == "Agent");
+    // Background-ness comes from the call's structured `run_in_background`
+    // input, not from the child's prose: a foreground subagent is free to
+    // *write about* background launches, and treating that as a launch
+    // stranded its row at "working" and swallowed its output. The tool's
+    // own acknowledgement is then required as confirmation, because a
+    // background request still runs in the foreground when no TaskManager
+    // is available.
+    let backgrounded = call.is_some_and(|c| crate::tools::agent::requested_background(&c.input))
+        && crate::tools::agent::is_background_launch_ack(&result.content);
     let state = if result.is_error {
         "failed"
-    } else if result.content.contains("started in the background") {
+    } else if backgrounded {
         "working"
     } else {
         "done"
     };
     let headline = result.content.lines().next().unwrap_or(state);
     let headline: String = headline.chars().take(120).collect();
-    let agent_id = tool_calls
-        .iter()
-        .find(|c| c.id == tool_use_id && c.name == "Agent")
+    let agent_id = call
         .map(|c| crate::tools::agent::resolve_subagent_id(&c.input))
         .or_else(|| {
             // Fallback: parse `subagent_id=…` from the tool result body.
@@ -2414,6 +2424,109 @@ mod tests {
         assert!(!is_file_mutating_tool("Bash"));
         assert!(!is_file_mutating_tool("Glob"));
         assert!(!is_file_mutating_tool(""));
+    }
+
+    // ---- Subagent result classification ----
+
+    /// Records the subagent events a turn emits, so the classification
+    /// can be asserted without an engine.
+    #[derive(Default)]
+    struct SubagentSink {
+        updates: std::sync::Mutex<Vec<(String, String)>>,
+        outputs: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl StreamSink for SubagentSink {
+        fn on_text(&self, _: &str) {}
+        fn on_tool_start(&self, _: &str, _: &serde_json::Value) {}
+        fn on_tool_result(&self, _: &str, _: &crate::tools::ToolResult) {}
+        fn on_error(&self, _: &str) {}
+        fn on_subagent_update(&self, agent_id: &str, state: &str, _: &str) {
+            self.updates
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), state.to_string()));
+        }
+        fn on_subagent_output(&self, agent_id: &str, output: &str) {
+            self.outputs
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), output.to_string()));
+        }
+    }
+
+    fn classify(input: serde_json::Value, result: crate::tools::ToolResult) -> SubagentSink {
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input,
+        }];
+        let sink = SubagentSink::default();
+        emit_agent_result_update(&sink, &result, &calls, "t1");
+        sink
+    }
+
+    /// The bug: state was inferred from the child's prose, so a
+    /// foreground subagent that merely *wrote about* background launches
+    /// was pinned to "working" and its finished output was suppressed —
+    /// drill-in then reported it had produced nothing.
+    #[test]
+    fn a_foreground_subagent_writing_about_background_launches_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "explain tasks"}),
+            crate::tools::ToolResult::success(
+                "Passing run_in_background means the agent is started in the background.",
+            ),
+        );
+        assert_eq!(
+            sink.updates.lock().unwrap().first().unwrap().1,
+            "done",
+            "a foreground run was classified from its own prose"
+        );
+        assert_eq!(
+            sink.outputs.lock().unwrap().len(),
+            1,
+            "a finished subagent's output was suppressed"
+        );
+    }
+
+    /// A genuine background dispatch is still "working", and its
+    /// acknowledgement is not the subagent's output.
+    #[test]
+    fn a_real_background_launch_stays_working_and_emits_no_output() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success(
+                "Agent (sweep, type=general-purpose) started in the background as task b7 \
+                 (subagent_id=sweep).",
+            ),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "working");
+        assert!(sink.outputs.lock().unwrap().is_empty());
+    }
+
+    /// A background request runs in the foreground when no `TaskManager`
+    /// is available. The structured flag alone would strand that run at
+    /// "working"; the tool's own acknowledgement is what confirms a real
+    /// dispatch.
+    #[test]
+    fn a_background_request_that_ran_in_the_foreground_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success("found three call sites"),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "done");
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_subagent_is_failed_and_its_error_is_still_offered() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep"}),
+            crate::tools::ToolResult::error("subagent exited: started in the background"),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "failed");
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
     }
 
     #[test]
