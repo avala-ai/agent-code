@@ -25,6 +25,13 @@ pub struct UiQuestion {
 pub enum EngineEvent {
     Text(String),
     Thinking(String),
+    /// The model's current checklist, parsed from a `TodoWrite` call.
+    ///
+    /// Carried as its own event because `ToolStart` forwards only a
+    /// display string; the checklist needs the structured items.
+    TodoUpdate {
+        items: Vec<(String, String, String)>,
+    },
     ToolStart {
         /// Stable engine tool-call id, used to correlate the result card.
         /// Empty only if the engine emitted the legacy id-less callback.
@@ -216,6 +223,25 @@ impl StreamSink for ChannelSink {
     }
 
     fn on_tool_call_start(&self, call_id: &str, tool_name: &str, input: &serde_json::Value) {
+        // The checklist is the point of a TodoWrite call, so surface it
+        // as state rather than leaving it buried in a tool card.
+        if tool_name == "TodoWrite"
+            && let Some(todos) = input.get("todos").and_then(|v| v.as_array())
+        {
+            let items = todos
+                .iter()
+                .map(|t| {
+                    let get = |k: &str| {
+                        t.get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (get("id"), get("content"), get("status"))
+                })
+                .collect();
+            self.send(EngineEvent::TodoUpdate { items });
+        }
         let detail = tool_detail(tool_name, input);
         self.send(EngineEvent::ToolStart {
             call_id: call_id.to_string(),

@@ -79,7 +79,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // the transcript keeps at least half the area; the pane
             // shows a "+n more" line when it still cannot fit.
             // +1 for the block title row the pane spends.
-            let needed = super::tasks::pane_rows(&app.tasks) as u16 + 1;
+            let needed = super::tasks::pane_rows_with_todos(&app.tasks, &app.todos) as u16 + 1;
             let strip = needed
                 .min(chunks[1].height / 2)
                 .min(chunks[1].height.saturating_sub(3));
@@ -729,6 +729,38 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Line index of each task's last row, for the overflow count below.
     let mut task_ends: Vec<usize> = Vec::new();
     let inner_w = (inner.width as usize).saturating_sub(1);
+    // Checklist first: it is what the model says it is doing, which
+    // frames everything below it.
+    if !app.todos.is_empty() {
+        let (done, total) = super::tasks::todo_progress(&app.todos);
+        lines.push(Line::from(Span::styled(
+            format!("plan  {done}/{total}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for todo in &app.todos {
+            let p = palette();
+            let (color, modifier) = match todo.status {
+                super::tasks::TodoStatus::Done => (p.success, Modifier::DIM),
+                super::tasks::TodoStatus::InProgress => (p.accent, Modifier::BOLD),
+                super::tasks::TodoStatus::Pending => (Color::Gray, Modifier::empty()),
+            };
+            let text: String = todo
+                .content
+                .chars()
+                .take(inner_w.saturating_sub(4).max(4))
+                .collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {} {text}", todo.status.glyph()),
+                Style::default().fg(color).add_modifier(modifier),
+            )));
+        }
+        if !app.tasks.is_empty() {
+            lines.push(Line::from(""));
+        }
+    }
+
     let mut last_source: Option<super::tasks::TaskSource> = None;
     for (idx, t) in app.tasks.iter().enumerate() {
         let p = palette();
@@ -1679,6 +1711,34 @@ mod tests {
             corners_before,
             "search bar must not eat a border row:\n{s}"
         );
+    }
+
+    /// The checklist was only ever visible as the text of a tool card,
+    /// which scrolls away. The pane keeps it in front of the user.
+    #[test]
+    fn the_plan_checklist_renders_in_the_tasks_pane() {
+        use crate::ui::modern::sink::EngineEvent;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            items: vec![
+                ("1".into(), "read the parser".into(), "done".into()),
+                ("2".into(), "add the guard".into(), "in_progress".into()),
+                ("3".into(), "write tests".into(), "pending".into()),
+            ],
+        });
+        assert!(
+            app.tasks_visible(),
+            "a plan with no tasks should still show the pane"
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("plan  1/3"), "progress missing:\n{s}");
+        assert!(s.contains("add the guard"), "item missing:\n{s}");
+        assert!(s.contains("✔"), "done glyph missing:\n{s}");
+        assert!(s.contains("◐"), "in-progress glyph missing:\n{s}");
+        assert!(s.contains("□"), "pending glyph missing:\n{s}");
     }
 
     #[test]

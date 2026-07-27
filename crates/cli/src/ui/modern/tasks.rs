@@ -106,6 +106,19 @@ pub struct ManagerRow {
 /// Pane lines the grouped list needs: a heading per source group, a
 /// blank line between groups, and two lines per task. The layout uses
 /// this to size the below-transcript strip on narrow terminals.
+pub fn pane_rows_with_todos(tasks: &[TaskEntry], todos: &[TodoItem]) -> usize {
+    let mut rows = pane_rows(tasks);
+    if !todos.is_empty() {
+        // heading + one row per item, plus a blank separator when tasks
+        // follow it.
+        rows += 1 + todos.len();
+        if !tasks.is_empty() {
+            rows += 1;
+        }
+    }
+    rows
+}
+
 pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
     let mut rows = 0;
     let mut last: Option<TaskSource> = None;
@@ -286,5 +299,89 @@ mod tests {
             states,
             vec![TaskState::NeedsInput, TaskState::Working, TaskState::Done]
         );
+    }
+}
+
+/// A checklist entry from the model's latest `TodoWrite` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl TodoStatus {
+    /// Map the tool's status string. Unknown values read as pending,
+    /// which is the honest default: an item nobody claimed is not done.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "done" | "completed" | "complete" => TodoStatus::Done,
+            "in_progress" | "in progress" | "active" => TodoStatus::InProgress,
+            _ => TodoStatus::Pending,
+        }
+    }
+
+    /// Checklist glyph, matching the markers `TodoWrite` already prints.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            TodoStatus::Done => "✔",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Pending => "□",
+        }
+    }
+}
+
+/// `2/5` — how far through the checklist the model is.
+pub fn todo_progress(todos: &[TodoItem]) -> (usize, usize) {
+    let done = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Done)
+        .count();
+    (done, todos.len())
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+
+    #[test]
+    fn status_parsing_defaults_to_pending() {
+        assert_eq!(TodoStatus::parse("done"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("completed"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("in_progress"), TodoStatus::InProgress);
+        assert_eq!(TodoStatus::parse("pending"), TodoStatus::Pending);
+        // An unrecognised status must not read as finished.
+        assert_eq!(TodoStatus::parse("garbage"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
+    }
+
+    #[test]
+    fn progress_counts_only_completed_items() {
+        let todos = vec![
+            TodoItem {
+                id: "1".into(),
+                content: "a".into(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: "2".into(),
+                content: "b".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "3".into(),
+                content: "c".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        assert_eq!(todo_progress(&todos), (1, 3));
+        assert_eq!(todo_progress(&[]), (0, 0));
     }
 }

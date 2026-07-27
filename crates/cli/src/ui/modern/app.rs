@@ -417,6 +417,8 @@ pub struct App {
     pub queue_selected: usize,
     /// Selected row in the tasks pane, for drill-in.
     pub tasks_selected: usize,
+    /// The model's current checklist, from the latest `TodoWrite`.
+    pub todos: Vec<super::tasks::TodoItem>,
     /// Task id whose output the run loop should fetch and show.
     pub pending_task_output: Option<String>,
     /// Ctrl+P command palette (slash command picker).
@@ -594,6 +596,7 @@ impl App {
             show_queue_pane: false,
             queue_selected: 0,
             tasks_selected: 0,
+            todos: Vec::new(),
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
@@ -726,6 +729,17 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
+            EngineEvent::TodoUpdate { items } => {
+                self.todos = items
+                    .into_iter()
+                    .map(|(id, content, status)| super::tasks::TodoItem {
+                        id,
+                        content,
+                        status: super::tasks::TodoStatus::parse(&status),
+                    })
+                    .collect();
+                self.dirty = true;
+            }
             EngineEvent::ToolStart {
                 call_id,
                 name,
@@ -2288,7 +2302,9 @@ impl App {
 
     /// Whether the tasks pane should render (has tasks and is toggled on).
     pub fn tasks_visible(&self) -> bool {
-        self.show_tasks && !self.tasks.is_empty()
+        // The pane shows work in flight: agents, background jobs, and the
+        // model's checklist. A plan with no tasks is still worth showing.
+        self.show_tasks && (!self.tasks.is_empty() || !self.todos.is_empty())
     }
 
     /// Force a full repaint (Ctrl+L). Drops the layout cache so every block
