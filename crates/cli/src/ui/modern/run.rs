@@ -576,7 +576,8 @@ pub(super) async fn event_loop(
             // starts, and lets a read failure be reported as a note
             // instead of blocking the prompt.
             let images = std::mem::take(&mut app.pending_images);
-            let (blocks, refused) = super::mentions::load_image_blocks(&images);
+            let (blocks, refused) =
+                super::mentions::load_image_blocks(std::path::Path::new(&app.cwd), &images);
             for note in refused {
                 app.transcript
                     .push(super::app::TranscriptItem::System(note));
