@@ -309,9 +309,22 @@ fn ensure_not_protected(
 
     // Check every spelling the token can denote — see `normalized_forms`.
     // A path is refused if *any* of them lands somewhere protected.
-    let forms = normalized_forms(path, &state.anchor);
+    let Forms { forms, exhausted } = normalized_forms(path, &state.anchor);
     for normalized in &forms {
         ensure_form_not_protected(normalized, path, source)?;
+    }
+
+    // The symlink walk ran out of budget, so a link deeper in the path
+    // could still redirect this write somewhere protected. Unknown is
+    // not safe: refuse rather than trust the literal spelling.
+    if exhausted {
+        return Err(ProtectedPathViolation {
+            reason: format!(
+                "{source} writes to {path}, which has too many path \
+                 components to resolve symlinks through; failing closed — \
+                 use a shorter absolute path"
+            ),
+        });
     }
 
     // A previous segment created a link whose name we could not
@@ -375,9 +388,25 @@ fn follow_created_links(
             });
         }
         let substituted = link.substituted(&remainder);
-        let sub_forms = normalized_forms(&substituted, &state.anchor);
+        let Forms {
+            forms: sub_forms,
+            exhausted,
+        } = normalized_forms(&substituted, &state.anchor);
         for form in &sub_forms {
             ensure_form_not_protected(form, path, source)?;
+        }
+        // The substituted target is a path in its own right: if its
+        // symlink walk ran out of budget, where it lands is unknown and
+        // dropping the flag here would reopen the fail-open hole one
+        // level down.
+        if exhausted {
+            return Err(ProtectedPathViolation {
+                reason: format!(
+                    "{source} writes to {path} through a link created by this \
+                     command whose target has too many path components to \
+                     resolve; failing closed — use a shorter absolute path"
+                ),
+            });
         }
         follow_created_links(&sub_forms, path, source, state, depth + 1)?;
     }
@@ -631,7 +660,7 @@ fn record_link_creations(head: &str, args: &[String], state: &mut ScanState) {
             state.opaque_link = true;
             continue;
         }
-        let name_forms = normalized_forms(&name, &state.anchor);
+        let name_forms = normalized_forms(&name, &state.anchor).forms;
         // Prefer an absolute spelling of the link's directory when the
         // anchor produced one, so a relative symbolic target resolves
         // from where the link actually lives.
@@ -1020,7 +1049,7 @@ fn path_targets_dir(path: &str, dir: &str) -> bool {
 /// a protected location. Resolution is best-effort: the write target
 /// usually does not exist yet, so a failure to canonicalize falls back
 /// to the lexical form rather than skipping the check.
-fn normalized_forms(raw: &str, anchor: &Anchor) -> Vec<String> {
+fn normalized_forms(raw: &str, anchor: &Anchor) -> Forms {
     let trimmed = raw.trim_matches(|c: char| c == '"' || c == '\'');
     let lexical = join_components(&crate::permissions::lexical_normalize(Path::new(trimmed)));
 
@@ -1047,13 +1076,27 @@ fn normalized_forms(raw: &str, anchor: &Anchor) -> Vec<String> {
     } else {
         None
     };
-    if let Some(abs) = absolute
-        && let Some(resolved) = resolve_symlinked_ancestor(&abs)
-        && !forms.contains(&resolved)
-    {
-        forms.push(resolved);
+    let mut exhausted = false;
+    if let Some(abs) = absolute {
+        match resolve_symlinked_ancestor(&abs) {
+            Ancestor::Resolved(resolved) => {
+                if !forms.contains(&resolved) {
+                    forms.push(resolved);
+                }
+            }
+            Ancestor::Exhausted => exhausted = true,
+            Ancestor::None => {}
+        }
     }
-    forms
+    Forms { forms, exhausted }
+}
+
+/// Every spelling a destination token can denote, plus whether the
+/// symlink walk ran out of budget (in which case the list is known to
+/// be incomplete and the caller must fail closed).
+struct Forms {
+    forms: Vec<String>,
+    exhausted: bool,
 }
 
 /// Render a path with `/` separators on every platform.
@@ -1092,29 +1135,53 @@ fn join_components(path: &std::path::Path) -> String {
 /// Canonicalize the deepest existing ancestor of `path` and re-append the
 /// components below it, so a symlinked directory in the middle of the
 /// path is followed even when the leaf does not exist yet.
-fn resolve_symlinked_ancestor(path: &str) -> Option<String> {
+/// Outcome of walking up `path` looking for a resolvable ancestor.
+enum Ancestor {
+    /// The deepest existing ancestor was canonicalized; this is the
+    /// path with the remaining components re-appended.
+    Resolved(String),
+    /// The walk completed without finding one — nothing is symlinked
+    /// here, so the literal spellings are the whole story.
+    None,
+    /// The walk hit [`MAX_ANCESTOR_HOPS`] with components still left.
+    /// The destination is *unknown*, not "not symlinked": callers must
+    /// refuse rather than fall through to the literal path.
+    Exhausted,
+}
+
+/// Ancestor hops before the walk gives up. Each hop is one
+/// `canonicalize` syscall, so this also bounds the filesystem work an
+/// attacker-supplied path can provoke — the command carries no length
+/// limit of its own. Real paths are orders of magnitude shorter; a path
+/// this deep is refused, not resolved.
+const MAX_ANCESTOR_HOPS: usize = 4096;
+
+fn resolve_symlinked_ancestor(path: &str) -> Ancestor {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
-        return None;
+        return Ancestor::None;
     }
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
-    // Bounded so a pathological path cannot spin here.
-    for _ in 0..64 {
+    for _ in 0..MAX_ANCESTOR_HOPS {
         if let Ok(real) = cur.canonicalize() {
             let mut out = real;
             for part in suffix.iter().rev() {
                 out.push(part);
             }
-            return Some(join_components(&out));
+            return Ancestor::Resolved(join_components(&out));
         }
-        let name = cur.file_name()?.to_os_string();
+        let Some(name) = cur.file_name().map(|n| n.to_os_string()) else {
+            return Ancestor::None;
+        };
         suffix.push(name);
         if !cur.pop() {
-            return None;
+            return Ancestor::None;
         }
     }
-    None
+    // Components remain but the budget is spent: a deeper link could
+    // still be hiding the real destination.
+    Ancestor::Exhausted
 }
 
 /// Strip surrounding quotes and a trailing slash from a path token.
@@ -1261,7 +1328,7 @@ mod tests {
             ("/usr/local/../../etc/passwd", "/etc/passwd"),
             ("/var/tmp/../../etc/passwd", "/etc/passwd"),
         ] {
-            let forms = normalized_forms(input, &Anchor::None);
+            let forms = normalized_forms(input, &Anchor::None).forms;
             assert!(
                 forms.iter().any(|f| f == expected),
                 "{input} did not normalize to {expected}: {forms:?}"
@@ -1312,6 +1379,51 @@ mod tests {
         }
         let cmd = format!("echo x > {}/passwd", link.display());
         assert!(check(&cmd).is_err(), "symlink hid the destination: {cmd}");
+    }
+
+    /// Padding the path with components must not exhaust the ancestor
+    /// walk into a `None` that reads as "nothing symlinked here".
+    #[cfg(unix)]
+    #[test]
+    fn a_deep_path_cannot_outrun_the_symlinked_ancestor_walk() {
+        let td = tempfile::tempdir().unwrap();
+        let link = td.path().join("e");
+        if std::os::unix::fs::symlink("/etc", &link).is_err() {
+            return; // no permission to symlink here; nothing to assert
+        }
+        let deep = "d/".repeat(128);
+        let cmd = format!("echo x > {}/{deep}passwd", link.display());
+        assert!(
+            check(&cmd).is_err(),
+            "a deep path outran the ancestor walk and hid the destination: {cmd}"
+        );
+    }
+
+    /// A path too deep to resolve is refused, not silently trusted:
+    /// exhausting the walk means the destination is unknown, and a
+    /// link below the budget could still redirect it.
+    /// Unix-only: a `/`-rooted path is not absolute on Windows, so the
+    /// ancestor walk never engages there (see `is_shell_absolute`).
+    #[cfg(unix)]
+    #[test]
+    fn a_path_deeper_than_the_walk_budget_is_refused() {
+        let deep = "d/".repeat(MAX_ANCESTOR_HOPS + 16);
+        let cmd = format!("echo x > /{deep}file");
+        let err = check(&cmd).expect_err("a path past the budget must fail closed");
+        assert!(
+            err.reason.contains("too many path components"),
+            "unexpected refusal reason: {}",
+            err.reason
+        );
+    }
+
+    /// ...but a path merely long stays workable, so the bound cannot
+    /// become an over-block in ordinary use.
+    #[test]
+    fn a_long_but_bounded_path_is_still_allowed() {
+        let deep = "d/".repeat(64);
+        let cmd = format!("echo x > /tmp/{deep}file");
+        assert!(check(&cmd).is_ok(), "ordinary deep path was refused: {cmd}");
     }
 
     /// The normalization must not turn ordinary writes into refusals —

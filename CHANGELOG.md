@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.28.0] - 2026-07-25
+
+### Added
+
+- **Auto permission mode** (#494) — a new stop between AcceptEdits and Allow in the Shift+Tab cycle: provably-harmless operations (read-only tools, allowlisted read-only shell commands) run without prompting while everything else still asks. Protected-path and destructive-command guards run first, unchanged.
+- **Tool events on `serve` carry input and output** (#488) — `tool_start` now includes the tool's arguments and `tool_result` its content (capped at 64 KiB), so SSE/WebSocket consumers can render the bash command, the edited file, or the unified diff. Both fields are additive; existing consumers are unaffected.
+- **Live session dashboard in the Flutter client** (#486) — the session list shows per-session activity (working / needs input / idle) derived from each session's own event stream, with a summary header across sessions.
+- **`@path` file mentions restored in the TUI** (#493, #499) — gitignore-aware Tab completion under the cursor, contents inlined on submit (transcript keeps the literal line), directories expand to a one-level listing; queued and interjected prompts expand too. This had regressed out with the classic REPL removal. The `<file path="…">` labels serialize with forward slashes on every platform (#499), so the model-facing tag no longer differs on Windows.
+- **User turns are tinted in the transcript** (#492) — your own input renders with a subtle background derived from the active theme, so long transcripts scan at a glance; the already-derived-but-unused theme slots for user/bash/error backgrounds are now honored.
+
+### Fixed
+
+- **Shell classification follows arguments, not binary names** (#495) — the dangerous-command guard and the read-only classifier now evaluate the parsed invocation (wrappers like `env`/`nice`, quoting, and subshells no longer disguise a mutating command as read-only), closing a bypass of the destructive-command warning.
+- **Accessibility themes restored** (#489) — the colorblind (Okabe-Ito) and 16-color ANSI palettes dropped by the v0.27.0 theme rewrite are back, the first-run config no longer writes a dead theme id, and guard tests pin every documented theme id to a real palette.
+- **Unreachable TUI features wired up** (#490) — Ctrl+L full repaint, the kitty keyboard protocol push/pop that Ctrl+Enter disambiguation depends on, and desktop notifications when a modal or turn completion arrives while the terminal is unfocused; each pinned with tests.
+- **Release pipeline: npm publish job pinned to node 24 + npm ^12** (#487) — the v0.27.0 npm publish died before publishing when `npm@latest` (npm 12) refused the job's node 20; the majors are now pinned together.
+
+### Changed
+
+- **Plan-pointer tests no longer race on the shared pid pointer** (#491) — test hygiene for the session-scoped active-plan pointer introduced in 0.27.0.
+
 ## [0.27.0] - 2026-07-24
 
 ### Removed
@@ -588,7 +609,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/avala-ai/agent-code/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/avala-ai/agent-code/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/avala-ai/agent-code/compare/v0.25.3...v0.26.0
 [0.25.3]: https://github.com/avala-ai/agent-code/compare/v0.25.2...v0.25.3
