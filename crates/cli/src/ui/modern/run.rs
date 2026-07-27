@@ -148,42 +148,42 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
-/// Move the process, the engine and the UI into a restored session's
-/// directory, the same way `/cd` does: process cwd, engine state, prompt
-/// cache (the cwd is baked into it) and persistent grants (they are
-/// per-project, so approvals from the old one must stop applying).
+/// Enter a restored session's directory, or report why not.
 ///
-/// All or nothing. If the directory cannot be entered, nothing claims to
-/// have moved — the engine keeps the cwd the process is actually in and
-/// the user is told. A state naming a directory the process is not in is
-/// what would resolve `@path` mentions and tool calls against the wrong
-/// tree, which is the failure this exists to prevent.
-async fn adopt_session_cwd(
-    app: &mut App,
-    eng: &mut agent_code_lib::query::QueryEngine,
+/// This runs *before* any session state is replaced, because it is a
+/// precondition of the restore rather than a step in it: if the saved
+/// directory is gone, adopting the conversation anyway would leave a
+/// project-A session running against project-B's cwd — the wrong-tree
+/// hazard the whole cwd restore exists to prevent. `Ok(None)` means
+/// there was nothing to move to.
+fn enter_session_cwd(
     restored_cwd: &str,
     previous_cwd: &str,
-) {
+) -> Result<Option<std::path::PathBuf>, std::io::Error> {
     if restored_cwd.is_empty() || restored_cwd == previous_cwd {
-        return;
+        return Ok(None);
     }
     let dir = std::path::PathBuf::from(restored_cwd);
-    match std::env::set_current_dir(&dir) {
-        Ok(()) => {
-            eng.state_mut().cwd = restored_cwd.to_string();
-            eng.reset_system_prompt_cache();
-            eng.rescope_persistent_grants(&dir);
-            app.cwd = restored_cwd.to_string();
-            let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
-        }
-        Err(e) => {
-            app.transcript
-                .push(super::app::TranscriptItem::System(format!(
-                    "this session was saved in {restored_cwd}, which cannot be entered \
-                 ({e}) — staying in {previous_cwd}"
-                )));
-        }
-    }
+    std::env::set_current_dir(&dir)?;
+    Ok(Some(dir))
+}
+
+/// Finish moving into a directory the process has already entered:
+/// engine state, prompt cache (the cwd is baked into it), persistent
+/// grants (per-project, so approvals from the old one must stop
+/// applying) and the UI, then `CwdChanged` so watchers retune.
+async fn finish_cwd_adoption(
+    app: &mut App,
+    eng: &mut agent_code_lib::query::QueryEngine,
+    dir: &std::path::Path,
+    previous_cwd: &str,
+) {
+    let cwd = dir.display().to_string();
+    eng.state_mut().cwd = cwd.clone();
+    eng.reset_system_prompt_cache();
+    eng.rescope_persistent_grants(dir);
+    app.cwd = cwd;
+    let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
 
 fn probe_caps() -> TerminalCaps {
@@ -550,6 +550,34 @@ pub(super) async fn event_loop(
                         // guard held across an await is how this loop
                         // deadlocked before.
                         drop(probe);
+                        // Enter the session's directory first. It is a
+                        // precondition, not a step: everything below
+                        // replaces the conversation, and adopting one
+                        // whose directory we could not enter leaves a
+                        // project-A session running against project-B's
+                        // cwd — the wrong-tree hazard this restore exists
+                        // to prevent. Refuse the whole resume instead.
+                        let previous_cwd = session.engine().lock().await.state().cwd.clone();
+                        let entered = match enter_session_cwd(&data.cwd, &previous_cwd) {
+                            Ok(dir) => dir,
+                            Err(e) => {
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::Error(format!(
+                                        "could not resume {id}: its directory {} cannot be \
+                                         entered ({e}) — staying in {previous_cwd}",
+                                        data.cwd
+                                    )));
+                                // Same order as a failed load: release the
+                                // work held for a swap that is not going to
+                                // happen before the gate opens, or it lands
+                                // on the conversation being kept.
+                                app.cancel_deferred_resume_work();
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
+                            }
+                        };
                         // SessionStop for the session being *left*, while
                         // the engine still describes it — the hook context
                         // is built from engine state, so firing after the
@@ -583,13 +611,6 @@ pub(super) async fn event_loop(
                         let user_mode =
                             (app.mode_chosen || app.mode != last_mode).then_some(app.mode);
                         let turns = data.turn_count;
-                        // The conversation's directory belongs to it. Left
-                        // behind, the restored session describes one project
-                        // while `@path` mentions and every tool call still
-                        // resolve against the project being left — which can
-                        // edit the wrong repository.
-                        let restored_cwd = data.cwd.clone();
-                        let previous_cwd = eng.state().cwd.clone();
                         {
                             let st = eng.state_mut();
                             // Identity moves with the conversation. Left alone,
@@ -678,7 +699,9 @@ pub(super) async fn event_loop(
                         // in, and says so. Claiming a directory we did not
                         // move to is what would resolve paths against the
                         // wrong tree.
-                        adopt_session_cwd(app, &mut eng, &restored_cwd, &previous_cwd).await;
+                        if let Some(dir) = entered.as_deref() {
+                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd).await;
+                        }
                         app.pending_resume = None;
                         drop(eng);
                         // SessionStart for the session just restored, now
@@ -4151,51 +4174,35 @@ mod tests {
         );
     }
 
-    /// A saved directory that no longer exists must not be adopted in
-    /// name only. If the engine claimed a cwd the process is not in,
-    /// every `@path` mention and tool call would resolve against the
-    /// wrong tree — the exact failure restoring the cwd is meant to fix.
+    /// The saved directory is a *precondition* of the restore. If it
+    /// cannot be entered the resume must be refused outright — adopting
+    /// the conversation anyway would leave a project-A session running
+    /// against project-B's cwd, which is the wrong-tree hazard restoring
+    /// the cwd exists to prevent.
     ///
-    /// Only the refusal is covered: the success path calls
+    /// Only the refusal is covered: entering a directory calls
     /// `set_current_dir`, which is process-global, and a test that moved
-    /// the whole test binary's cwd would flake every other test running
-    /// beside it.
-    #[tokio::test]
-    async fn a_missing_session_directory_is_refused_not_half_applied() {
+    /// the whole test binary's cwd would flake every other test beside
+    /// it.
+    #[test]
+    fn a_missing_session_directory_refuses_the_move() {
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("no-such-project");
-        let harness = crate::ui::modern::fake_engine::harness(
-            crate::ui::modern::fake_engine::ScriptedProvider::new(Vec::new()),
-            tmp.path(),
-        );
-        let engine_arc = harness.session.engine();
-        let mut eng = engine_arc.lock().await;
-        let before_engine = eng.state().cwd.clone();
-        let mut app = App::new("m", "/tmp/original", "s");
-        let before_app = app.cwd.clone();
 
-        adopt_session_cwd(
-            &mut app,
-            &mut eng,
-            &gone.display().to_string(),
-            &before_engine,
-        )
-        .await;
+        let err = enter_session_cwd(&gone.display().to_string(), "/tmp/original")
+            .expect_err("a directory that does not exist must not be entered");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
-        assert_eq!(eng.state().cwd, before_engine, "engine moved anyway");
-        assert_eq!(app.cwd, before_app, "the UI moved anyway");
-        let said = app
-            .transcript
-            .iter()
-            .filter_map(|i| match i {
-                crate::ui::modern::app::TranscriptItem::System(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Nothing to move to is not a failure — it just means stay put.
         assert!(
-            said.contains("cannot be entered"),
-            "the user was not told the directory was unavailable: {said}"
+            enter_session_cwd("", "/tmp/original").unwrap().is_none(),
+            "an empty saved cwd should be a no-op, not an error"
+        );
+        assert!(
+            enter_session_cwd("/tmp/original", "/tmp/original")
+                .unwrap()
+                .is_none(),
+            "already being there should be a no-op, not a move"
         );
     }
 }
