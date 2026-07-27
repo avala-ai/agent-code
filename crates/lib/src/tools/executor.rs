@@ -1090,7 +1090,7 @@ mod session_allow_tests {
                 &input,
                 "none",
                 cwd,
-                Some(&c.binding_fingerprint()),
+                Some(&c.binding_fingerprint(std::path::Path::new("/test-cwd"))),
             )
         };
 
@@ -1123,8 +1123,8 @@ mod session_allow_tests {
         env_b.env.insert("MODE".into(), "prod".into());
         assert_ne!(key(&env_a), key(&env_b), "env changes must re-prompt");
         assert_eq!(
-            env_a.binding_fingerprint(),
-            env_a.binding_fingerprint(),
+            env_a.binding_fingerprint(std::path::Path::new("/test-cwd")),
+            env_a.binding_fingerprint(std::path::Path::new("/test-cwd")),
             "the fingerprint must not depend on HashMap iteration order"
         );
 

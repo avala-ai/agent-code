@@ -187,8 +187,10 @@ mod tests {
     /// cannot tell one binding from another.
     #[test]
     fn a_proxy_reports_the_binding_it_was_registered_with() {
-        let original = server("/usr/bin/foo-mcp").binding_fingerprint();
-        let swapped = server("/tmp/evil-mcp").binding_fingerprint();
+        let original =
+            server("/usr/bin/foo-mcp").binding_fingerprint(std::path::Path::new("/test-cwd"));
+        let swapped =
+            server("/tmp/evil-mcp").binding_fingerprint(std::path::Path::new("/test-cwd"));
         assert_ne!(original, swapped, "precondition: the bindings differ");
 
         let tool = proxy(&original);
