@@ -407,16 +407,13 @@ pub(super) async fn event_loop(
 
         // `/vim` and `/emacs` change config through the command bridge,
         // so the composer picks the change up here rather than only at
-        // startup — "takes effect next session" was the old lie.
+        // startup — "takes effect next session" was the old lie. The
+        // bridge itself syncs again once the command has run; this pass
+        // catches any other writer of `ui.edit_mode`.
         if let Ok(eng) = session.engine().try_lock() {
-            let wants_vi = eng.state().config.ui.edit_mode == "vi";
-            if wants_vi != app.vi_mode {
-                app.vi_mode = wants_vi;
-                // Turning vi off must not strand the composer in a mode
-                // that no longer accepts typing.
-                app.composer_mode = super::app::ComposerMode::Insert;
-                app.dirty = true;
-            }
+            let edit_mode = eng.state().config.ui.edit_mode.clone();
+            drop(eng);
+            sync_edit_mode(app, &edit_mode);
         }
 
         // Apply a deferred `/clear` to the engine conversation (classic
@@ -503,6 +500,12 @@ pub(super) async fn event_loop(
                     // theme picker should treat as current.
                     let configured = eng.state().config.ui.theme.clone();
                     app.sync_theme_from_config(&configured);
+                    // And for `/vim` and `/emacs`: the loop-level check
+                    // ran before this command executed, so without a
+                    // second look the very next key would be routed with
+                    // the mode the user just changed away from.
+                    let edit_mode = eng.state().config.ui.edit_mode.clone();
+                    sync_edit_mode(app, &edit_mode);
                     if interactive {
                         app.force_full_redraw = true;
                     }
@@ -976,6 +979,19 @@ fn is_cancel_chord(key: &KeyEvent) -> bool {
 
 fn is_esc(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Esc)
+}
+
+/// Mirror `ui.edit_mode` onto the composer.
+fn sync_edit_mode(app: &mut App, edit_mode: &str) {
+    let wants_vi = edit_mode == "vi";
+    if wants_vi == app.vi_mode {
+        return;
+    }
+    app.vi_mode = wants_vi;
+    // Turning vi off must not strand the composer in a mode that no
+    // longer accepts typing.
+    app.composer_mode = super::app::ComposerMode::Insert;
+    app.dirty = true;
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
