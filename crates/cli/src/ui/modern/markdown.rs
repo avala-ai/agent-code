@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -46,18 +46,40 @@ pub(super) fn syntax_set() -> &'static SyntaxSet {
     SS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
+/// Syntax-highlighting theme, matched to the active product theme's
+/// polarity.
+///
+/// The highlighter ships its own palette, and its foregrounds are drawn
+/// for a particular background: `base16-ocean.dark`'s pale greens and
+/// blues are illegible on the near-white `code_bg` a light theme
+/// derives. Now that the code background follows the theme, the syntax
+/// theme has to follow it too.
 pub(super) fn code_theme() -> &'static Theme {
-    static TS: OnceLock<Theme> = OnceLock::new();
-    TS.get_or_init(|| {
-        let mut set = ThemeSet::load_defaults();
-        set.themes.remove("base16-ocean.dark").unwrap_or_else(|| {
-            ThemeSet::load_defaults()
-                .themes
-                .into_values()
-                .next()
-                .unwrap()
-        })
-    })
+    static DARK: OnceLock<Theme> = OnceLock::new();
+    static LIGHT: OnceLock<Theme> = OnceLock::new();
+    if crate::ui::theme::current().is_dark {
+        DARK.get_or_init(|| load_code_theme(&["base16-ocean.dark"]))
+    } else {
+        // InspiredGitHub ahead of base16-ocean.light: the base16 light
+        // palettes are deliberately low-contrast, and their keyword
+        // purple only reaches about 2.4:1 on a cream code background.
+        LIGHT.get_or_init(|| load_code_theme(&["InspiredGitHub", "base16-ocean.light"]))
+    }
+}
+
+/// First of `names` present in syntect's defaults, or any theme at all
+/// rather than panicking on a bundled-asset change.
+fn load_code_theme(names: &[&str]) -> Theme {
+    let mut set = ThemeSet::load_defaults();
+    for name in names {
+        if let Some(t) = set.themes.remove(*name) {
+            return t;
+        }
+    }
+    set.themes
+        .into_values()
+        .next()
+        .expect("syntect ships at least one default theme")
 }
 
 /// Render markdown source to styled lines.
@@ -132,7 +154,7 @@ impl Builder {
             p.push(Span::styled(
                 "▎ ",
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette().muted)
                     .add_modifier(Modifier::ITALIC),
             ));
         }
@@ -182,9 +204,7 @@ impl Builder {
                 }
             }
             Event::Code(t) => {
-                let style = Style::default()
-                    .fg(Color::Rgb(220, 220, 170))
-                    .bg(Color::Rgb(45, 45, 55));
+                let style = Style::default().fg(palette().code_fg).bg(palette().code_bg);
                 self.push_text(&format!(" {t} "), style);
             }
             Event::SoftBreak => {
@@ -196,7 +216,7 @@ impl Builder {
                 self.finish_line();
                 self.lines.push(Line::from(Span::styled(
                     "─".repeat(24),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette().muted),
                 )));
             }
             Event::TaskListMarker(done) => {
@@ -277,10 +297,10 @@ impl Builder {
                         .fg(palette().accent)
                         .add_modifier(Modifier::BOLD),
                     Some(HeadingLevel::H3) => Style::default()
-                        .fg(Color::Gray)
+                        .fg(palette().inactive)
                         .add_modifier(Modifier::BOLD),
                     Some(_) => Style::default()
-                        .fg(Color::Gray)
+                        .fg(palette().inactive)
                         .add_modifier(Modifier::BOLD),
                     None => Style::default().add_modifier(Modifier::BOLD),
                 };
@@ -299,7 +319,7 @@ impl Builder {
                         .max(3);
                     self.lines.push(Line::from(Span::styled(
                         "─".repeat(w),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette().muted),
                     )));
                 }
                 self.blank_line();
@@ -318,7 +338,7 @@ impl Builder {
                         .join(" │ ");
                     self.lines.push(Line::from(Span::styled(
                         format!(" {line} "),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(palette().inactive),
                     )));
                     self.table_row.clear();
                 }
@@ -361,9 +381,9 @@ impl Builder {
 
     fn emit_code_block(&mut self, lang: &str, content: &str) {
         let accent = palette().accent;
-        let muted = Color::DarkGray;
+        let muted = palette().muted;
         let gutter = Style::default().fg(muted);
-        let body_bg = Color::Rgb(24, 24, 32);
+        let body_bg = palette().code_bg;
         let tag = if lang.is_empty() {
             "code".to_string()
         } else {
@@ -378,7 +398,7 @@ impl Builder {
             Span::styled(
                 format!(" {tag} "),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(super::colors::on_fill(accent))
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -419,7 +439,9 @@ impl Builder {
                         let c = sty.foreground;
                         spans.push(Span::styled(
                             t.to_string(),
-                            Style::default().fg(Color::Rgb(c.r, c.g, c.b)).bg(body_bg),
+                            Style::default()
+                                .fg(super::colors::syntax_color(c.r, c.g, c.b))
+                                .bg(body_bg),
                         ));
                         self.spans_emitted += 1;
                     }
@@ -429,7 +451,7 @@ impl Builder {
                 }
                 Err(_) => spans.push(Span::styled(
                     line.trim_end_matches('\n').to_string(),
-                    Style::default().fg(Color::Gray).bg(body_bg),
+                    Style::default().fg(palette().inactive).bg(body_bg),
                 )),
             }
             self.lines.push(Line::from(spans));
@@ -457,6 +479,94 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Markdown was the last part of the transcript still painting
+    /// hardcoded RGB: the inline-code chip, the code-block background,
+    /// and syntect's own highlight palette. None of those reach
+    /// `adapt_for_emit` on their own, so under `NO_COLOR` they kept
+    /// emitting 24-bit colour long after the chrome had stopped.
+    #[test]
+    fn no_colour_mode_strips_inline_code_and_highlighting() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+
+        let md = render_markdown("uses `run()` here\n\n```rust\nfn main() { let x = 1; }\n```\n");
+        let mut offenders = Vec::new();
+        for line in &md.lines {
+            for span in &line.spans {
+                for (what, c) in [("fg", span.style.fg), ("bg", span.style.bg)] {
+                    if let Some(c) = c
+                        && c != ratatui::style::Color::Reset
+                    {
+                        offenders.push(format!("{what}={c:?} on {:?}", span.content));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "markdown still carries colour under NO_COLOR: {offenders:?}"
+        );
+    }
+
+    /// The syntax theme has to follow the product theme's polarity.
+    ///
+    /// `code_bg` now comes from the palette, so on a light theme the
+    /// code block is near-white. The highlighter kept its own fixed
+    /// `base16-ocean.dark` palette, whose pale foregrounds were drawn
+    /// for a dark background — light-on-light, unreadable. Every
+    /// highlighted run must clear a legibility floor against the
+    /// background it is actually painted on.
+    #[test]
+    fn highlighting_stays_legible_against_the_code_background() {
+        use super::super::colors::{contrast, luminance};
+        let _g = crate::ui::theme::test_lock();
+        for name in ["one-dark", "solarized-light"] {
+            crate::ui::theme::init(name);
+            let bg = palette().code_bg;
+            let bg_l = luminance(bg).expect("code_bg is rgb on these themes");
+            let md = render_markdown("```rust\nfn main() { let x = 1; }\n```\n");
+            let mut checked = 0;
+            for line in &md.lines {
+                for span in &line.spans {
+                    if span.style.bg != Some(bg) || span.content.trim().is_empty() {
+                        continue;
+                    }
+                    let Some(fg_l) = span.style.fg.and_then(luminance) else {
+                        continue;
+                    };
+                    let ratio = contrast(fg_l, bg_l);
+                    assert!(
+                        ratio >= 3.0,
+                        "{name}: {:?} reaches only {ratio:.2}:1 on {bg:?}",
+                        span.content
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "{name}: no highlighted runs were checked");
+        }
+        crate::ui::theme::init("one-dark");
+    }
+
+    /// The inline-code chip and the fenced block share one pair of
+    /// palette slots, so a theme swap moves both together.
+    #[test]
+    fn inline_code_uses_the_theme_code_slots() {
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let md = render_markdown("uses `run()` here");
+        let chip = md
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("run()"))
+            .expect("inline code span");
+        assert_eq!(chip.style.fg, Some(palette().code_fg));
+        assert_eq!(chip.style.bg, Some(palette().code_bg));
     }
 
     #[test]

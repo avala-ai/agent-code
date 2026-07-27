@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -361,7 +361,7 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
                     body.push(Line::from(Span::styled(
                         "  … folded · press e to expand".to_string(),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(palette().muted)
                             .add_modifier(Modifier::ITALIC),
                     )));
                 }
@@ -406,7 +406,7 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
                 Span::styled(
                     header,
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(palette().muted)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -415,7 +415,7 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
                     for span in &mut line.spans {
                         span.style = span
                             .style
-                            .fg(Color::DarkGray)
+                            .fg(palette().muted)
                             .add_modifier(Modifier::ITALIC);
                     }
                     lines.push(line);
@@ -423,7 +423,7 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
             } else if !text.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "     (e expand · Ctrl+E all thinking)".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette().muted),
                 )));
             }
         }
@@ -445,19 +445,19 @@ pub fn render_item(item: &TranscriptItem, expanded: bool, selected: bool) -> Vec
         TranscriptItem::System(t) => {
             lines.push(Line::from(vec![
                 sel,
-                Span::styled(format!(" · {t}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" · {t}"), Style::default().fg(palette().muted)),
             ]));
         }
         TranscriptItem::Error(t) => {
             lines.push(Line::from(vec![
                 sel,
-                Span::styled(format!(" ✗ {t}"), Style::default().fg(Color::Red)),
+                Span::styled(format!(" ✗ {t}"), Style::default().fg(palette().error)),
             ]));
         }
         TranscriptItem::Warning(t) => {
             lines.push(Line::from(vec![
                 sel,
-                Span::styled(format!(" ! {t}"), Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" ! {t}"), Style::default().fg(palette().warning)),
             ]));
         }
     }
@@ -478,9 +478,9 @@ fn render_tool_card(
     use super::toolcard::ToolKind;
     let kind = ToolKind::classify(name);
     let (glyph, status_color) = match (running, is_error) {
-        (true, _) => ("⚡", Color::Yellow), // running (may have live tail)
-        (false, false) => ("✓", Color::Green), // ok
-        (false, true) => ("✗", Color::Red), // failed
+        (true, _) => ("⚡", palette().warning), // running (may have live tail)
+        (false, false) => ("✓", palette().success), // ok
+        (false, true) => ("✗", palette().error), // failed
     };
     let sel = if selected {
         Span::styled("▌", Style::default().fg(palette().accent))
@@ -496,8 +496,8 @@ fn render_tool_card(
                 .fg(status_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("· ", Style::default().fg(Color::DarkGray)),
-        Span::styled(detail.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled("· ", Style::default().fg(palette().muted)),
+        Span::styled(detail.to_string(), Style::default().fg(palette().inactive)),
     ])];
     // Errors keep more of their output visible; successes stay compact
     // unless the user expanded the card (`e`).
@@ -514,9 +514,9 @@ fn render_tool_card(
             ));
         } else {
             let color = if is_error {
-                Color::Red
+                palette().error
             } else {
-                Color::DarkGray
+                palette().muted
             };
             let total = r.lines().count();
             let head = if expanded {
@@ -537,7 +537,7 @@ fn render_tool_card(
                 lines.push(Line::from(Span::styled(
                     format!("     … +{} more lines · e expand", total - head),
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(palette().muted)
                         .add_modifier(Modifier::ITALIC),
                 )));
             }
@@ -580,12 +580,12 @@ fn render_group(items: &[TranscriptItem], idxs: &[usize], selected: bool) -> Vec
         Span::styled(
             format!("read {n} "),
             Style::default()
-                .fg(Color::Green)
+                .fg(palette().success)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("({shown}{more})"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
     ])]
 }

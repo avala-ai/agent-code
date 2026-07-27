@@ -18,6 +18,11 @@ pub struct Theme {
     pub tool: Color,
     pub plan: Color,
     pub text: Color,
+    /// The theme's own background.
+    pub bg: Color,
+    /// Inline-code and code-block foreground / background.
+    pub code_fg: Color,
+    pub code_bg: Color,
     pub diff_add: Color,
     pub diff_remove: Color,
     pub agent_colors: [Color; 8],
@@ -118,6 +123,9 @@ impl From<legacy::Theme> for Theme {
             tool: theme.tool,
             plan: theme.plan,
             text: theme.text,
+            bg: theme.bg,
+            code_fg: theme.code_fg,
+            code_bg: theme.code_bg,
             diff_add: theme.diff_add,
             diff_remove: theme.diff_remove,
             agent_colors: theme.agent_colors,
@@ -160,6 +168,11 @@ impl From<legacy::Theme> for Theme {
         }
     }
 }
+
+/// Shared contrast utilities. Live on the palette side because that is
+/// where derived slots are computed; re-exported so the ratatui-side
+/// chrome measures legibility the same way.
+pub(crate) use legacy::{MIN_TEXT_CONTRAST, contrast_ratio, relative_luminance};
 
 pub fn styled(text: &str, color: Color) -> StyledContent<String> {
     legacy::styled(text, color)
@@ -349,6 +362,9 @@ fn adapt_for_emit_with(theme: Theme, mode: super::color_emit::EmitMode) -> Theme
         tool: adapt(theme.tool),
         plan: adapt(theme.plan),
         text: adapt(theme.text),
+        bg: adapt(theme.bg),
+        code_fg: adapt(theme.code_fg),
+        code_bg: adapt(theme.code_bg),
         diff_add: adapt(theme.diff_add),
         diff_remove: adapt(theme.diff_remove),
         agent_colors: theme.agent_colors.map(adapt),
@@ -409,6 +425,9 @@ mod tests {
             ("tool", theme.tool),
             ("plan", theme.plan),
             ("text", theme.text),
+            ("bg", theme.bg),
+            ("code_fg", theme.code_fg),
+            ("code_bg", theme.code_bg),
             ("diff_add", theme.diff_add),
             ("diff_remove", theme.diff_remove),
             ("selection_bg", theme.selection_bg),
