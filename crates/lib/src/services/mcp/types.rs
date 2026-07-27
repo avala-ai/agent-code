@@ -346,6 +346,15 @@ impl McpServerConfig {
     }
 }
 
+/// Whether `exec` would actually run this file *for us*.
+///
+/// Deliberately not a mode-bit test. `mode & 0o111` says *somebody* may
+/// execute the file, not that this process may: a regular file with mode
+/// `0100` owned by another user, or one an ACL denies us, passes that
+/// check while `execvp` gets `EACCES`, skips it, and launches whatever
+/// comes later on `PATH`. Fingerprinting the skipped file would bind the
+/// grant to something the spawn never reaches — and leave the executable
+/// it *does* reach free to be replaced under an unchanged grant.
 fn is_executable_file(path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -355,8 +364,24 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            // An interior NUL cannot name a real file, and `exec` could
+            // not be handed it either.
+            return false;
+        };
+        // `AT_EACCESS` asks about the effective ids — the ones `exec`
+        // checks — rather than the real ones `access(2)` would use.
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives
+        // the call, and the flags are constants from libc.
+        unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            ) == 0
+        }
     }
     #[cfg(not(unix))]
     {
@@ -489,6 +514,21 @@ mod binding_tests {
         }
     }
 
+    /// `dir` **prepended** to the process `PATH`, never replacing it.
+    ///
+    /// `EnvGuard` pins a process-global variable and only serializes
+    /// against other `EnvGuard` users, so every other test in this binary
+    /// keeps running against whatever it sets. Replacing `PATH` outright
+    /// made unrelated tests that spawn `git` fail with `NotFound` roughly
+    /// one run in six. Prepending still puts the fixture first for
+    /// resolution while leaving the real toolchain reachable.
+    fn path_with(dir: &Path) -> std::ffi::OsString {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![dir.to_path_buf()];
+        entries.extend(std::env::split_paths(&existing));
+        std::env::join_paths(entries).expect("fixture dir is a valid PATH entry")
+    }
+
     /// Write an executable file, returning its path.
     #[cfg(unix)]
     fn write_exe(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -515,7 +555,7 @@ mod binding_tests {
         let cfg = stdio("npx", &["server"]);
         let cwd = Path::new("/");
 
-        let _guard = crate::test_support::EnvGuard::set("PATH", a.path());
+        let _guard = crate::test_support::EnvGuard::set("PATH", Path::new(&path_with(a.path())));
         let from_a = cfg.binding_fingerprint(cwd);
         assert_eq!(
             from_a,
@@ -524,7 +564,7 @@ mod binding_tests {
         );
         drop(_guard);
 
-        let _guard = crate::test_support::EnvGuard::set("PATH", b.path());
+        let _guard = crate::test_support::EnvGuard::set("PATH", Path::new(&path_with(b.path())));
         let from_b = cfg.binding_fingerprint(cwd);
         assert_ne!(
             from_a, from_b,
@@ -580,7 +620,7 @@ mod binding_tests {
     #[test]
     fn an_unresolvable_command_gets_its_own_stable_binding() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = crate::test_support::EnvGuard::set("PATH", dir.path());
+        let _guard = crate::test_support::EnvGuard::set("PATH", Path::new(&path_with(dir.path())));
         let cfg = stdio("definitely-not-on-path-xyz", &[]);
         let first = cfg.binding_fingerprint(Path::new("/"));
         assert_eq!(first, cfg.binding_fingerprint(Path::new("/")));
@@ -608,7 +648,8 @@ mod binding_tests {
         write_exe(configured_a.path(), "srv", "#!/bin/sh\necho a\n");
         write_exe(configured_b.path(), "srv", "#!/bin/sh\necho b\n");
 
-        let _guard = crate::test_support::EnvGuard::set("PATH", inherited.path());
+        let _guard =
+            crate::test_support::EnvGuard::set("PATH", Path::new(&path_with(inherited.path())));
         let cwd = Path::new("/");
 
         let mut cfg_a = stdio("srv", &[]);
@@ -809,7 +850,8 @@ mod binding_tests {
         std::fs::write(configured.path().join("srv.exe"), "configured").unwrap();
         std::fs::write(inherited.path().join("srv.exe"), "inherited").unwrap();
 
-        let _guard = crate::test_support::EnvGuard::set("PATH", inherited.path());
+        let _guard =
+            crate::test_support::EnvGuard::set("PATH", Path::new(&path_with(inherited.path())));
         let mut env = HashMap::new();
         env.insert(
             "Path".to_string(),

@@ -254,10 +254,6 @@ async fn execute_single_tool(
             // "allow for session" does not blanket every future call of
             // the same tool name (M0 AllowSession store).
             let allow_key = session_allow_key(&call.name, &call.input);
-            let session_allowed = match ctx.session_allows {
-                Some(ref allows) => allows.lock().await.contains(&allow_key),
-                None => false,
-            };
             // A persistent grant is matched by exact key over the full
             // normalized operation, so it covers this call and nothing
             // adjacent to it. Reached only from `Ask`, so it can never
@@ -275,6 +271,18 @@ async fn execute_single_tool(
                 binding.as_ref(),
                 &destinations,
             );
+            let session_allowed = match ctx.session_allows {
+                Some(ref allows) => {
+                    let allows = allows.lock().await;
+                    // Two shapes share this set: the broad `AllowSession`
+                    // key, and the exact grant key an `AllowAlways` falls
+                    // back to when the host disabled persistence. Both are
+                    // matched by full string equality, and the two shapes
+                    // cannot be confused for one another.
+                    allows.contains(&allow_key) || allows.contains(&grant_key)
+                }
+                None => false,
+            };
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
                 None => false,
@@ -346,9 +354,19 @@ async fn execute_single_tool(
                             }
                             // Feature disabled by the host: degrade to
                             // session scope, the documented fallback.
+                            //
+                            // Narrowed, never widened. The stored key is
+                            // the exact one, not `allow_key`: that key
+                            // reduces a write tool to its path, so an
+                            // "always" answer for one payload would go on
+                            // to authorize any other content written to
+                            // that path for the rest of the session —
+                            // which is not what `AllowAlways` promises.
+                            // Losing durability is the documented cost of
+                            // the opt-out; losing exactness is not.
                             None => {
                                 if let Some(ref allows) = ctx.session_allows {
-                                    allows.lock().await.insert(allow_key.clone());
+                                    allows.lock().await.insert(grant_key.clone());
                                 }
                             }
                         }
@@ -1671,6 +1689,115 @@ mod parallel_batch_tests {
         let (results, ran) = run_shifting(None).await;
         assert_eq!(ran, 1, "a stable binding must still run");
         assert!(!results[0].result.is_error);
+    }
+
+    /// A write tool, so the session-allow key reduces to `file_path`
+    /// while the durable key covers the whole payload.
+    struct WriteLikeTool {
+        ran: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for WriteLikeTool {
+        fn name(&self) -> &'static str {
+            "FileWrite"
+        }
+        fn description(&self) -> &'static str {
+            "test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        async fn check_permissions(
+            &self,
+            _input: &serde_json::Value,
+            _checker: &crate::permissions::PermissionChecker,
+        ) -> PermissionDecision {
+            PermissionDecision::Ask("writing".into())
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("ok".to_string()))
+        }
+    }
+
+    struct AlwaysPrompter {
+        asked: Arc<AtomicUsize>,
+    }
+    impl PermissionPrompter for AlwaysPrompter {
+        fn ask(
+            &self,
+            _tool_name: &str,
+            _description: &str,
+            _input_preview: Option<&str>,
+            _origin: Option<&str>,
+        ) -> PermissionResponse {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            PermissionResponse::AllowAlways
+        }
+    }
+
+    /// With persistence disabled by the host, `AllowAlways` degrades to
+    /// session scope — but it must not also degrade to the *session-allow
+    /// key*, which for a write tool is only the path. Approving one
+    /// payload as "always" must not license different content written to
+    /// the same path for the rest of the session; `AllowAlways` promises
+    /// this exact call and nothing adjacent to it.
+    #[tokio::test]
+    async fn a_session_fallback_grant_stays_exact() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(WriteLikeTool { ran: ran.clone() })];
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.permission_prompter = Some(Arc::new(AlwaysPrompter {
+            asked: asked.clone(),
+        }));
+        // The opt-out path: a library host that never called
+        // `enable_persistent_grants`.
+        ctx.persistent_grants = None;
+        ctx.session_allows = Some(Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )));
+        let checker = crate::permissions::PermissionChecker::allow_all();
+
+        let write = |id: &str, content: &str| PendingToolCall {
+            id: id.into(),
+            name: "FileWrite".into(),
+            input: serde_json::json!({"file_path": "/tmp/grant-scope-probe", "content": content}),
+        };
+
+        execute_tool_calls(&[write("c1", "approved")], &tools, &ctx, &checker).await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // Same path, different content: a different operation, so it has
+        // to be asked about again.
+        execute_tool_calls(&[write("c2", "smuggled")], &tools, &ctx, &checker).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "the always-grant widened to cover any write to that path"
+        );
+
+        // The exact call that was approved is still covered — the grant
+        // was narrowed, not discarded.
+        execute_tool_calls(&[write("c3", "approved")], &tools, &ctx, &checker).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "the approved call was re-prompted"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
     }
 
     /// A mutating concurrency-safe tool must NOT ride the parallel branch
