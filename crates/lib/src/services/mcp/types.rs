@@ -311,7 +311,7 @@ fn windows_search_dirs(
     use std::path::PathBuf;
 
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut push_entries = |dirs: &mut Vec<PathBuf>, raw: std::ffi::OsString| {
+    let push_entries = |dirs: &mut Vec<PathBuf>, raw: std::ffi::OsString| {
         for dir in std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()) {
             dirs.push(if dir.is_absolute() {
                 dir
