@@ -89,14 +89,31 @@ impl McpServerConfig {
         // Sorted: `HashMap` iteration order is not stable, and a
         // fingerprint that changed between runs would re-prompt forever.
         part(b"|env|");
-        let mut env: Vec<(&String, &String)> = self.env.iter().collect();
-        env.sort();
-        for (k, v) in env {
+        for (k, v) in ordered_env(&self.env) {
             part(k.as_bytes());
             part(v.as_bytes());
         }
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
+}
+
+/// A server's environment in the order
+/// [`super::transport::McpTransportConnection::connect_stdio`] applies it
+/// to the `Command`.
+///
+/// Sorting is load-bearing, not tidiness. `HashMap` iteration order is
+/// unspecified, and on Windows `Command::env` keys case-insensitively —
+/// so an environment carrying both `PATH` and `Path` would hand the child
+/// a different effective value from run to run, while the fingerprint
+/// stayed put. That is exactly the swap a durable grant has to notice.
+/// Applying in a fixed order makes "last one wins" mean one specific
+/// entry, and [`env_lookup`] reads it back the same way.
+pub(crate) fn ordered_env(
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<(&String, &String)> {
+    let mut entries: Vec<(&String, &String)> = env.iter().collect();
+    entries.sort();
+    entries
 }
 
 /// Canonical path of the executable a stdio `command` actually launches,
@@ -294,22 +311,27 @@ fn windows_search_dirs(
 /// for the child. A case-sensitive lookup would miss that, resolve along
 /// the agent's own `PATH` instead, and stop tracking swaps inside the
 /// configured one.
+///
+/// Reads back exactly what the child will see: [`ordered_env`] is the
+/// order the values are applied in, and the last case-insensitive match
+/// is the one left standing. Picking any other variant would fingerprint
+/// a `PATH` the spawn does not use.
 fn env_lookup<'a>(
     env: &'a std::collections::HashMap<String, String>,
     name: &str,
 ) -> Option<&'a String> {
     #[cfg(windows)]
     {
-        // Several case variants leave the child's own value ambiguous —
-        // `HashMap` order decides which `Command::env` call lands last —
-        // so pick deterministically rather than let the fingerprint churn.
-        env.iter()
+        ordered_env(env)
+            .into_iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-            .min_by(|a, b| a.0.cmp(b.0))
             .map(|(_, v)| v)
+            .next_back()
     }
     #[cfg(not(windows))]
     {
+        // Unix environments are case-sensitive: `PATH` and `Path` are two
+        // unrelated variables, and only one of them is the search path.
         env.get(name)
     }
 }
@@ -727,6 +749,51 @@ mod binding_tests {
             resolve_executable("srv", Path::new("/"), &env),
             bin.path().join("srv.exe").canonicalize().ok(),
             "the extensionless neighbour captured the binding"
+        );
+    }
+
+    /// `connect_stdio` applies the environment in this order, so it has
+    /// to be total and stable — `HashMap` order is neither, and on
+    /// Windows the last write decides the child's PATH.
+    #[test]
+    fn the_environment_is_applied_in_a_fixed_order() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "first".to_string());
+        env.insert("Path".to_string(), "second".to_string());
+        env.insert("HOME".to_string(), "third".to_string());
+
+        let keys: Vec<&str> = ordered_env(&env).iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["HOME", "PATH", "Path"]);
+        // Stable across repeated calls on the same map.
+        assert_eq!(ordered_env(&env), ordered_env(&env));
+    }
+
+    /// The fingerprint must read back the variant the child is actually
+    /// left with — the last one `connect_stdio` applies — or a grant
+    /// would pin a PATH the spawn never uses.
+    #[cfg(windows)]
+    #[test]
+    fn the_last_applied_case_variant_is_the_one_resolved() {
+        let losing = tempfile::tempdir().unwrap();
+        let winning = tempfile::tempdir().unwrap();
+        std::fs::write(losing.path().join("srv.exe"), "losing").unwrap();
+        std::fs::write(winning.path().join("srv.exe"), "winning").unwrap();
+
+        let mut env = HashMap::new();
+        // "PATH" sorts before "Path", so "Path" is applied last and wins.
+        env.insert(
+            "PATH".to_string(),
+            losing.path().to_str().unwrap().to_string(),
+        );
+        env.insert(
+            "Path".to_string(),
+            winning.path().to_str().unwrap().to_string(),
+        );
+
+        assert_eq!(
+            resolve_executable("srv", Path::new("/"), &env),
+            winning.path().join("srv.exe").canonicalize().ok(),
+            "the fingerprint resolved a PATH variant the child does not use"
         );
     }
 
