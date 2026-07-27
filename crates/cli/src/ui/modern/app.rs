@@ -446,6 +446,12 @@ pub struct App {
     /// The same images once read and encoded off the UI thread, waiting for
     /// the turn they belong to to start.
     pub pending_attachments: Vec<agent_code_lib::llm::message::ContentBlock>,
+    /// A prompt whose images were already read when another prompt took
+    /// the turn, held with those images so it can be sent as it was.
+    /// Never queued as text: the queue re-expands what it holds, which
+    /// would resolve the mention a second time and read the file again.
+    #[allow(clippy::type_complexity)]
+    pub deferred_prompt: Option<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
     /// Whether `ui.edit_mode` asked for vi bindings.
     pub vi_mode: bool,
     /// Composer mode when `vi_mode` is on.
@@ -630,6 +636,7 @@ impl App {
             model_picker: None,
             pending_images: Vec::new(),
             pending_attachments: Vec::new(),
+            deferred_prompt: None,
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
             vi_pending_d: false,
@@ -2719,28 +2726,43 @@ impl App {
     /// queued — and that one has its own attachments staged with it.
     /// Overwriting it would lose it silently; keeping it and attaching
     /// *these* blocks would be worse still, putting one prompt's image on
-    /// another's turn. So the newer prompt keeps its turn, this one goes
-    /// back to the head of the queue, and the user is told its images did
-    /// not come with it.
+    /// another's turn. So the newer prompt keeps its turn and this one is
+    /// held aside *with its blocks* until the turn frees up — not queued
+    /// as text, which would re-expand the mention and read the file a
+    /// second time, sending bytes the staged turn never had.
     pub fn accept_encoded_attachments(
         &mut self,
         prompt: String,
         blocks: Vec<agent_code_lib::llm::message::ContentBlock>,
     ) {
         if self.pending_submit.is_some() {
-            self.queue.push_front(prompt);
-            if !blocks.is_empty() {
-                self.transcript.push(TranscriptItem::System(
-                    "another prompt was sent first — the queued prompt's images were not attached"
-                        .into(),
-                ));
-            }
+            self.transcript.push(TranscriptItem::System(
+                "another prompt was sent first — sending this one with its images next".into(),
+            ));
+            self.deferred_prompt = Some((prompt, blocks));
             self.dirty = true;
             return;
         }
         self.pending_attachments = blocks;
         self.pending_submit = Some(prompt);
         self.dirty = true;
+    }
+
+    /// Send a deferred prompt once the turn it was waiting behind is gone.
+    ///
+    /// Restored with the blocks it was encoded with, so the file is never
+    /// read again. Held back while another prompt's descriptors are still
+    /// staged, so the two cannot be mixed.
+    pub fn rearm_deferred_prompt(&mut self) {
+        if self.pending_submit.is_some() || !self.pending_images.is_empty() {
+            return;
+        }
+        if let Some((prompt, blocks)) = self.deferred_prompt.take() {
+            self.pending_attachments = blocks;
+            self.pending_submit = Some(prompt);
+            self.phase = Phase::Streaming;
+            self.dirty = true;
+        }
     }
 
     /// Give up on a prompt whose attachments were still being read when the
@@ -2757,6 +2779,8 @@ impl App {
     /// interjection with its own images — and clearing that would send it
     /// as a text-only turn.
     pub fn abandon_staged_attachments(&mut self) {
+        // A cancel means nothing more should go out on its own.
+        self.deferred_prompt = None;
         self.turn_live = false;
         self.turn_started_at = None;
         self.phase = if self.pending_submit.is_some() {
@@ -5260,17 +5284,66 @@ mod tests {
             app.pending_attachments.is_empty(),
             "the newer prompt inherited another prompt's image"
         );
-        assert_eq!(
-            app.queue.front().map(String::as_str),
-            Some("look at @shot.png"),
-            "the superseded prompt was dropped instead of queued"
+        assert!(
+            app.deferred_prompt.is_some(),
+            "the superseded prompt was dropped"
         );
         assert!(
-            app.transcript
-                .iter()
-                .any(|i| matches!(i, TranscriptItem::System(s) if s.contains("were not attached"))),
-            "no note that the images did not come along"
+            app.queue.iter().all(|q| q != "look at @shot.png"),
+            "the expanded prompt was queued as text and would re-expand"
         );
+    }
+
+    /// The deferred prompt comes back with the blocks it was encoded
+    /// with. Queuing it as text would re-run `expand_mentions`, reading
+    /// the file a second time and sending bytes the staged turn never had
+    /// — after telling the user it had already been read.
+    #[test]
+    fn a_deferred_prompt_returns_with_its_original_blocks() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("show me the diff".into());
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+
+        // The turn it was waiting behind starts and finishes.
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+
+        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(
+            app.pending_attachments.len(),
+            1,
+            "the deferred prompt lost its images"
+        );
+        assert!(app.deferred_prompt.is_none(), "deferred prompt sent twice");
+    }
+
+    /// Re-arming must not race another prompt's staged descriptors: those
+    /// belong to a different turn.
+    #[test]
+    fn a_deferred_prompt_waits_for_staged_descriptors_to_clear() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        write_png(&app, "later.png");
+        type_input(&mut app, "later @later.png");
+        app.submit();
+        let _ = app.pending_submit.take();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.rearm_deferred_prompt();
+        assert!(
+            app.pending_submit.is_none(),
+            "sent a deferred prompt while another's descriptors were staged"
+        );
+        assert!(app.deferred_prompt.is_some(), "deferred prompt lost");
+    }
+
+    /// A cancel means nothing more goes out on its own.
+    #[test]
+    fn cancelling_drops_a_deferred_prompt() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        app.abandon_staged_attachments();
+        assert!(app.deferred_prompt.is_none(), "cancel left a prompt armed");
     }
 
     /// A cancel abandons only the prompt that was being read for. If the

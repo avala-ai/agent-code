@@ -624,6 +624,12 @@ pub(super) async fn event_loop(
             }
         }
 
+        // A prompt that was held aside for a turn that has since gone can
+        // send now, with the blocks it was already encoded with.
+        if turn.is_none() && !encoding {
+            app.rearm_deferred_prompt();
+        }
+
         // Hand a prompt's images to the blocking pool. The descriptors were
         // opened when their mentions were validated, so nothing is resolved
         // here; the result comes back through `img_rx` and re-arms the
