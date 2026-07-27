@@ -263,44 +263,81 @@ fn glob_pattern_matching_rs_files() {
 }
 
 // ---------------------------------------------------------------------------
-// Multiple rules: first match wins
+// Multiple rules: the most restrictive match wins
 // ---------------------------------------------------------------------------
 
+/// This test previously asserted first-match-wins, i.e. that an `allow`
+/// listed before a blanket `deny` kept winning. That was the bug: a user
+/// who wrote "deny all Bash" still got `git diff` executed, and which
+/// rule came first was not under their control anyway — config layers
+/// concatenate their `rules` arrays, so every layer's rules stay live.
 #[test]
-fn first_matching_rule_wins() {
+fn most_restrictive_rule_wins_over_position() {
+    let rules = vec![
+        // Allow git commands...
+        PermissionRule {
+            tool: "Bash".into(),
+            pattern: Some("git *".into()),
+            action: PermissionMode::Allow,
+        },
+        // ...but deny ALL bash. The deny is the stronger claim and wins
+        // no matter which order the two are written in.
+        PermissionRule {
+            tool: "Bash".into(),
+            pattern: None,
+            action: PermissionMode::Deny,
+        },
+    ];
+    let mut reversed = rules.clone();
+    reversed.reverse();
+
+    for rules in [rules, reversed] {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        });
+
+        // The blanket deny covers git too.
+        assert!(matches!(
+            checker.check("Bash", &json_cmd("git diff")),
+            PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            checker.check("Bash", &json_cmd("ls")),
+            PermissionDecision::Deny(_)
+        ));
+        // FileWrite has no matching rule -> falls to default Ask.
+        assert!(matches!(
+            checker.check("FileWrite", &json_file("src/lib.rs")),
+            PermissionDecision::Ask(_)
+        ));
+    }
+}
+
+/// Without a competing deny, a narrow `allow` still does its job — the
+/// severity ordering must not turn every rule set into a refusal.
+#[test]
+fn a_lone_allow_rule_still_allows() {
     let checker = PermissionChecker::from_config(&PermissionsConfig {
         default_mode: PermissionMode::Ask,
-        rules: vec![
-            // Rule 0: allow git commands.
-            PermissionRule {
-                tool: "Bash".into(),
-                pattern: Some("git *".into()),
-                action: PermissionMode::Allow,
-            },
-            // Rule 1: deny ALL bash. This comes after, so git * still allowed.
-            PermissionRule {
-                tool: "Bash".into(),
-                pattern: None,
-                action: PermissionMode::Deny,
-            },
-        ],
+        rules: vec![PermissionRule {
+            tool: "Bash".into(),
+            pattern: Some("git *".into()),
+            action: PermissionMode::Allow,
+        }],
         allowed_tools: Vec::new(),
         disallowed_tools: Vec::new(),
     });
 
-    // git commands match rule 0 first -> Allow.
     assert!(matches!(
         checker.check("Bash", &json_cmd("git diff")),
         PermissionDecision::Allow
     ));
-    // Non-git bash commands match rule 1 -> Deny.
+    // Unmatched commands still fall through to the default.
     assert!(matches!(
         checker.check("Bash", &json_cmd("ls")),
-        PermissionDecision::Deny(_)
-    ));
-    // FileWrite has no matching rule -> falls to default Ask.
-    assert!(matches!(
-        checker.check("FileWrite", &json_file("src/lib.rs")),
         PermissionDecision::Ask(_)
     ));
 }

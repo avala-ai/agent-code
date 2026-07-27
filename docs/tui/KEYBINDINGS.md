@@ -13,11 +13,14 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+C` (also `Cmd+C` / Super+C) | Modal: deny/dismiss **and** cancel turn · mid-turn with draft: clear draft first · mid-turn empty: **cancel turn** · idle empty: press twice within 1.5 s to quit · **not** `Ctrl+Shift+C` (that is copy) |
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
+| `↑`/`↓` | Move the tasks-pane selection (pane open, empty composer) |
+| `Enter` | Open the selected background task's output (pane open, empty composer) |
 | `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
+| `Ctrl+F` | Search the transcript (smart case; `↓`/`Ctrl+N` next, `↑`/`Ctrl+P` prev, `Enter` closes keeping the match position, `Esc` closes restoring the original position) |
 
 ## Prompt editing (composer)
 
@@ -137,3 +140,35 @@ exactly as typed.
 | More than **256 KiB** across all mentions | Remaining mentions skipped, noted |
 
 `/copy` and `y`/`Y` use the clipboard cascade: native → tmux buffer → OSC 52.
+
+## Custom keybindings
+
+Put a `keybindings.json` in your config directory — `~/.config/agent-code/` on
+Linux, `~/Library/Application Support/agent-code/` on macOS,
+`%APPDATA%\agent-code\` on Windows. `/keybindings` prints the resolved path.
+
+```json
+[
+  { "key": "ctrl+k", "action": { "type": "command", "command": "tasks" } },
+  { "key": "alt+r",  "action": { "type": "prompt",  "prompt": "run the tests" } },
+  { "key": "f5",     "action": { "type": "toggle",  "setting": "queue" } }
+]
+```
+
+Chord syntax is `ctrl+`/`alt+`/`shift+` prefixes plus a key name — a letter,
+`f1`–`f12`, or `up` `down` `left` `right` `home` `end` `pageup` `pagedown`
+`enter` `tab` `backspace` `delete` `insert`. Prefixes render in
+`ctrl+alt+shift` order (`ctrl+shift+p`). A bare letter with no modifier is
+ordinary typing and cannot be bound; a bare `shift+letter` is just a capital
+letter and cannot be bound either.
+
+`ctrl+c` and `esc` are reserved and cannot be rebound — they are how you get
+out of a stuck state, including a binding that turned out to be a mistake.
+This covers modified variants the escape hatches also consume (`ctrl+alt+c`,
+`esc` with any modifier); entries for them in the file are ignored with a
+warning. `ctrl+shift+c` (copy) remains bindable.
+Bindings never fire while a permission prompt (or any modal) is open, and a
+binding that runs never discards the prompt you were composing.
+
+The file is read once at startup; `/keybindings` lists the bindings active in
+the current session — after editing the file, restart to apply.

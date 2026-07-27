@@ -82,6 +82,7 @@ fn task_payload_local_agent_round_trips() {
         subagent_kind: Some("research".into()),
         prompt: "investigate".into(),
         parent_session: Some("sess_abc".into()),
+        subagent_id: Some("research-7".into()),
     };
     let s = serde_json::to_string(&p).unwrap();
     let back: TaskPayload = serde_json::from_str(&s).unwrap();
@@ -90,11 +91,24 @@ fn task_payload_local_agent_round_trips() {
             subagent_kind,
             prompt,
             parent_session,
+            subagent_id,
         } => {
             assert_eq!(subagent_kind.as_deref(), Some("research"));
             assert_eq!(prompt, "investigate");
             assert_eq!(parent_session.as_deref(), Some("sess_abc"));
+            assert_eq!(subagent_id.as_deref(), Some("research-7"));
         }
+        other => panic!("expected LocalAgent, got {other:?}"),
+    }
+}
+
+/// Records persisted before `subagent_id` existed must still load.
+#[test]
+fn task_payload_local_agent_legacy_records_deserialize() {
+    let legacy = r#"{"kind":"local_agent","payload":{"subagent_kind":"research","prompt":"investigate","parent_session":null}}"#;
+    let back: TaskPayload = serde_json::from_str(legacy).unwrap();
+    match back {
+        TaskPayload::LocalAgent { subagent_id, .. } => assert_eq!(subagent_id, None),
         other => panic!("expected LocalAgent, got {other:?}"),
     }
 }
@@ -254,6 +268,7 @@ async fn task_create_local_agent_then_task_list_surfaces_the_kind() {
                 subagent_kind: Some("research".into()),
                 prompt: "trace the leak".into(),
                 parent_session: None,
+                subagent_id: None,
             },
         )
         .await;

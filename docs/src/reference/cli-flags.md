@@ -12,7 +12,7 @@ agent [OPTIONS]
 | `--api-base-url <URL>` | auto-detected | API endpoint URL |
 | `--api-key <KEY>` | from env | API key (prefer env var) |
 | `--provider <NAME>` | `auto` | LLM provider: `anthropic`, `openai`, or `auto` |
-| `--permission-mode <MODE>` | `ask` | Permission mode: `ask`, `allow`, `deny`, `plan`, `accept_edits`, `auto` |
+| `--permission-mode <MODE>` | config `default_mode` | Permission mode: `ask`, `allow`, `deny`, `plan`, `accept_edits`, `auto`. Omitting the flag keeps the configured `[permissions] default_mode`; an unrecognised value is an error |
 | `--dangerously-skip-permissions` | false | Skip all permission checks |
 | `-C, --cwd <DIR>` | current dir | Working directory |
 | `--max-turns <N>` | 50 | Maximum agent turns per request |

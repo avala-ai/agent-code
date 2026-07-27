@@ -69,6 +69,7 @@ mod tests {
 
     #[test]
     fn palette_reflects_active_theme_accent() {
+        let _g = crate::ui::theme::test_lock();
         // one-dark's accent is #61afef (97, 175, 239).
         let classic = theme::Theme::from_name("one-dark");
         assert!(

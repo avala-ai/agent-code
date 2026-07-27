@@ -41,7 +41,16 @@ pub enum EmitMode {
 static EMIT_MODE: OnceLock<EmitMode> = OnceLock::new();
 
 /// Returns the cached emit mode, initializing it on first call.
+///
+/// Under `cfg(test)` this is pinned to [`EmitMode::Truecolor`]: rendered
+/// frames — the golden snapshots above all — must be identical on every
+/// runner, not a function of the ambient `NO_COLOR` / `CLICOLOR` /
+/// `FORCE_COLOR` / `TERM` environment the tests happen to inherit.
+/// Detection itself stays covered through the pure [`detect_from_env`].
 pub fn current() -> EmitMode {
+    if cfg!(test) {
+        return EmitMode::Truecolor;
+    }
     *EMIT_MODE.get_or_init(detect_uncached)
 }
 
@@ -619,6 +628,14 @@ mod tests {
     fn empty_env_defaults_to_truecolor() {
         let env = |_name: &str| None;
         assert_eq!(detect_from_env(env), EmitMode::Truecolor);
+    }
+
+    /// Golden-frame snapshots (and every other colour-asserting test)
+    /// depend on this: the emit mode inside the test binary must not
+    /// vary with the terminal environment of whoever runs the suite.
+    #[test]
+    fn current_is_pinned_to_truecolor_under_test() {
+        assert_eq!(current(), EmitMode::Truecolor);
     }
 
     // ---- Format functions ----
