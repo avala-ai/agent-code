@@ -476,6 +476,28 @@ fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// True when this entry is a reparse point of any kind.
+///
+/// The attribute, not `FileType::is_symlink`: that predicate keys off the
+/// name-surrogate bit in the reparse tag, which is a property of how the
+/// tag is meant to be interpreted rather than of whether traversing the
+/// entry leaves the workspace. Testing the attribute refuses every reparse
+/// tag — junction, symlink, and whatever else the filesystem grows —
+/// which is the only answer that stays correct as tags are added.
+#[cfg(not(unix))]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
 /// Windows has no `openat`, so the ancestors are checked explicitly.
 ///
 /// `FILE_FLAG_OPEN_REPARSE_POINT` covers the final component: a symlink or
@@ -501,11 +523,9 @@ fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
         if ancestor == path {
             break;
         }
-        if std::fs::symlink_metadata(&ancestor)
-            .map_err(|e| format!("unreadable ({})", e.kind()))?
-            .file_type()
-            .is_symlink()
-        {
+        let meta = std::fs::symlink_metadata(&ancestor)
+            .map_err(|e| format!("unreadable ({})", e.kind()))?;
+        if is_reparse_point(&meta) {
             return Err("not a regular file".into());
         }
     }
