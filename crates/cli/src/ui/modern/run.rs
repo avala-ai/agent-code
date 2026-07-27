@@ -411,11 +411,6 @@ pub(super) async fn event_loop(
         {
             eng.state_mut().messages.clear();
             app.pending_clear = false;
-            // Clear the checklist here too, not only at submit time. The
-            // turn that was running when `/clear` was typed may have
-            // finished a TodoWrite in between, and that plan belongs to
-            // the conversation just discarded.
-            app.todos.clear();
             app.status_message = "context cleared".into();
             app.dirty = true;
         }
@@ -501,7 +496,14 @@ pub(super) async fn event_loop(
                     // than just clearing) also means a *failed* resume
                     // leaves the current checklist intact, since the
                     // messages it reads are still the current ones.
+                    //
+                    // Bump the epoch first: the turn that was running
+                    // when the command was queued may still have events
+                    // in flight, and they are drained *after* this point
+                    // in the loop. Disowning them by epoch is what stops
+                    // the old plan from landing on top of the rebuild.
                     if crate::commands::slash_rewrites_conversation(&slash) {
+                        app.new_conversation();
                         app.todos = super::tasks::todos_from_messages(&eng.state().messages);
                     }
                     if interactive {
@@ -587,7 +589,7 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
-            let sink = ChannelSink::new(eng_tx.clone());
+            let sink = ChannelSink::new(eng_tx.clone(), app.conversation_epoch);
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {
                     turn = Some(handle);
@@ -1841,6 +1843,7 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.show_tasks = true;
         app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
         });
         app.prompt_history.push("the earlier prompt".into());

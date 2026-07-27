@@ -419,6 +419,10 @@ pub struct App {
     pub tasks_selected: usize,
     /// The model's current checklist, from the latest `TodoWrite`.
     pub todos: Vec<super::tasks::TodoItem>,
+    /// Which conversation `todos` describes. Bumped whenever the
+    /// conversation is cleared, replaced or rewritten; see
+    /// [`App::new_conversation`].
+    pub conversation_epoch: u64,
     /// Task id whose output the run loop should fetch and show.
     pub pending_task_output: Option<String>,
     /// Ctrl+P command palette (slash command picker).
@@ -597,6 +601,7 @@ impl App {
             queue_selected: 0,
             tasks_selected: 0,
             todos: Vec::new(),
+            conversation_epoch: 0,
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
@@ -729,13 +734,15 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
-            EngineEvent::TodoUpdate { items } => {
-                // `/clear` during a turn cannot take the engine lock, so
-                // the turn keeps running and may still write a checklist.
-                // That work belongs to the conversation being discarded;
-                // accepting it would repopulate the pane behind the
-                // clear the user just asked for.
-                if !self.pending_clear {
+            EngineEvent::TodoUpdate { epoch, items } => {
+                // A turn outlives the conversation that started it. When
+                // `/clear`, `/resume`, `/rewind` or `/snip` lands mid-turn,
+                // the turn keeps running and its queued events are drained
+                // afterwards -- potentially *after* the checklist has been
+                // cleared or rebuilt. Matching the epoch decides that by
+                // provenance rather than by drain order, so a plan from a
+                // conversation that is gone cannot win the race.
+                if epoch == self.conversation_epoch {
                     self.todos = items
                         .into_iter()
                         .map(super::tasks::TodoItem::from_fields)
@@ -1261,8 +1268,9 @@ impl App {
             self.ctx_meter = None;
             // The checklist belongs to the conversation being discarded;
             // keeping it would hold the pane open on work that no longer
-            // exists.
-            self.todos.clear();
+            // exists. Bumping the epoch also disowns anything the
+            // still-running turn writes from here on.
+            self.new_conversation();
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
@@ -2314,6 +2322,19 @@ impl App {
         self.show_tasks && (!self.tasks.is_empty() || !self.todos.is_empty())
     }
 
+    /// Declare that the conversation on screen has been cleared,
+    /// replaced or rewritten: drop the checklist and stop accepting
+    /// updates stamped for the previous one.
+    ///
+    /// Callers that know the new conversation's checklist (`/resume` and
+    /// friends, which can read it back out of the restored messages)
+    /// assign `todos` afterwards.
+    pub fn new_conversation(&mut self) {
+        self.conversation_epoch = self.conversation_epoch.wrapping_add(1);
+        self.todos.clear();
+        self.dirty = true;
+    }
+
     /// Whether the pane's arrow/Enter bindings may claim the key. Visible
     /// is not enough: a checklist-only pane has nothing to select, and
     /// swallowing the keys there would make prompt history unreachable
@@ -3232,6 +3253,7 @@ mod tests {
     fn clear_drops_the_checklist() {
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
         });
         assert!(app.tasks_visible());
@@ -3247,6 +3269,41 @@ mod tests {
         );
     }
 
+    /// The run loop rebuilds the checklist when a command replaces the
+    /// conversation, but the finished turn's queued events are drained
+    /// *after* that point. Provenance, not drain order, has to decide:
+    /// a stale event arriving late must not overwrite the rebuild.
+    #[test]
+    fn a_late_event_from_the_old_conversation_cannot_overwrite_the_rebuild() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "the plan being replaced".into(), "done".into())],
+        });
+        let stale = app.conversation_epoch;
+
+        // `/resume` (or `/rewind`, `/snip`) lands: the run loop declares a
+        // new conversation and assigns the restored checklist.
+        app.new_conversation();
+        app.todos = vec![crate::ui::modern::tasks::TodoItem::from_fields((
+            "7".into(),
+            "the restored plan".into(),
+            "in_progress".into(),
+        ))];
+
+        // Only now is the old turn's queued event drained.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: stale,
+            items: vec![("1".into(), "the plan being replaced".into(), "done".into())],
+        });
+        assert_eq!(app.todos.len(), 1);
+        assert_eq!(
+            app.todos[0].content, "the restored plan",
+            "a stale event overwrote the restored checklist"
+        );
+        assert_ne!(stale, app.conversation_epoch);
+    }
+
     /// `/clear` typed mid-turn cannot take the engine lock, so the turn
     /// runs on and may still finish a `TodoWrite`. That checklist belongs
     /// to the conversation being discarded and must not repopulate the
@@ -3255,6 +3312,7 @@ mod tests {
     fn a_checklist_written_after_clear_does_not_revive_the_pane() {
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![("1".into(), "the old plan".into(), "in_progress".into())],
         });
         app.input = "/clear".into();
@@ -3268,6 +3326,7 @@ mod tests {
         // The in-flight turn writes a checklist before the run loop wins
         // the lock.
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![(
                 "9".into(),
                 "work from the discarded turn".into(),
@@ -3281,9 +3340,24 @@ mod tests {
         );
         assert!(!app.tasks_visible());
 
-        // Once the clear has actually been applied, checklists land again.
+        // The old turn stays disowned even after the deferred clear has
+        // been applied — it is still writing about the discarded
+        // conversation. The `pending_clear` window this used to key on
+        // would have reopened here and let it back in.
         app.pending_clear = false;
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("9".into(), "still the discarded turn".into(), "done".into())],
+        });
+        assert!(
+            app.todos.is_empty(),
+            "the discarded turn was readmitted once the clear applied: {:?}",
+            app.todos
+        );
+
+        // A turn started against the new conversation lands normally.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: app.conversation_epoch,
             items: vec![("1".into(), "the new plan".into(), "in_progress".into())],
         });
         assert_eq!(app.todos.len(), 1, "the pane stayed deaf after the clear");

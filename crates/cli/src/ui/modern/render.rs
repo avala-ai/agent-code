@@ -1779,6 +1779,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![
                 ("1".into(), "read the parser".into(), "done".into()),
                 ("2".into(), "add the guard".into(), "in_progress".into()),
@@ -1809,6 +1810,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new("m", "/tmp", "s");
         app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
             items: vec![(
                 "1".into(),
                 "delete \u{202e}sredro\u{202c} safely".into(),
@@ -1853,7 +1855,7 @@ mod tests {
                 )
             })
             .collect();
-        app.apply_engine(EngineEvent::TodoUpdate { items });
+        app.apply_engine(EngineEvent::TodoUpdate { epoch: 0, items });
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
 
@@ -1895,6 +1897,7 @@ mod tests {
                 let mut app = App::new("m", "/tmp", "s");
                 crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
                 app.apply_engine(EngineEvent::TodoUpdate {
+                    epoch: 0,
                     items: (0..todo_count)
                         .map(|i| (format!("{i}"), format!("entry {i:02}"), "pending".into()))
                         .collect(),

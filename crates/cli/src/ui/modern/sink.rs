@@ -38,6 +38,10 @@ pub enum EngineEvent {
     /// Carried as its own event because `ToolStart` forwards only a
     /// display string; the checklist needs the structured items.
     TodoUpdate {
+        /// Which conversation this checklist describes. Stamped when the
+        /// turn's sink is built; the UI drops updates that do not match
+        /// the conversation on screen. See [`ChannelSink::new`].
+        epoch: u64,
         items: Vec<TodoFields>,
     },
     ToolStart {
@@ -199,15 +203,27 @@ const MAX_PENDING_TODOS: usize = 8;
 /// Sink that forwards every stream callback onto `tx`.
 pub struct ChannelSink {
     tx: mpsc::UnboundedSender<EngineEvent>,
+    /// The conversation this turn belongs to, stamped onto checklist
+    /// updates. See [`ChannelSink::new`].
+    epoch: u64,
     /// Validated `TodoWrite` checklists waiting for their tool result,
     /// keyed by call id. See [`ChannelSink::on_tool_call_start`].
     pending_todos: std::sync::Mutex<PendingTodos>,
 }
 
 impl ChannelSink {
-    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>) -> Arc<Self> {
+    /// `epoch` identifies the conversation this turn runs against.
+    ///
+    /// A turn outlives the conversation that started it: `/clear`,
+    /// `/resume`, `/rewind` and `/snip` can all land while a turn is
+    /// still streaming, and its queued events are drained afterwards.
+    /// Stamping the epoch here — a sink is built per turn — lets the UI
+    /// drop a checklist belonging to a conversation that is gone,
+    /// instead of racing the drain order to decide which write wins.
+    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>, epoch: u64) -> Arc<Self> {
         Arc::new(Self {
             tx,
+            epoch,
             pending_todos: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -308,7 +324,10 @@ impl StreamSink for ChannelSink {
             if let Some(items) = parsed
                 && !result.is_error
             {
-                self.send(EngineEvent::TodoUpdate { items });
+                self.send(EngineEvent::TodoUpdate {
+                    epoch: self.epoch,
+                    items,
+                });
             }
         }
     }
@@ -416,7 +435,7 @@ mod tests {
     #[test]
     fn sink_forwards_text() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = ChannelSink::new(tx);
+        let sink = ChannelSink::new(tx, 0);
         sink.on_text("hello");
         match rx.try_recv().unwrap() {
             EngineEvent::Text(t) => assert_eq!(t, "hello"),
@@ -432,7 +451,7 @@ mod tests {
     #[test]
     fn a_malformed_todo_write_leaves_the_checklist_alone() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = ChannelSink::new(tx);
+        let sink = ChannelSink::new(tx, 0);
 
         let todos = |v: serde_json::Value| serde_json::json!({ "todos": v });
         let rejected = [
@@ -497,7 +516,7 @@ mod tests {
     #[test]
     fn an_unresolved_todo_write_is_never_published_and_is_bounded() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = ChannelSink::new(tx);
+        let sink = ChannelSink::new(tx, 0);
         let input = serde_json::json!({
             "todos": [{ "id": "1", "content": "a", "status": "pending" }]
         });
