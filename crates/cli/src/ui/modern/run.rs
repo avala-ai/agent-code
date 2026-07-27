@@ -66,22 +66,36 @@ pub struct CliPermissionOverride {
     pub default_mode: Option<agent_code_lib::config::PermissionMode>,
     /// The `[permissions]` section of `--permissions-overlay`.
     pub overlay: Option<agent_code_lib::config::PermissionsConfig>,
+    /// From `--no-sandbox`. Every turn builds its executor from
+    /// `state.config`, so a project reload that restored the file value
+    /// silently re-enabled the sandbox the operator turned off.
+    pub no_sandbox: bool,
 }
 
 impl CliPermissionOverride {
     /// Re-apply in the same order startup does: the mode first, then the
     /// overlay composed on top, so a deny rule in the overlay still wins.
     fn apply(&self, cfg: &mut agent_code_lib::config::Config) {
-        if let Some(mode) = self.default_mode {
-            cfg.permissions.default_mode = mode;
-        }
-        // The destination's lock decides, exactly as it would at startup:
-        // a project that sets `disable_bypass_permissions` cannot be
-        // loosened by an overlay the process happened to start with.
-        // Without this, resuming *into* a locked-down project was a way
-        // to carry a permissive overlay past its own gate.
+        // The destination's lock decides, and it decides *first*. A
+        // project that sets `disable_bypass_permissions` cannot be
+        // loosened by anything the process started with — neither a
+        // permissive overlay nor an `Allow` carried from
+        // `--dangerously-skip-permissions`. Checking after the mode had
+        // been assigned blocked only half of it.
+        //
+        // Deliberately stricter than startup, which applies that flag
+        // before any project's lock has been read. Carrying a bypass
+        // *into* a project that forbids it is the case this path creates,
+        // and refusing it is the only answer that keeps the lock
+        // meaningful.
         if cfg.security.disable_bypass_permissions {
             return;
+        }
+        if self.no_sandbox {
+            cfg.sandbox.enabled = false;
+        }
+        if let Some(mode) = self.default_mode {
+            cfg.permissions.default_mode = mode;
         }
         if let Some(overlay) = &self.overlay {
             cfg.permissions = agent_code_lib::services::coordinator::compose_permissions_overlay(
@@ -666,7 +680,21 @@ pub(super) async fn event_loop(
                         let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
                             None
                         } else {
-                            match load_project_config(&data.cwd, cli_permissions) {
+                            // Off-thread: `.agent` files can sit on a slow
+                            // or stalled mount, and the read blocks
+                            // redraws and Ctrl+C exactly like the session
+                            // read this loop already offloads. Awaited
+                            // here because the resume cannot proceed
+                            // without the answer — the loop stays
+                            // responsive because the *work* is not on it.
+                            let cwd_for_cfg = data.cwd.clone();
+                            let cli_for_cfg = cli_permissions.clone();
+                            let loaded_cfg = tokio::task::spawn_blocking(move || {
+                                load_project_config(&cwd_for_cfg, &cli_for_cfg)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("config load panicked: {e}")));
+                            match loaded_cfg {
                                 Ok(cfg) => Some(cfg),
                                 Err(e) => {
                                     app.status_message.clear();
@@ -4444,7 +4472,7 @@ mod tests {
         // Mode-only: the operator's default must outlive the reload.
         let deny_mode = CliPermissionOverride {
             default_mode: Some(PermissionMode::Deny),
-            overlay: None,
+            ..Default::default()
         };
         let guarded = load_project_config(&dir.path().display().to_string(), &deny_mode)
             .expect("settings parse");
@@ -4460,6 +4488,7 @@ mod tests {
         // started one answer identically.
         let with_overlay = CliPermissionOverride {
             default_mode: Some(PermissionMode::Deny),
+            no_sandbox: false,
             overlay: Some(agent_code_lib::config::PermissionsConfig {
                 default_mode: PermissionMode::Deny,
                 rules: vec![PermissionRule {
@@ -4497,12 +4526,14 @@ mod tests {
         std::fs::write(
             agent.join("settings.toml"),
             "[permissions]\ndefault_mode = \"ask\"\n\n\
-             [security]\ndisable_bypass_permissions = true\n",
+             [security]\ndisable_bypass_permissions = true\n\n\
+             [sandbox]\nenabled = true\n",
         )
         .unwrap();
 
         let permissive = CliPermissionOverride {
             default_mode: None,
+            no_sandbox: false,
             overlay: Some(agent_code_lib::config::PermissionsConfig {
                 default_mode: PermissionMode::Allow,
                 rules: vec![PermissionRule {
@@ -4533,6 +4564,26 @@ mod tests {
                 .any(|r| r.tool == "Bash" && r.action == PermissionMode::Allow),
             "the overlay's allow-all rule was applied in a locked project"
         );
+
+        // The same lock also refuses a carried `Allow` — the mode is not
+        // a lesser bypass than the overlay, and checking it after the
+        // assignment blocked only half.
+        let skip_all = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Allow),
+            no_sandbox: true,
+            overlay: None,
+        };
+        let cfg = load_project_config(&dir.path().display().to_string(), &skip_all)
+            .expect("settings parse");
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Ask,
+            "--dangerously-skip-permissions was carried into a locked project"
+        );
+        assert!(
+            cfg.sandbox.enabled,
+            "--no-sandbox was carried into a locked project that enables the sandbox"
+        );
     }
 
     /// The preflight must not run the destination's `api_key_helper`: it
@@ -4547,7 +4598,13 @@ mod tests {
         let marker = dir.path().join("helper-ran");
         std::fs::write(
             agent.join("settings.toml"),
-            format!("[api]\napi_key_helper = \"touch {}\"\n", marker.display()),
+            // A TOML *literal* string and forward slashes: a basic string
+            // processes backslash escapes, so a Windows temp path made
+            // the file unparseable (`\U...` reads as a unicode escape).
+            format!(
+                "[api]\napi_key_helper = 'touch {}'\n",
+                marker.display().to_string().replace('\\', "/")
+            ),
         )
         .unwrap();
 

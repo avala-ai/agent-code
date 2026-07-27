@@ -534,6 +534,11 @@ async fn async_main() -> anyhow::Result<()> {
         config.api.auth_mode = auth_mode;
     }
 
+    // Captured as its own layer, not just folded into `config`: a
+    // cross-project resume reloads the file and environment layers from
+    // the destination, and the operator's command line has to be applied
+    // on top of those too.
+    let mut cli_permissions = ui::modern::CliPermissionOverride::default();
     // Apply --no-sandbox before permission-mode handling so the bypass
     // gate applies uniformly.
     if cli.no_sandbox {
@@ -543,6 +548,7 @@ async fn async_main() -> anyhow::Result<()> {
                 "--no-sandbox ignored: security.disable_bypass_permissions is set in config",
             );
         } else {
+            cli_permissions.no_sandbox = true;
             config.sandbox.enabled = false;
             tracing::warn!("Process-level sandbox disabled for this session (--no-sandbox)");
             agent_code_lib::services::warnings::warn(
@@ -553,11 +559,6 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Apply permission mode from CLI.
-    // Captured as its own layer, not just folded into `config`: a
-    // cross-project resume reloads the file and environment layers from
-    // the destination, and the operator's command line has to be applied
-    // on top of those too.
-    let mut cli_permissions = ui::modern::CliPermissionOverride::default();
     if cli.dangerously_skip_permissions {
         cli_permissions.default_mode = Some(agent_code_lib::config::PermissionMode::Allow);
         config.permissions.default_mode = agent_code_lib::config::PermissionMode::Allow;
