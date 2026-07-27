@@ -196,16 +196,6 @@ impl Tool for BashTool {
             }
         });
 
-        // Protected-path check anchored to the directory the command
-        // will actually run in (`.current_dir(&ctx.cwd)` below and the
-        // background path both use it). `validate_input` already ran
-        // the lexical pass, but only here is the cwd available to
-        // resolve relative destinations through symlinks — `out ->
-        // .git` in the cwd must make `printf x > out/config` refuse.
-        if let Err(violation) = protected_paths::check_at(command, &ctx.cwd) {
-            return Err(ToolError::InvalidInput(violation.reason));
-        }
-
         // Plan mode is documented as read-only, so the effect classifier
         // gets the final say on the command even when an explicit
         // permission rule would otherwise allow Bash through. Without

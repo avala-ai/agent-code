@@ -1,4 +1,0 @@
-# Snapshot goldens are compared byte-for-byte against freshly rendered
-# frames, which always use LF. Letting git rewrite line endings on
-# checkout made every one of them fail on Windows.
-crates/cli/tests/snapshots/*.txt -text

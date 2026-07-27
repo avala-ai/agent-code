@@ -59,7 +59,7 @@ This maximizes throughput for read-heavy turns (common when the agent explores c
 Every tool call passes through `PermissionChecker::check()` before execution:
 
 1. **Protected directories**: write tools blocked from `.git/`, `.husky/`, `node_modules/` (hardcoded, not overridable)
-2. **Explicit rules**: user-configured per-tool/pattern rules; the most restrictive match wins (`deny` > `ask` > `allow`)
+2. **Explicit rules**: user-configured per-tool/pattern rules evaluated in order, first match wins
 3. **Default mode**: `ask`, `allow`, `deny`, `plan`, `accept_edits`, or `auto`
 
 Read-only tools use a relaxed check (`check_read()`) that only blocks explicit deny rules.

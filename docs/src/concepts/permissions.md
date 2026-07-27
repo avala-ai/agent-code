@@ -97,30 +97,7 @@ pattern = "/tmp/*"
 action = "allow"
 ```
 
-Rules resolve by **severity, not by position**: `deny` beats `ask`, which beats
-`allow`. If no rule matches, the default mode applies.
-
-Severity ordering matters because config layers *concatenate* their `rules`
-arrays (every layer's rules stay active), so which rule comes first is not
-something you can reliably control across `~/.config`, `.agent/settings.toml`
-and `.agent/settings.local.toml`. A `deny` you wrote is never silently
-outranked by a broader `allow` from another layer, and a stricter mode from
-one layer (for example a project-level `auto`) outranks a looser one (a
-user-level `allow`) even when the looser rule appears first.
-
-### Shell commands are matched per invocation
-
-A `pattern` on a `Bash` rule is matched against each invocation in the command,
-not against the raw text, and the two directions are deliberately asymmetric:
-
-- an `allow` must match **every** invocation, and refuses outright when the
-  command contains substitutions, subshells, redirection or variable
-  assignment — constructs whose effective text is not knowable at gate time;
-- a `deny` or `ask` matches when **any** invocation matches.
-
-So `pattern = "git *"` with `action = "allow"` approves `git status`, but not
-`git status && rm -rf /`. Adding a segment or a wrapper can only ever cost
-permissions, never grant them.
+Rules are evaluated in order. The first matching rule wins. If no rule matches, the default mode applies.
 
 ## Built-in safety
 

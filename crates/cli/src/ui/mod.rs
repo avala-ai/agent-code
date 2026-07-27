@@ -11,7 +11,6 @@ pub mod render;
 pub mod selector;
 pub mod setup;
 pub mod terminal_query;
-pub mod text_safety;
 #[path = "theme_runtime.rs"]
 pub mod theme;
 pub mod tui;

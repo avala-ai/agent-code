@@ -509,7 +509,6 @@ pub async fn spawn_background_agent(
         ),
         prompt: prompt.to_string(),
         parent_session: None,
-        subagent_id: Some(subagent_id.to_string()),
     };
     task_manager
         .spawn_command(

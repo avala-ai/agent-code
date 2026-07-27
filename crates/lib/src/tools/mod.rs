@@ -117,16 +117,27 @@ pub trait Tool: Send + Sync {
         true
     }
 
-    /// Digest of the external binding this tool dispatches to, when the
-    /// tool name alone does not pin that down.
+    /// The external binding this tool dispatches to, when the tool name
+    /// alone does not pin that down.
     ///
     /// Durable permission grants include it, so an approval stops
     /// matching once the same tool name resolves somewhere else. `None`
     /// for built-in tools, whose name *is* the implementation; MCP
     /// proxies return a fingerprint of their server's transport
     /// configuration, which is mutable between sessions.
-    fn grant_binding(&self) -> Option<String> {
+    fn grant_binding(&self) -> Option<GrantBinding> {
         None
+    }
+
+    /// Every filesystem destination this call would write to.
+    ///
+    /// Durable grants bind to the *resolved* target, so an approval stops
+    /// matching once the path is repointed at another file. Defaults to
+    /// [`Tool::get_path`]; tools that touch several files in one call
+    /// (`ApplyPatch`) must return all of them, or the unlisted ones stay
+    /// covered by a grant that never described them.
+    fn grant_destinations(&self, input: &serde_json::Value) -> Vec<PathBuf> {
+        self.get_path(input).into_iter().collect()
     }
 
     /// Maximum result size in characters before truncation.
@@ -177,6 +188,26 @@ pub trait Tool: Send + Sync {
     fn get_path(&self, _input: &serde_json::Value) -> Option<PathBuf> {
         None
     }
+}
+
+/// What a tool dispatches to, when its name does not pin that down.
+///
+/// Carried into the durable grant key by
+/// [`crate::tools::executor::persistent_grant_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantBinding {
+    /// Digest of the external target. Never the values themselves —
+    /// commands, urls and environments carry credentials, and grant keys
+    /// are persisted into the config directory.
+    pub digest: String,
+    /// Whether the working directory changes what this binding reaches.
+    ///
+    /// True for a local subprocess, which resolves bare commands and
+    /// relative paths against the directory it inherits. False for a
+    /// remote endpoint: the same call means the same thing from any
+    /// directory, so binding it to the cwd would only re-prompt after a
+    /// `/cd` inside one project.
+    pub cwd_sensitive: bool,
 }
 
 /// Permission prompt response from the UI layer.

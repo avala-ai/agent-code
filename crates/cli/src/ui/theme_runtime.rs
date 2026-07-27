@@ -237,21 +237,6 @@ static ACTIVE_OPTIONS: RwLock<ActiveOptions> = RwLock::new(ActiveOptions {
     inherit_fg: false,
 });
 
-/// Serializes tests that mutate the process-global active theme.
-///
-/// [`init`] writes a `static RwLock`, so two tests that set different
-/// themes and then assert on [`current`] race under the default parallel
-/// test runner. Every test that calls `init*` must hold this guard.
-/// Poisoning is ignored: a panicking test should fail on its own
-/// assertion, not cascade into unrelated ones.
-#[cfg(test)]
-pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    THEME_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Initialize (or re-set) the global theme. Convenience wrapper that
 /// disables the inherit-fg override; callers that want the override
 /// should reach for [`init_with_options`] and pass the configured

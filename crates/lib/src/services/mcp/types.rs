@@ -40,11 +40,17 @@ impl McpServerConfig {
     /// `launch_cwd` (the directory the server process inherits) are part
     /// of the digest, and a swap re-prompts.
     ///
+    /// Resolution uses the *child's* effective `PATH`: `connect_stdio`
+    /// applies `env` to the `Command` before spawning, so a server that
+    /// sets `env.PATH` is looked up along that, not along the agent's own
+    /// `PATH`. Same for `PATHEXT` on Windows.
+    ///
     /// The resolved path is canonicalized, so flipping the symlink an
-    /// entry like `/usr/bin/npx` points at also re-prompts. `PATH` itself
-    /// is deliberately *not* hashed: it varies with shell and version
-    /// manager on every launch, and hashing it would re-prompt constantly
-    /// while adding nothing once the resolution result is already bound.
+    /// entry like `/usr/bin/npx` points at also re-prompts — including a
+    /// symlink inside a configured `env.PATH`. The `PATH` *string* is
+    /// deliberately not relied on for this: it varies with shell and
+    /// version manager on every launch, and it says nothing about what
+    /// the entries currently point at.
     pub fn binding_fingerprint(&self, launch_cwd: &std::path::Path) -> String {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -62,7 +68,7 @@ impl McpServerConfig {
                 // differing only in invalid UTF-8 must not collapse into
                 // one fingerprint.
                 part(b"|exe|");
-                match resolve_executable(command, launch_cwd) {
+                match resolve_executable(command, launch_cwd, &self.env) {
                     Some(exe) => part(&crate::config::os_path_bytes(&exe)),
                     // Distinct from any resolved path, so an unresolvable
                     // command never shares a digest with a resolved one.
@@ -95,11 +101,19 @@ impl McpServerConfig {
 /// Canonical path of the executable a stdio `command` actually launches,
 /// resolved the way `Command::new` resolves it: a name containing a
 /// separator is taken relative to `launch_cwd`, a bare name is searched
-/// along `PATH`.
+/// along the child's effective `PATH`.
+///
+/// `env` is the server's configured environment, which `connect_stdio`
+/// applies before spawning — so an `env.PATH` override decides the
+/// lookup, exactly as it will for the real child.
 ///
 /// `None` when nothing matches — the spawn would fail too, so the
 /// binding falls back to the configured text and launch directory.
-fn resolve_executable(command: &str, launch_cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+fn resolve_executable(
+    command: &str,
+    launch_cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<std::path::PathBuf> {
     use std::path::Path;
 
     if command.is_empty() {
@@ -116,7 +130,13 @@ fn resolve_executable(command: &str, launch_cwd: &std::path::Path) -> Option<std
         return joined.canonicalize().ok();
     }
 
-    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+    // The child's PATH: the configured override when there is one,
+    // otherwise the one this process would pass down.
+    let path_var = match env.get("PATH") {
+        Some(p) => std::ffi::OsString::from(p),
+        None => std::env::var_os("PATH")?,
+    };
+    for dir in std::env::split_paths(&path_var) {
         // A relative `PATH` entry resolves against the launch directory,
         // exactly as the child's own lookup would.
         let dir = if dir.is_absolute() {
@@ -124,7 +144,7 @@ fn resolve_executable(command: &str, launch_cwd: &std::path::Path) -> Option<std
         } else {
             launch_cwd.join(dir)
         };
-        for candidate in executable_candidates(&dir, command) {
+        for candidate in executable_candidates(&dir, command, env) {
             if is_executable_file(&candidate) {
                 return candidate.canonicalize().ok();
             }
@@ -134,14 +154,22 @@ fn resolve_executable(command: &str, launch_cwd: &std::path::Path) -> Option<std
 }
 
 /// Filenames a bare `command` can match in one directory. On Windows the
-/// loader appends each `PATHEXT` suffix, so `foo` finds `foo.exe`.
-fn executable_candidates(dir: &std::path::Path, command: &str) -> Vec<std::path::PathBuf> {
+/// loader appends each `PATHEXT` suffix, so `foo` finds `foo.exe` — and
+/// a configured `env.PATHEXT` overrides the inherited one, same as PATH.
+fn executable_candidates(
+    dir: &std::path::Path,
+    command: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<std::path::PathBuf> {
     let exact = dir.join(command);
     #[cfg(windows)]
     {
         let mut out = vec![exact];
-        let pathext = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        let pathext = env
+            .get("PATHEXT")
+            .cloned()
+            .or_else(|| std::env::var("PATHEXT").ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
             .to_ascii_lowercase();
         for ext in pathext.split(';').filter(|e| !e.is_empty()) {
             out.push(dir.join(format!("{command}{ext}")));
@@ -150,7 +178,18 @@ fn executable_candidates(dir: &std::path::Path, command: &str) -> Vec<std::path:
     }
     #[cfg(not(windows))]
     {
+        let _ = env;
         vec![exact]
+    }
+}
+
+impl McpServerConfig {
+    /// Whether the working directory changes what this server resolves
+    /// to. A stdio child inherits the launch directory and resolves bare
+    /// commands against it; an SSE endpoint is the same endpoint from
+    /// anywhere.
+    pub fn is_cwd_sensitive(&self) -> bool {
+        matches!(self.transport, McpTransport::Stdio { .. })
     }
 }
 
@@ -398,6 +437,78 @@ mod binding_tests {
             first,
             cfg.binding_fingerprint(Path::new("/")),
             "an unresolvable command shared a binding with a resolved one"
+        );
+    }
+
+    /// `connect_stdio` applies `env` to the `Command` before spawning,
+    /// so a server that sets `env.PATH` is looked up along *that*. If
+    /// resolution used only the agent's inherited PATH, repointing a
+    /// symlink inside the configured PATH would launch a different
+    /// server under an unchanged fingerprint.
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_env_path_decides_the_resolution() {
+        let inherited = tempfile::tempdir().unwrap();
+        let configured_a = tempfile::tempdir().unwrap();
+        let configured_b = tempfile::tempdir().unwrap();
+        write_exe(inherited.path(), "srv", "#!/bin/sh\necho inherited\n");
+        write_exe(configured_a.path(), "srv", "#!/bin/sh\necho a\n");
+        write_exe(configured_b.path(), "srv", "#!/bin/sh\necho b\n");
+
+        let _guard = crate::test_support::EnvGuard::set("PATH", inherited.path());
+        let cwd = Path::new("/");
+
+        let mut cfg_a = stdio("srv", &[]);
+        cfg_a.env.insert(
+            "PATH".to_string(),
+            configured_a.path().to_str().unwrap().to_string(),
+        );
+        let mut cfg_b = stdio("srv", &[]);
+        cfg_b.env.insert(
+            "PATH".to_string(),
+            configured_b.path().to_str().unwrap().to_string(),
+        );
+
+        assert_ne!(
+            cfg_a.binding_fingerprint(cwd),
+            cfg_b.binding_fingerprint(cwd),
+            "two configured PATHs resolved to the same binding"
+        );
+
+        // And the configured PATH wins over the inherited one: the
+        // binding must not be the one the agent's own PATH would find.
+        let plain = stdio("srv", &[]);
+        assert_ne!(
+            cfg_a.binding_fingerprint(cwd),
+            plain.binding_fingerprint(cwd),
+            "env.PATH was ignored in favour of the inherited PATH"
+        );
+    }
+
+    /// Repointing a symlink *inside* a configured `env.PATH` must
+    /// invalidate the grant, even though every configured string —
+    /// command, args and the PATH value itself — is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn repointing_inside_a_configured_env_path_changes_the_binding() {
+        let bin = tempfile::tempdir().unwrap();
+        let targets = tempfile::tempdir().unwrap();
+        let real_a = write_exe(targets.path(), "a", "#!/bin/sh\necho a\n");
+        let real_b = write_exe(targets.path(), "b", "#!/bin/sh\necho b\n");
+        let link = bin.path().join("srv");
+        std::os::unix::fs::symlink(&real_a, &link).unwrap();
+
+        let mut cfg = stdio("srv", &[]);
+        cfg.env
+            .insert("PATH".to_string(), bin.path().to_str().unwrap().to_string());
+        let before = cfg.binding_fingerprint(Path::new("/"));
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real_b, &link).unwrap();
+        assert_ne!(
+            before,
+            cfg.binding_fingerprint(Path::new("/")),
+            "a swapped symlink inside env.PATH kept the old binding"
         );
     }
 

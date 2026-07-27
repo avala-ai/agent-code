@@ -1838,13 +1838,6 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             if let Some(name) = args {
                 if themes.iter().any(|t| t == name) {
                     engine.state_mut().config.ui.theme = name.to_string();
-                    // Setting the config alone left the old palette on
-                    // screen until restart; re-init so the change is
-                    // visible now. `auto` has to be resolved first — it
-                    // is a selector, not a palette id.
-                    let resolved = crate::ui::theme::resolve_theme(name);
-                    let inherit_fg = engine.state().config.ui.inherit_fg;
-                    crate::ui::theme::init_with_options(&resolved, name, inherit_fg);
                     println!("Theme set to: {name}");
                 } else {
                     println!("Unknown theme. Available: {}", themes.join(", "));
@@ -8079,7 +8072,6 @@ mod tests {
 
         // Initialise the global theme so `current()` returns a real
         // theme (the helper falls back to a default otherwise).
-        let _g = crate::ui::theme::test_lock();
         crate::ui::theme::init("midnight");
 
         let now = std::time::Instant::now();
@@ -8335,10 +8327,8 @@ mod tests {
         use agent_code_lib::services::background::{TaskKind, TaskManager, TaskPayload};
         use agent_code_lib::services::subagent_colors::SubagentColorManager;
 
-        // No theme init: this test asserts only on row text, and
-        // `format_task_list` falls back to a default theme on its own.
-        // Writing the process-global theme here would race the tests
-        // that do assert on colours.
+        crate::ui::theme::init("midnight");
+
         let mgr = SubagentColorManager::new();
         let c1 = mgr.assign("agent-one").await;
         let c2 = mgr.assign("agent-two").await;
@@ -8353,7 +8343,6 @@ mod tests {
                     subagent_kind: Some("agent-one".into()),
                     prompt: "do thing 1".into(),
                     parent_session: None,
-                    subagent_id: None,
                 },
                 Some(c1),
             )
@@ -8366,7 +8355,6 @@ mod tests {
                     subagent_kind: Some("agent-two".into()),
                     prompt: "do thing 2".into(),
                     parent_session: None,
-                    subagent_id: None,
                 },
                 Some(c2),
             )

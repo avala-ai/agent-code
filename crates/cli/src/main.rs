@@ -93,13 +93,9 @@ struct Cli {
     #[arg(short = 'C', long)]
     cwd: Option<String>,
 
-    /// Permission mode: ask, allow, deny, plan, accept_edits, auto.
-    ///
-    /// No default: when the flag is absent the configured
-    /// `[permissions] default_mode` is kept. A default here would
-    /// silently overwrite it on every run.
-    #[arg(long)]
-    permission_mode: Option<String>,
+    /// Permission mode: ask, allow, deny, plan, accept_edits.
+    #[arg(long, default_value = "ask")]
+    permission_mode: String,
 
     /// Skip all permission checks. Equivalent to --permission-mode allow.
     /// Use only in trusted environments (CI, scripting).
@@ -298,26 +294,6 @@ fn parse_api_auth_mode(value: &str) -> anyhow::Result<ApiAuthMode> {
             )
         }
     }
-}
-
-/// Parse a `--permission-mode` value.
-///
-/// Errors on anything unrecognised rather than defaulting, so a typo is
-/// reported instead of silently downgrading the session to `ask`.
-fn parse_permission_mode(value: &str) -> anyhow::Result<agent_code_lib::config::PermissionMode> {
-    use agent_code_lib::config::PermissionMode;
-    Ok(match value {
-        "ask" => PermissionMode::Ask,
-        "allow" => PermissionMode::Allow,
-        "deny" => PermissionMode::Deny,
-        "plan" => PermissionMode::Plan,
-        "accept_edits" => PermissionMode::AcceptEdits,
-        "auto" => PermissionMode::Auto,
-        other => anyhow::bail!(
-            "unknown --permission-mode `{other}` \
-             (supported: ask, allow, deny, plan, accept_edits, auto)"
-        ),
-    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -560,10 +536,14 @@ async fn async_main() -> anyhow::Result<()> {
             "All permission checks disabled (--dangerously-skip-permissions). The agent \
              can run any tool without confirmation.",
         );
-    } else if let Some(ref mode) = cli.permission_mode {
-        // An unrecognised value used to fall through to `Ask`, so a typo
-        // (`--permission-mode alow`) looked like it had been honoured.
-        config.permissions.default_mode = parse_permission_mode(mode)?;
+    } else {
+        config.permissions.default_mode = match cli.permission_mode.as_str() {
+            "allow" => agent_code_lib::config::PermissionMode::Allow,
+            "deny" => agent_code_lib::config::PermissionMode::Deny,
+            "plan" => agent_code_lib::config::PermissionMode::Plan,
+            "accept_edits" => agent_code_lib::config::PermissionMode::AcceptEdits,
+            _ => agent_code_lib::config::PermissionMode::Ask,
+        };
     }
 
     // Apply --permissions-overlay. Parsed as a TOML document whose
@@ -923,7 +903,10 @@ async fn async_main() -> anyhow::Result<()> {
         // spawned without `current_dir`, so that is the directory it
         // inherits and the one a bare command resolves against.
         let launch_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let binding = mcp_config.binding_fingerprint(&launch_cwd);
+        let binding = agent_code_lib::tools::GrantBinding {
+            digest: mcp_config.binding_fingerprint(&launch_cwd),
+            cwd_sensitive: mcp_config.is_cwd_sensitive(),
+        };
 
         let mut client = agent_code_lib::services::mcp::McpClient::new(mcp_config);
         match client.connect().await {
@@ -1303,49 +1286,4 @@ async fn handle_schedule_run(
         outcome.session_id // codeql[cleartext-logging]: non-secret session ID for /resume
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod permission_mode_flag_tests {
-    use super::parse_permission_mode;
-    use agent_code_lib::config::PermissionMode;
-
-    #[test]
-    fn every_documented_value_parses() {
-        // The help text lists these; a value that is advertised but does
-        // not parse is worse than one that is simply missing.
-        for (input, expected) in [
-            ("ask", PermissionMode::Ask),
-            ("allow", PermissionMode::Allow),
-            ("deny", PermissionMode::Deny),
-            ("plan", PermissionMode::Plan),
-            ("accept_edits", PermissionMode::AcceptEdits),
-            ("auto", PermissionMode::Auto),
-        ] {
-            assert_eq!(
-                parse_permission_mode(input).unwrap(),
-                expected,
-                "value `{input}` did not parse"
-            );
-        }
-    }
-
-    #[test]
-    fn auto_is_reachable_from_the_command_line() {
-        // `auto` was absent from the match arms and fell through to the
-        // catch-all, so the flag silently produced `Ask` and the mode was
-        // reachable only via the TUI's Shift+Tab cycle.
-        assert_eq!(parse_permission_mode("auto").unwrap(), PermissionMode::Auto);
-    }
-
-    #[test]
-    fn a_typo_is_an_error_not_a_silent_downgrade() {
-        let err = parse_permission_mode("alow").expect_err("typo must not be accepted");
-        let msg = err.to_string();
-        assert!(msg.contains("alow"), "error should quote the input: {msg}");
-        assert!(
-            msg.contains("accept_edits") && msg.contains("auto"),
-            "error should list the supported values: {msg}"
-        );
-    }
 }

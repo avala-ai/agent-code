@@ -501,10 +501,7 @@ fn render_preview(theme: &Theme) -> String {
 /// Read the existing user config (if any), set `[ui].theme = "<name>"`
 /// while preserving every other key, and write the result back
 /// atomically using the secret-preserving helper from agent-code-lib.
-/// Write `[ui].theme` into the user config, preserving every other key.
-/// Shared with the modern TUI's `/theme` picker so both surfaces persist
-/// a choice the same way.
-pub(crate) fn persist_theme(theme_name: &str) -> Result<(), String> {
+fn persist_theme(theme_name: &str) -> Result<(), String> {
     let dir = config_dir().ok_or_else(|| "no user config directory".to_string())?;
     let path = dir.join("config.toml");
     if !dir.exists() {

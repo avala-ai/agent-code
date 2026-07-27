@@ -256,12 +256,15 @@ async fn execute_single_tool(
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
             let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
+            let binding = tool.grant_binding();
+            let destinations = tool.grant_destinations(&call.input);
             let grant_key = persistent_grant_key(
                 &call.name,
                 &call.input,
                 &sandbox_state,
                 &ctx.cwd,
-                tool.grant_binding().as_deref(),
+                binding.as_ref(),
+                &destinations,
             );
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
@@ -521,7 +524,8 @@ pub fn persistent_grant_key(
     input: &serde_json::Value,
     sandbox_state: &str,
     cwd: &std::path::Path,
-    binding: Option<&str>,
+    binding: Option<&super::GrantBinding>,
+    destinations: &[std::path::PathBuf],
 ) -> String {
     let cwd_digest = {
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -569,11 +573,38 @@ pub fn persistent_grant_key(
             // names, secret-bearing MCP path fields), and this key is
             // persisted; the path is already inside the hashed input.
             let s = serde_json::to_string(input).unwrap_or_default();
-            format!(
-                "sha256:{}\0cwd-sha256:{cwd_digest}",
-                sha256_hex(s.as_bytes())
-            )
+            // A remotely bound tool means the same thing from any
+            // directory, so binding it to the cwd would only re-prompt
+            // after a `/cd` inside one project — the grant store already
+            // scopes to the repository root.
+            let cwd_matters = binding.is_none_or(|b| b.cwd_sensitive);
+            if cwd_matters {
+                format!(
+                    "sha256:{}\0cwd-sha256:{cwd_digest}",
+                    sha256_hex(s.as_bytes())
+                )
+            } else {
+                format!("sha256:{}", sha256_hex(s.as_bytes()))
+            }
         }
+    };
+
+    // Bind to where a write actually lands, not just how it was spelled.
+    // A path approved once can later be repointed at another file — the
+    // permission checker still returns `Ask`, and without this the old
+    // key would match and the new destination would be written without a
+    // prompt. Resolved, so retargeting a symlink invalidates the grant.
+    let shape = if destinations.is_empty() {
+        shape
+    } else {
+        let mut out = shape;
+        for dest in destinations {
+            out.push_str(&format!(
+                "\0dest-sha256:{}",
+                sha256_hex(&resolved_destination(dest, cwd))
+            ));
+        }
+        out
     };
     // A tool name is not always the implementation: `mcp__foo__bar` is
     // whatever `[mcp_servers.foo]` currently points at, and that mapping
@@ -581,8 +612,33 @@ pub fn persistent_grant_key(
     // Binding the key to the server's transport digest keeps an approval
     // from following the *name* onto a replacement external process.
     match binding {
-        Some(b) => format!("{tool}\0{shape}\0binding:{b}"),
+        Some(b) => format!("{tool}\0{shape}\0binding:{}", b.digest),
         None => format!("{tool}\0{shape}"),
+    }
+}
+
+/// The file a write will actually land on, as raw path bytes.
+///
+/// Symlinks are resolved, so a grant stops matching once the path is
+/// repointed at another file. A destination that does not exist yet
+/// canonicalizes its *parent* and appends the file name — the same
+/// string the leaf resolves to once created, so approving a write to a
+/// new file does not re-prompt on the next identical write.
+fn resolved_destination(path: &std::path::Path, cwd: &std::path::Path) -> Vec<u8> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if let Ok(canonical) = abs.canonicalize() {
+        return crate::config::os_path_bytes(&canonical);
+    }
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(p) => crate::config::os_path_bytes(&p.join(name)),
+            Err(_) => crate::config::os_path_bytes(&abs),
+        },
+        _ => crate::config::os_path_bytes(&abs),
     }
 }
 
@@ -662,7 +718,14 @@ mod session_allow_tests {
     /// `persistent_grant_key` with no active isolation and a fixed cwd —
     /// the common fixture for properties that concern neither.
     fn pkey(tool: &str, input: &serde_json::Value) -> String {
-        persistent_grant_key(tool, input, "none", std::path::Path::new("/test-cwd"), None)
+        persistent_grant_key(
+            tool,
+            input,
+            "none",
+            std::path::Path::new("/test-cwd"),
+            None,
+            &[],
+        )
     }
 
     /// The grant scope is the repository root while the session can
@@ -673,12 +736,33 @@ mod session_allow_tests {
     #[test]
     fn a_grant_key_is_bound_to_the_effective_cwd() {
         let cmd = serde_json::json!({"command": "./build.sh"});
-        let a = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"), None);
-        let b = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/b"), None);
+        let a = persistent_grant_key(
+            "Bash",
+            &cmd,
+            "none",
+            std::path::Path::new("/repo/a"),
+            None,
+            &[],
+        );
+        let b = persistent_grant_key(
+            "Bash",
+            &cmd,
+            "none",
+            std::path::Path::new("/repo/b"),
+            None,
+            &[],
+        );
         assert_ne!(a, b, "a relative command crossed directories");
         assert_eq!(
             a,
-            persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"), None)
+            persistent_grant_key(
+                "Bash",
+                &cmd,
+                "none",
+                std::path::Path::new("/repo/a"),
+                None,
+                &[]
+            )
         );
 
         let write = serde_json::json!({"file_path": "notes.md", "content": "x"});
@@ -688,14 +772,16 @@ mod session_allow_tests {
                 &write,
                 "none",
                 std::path::Path::new("/repo/a"),
-                None
+                None,
+                &[]
             ),
             persistent_grant_key(
                 "FileWrite",
                 &write,
                 "none",
                 std::path::Path::new("/repo/b"),
-                None
+                None,
+                &[]
             ),
             "a relative write crossed directories"
         );
@@ -707,14 +793,16 @@ mod session_allow_tests {
                 &fetch,
                 "none",
                 std::path::Path::new("/repo/a"),
-                None
+                None,
+                &[]
             ),
             persistent_grant_key(
                 "WebFetch",
                 &fetch,
                 "none",
                 std::path::Path::new("/repo/b"),
-                None
+                None,
+                &[]
             ),
         );
     }
@@ -841,6 +929,7 @@ mod session_allow_tests {
             "fp-strict-policy",
             std::path::Path::new("/test-cwd"),
             None,
+            &[],
         );
         assert_ne!(
             isolated,
@@ -849,7 +938,8 @@ mod session_allow_tests {
                 &input,
                 "none",
                 std::path::Path::new("/test-cwd"),
-                None
+                None,
+                &[]
             ),
             "a grant crossed between isolated and unisolated sessions"
         );
@@ -860,7 +950,8 @@ mod session_allow_tests {
                 &input,
                 "fp-weaker-policy",
                 std::path::Path::new("/test-cwd"),
-                None
+                None,
+                &[]
             ),
             "a grant survived an isolation-policy change"
         );
@@ -1085,13 +1176,11 @@ mod session_allow_tests {
         });
 
         let key = |c: &McpServerConfig| {
-            persistent_grant_key(
-                "mcp__foo__query",
-                &input,
-                "none",
-                cwd,
-                Some(&c.binding_fingerprint(std::path::Path::new("/test-cwd"))),
-            )
+            let binding = super::super::GrantBinding {
+                digest: c.binding_fingerprint(std::path::Path::new("/test-cwd")),
+                cwd_sensitive: c.is_cwd_sensitive(),
+            };
+            persistent_grant_key("mcp__foo__query", &input, "none", cwd, Some(&binding), &[])
         };
 
         assert_eq!(key(&original), key(&original), "the key must be stable");
@@ -1144,6 +1233,114 @@ mod session_allow_tests {
         assert!(!pkey("FileWrite", &input).contains("\0binding:"));
     }
 
+    /// A write grant must bind to where the write *lands*. The path is
+    /// still spelled the same and the checker still returns `Ask`, so
+    /// without the resolved destination in the key a repointed symlink
+    /// would ride in on the old approval.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_grant_is_bound_to_the_resolved_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_a = dir.path().join("real-a.txt");
+        let real_b = dir.path().join("real-b.txt");
+        std::fs::write(&real_a, "a").unwrap();
+        std::fs::write(&real_b, "b").unwrap();
+        let link = dir.path().join("notes.txt");
+        std::os::unix::fs::symlink(&real_a, &link).unwrap();
+
+        let input = serde_json::json!({"file_path": link.to_str().unwrap(), "content": "x"});
+        let dests = vec![link.clone()];
+        let key = |d: &[std::path::PathBuf]| {
+            persistent_grant_key("FileWrite", &input, "none", dir.path(), None, d)
+        };
+
+        let before = key(&dests);
+        assert_eq!(before, key(&dests), "the key must be stable");
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real_b, &link).unwrap();
+        assert_ne!(
+            before,
+            key(&dests),
+            "a retargeted symlink kept the old write grant"
+        );
+
+        // With no destinations the key keeps its previous shape, so
+        // non-file tools are unaffected.
+        assert!(!key(&[]).contains("\0dest-sha256:"));
+    }
+
+    /// A file that does not exist yet must key the same before and after
+    /// it is created, or the first approved write would re-prompt on the
+    /// very next identical one.
+    #[test]
+    fn a_write_grant_to_a_new_file_survives_its_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fresh.txt");
+        let input = serde_json::json!({"file_path": target.to_str().unwrap(), "content": "x"});
+        let dests = vec![target.clone()];
+
+        let before = persistent_grant_key("FileWrite", &input, "none", dir.path(), None, &dests);
+        std::fs::write(&target, "x").unwrap();
+        let after = persistent_grant_key("FileWrite", &input, "none", dir.path(), None, &dests);
+        assert_eq!(
+            before, after,
+            "creating the approved file invalidated its own grant"
+        );
+    }
+
+    /// A patch touching several files must bind to every one of them —
+    /// otherwise the unlisted files ride in on an approval that never
+    /// described them.
+    #[test]
+    fn a_multi_file_grant_binds_every_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"patch": "irrelevant here"});
+        let one = vec![dir.path().join("a.txt")];
+        let both = vec![dir.path().join("a.txt"), dir.path().join("b.txt")];
+        assert_ne!(
+            persistent_grant_key("ApplyPatch", &input, "none", dir.path(), None, &one),
+            persistent_grant_key("ApplyPatch", &input, "none", dir.path(), None, &both),
+            "a second destination did not change the grant"
+        );
+    }
+
+    /// A remotely bound tool means the same thing from any directory.
+    /// Binding it to the cwd would re-prompt after a `/cd` inside one
+    /// project, even though the endpoint never moved.
+    #[test]
+    fn a_remotely_bound_grant_ignores_the_cwd() {
+        let input = serde_json::json!({"query": "select 1"});
+        let remote = super::super::GrantBinding {
+            digest: "sse-digest".to_string(),
+            cwd_sensitive: false,
+        };
+        let local = super::super::GrantBinding {
+            digest: "stdio-digest".to_string(),
+            cwd_sensitive: true,
+        };
+        let key = |b: &super::super::GrantBinding, cwd: &str| {
+            persistent_grant_key(
+                "mcp__foo__query",
+                &input,
+                "none",
+                std::path::Path::new(cwd),
+                Some(b),
+                &[],
+            )
+        };
+        assert_eq!(
+            key(&remote, "/repo/a"),
+            key(&remote, "/repo/b"),
+            "an SSE-bound grant re-prompted after a /cd"
+        );
+        assert_ne!(
+            key(&local, "/repo/a"),
+            key(&local, "/repo/b"),
+            "a stdio-bound grant must stay cwd-bound"
+        );
+    }
+
     /// `is_active()` is false for a degraded sandbox whether it fails
     /// closed or open, so both states would key as `"none"`. A grant
     /// recorded while the backend was missing and the call was being
@@ -1191,8 +1388,8 @@ mod session_allow_tests {
         let input = serde_json::json!({"command": "make"});
         let cwd = std::path::Path::new("/test-cwd");
         assert_ne!(
-            persistent_grant_key("Bash", &input, &blocked_state, cwd, None),
-            persistent_grant_key("Bash", &input, &permitted_state, cwd, None),
+            persistent_grant_key("Bash", &input, &blocked_state, cwd, None, &[]),
+            persistent_grant_key("Bash", &input, &permitted_state, cwd, None, &[]),
             "a grant stored while degraded-and-refusing carried into a \
              degraded-but-permitted session"
         );

@@ -169,24 +169,6 @@ impl App {
         self.pending_theme = Some(id.to_string());
     }
 
-    /// Adopt a theme change made behind the app's back — `/color <name>`
-    /// runs through the classic slash bridge, which re-inits the global
-    /// palette and updates the engine config without ever seeing the app.
-    /// Without this rebase the picker would open highlighting the stale
-    /// name and Esc would "restore" a theme the session already left.
-    ///
-    /// The palette itself is already live, so only the session name and
-    /// the styled-line cache need to catch up; `pending_theme` stays
-    /// untouched because the config is the source here, not the target.
-    pub fn sync_theme_from_config(&mut self, configured: &str) {
-        if self.theme_name == configured {
-            return;
-        }
-        self.theme_name = configured.to_string();
-        self.layout.invalidate();
-        self.dirty = true;
-    }
-
     /// Repaint in `id` without touching what the session considers its
     /// configured theme. Both the live preview and the Esc restore go
     /// through here, so neither can leave a config write queued.
@@ -287,44 +269,6 @@ mod tests {
         assert!(!a.theme_picker_open());
         assert_eq!(a.theme_name, "one-dark");
         assert!(a.pending_theme.is_none());
-    }
-
-    #[test]
-    fn color_command_rebases_the_picker_baseline() {
-        let _g = guard();
-        let mut a = app();
-        // `/color dracula` through the classic bridge: engine config and
-        // global palette changed, the app was never consulted.
-        a.sync_theme_from_config("dracula");
-        assert_eq!(a.theme_name, "dracula");
-        assert!(
-            a.pending_theme.is_none(),
-            "config is the source of this change; queuing a write-back would persist a theme /color never persisted"
-        );
-        // The picker must now treat `dracula` as current: highlight it on
-        // open, and leave it active after an Esc.
-        a.open_theme_picker();
-        let p = a.theme_picker.as_ref().unwrap();
-        assert_eq!(p.original, "dracula");
-        assert_eq!(p.highlighted().as_deref(), Some("dracula"));
-        a.theme_picker_move(1);
-        a.theme_picker_cancel();
-        assert_eq!(a.theme_name, "dracula");
-        assert_eq!(
-            crate::ui::theme::current().accent,
-            crate::ui::theme::Theme::from_name("dracula").accent,
-            "Esc must restore the theme `/color` selected, not the startup theme"
-        );
-    }
-
-    #[test]
-    fn sync_with_unchanged_name_is_a_no_op() {
-        let _g = guard();
-        let mut a = app();
-        a.dirty = false;
-        a.sync_theme_from_config("one-dark");
-        assert_eq!(a.theme_name, "one-dark");
-        assert!(!a.dirty, "no state changed, no repaint needed");
     }
 
     #[test]

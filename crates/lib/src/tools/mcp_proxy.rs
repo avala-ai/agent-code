@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::{Tool, ToolContext, ToolResult};
+use super::{GrantBinding, Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
 use crate::services::mcp::{McpClient, McpTool};
 
@@ -25,7 +25,7 @@ pub struct McpProxyTool {
     /// Digest of the server's transport configuration, captured at
     /// registration. Durable grants key on it so an approval does not
     /// follow the server *name* onto a different command or endpoint.
-    binding: String,
+    binding: GrantBinding,
 }
 
 impl McpProxyTool {
@@ -33,7 +33,7 @@ impl McpProxyTool {
         definition: McpTool,
         server_name: &str,
         client: Arc<Mutex<McpClient>>,
-        binding: &str,
+        binding: GrantBinding,
     ) -> Self {
         let qualified_name = format!(
             "mcp__{}__{}",
@@ -45,7 +45,7 @@ impl McpProxyTool {
             qualified_name,
             client,
             server_name: server_name.to_string(),
-            binding: binding.to_string(),
+            binding,
         }
     }
 }
@@ -79,7 +79,7 @@ impl Tool for McpProxyTool {
         false // MCP servers may have internal state.
     }
 
-    fn grant_binding(&self) -> Option<String> {
+    fn grant_binding(&self) -> Option<GrantBinding> {
         Some(self.binding.clone())
     }
 
@@ -140,7 +140,7 @@ pub fn create_proxy_tools(
     server_name: &str,
     mcp_tools: &[McpTool],
     client: Arc<Mutex<McpClient>>,
-    binding: &str,
+    binding: &GrantBinding,
 ) -> Vec<Arc<dyn Tool>> {
     mcp_tools
         .iter()
@@ -149,7 +149,7 @@ pub fn create_proxy_tools(
                 t.clone(),
                 server_name,
                 client.clone(),
-                binding,
+                binding.clone(),
             )) as Arc<dyn Tool>
         })
         .collect()
@@ -171,14 +171,22 @@ mod tests {
         }
     }
 
-    fn proxy(binding: &str) -> McpProxyTool {
+    fn proxy(digest: &str) -> McpProxyTool {
         let definition = McpTool {
             name: "query".to_string(),
             description: None,
             input_schema: serde_json::json!({}),
         };
         let client = Arc::new(Mutex::new(McpClient::new(server("/usr/bin/foo-mcp"))));
-        McpProxyTool::new(definition, "foo", client, binding)
+        McpProxyTool::new(
+            definition,
+            "foo",
+            client,
+            GrantBinding {
+                digest: digest.to_string(),
+                cwd_sensitive: true,
+            },
+        )
     }
 
     /// The permission system only ever sees the flattened
@@ -195,7 +203,10 @@ mod tests {
 
         let tool = proxy(&original);
         assert_eq!(tool.name(), "mcp__foo__query");
-        assert_eq!(tool.grant_binding().as_deref(), Some(original.as_str()));
+        assert_eq!(
+            tool.grant_binding().map(|b| b.digest),
+            Some(original.clone())
+        );
         assert_ne!(proxy(&swapped).grant_binding(), tool.grant_binding());
     }
 }
