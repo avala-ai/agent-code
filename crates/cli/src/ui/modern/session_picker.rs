@@ -54,6 +54,35 @@ impl SessionPicker {
     }
 }
 
+/// Longest restored user row rendered in full.
+///
+/// A saved user message is the *engine* payload: a skill invocation is
+/// stored as the whole skill body. Nothing clamps user rows on the way
+/// to the screen, so a resumed session would otherwise open with one
+/// enormous block where the user remembers a one-line prompt.
+const MAX_RESTORED_USER_CHARS: usize = 4000;
+
+/// Recover something close to what the user actually typed from a saved
+/// user message.
+///
+/// `enqueue_turn` keeps the typed line and the engine payload separate
+/// and only the payload is persisted, so this reverses what it can:
+/// `@mention` inlining is cut at its envelope exactly, and anything
+/// still far too long to be a typed line (skill bodies, which the
+/// payload gives no way to reverse) is clamped with a visible marker
+/// rather than dumped into the transcript.
+fn display_form(text: &str) -> String {
+    let typed = match text.find(super::mentions::MENTION_ENVELOPE) {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    if typed.chars().count() <= MAX_RESTORED_USER_CHARS {
+        return typed.to_string();
+    }
+    let head: String = typed.chars().take(MAX_RESTORED_USER_CHARS).collect();
+    format!("{head}\n… (expanded prompt — truncated for display)")
+}
+
 /// First eight *characters* of a session id, for compact display.
 ///
 /// Character-safe, not byte-safe: ids come from session filenames, and
@@ -166,7 +195,7 @@ pub fn transcript_from_messages(
                     continue;
                 }
                 if !text.trim().is_empty() {
-                    items.push(TranscriptItem::User(text));
+                    items.push(TranscriptItem::User(display_form(&text)));
                 }
             }
             Message::Assistant(a) => {
@@ -1386,6 +1415,76 @@ mod tests {
             app.conversation_epoch, epoch_before,
             "in-flight work from the old conversation was not disowned"
         );
+    }
+
+    /// A saved user message is the engine payload, so a turn sent with
+    /// an `@path` mention stores the inlined file. Rebuilding it
+    /// verbatim shows the whole file as something the user typed.
+    #[test]
+    fn a_restored_mention_turn_shows_the_typed_line_not_the_inlined_file() {
+        let payload = format!(
+            "look at @src/main.rs{}\n<file path=\"src/main.rs\">\nfn main() {{}}\n</file>\n",
+            super::super::mentions::MENTION_ENVELOPE
+        );
+        let items = transcript_from_messages(&[user(&payload)], true);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TranscriptItem::User(t) => {
+                assert_eq!(t, "look at @src/main.rs");
+                assert!(
+                    !t.contains("fn main"),
+                    "the inlined file leaked into the row"
+                );
+            }
+            other => panic!("expected a user row, got {other:?}"),
+        }
+    }
+
+    /// A skill invocation is stored as the whole skill body and cannot be
+    /// reversed from the payload, so it is clamped rather than dumped —
+    /// nothing clamps user rows on the way to the screen.
+    #[test]
+    fn an_enormous_restored_user_turn_is_clamped() {
+        let huge = "x".repeat(MAX_RESTORED_USER_CHARS * 2);
+        let items = transcript_from_messages(&[user(&huge)], true);
+        match &items[0] {
+            TranscriptItem::User(t) => {
+                assert!(
+                    t.chars().count() < huge.chars().count(),
+                    "the whole payload was rendered as one user row"
+                );
+                assert!(
+                    t.contains("truncated for display"),
+                    "clamped without saying so"
+                );
+            }
+            other => panic!("expected a user row, got {other:?}"),
+        }
+    }
+
+    /// One slot each: a second submission before the loop drains the
+    /// first silently discarded it while its row claimed it had run.
+    #[test]
+    fn a_second_shell_submission_does_not_discard_the_first() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("abcdef123456".into());
+
+        app.input = "!one".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.pending_shell.as_deref(), Some("one"));
+
+        app.input = "!two".into();
+        app.cursor = app.input.len();
+        app.submit();
+
+        assert_eq!(
+            app.pending_shell.as_deref(),
+            Some("one"),
+            "the queued command was overwritten and never ran"
+        );
+        assert_eq!(app.input, "!two", "the refused text was lost");
+        assert!(app.status_message.contains("still pending"));
     }
 
     /// `/clear` submitted during a load must not blank the screen: the

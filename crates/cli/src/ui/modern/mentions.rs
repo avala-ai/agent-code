@@ -173,6 +173,14 @@ pub struct MentionExpansion {
 /// Returns `None` when `text` holds no mentions, so the submit path is
 /// untouched for ordinary prompts. The user's own text is always the prefix
 /// of `prompt` — expansion only appends.
+/// Header introducing inlined `@mention` content in the engine payload.
+///
+/// Shared rather than inlined at both ends: restoring a session cuts a
+/// saved prompt back to the line the user actually typed by looking for
+/// exactly this string, and a silent drift between the two would leave
+/// resumed transcripts showing whole files as user turns.
+pub const MENTION_ENVELOPE: &str = "\n\nReferenced files (expanded from @ mentions above):\n";
+
 pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     let mentions = crate::commands::extract_at_mentions(text);
     if mentions.is_empty() {
@@ -221,7 +229,7 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
         }
         used += content.len();
         if body.is_empty() {
-            body.push_str("\n\nReferenced files (expanded from @ mentions above):\n");
+            body.push_str(MENTION_ENVELOPE);
         }
         body.push_str(&format!(
             "\n<{kind} path=\"{label}\">\n{content}\n</{kind}>\n"

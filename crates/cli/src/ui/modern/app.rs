@@ -1532,6 +1532,14 @@ impl App {
         if let Some(cmd) = text.strip_prefix('!').map(str::trim)
             && !cmd.is_empty()
         {
+            // One slot, so a second submission before the loop drains the
+            // first would silently discard it — the run never happens and
+            // its row sits in the transcript as if it had. Refuse instead,
+            // keeping the text in the composer.
+            if self.pending_shell.is_some() {
+                self.note_deferred_slot_busy("a shell command");
+                return;
+            }
             self.pending_shell = Some(cmd.to_string());
             self.transcript
                 .push(TranscriptItem::User(format!("!{cmd}")));
@@ -1549,6 +1557,11 @@ impl App {
                 .next()
                 .unwrap_or("");
             if crate::commands::is_builtin_command(name) {
+                // Same single slot as `pending_shell`.
+                if self.pending_slash.is_some() {
+                    self.note_deferred_slot_busy("a command");
+                    return;
+                }
                 self.pending_slash = Some(text.clone());
                 self.input.clear();
                 self.cursor = 0;
@@ -1846,6 +1859,13 @@ impl App {
         self.phase = Phase::Streaming;
         // Jump back to the live tail when the user sends.
         self.scroll = ScrollState::Follow;
+        self.dirty = true;
+    }
+
+    /// Tell the user a deferred slot is still occupied, leaving what
+    /// they typed in the composer so nothing is lost.
+    fn note_deferred_slot_busy(&mut self, what: &str) {
+        self.status_message = format!("{what} is still pending — press Enter again in a moment");
         self.dirty = true;
     }
 
