@@ -526,6 +526,15 @@ fn user_themes_dir() -> Option<PathBuf> {
 
 /// Load every user palette from disk. Best-effort: a missing directory
 /// yields no themes; malformed files are logged and skipped.
+/// Whether a user palette file owns `id`.
+///
+/// The runtime facade intercepts `auto` before any palette lookup, so it
+/// has to ask this before doing so — otherwise a user's `auto.toml` is
+/// advertised by the catalog but never actually applied.
+pub fn user_palette_exists(id: &str) -> bool {
+    user_palettes().iter().any(|p| p.id == id)
+}
+
 fn user_palettes() -> Vec<Palette> {
     user_themes_dir()
         .map(|d| load_palettes_dir(&d))
