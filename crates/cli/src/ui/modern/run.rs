@@ -75,6 +75,14 @@ impl CliPermissionOverride {
         if let Some(mode) = self.default_mode {
             cfg.permissions.default_mode = mode;
         }
+        // The destination's lock decides, exactly as it would at startup:
+        // a project that sets `disable_bypass_permissions` cannot be
+        // loosened by an overlay the process happened to start with.
+        // Without this, resuming *into* a locked-down project was a way
+        // to carry a permissive overlay past its own gate.
+        if cfg.security.disable_bypass_permissions {
+            return;
+        }
         if let Some(overlay) = &self.overlay {
             cfg.permissions = agent_code_lib::services::coordinator::compose_permissions_overlay(
                 &cfg.permissions,
@@ -198,7 +206,11 @@ fn load_project_config(
     dir: &str,
     cli_permissions: &CliPermissionOverride,
 ) -> Result<agent_code_lib::config::Config, String> {
-    let mut cfg = agent_code_lib::config::Config::load_from(std::path::Path::new(dir))
+    // Policy only: this may still refuse the resume, and resolving the
+    // key would run the destination's `api_key_helper` through `bash -c`
+    // — a command from a project the session may never enter, executed on
+    // the event-loop thread, blocking redraws and Ctrl+C while it runs.
+    let mut cfg = agent_code_lib::config::Config::load_policy_from(std::path::Path::new(dir))
         .map_err(|e| e.to_string())?;
     // The command line is a layer above the files, and it belongs to the
     // process rather than to any directory. Reloading only the file and
@@ -4395,6 +4407,13 @@ mod tests {
         );
     }
 
+    /// `Config::load*` guards against re-entrancy with a process-global
+    /// flag, and a load that finds it set returns `Config::default()`
+    /// instead of the project's settings. Two of these tests running at
+    /// once therefore made one of them silently assert against defaults
+    /// — which looked like the gate failing to fire. Serialize them.
+    static CONFIG_LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The command line is a layer above the files and belongs to the
     /// process, not to a directory. A cross-project resume reloads the
     /// file layers from the destination, so without reapplying it a
@@ -4402,6 +4421,7 @@ mod tests {
     /// operator's `--permission-mode deny`.
     #[test]
     fn the_operators_command_line_survives_a_project_reload() {
+        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use agent_code_lib::config::{PermissionMode, PermissionRule};
 
         let dir = tempfile::tempdir().unwrap();
@@ -4460,6 +4480,86 @@ mod tests {
                 .iter()
                 .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
             "the operator's deny rule did not survive the reload"
+        );
+    }
+
+    /// A project that locks bypassing cannot be loosened by an overlay
+    /// the process happened to start with. Startup ignores the overlay
+    /// in such a project; resuming *into* one was a way around that gate.
+    #[test]
+    fn a_locked_destination_ignores_a_carried_overlay() {
+        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use agent_code_lib::config::{PermissionMode, PermissionRule};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"ask\"\n\n\
+             [security]\ndisable_bypass_permissions = true\n",
+        )
+        .unwrap();
+
+        let permissive = CliPermissionOverride {
+            default_mode: None,
+            overlay: Some(agent_code_lib::config::PermissionsConfig {
+                default_mode: PermissionMode::Allow,
+                rules: vec![PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: None,
+                    action: PermissionMode::Allow,
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let cfg = load_project_config(&dir.path().display().to_string(), &permissive)
+            .expect("settings parse");
+        assert!(
+            cfg.security.disable_bypass_permissions,
+            "precondition: the destination's lock must have been read"
+        );
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Ask,
+            "a carried overlay loosened a project that forbids bypassing"
+        );
+        assert!(
+            !cfg.permissions
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Allow),
+            "the overlay's allow-all rule was applied in a locked project"
+        );
+    }
+
+    /// The preflight must not run the destination's `api_key_helper`: it
+    /// may still refuse the resume, and the helper is a shell command
+    /// executed on the event-loop thread.
+    #[test]
+    fn the_preflight_does_not_run_the_destination_key_helper() {
+        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let marker = dir.path().join("helper-ran");
+        std::fs::write(
+            agent.join("settings.toml"),
+            format!("[api]\napi_key_helper = \"touch {}\"\n", marker.display()),
+        )
+        .unwrap();
+
+        let _ = load_project_config(
+            &dir.path().display().to_string(),
+            &CliPermissionOverride::default(),
+        )
+        .expect("settings parse");
+
+        assert!(
+            !marker.exists(),
+            "the destination's key helper was executed during preflight"
         );
     }
 }

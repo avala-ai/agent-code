@@ -33,7 +33,7 @@ impl Config {
         if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(Config::default());
         }
-        let result = Self::load_inner(None);
+        let result = Self::load_inner(None, true);
         LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
@@ -55,14 +55,34 @@ impl Config {
         if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(Config::default());
         }
-        let result = Self::load_inner(Some(dir));
+        let result = Self::load_inner(Some(dir), true);
+        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    /// Load another project's *policy* without resolving its API key.
+    ///
+    /// [`Self::load_from`] runs the destination's `api_key_helper`
+    /// through `bash -c`. A resume preflight only reads policy and may
+    /// still refuse the resume, so running it there would execute a
+    /// command from a project the session never enters — and block the
+    /// caller (the TUI event loop, Ctrl+C included) while it does.
+    ///
+    /// The returned `api.api_key` is therefore whatever the files and
+    /// environment gave, with no helper invocation. Callers that need a
+    /// usable key must use [`Self::load_from`].
+    pub fn load_policy_from(dir: &Path) -> Result<Config, ConfigError> {
+        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Config::default());
+        }
+        let result = Self::load_inner(Some(dir), false);
         LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
     /// `start` is the directory the project layers are discovered from;
     /// `None` means the process working directory.
-    fn load_inner(start: Option<&Path>) -> Result<Config, ConfigError> {
+    fn load_inner(start: Option<&Path>, resolve_api_key: bool) -> Result<Config, ConfigError> {
         let mut layers: Vec<String> = Vec::new();
 
         // Layer 1: User-level config (lowest priority file).
@@ -141,7 +161,8 @@ impl Config {
         // user-configured `api_key_helper` command (via `bash -c`) and
         // use its trimmed stdout as the key. Allows fetching short-lived
         // tokens from a secrets manager without pinning them to disk.
-        if config.api.api_key.is_none()
+        if resolve_api_key
+            && config.api.api_key.is_none()
             && let Some(cmd) = &config.api.api_key_helper
         {
             match resolve_api_key_from_helper(cmd) {
