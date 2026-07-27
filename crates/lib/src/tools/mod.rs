@@ -234,6 +234,16 @@ pub enum PermissionResponse {
     /// this call and nothing adjacent to it — see
     /// [`crate::permissions::grants`].
     AllowAlways,
+    /// Approve and remember every command starting with `prefix`.
+    ///
+    /// Matched by parsing rather than by string prefix: the grant holds
+    /// only when *every* invocation in the command starts with it, and
+    /// never for a command containing a substitution, subshell or
+    /// redirection. So `git status` does not cover
+    /// `git status && rm -rf /`.
+    AllowAlwaysPrefix {
+        prefix: String,
+    },
     Deny,
 }
 
@@ -250,13 +260,25 @@ pub trait PermissionPrompter: Send + Sync {
         description: &str,
         input_preview: Option<&str>,
         origin: Option<&str>,
+        // `suggested_prefix` is a command prefix worth offering a
+        // durable grant for (`git status`), when this is a shell call the
+        // gate can reason about. `None` means only exact grants make
+        // sense here — the UI must not invent one.
+        suggested_prefix: Option<&str>,
     ) -> PermissionResponse;
 }
 
 /// Default prompter that always allows (for non-interactive/testing).
 pub struct AutoAllowPrompter;
 impl PermissionPrompter for AutoAllowPrompter {
-    fn ask(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>) -> PermissionResponse {
+    fn ask(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> PermissionResponse {
         PermissionResponse::AllowOnce
     }
 }

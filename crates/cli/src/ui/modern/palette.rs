@@ -155,6 +155,7 @@ mod tests {
             description: "run".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond: tx,
         }));
         app.phase = Phase::Permission;

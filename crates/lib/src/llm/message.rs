@@ -187,6 +187,18 @@ impl ContentBlock {
         }
     }
 
+    /// The wire `type` tag of this block, for logs and hook payloads.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::ToolUse { .. } => "tool_use",
+            ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::Thinking { .. } => "thinking",
+            ContentBlock::Image { .. } => "image",
+            ContentBlock::Document { .. } => "document",
+        }
+    }
+
     /// Extract tool use info, if this is a tool_use block.
     pub fn as_tool_use(&self) -> Option<(&str, &str, &serde_json::Value)> {
         match self {
@@ -240,6 +252,29 @@ pub enum StopReason {
 }
 
 /// Helper to create a user message with text content.
+/// A user message carrying attachments alongside its text.
+///
+/// Images go *before* the text: a model reads the prompt as being about
+/// the images it has just been shown, and the reverse order reads as an
+/// afterthought.
+pub fn user_message_with_attachments(
+    text: impl Into<String>,
+    attachments: Vec<ContentBlock>,
+) -> Message {
+    let text = text.into();
+    let mut content = attachments;
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    Message::User(UserMessage {
+        uuid: Uuid::new_v4(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        content,
+        is_meta: false,
+        is_compact_summary: false,
+    })
+}
+
 pub fn user_message(text: impl Into<String>) -> Message {
     Message::User(UserMessage {
         uuid: Uuid::new_v4(),
@@ -250,86 +285,105 @@ pub fn user_message(text: impl Into<String>) -> Message {
     })
 }
 
+/// Describe attachment blocks for hook payloads and logs.
+///
+/// Metadata, not payloads: a hook needs to know that an image of a given
+/// type and size is going out — enough to audit or refuse it — and putting
+/// megabytes of base64 into every hook invocation would serve nothing.
+pub fn describe_attachments(blocks: &[ContentBlock]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image { media_type, data } => serde_json::json!({
+                "type": "image",
+                "media_type": media_type,
+                "encoded_bytes": data.len(),
+            }),
+            ContentBlock::Document {
+                media_type, data, ..
+            } => serde_json::json!({
+                "type": "document",
+                "media_type": media_type,
+                "encoded_bytes": data.len(),
+            }),
+            other => serde_json::json!({ "type": other.kind_name() }),
+        })
+        .collect()
+}
+
+/// Media type for an image path, inferred from its extension.
+///
+/// Case-insensitive: callers that decide *whether* a path is an image
+/// normalize the extension, so `shot.PNG` must not fall through to a
+/// generic media type the provider then rejects.
+pub fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
+}
+
 /// Helper to create an image content block from a file path.
 ///
 /// Reads the file, base64-encodes it, and infers the media type
 /// from the file extension.
 pub fn image_block_from_file(path: &std::path::Path) -> Result<ContentBlock, String> {
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image: {e}"))?;
-
-    let media_type = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
-    };
-
-    use std::io::Write;
-    let mut encoded = String::new();
-    {
-        let mut encoder = base64_encode_writer(&mut encoded);
-        encoder
-            .write_all(&data)
-            .map_err(|e| format!("base64 error: {e}"))?;
-    }
-
-    Ok(ContentBlock::Image {
-        media_type: media_type.to_string(),
-        data: encoded,
-    })
+    Ok(image_block_from_bytes(path, &data))
 }
 
-/// Simple base64 encoder (no external dependency).
-fn base64_encode_writer(output: &mut String) -> Base64Writer<'_> {
-    Base64Writer {
-        output,
-        buffer: Vec::new(),
+/// Build an image block from bytes already in hand.
+///
+/// Lets a caller that must bound the read do it itself and still get the
+/// same media-type inference; `path` is used only for its extension.
+pub fn image_block_from_bytes(path: &std::path::Path, data: &[u8]) -> ContentBlock {
+    ContentBlock::Image {
+        media_type: image_media_type(path)
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        data: base64_encode(data),
     }
 }
 
-struct Base64Writer<'a> {
-    output: &'a mut String,
-    buffer: Vec<u8>,
-}
-
-impl<'a> std::io::Write for Base64Writer<'a> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
+/// Base64 (RFC 4648, padded) without an external dependency.
+///
+/// A whole-input function rather than an `io::Write` adaptor: the writer
+/// this replaced only encoded from `flush()`, and every caller dropped it
+/// after `write_all`, so every image block shipped with an empty payload.
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for c in &mut chunks {
+        let (b0, b1, b2) = (c[0] as usize, c[1] as usize, c[2] as usize);
+        out.push(CHARS[b0 >> 2] as char);
+        out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
+        out.push(CHARS[b2 & 0x3f] as char);
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i + 2 < self.buffer.len() {
-            let b0 = self.buffer[i] as usize;
-            let b1 = self.buffer[i + 1] as usize;
-            let b2 = self.buffer[i + 2] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-            self.output
-                .push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
-            self.output.push(CHARS[b2 & 0x3f] as char);
-            i += 3;
+    match *chunks.remainder() {
+        [b0] => {
+            let b0 = b0 as usize;
+            out.push(CHARS[b0 >> 2] as char);
+            out.push(CHARS[(b0 & 3) << 4] as char);
+            out.push('=');
+            out.push('=');
         }
-        let remaining = self.buffer.len() - i;
-        if remaining == 1 {
-            let b0 = self.buffer[i] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[(b0 & 3) << 4] as char);
-            self.output.push('=');
-            self.output.push('=');
-        } else if remaining == 2 {
-            let b0 = self.buffer[i] as usize;
-            let b1 = self.buffer[i + 1] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-            self.output.push(CHARS[(b1 & 0xf) << 2] as char);
-            self.output.push('=');
+        [b0, b1] => {
+            let (b0, b1) = (b0 as usize, b1 as usize);
+            out.push(CHARS[b0 >> 2] as char);
+            out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+            out.push(CHARS[(b1 & 0xf) << 2] as char);
+            out.push('=');
         }
-        Ok(())
+        _ => {}
     }
+    out
 }
 
 /// Helper to create a user message with an image.
@@ -505,6 +559,138 @@ pub fn messages_to_api_params_cached(messages: &[Message]) -> Vec<serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachments_precede_the_text_in_a_user_message() {
+        let img = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "abc".into(),
+        };
+        let msg = user_message_with_attachments("what is this?", vec![img]);
+        let Message::User(u) = msg else {
+            panic!("expected a user message");
+        };
+        assert_eq!(u.content.len(), 2);
+        // Images first: the prompt reads as being about what was just
+        // shown, not as an afterthought.
+        assert!(matches!(u.content[0], ContentBlock::Image { .. }));
+        assert!(matches!(&u.content[1], ContentBlock::Text { text } if text == "what is this?"));
+        assert!(!u.is_meta, "an attachment turn is still real user input");
+    }
+
+    /// Mention detection accepts `shot.PNG` by lowercasing the extension;
+    /// inferring the media type case-sensitively handed the provider an
+    /// `application/octet-stream` block it rejects.
+    #[test]
+    fn the_media_type_is_inferred_case_insensitively() {
+        use std::path::Path;
+        for (name, expected) in [
+            ("shot.PNG", "image/png"),
+            ("shot.png", "image/png"),
+            ("photo.Jpeg", "image/jpeg"),
+            ("photo.JPG", "image/jpeg"),
+            ("anim.GIF", "image/gif"),
+            ("pic.WebP", "image/webp"),
+            ("art.SVG", "image/svg+xml"),
+        ] {
+            assert_eq!(
+                image_media_type(Path::new(name)),
+                Some(expected),
+                "wrong media type for {name}"
+            );
+        }
+        assert_eq!(image_media_type(Path::new("blob.bin")), None);
+        assert_eq!(image_media_type(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn an_uppercase_image_file_still_gets_a_real_media_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("SHOT.PNG");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        let block = image_block_from_file(&path).expect("encoded");
+        let ContentBlock::Image { media_type, data } = block else {
+            panic!("expected an image block");
+        };
+        assert_eq!(media_type, "image/png");
+        // The encoder this replaced only produced output from `flush()`,
+        // which no caller invoked: every image shipped with empty data.
+        assert_eq!(data, "iVBORw==", "image payload was not encoded");
+    }
+
+    /// A `UserPromptSubmit` hook is documented to see the whole prompt so
+    /// it can scan or audit it; an attached image that appeared nowhere in
+    /// the payload went out unexamined.
+    #[test]
+    fn attachments_are_described_for_hooks() {
+        let blocks = vec![
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "iVBORw==".into(),
+            },
+            ContentBlock::Document {
+                media_type: "application/pdf".into(),
+                data: "JVBER".into(),
+                title: None,
+            },
+            ContentBlock::Text {
+                text: "hello".into(),
+            },
+        ];
+        let described = describe_attachments(&blocks);
+        assert_eq!(described[0]["type"], "image");
+        assert_eq!(described[0]["media_type"], "image/png");
+        assert_eq!(described[0]["encoded_bytes"], 8);
+        assert_eq!(described[1]["type"], "document");
+        assert_eq!(described[1]["media_type"], "application/pdf");
+        assert_eq!(described[2]["type"], "text");
+        // Metadata only: the bytes themselves would bloat every hook call.
+        assert!(described[0].get("data").is_none());
+    }
+
+    #[test]
+    fn describing_no_attachments_is_empty() {
+        assert!(describe_attachments(&[]).is_empty());
+    }
+
+    /// RFC 4648 §10 test vectors — the padded remainders are exactly where
+    /// the previous encoder silently produced nothing.
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encodes_every_byte_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let encoded = base64_encode(&all);
+        assert_eq!(encoded.len(), 344, "256 bytes encode to 344 base64 chars");
+        assert!(encoded.starts_with("AAECAwQF"));
+        assert!(encoded.ends_with("+/w=="));
+    }
+
+    #[test]
+    fn an_attachment_with_no_text_carries_only_the_attachment() {
+        let img = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "abc".into(),
+        };
+        let msg = user_message_with_attachments("", vec![img]);
+        let Message::User(u) = msg else {
+            panic!("expected a user message");
+        };
+        assert_eq!(u.content.len(), 1, "an empty text block was appended");
+    }
+
     use super::*;
 
     #[test]

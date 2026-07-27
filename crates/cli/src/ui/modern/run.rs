@@ -373,6 +373,29 @@ pub(super) async fn event_loop(
     // which is what suppresses queue auto-dispatch in the meantime.
     let mut resume_loading = false;
     let mut pending_restore: Option<Box<LoadedSession>> = None;
+    // Image attachments are read and encoded the same way: detached, with
+    // the result landing in a select arm. Awaiting the work inline would
+    // park this loop — the only one there is — so a workspace on a slow
+    // mount would stop redraws and Ctrl+C until the read finished.
+    #[allow(clippy::type_complexity)]
+    let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        u64,
+        u64,
+        String,
+        Vec<agent_code_lib::llm::message::ContentBlock>,
+        Vec<String>,
+    )>();
+    // Identifies the encode in flight, if any: the turn it belongs to must
+    // not start without it, and a second one must not be queued behind it.
+    // A cancel forgets the id rather than waiting — the read cannot be
+    // stopped, so its result is recognised as stale when it lands and the
+    // staged turn is released immediately.
+    let mut encode_seq = 0u64;
+    let mut active_encode: Option<u64> = None;
+    // The conversation the loop last saw, so a `/clear`, `/resume` or
+    // `/rewind` can be noticed the moment it happens rather than when a
+    // read that may never finish comes back.
+    let mut seen_epoch = app.conversation_epoch;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -652,31 +675,7 @@ pub(super) async fn event_loop(
                             })
                         }
                     });
-                    match result {
-                        crate::commands::CommandResult::Exit => {
-                            app.should_quit = true;
-                        }
-                        crate::commands::CommandResult::Prompt(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Passthrough(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Handled => {
-                            let text = captured.trim();
-                            if !text.is_empty() {
-                                for line in text.lines() {
-                                    // Strip ANSI for the transcript view.
-                                    let plain = strip_ansi_simple(line);
-                                    if !plain.is_empty() {
-                                        app.transcript
-                                            .push(super::app::TranscriptItem::System(plain));
-                                    }
-                                }
-                            }
-                            app.status_message = format!("ran {slash}");
-                        }
-                    }
+                    apply_command_result(app, result, &captured, &slash);
                     // Keep TUI header/path and `!` shell in sync with engine
                     // after `/cd` (and any other cwd-changing command).
                     app.cwd = eng.state().cwd.clone();
@@ -791,6 +790,55 @@ pub(super) async fn event_loop(
             }
         }
 
+        // A replaced conversation invalidates a read in flight at once:
+        // waiting for it would hold every prompt in the new conversation
+        // behind an encode that belongs to a conversation nobody is
+        // looking at any more.
+        if app.conversation_epoch != seen_epoch {
+            seen_epoch = app.conversation_epoch;
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
+            }
+        }
+
+        // A prompt that was held aside for a turn that has since gone can
+        // send now, with the blocks it was already encoded with. Not while
+        // a resume is outstanding: it would be staged against the
+        // conversation the restore is about to replace.
+        if turn.is_none() && active_encode.is_none() && app.pending_resume.is_none() {
+            app.rearm_deferred_prompt();
+        }
+
+        // Hand a prompt's images to the blocking pool. The descriptors were
+        // opened when their mentions were validated, so nothing is resolved
+        // here; the result comes back through `img_rx` and re-arms the
+        // prompt, which keeps this loop free to redraw and to take a Ctrl+C
+        // while a slow mount is being read.
+        //
+        // Gated on `pending_resume` for the same reason the turn start
+        // below is: taking the prompt here would encode it for the
+        // conversation being thrown away.
+        if turn.is_none()
+            && active_encode.is_none()
+            && app.pending_resume.is_none()
+            && !app.pending_images.is_empty()
+            && let Some(prompt) = app.pending_submit.take()
+        {
+            let images = std::mem::take(&mut app.pending_images);
+            let tx = img_tx.clone();
+            encode_seq += 1;
+            let id = encode_seq;
+            active_encode = Some(id);
+            // Stamped with the conversation it was submitted in: the engine
+            // lock is free while this runs, so `/clear`, `/resume` or
+            // `/rewind` can replace the conversation underneath it.
+            let epoch = app.conversation_epoch;
+            tokio::task::spawn_blocking(move || {
+                let (blocks, notes) = super::mentions::encode_staged_images(images);
+                let _ = tx.send((id, epoch, prompt, blocks, notes));
+            });
+        }
+
         // Start a pending turn if idle.
         //
         // Not while a resume is outstanding. The composer stays live
@@ -800,10 +848,19 @@ pub(super) async fn event_loop(
         // would then wipe the transcript that recorded it. The prompt is
         // handed back to the composer when the restore lands.
         if turn.is_none()
+            && active_encode.is_none()
             && app.pending_resume.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
             app.pending_submit_display = None;
+            let blocks = std::mem::take(&mut app.pending_attachments);
+            // Set unconditionally, awaiting the lock rather than skipping on
+            // contention: an empty set clears anything a previous attempt
+            // staged, so no turn can inherit another turn's attachment.
+            {
+                let engine = session.engine();
+                engine.lock().await.set_pending_attachments(blocks.clone());
+            }
             let sink = ChannelSink::new(eng_tx.clone(), app.conversation_epoch);
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {
@@ -812,8 +869,10 @@ pub(super) async fn event_loop(
                 }
                 Err(e) => {
                     // Should be rare: TUI serializes turns. Put the prompt
-                    // back so the next idle loop can retry.
+                    // and its attachments back so the next idle loop retries
+                    // them together.
                     app.pending_submit = Some(prompt);
+                    app.pending_attachments = blocks;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
                 }
@@ -824,6 +883,17 @@ pub(super) async fn event_loop(
         if app.cancel_requested {
             if let Some(ref h) = turn {
                 h.cancel();
+            }
+            // Nothing may follow on its own after a cancel — including a
+            // prompt held aside behind the turn being cancelled. Interject
+            // is the exception and says so by having staged its own prompt.
+            app.cancel_pending_followups();
+            // A read already handed to the blocking pool cannot be stopped.
+            // Forget its id instead: the result is stale when it lands, and
+            // the staged turn is released now rather than after a read that
+            // may never finish.
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
             }
             app.cancel_requested = false;
         }
@@ -897,6 +967,12 @@ pub(super) async fn event_loop(
                     }
                 }
                 app.mark_turn_idle();
+
+                // A prompt held aside with its images was submitted before
+                // anything in the queue, so it goes first — and it goes now
+                // rather than waiting for whatever event next wakes the
+                // loop, since nothing else would arm it.
+                app.rearm_deferred_prompt();
 
                 // Queue handling (plan §M5): auto-send the head on a clean
                 // finish; on abort/error keep the queue and tell the user.
@@ -1131,6 +1207,29 @@ pub(super) async fn event_loop(
                     }
                 }
             }
+            // Encoded image attachments coming back from the blocking pool.
+            // The prompt is re-armed with them so the turn starts on the
+            // next pass through the loop above.
+            Some((id, epoch, prompt, blocks, notes)) = img_rx.recv() => {
+                if active_encode != Some(id) {
+                    // Cancelled while this read was in flight: the state it
+                    // belonged to was released then, so the bytes are simply
+                    // dropped rather than sent with a turn nobody asked for.
+                } else if epoch != app.conversation_epoch {
+                    // The conversation it was submitted in has been cleared,
+                    // resumed or rewound. Starting it now would attach the
+                    // file to a thread the user never attached it to.
+                    active_encode = None;
+                    app.abandon_staged_attachments();
+                } else {
+                    active_encode = None;
+                    for note in notes {
+                        app.transcript.push(super::app::TranscriptItem::System(note));
+                    }
+                    app.accept_encoded_attachments(prompt, blocks);
+                }
+                app.dirty = true;
+            }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             // Gated on work that can still change: polling while any
             // rows exist at all would tick forever once a subagent row
@@ -1216,6 +1315,51 @@ async fn manager_rows(
             .then_with(|| a.id.cmp(&b.id))
     });
     rows
+}
+
+/// Apply a slash command's outcome to the app.
+///
+/// The captured stdout is emitted for *every* outcome, not just
+/// `Handled`. A command that returns a prompt still prints for the user
+/// — `/review` announces which target it resolved — and that line is
+/// the only feedback they get in the modern TUI. It goes in before the
+/// turn is enqueued so the note precedes the turn it explains.
+fn apply_command_result(
+    app: &mut App,
+    result: crate::commands::CommandResult,
+    captured: &str,
+    slash: &str,
+) {
+    push_captured_output(app, captured);
+    match result {
+        crate::commands::CommandResult::Exit => {
+            app.should_quit = true;
+        }
+        crate::commands::CommandResult::Prompt(p)
+        | crate::commands::CommandResult::Passthrough(p) => {
+            app.enqueue_turn_from_command(p);
+        }
+        crate::commands::CommandResult::Handled => {
+            app.status_message = format!("ran {slash}");
+        }
+    }
+}
+
+/// Push stdout captured from a slash command into the transcript, one
+/// `System` line per non-empty line.
+fn push_captured_output(app: &mut App, captured: &str) {
+    let text = captured.trim();
+    if text.is_empty() {
+        return;
+    }
+    for line in text.lines() {
+        // Strip ANSI for the transcript view.
+        let plain = strip_ansi_simple(line);
+        if !plain.is_empty() {
+            app.transcript
+                .push(super::app::TranscriptItem::System(plain));
+        }
+    }
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
@@ -1499,6 +1643,16 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('A')) | (_, KeyCode::Char('4')) => {
                     app.resolve_permission(PermissionResponse::AllowAlways);
                 }
+                // `P` grants the offered prefix. Only bound when one is
+                // offered, so it cannot fire for a command the gate could
+                // not reason about.
+                (_, KeyCode::Char('P')) | (_, KeyCode::Char('5'))
+                    if app.suggested_prefix().is_some() =>
+                {
+                    if let Some(prefix) = app.suggested_prefix() {
+                        app.resolve_permission(PermissionResponse::AllowAlwaysPrefix { prefix });
+                    }
+                }
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);
                 }
@@ -1615,7 +1769,13 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
             // A platform-modified character (Cmd+X) is a chord, not the
             // vi command `x`; the wrapper drops any pending operator for
             // it, and it falls through to the chord dispatch below.
-            KeyCode::Char(c) if bare_char(&key) == Some(c) => {
+            // Space on an empty composer is the pane's fold key, like
+            // Backspace and Enter below. As a vi motion it moves right,
+            // which does nothing on an empty line, so falling through
+            // costs normal mode nothing.
+            KeyCode::Char(c)
+                if bare_char(&key) == Some(c) && !(c == ' ' && app.space_folds_group()) =>
+            {
                 app.vi_normal_key(c);
                 return;
             }
@@ -1720,6 +1880,15 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
                 && app.input.is_empty() =>
         {
             app.tasks_select(1);
+        }
+        // Space folds/unfolds the selected group. Safe to claim here
+        // because this branch only runs with an empty composer, so it is
+        // not a space the user is trying to type. Gated on there being a
+        // group to fold: a pane showing only the model's checklist has
+        // none, and swallowing the key there would lose a keystroke the
+        // composer should have had.
+        (m, KeyCode::Char(' ')) if m.is_empty() && app.space_folds_group() => {
+            app.toggle_selected_group();
         }
         // Retained prompts win the empty Enter: after an aborted turn the
         // UI promises "press Enter to send", so drill-in only claims the
@@ -2271,6 +2440,12 @@ fn apply_mode_to_engine(
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
     use super::*;
     use crate::ui::modern::app::Phase;
 
@@ -2299,6 +2474,89 @@ mod tests {
             app.status_message.contains("not produced output yet"),
             "pane did not act on Enter: {}",
             app.status_message
+        );
+    }
+
+    /// Vi normal mode owns bare characters, so it swallowed the fold
+    /// key: `vi_normal_key(' ')` is a no-op and returned before the
+    /// pane arm, leaving vi users a documented key that did nothing
+    /// while their arrows and Enter still drove the pane.
+    #[test]
+    fn vi_normal_mode_still_folds_with_space() {
+        use crate::ui::modern::app::ComposerMode;
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.vi_mode = true;
+        app.composer_mode = ComposerMode::Normal;
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        assert!(app.in_normal_mode());
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.collapsed_groups.contains(&TaskSource::Subagent),
+            "vi normal mode swallowed the fold key"
+        );
+        assert!(app.input.is_empty(), "the space leaked into the composer");
+
+        // And it still unfolds.
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(app.collapsed_groups.is_empty());
+    }
+
+    /// With text in the composer, Space is a vi motion again — the
+    /// fold binding only ever claimed the empty-composer case.
+    #[test]
+    fn vi_normal_mode_keeps_space_as_a_motion_with_text() {
+        use crate::ui::modern::app::ComposerMode;
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.vi_mode = true;
+        app.input = "hello".into();
+        app.composer_mode = ComposerMode::Normal;
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.collapsed_groups.is_empty(),
+            "a vi motion folded the pane"
+        );
+        assert_eq!(app.input, "hello", "normal mode inserted text");
+    }
+
+    /// Space is the fold key, but a checklist-only pane has no group to
+    /// fold. The guard has to stand aside there like the arrows do, or
+    /// the keystroke is silently dropped instead of reaching the
+    /// composer.
+    #[test]
+    fn a_checklist_only_pane_passes_space_to_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        assert!(app.tasks_visible(), "the checklist should show the pane");
+        assert!(app.tasks.is_empty());
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.input, " ",
+            "the checklist-only pane swallowed the space"
+        );
+
+        // With a real task present Space is the pane's again.
+        app.input.clear();
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.input.is_empty(),
+            "a selectable pane should still claim Space"
+        );
+        assert!(
+            app.collapsed_groups
+                .contains(&crate::ui::modern::tasks::TaskSource::Subagent),
+            "Space did not fold the group"
         );
     }
 
@@ -3105,6 +3363,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3146,6 +3405,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3170,6 +3430,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3263,6 +3524,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3295,6 +3557,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3694,6 +3957,7 @@ mod tests {
                     description: "d".into(),
                     origin: None,
                     input_preview: None,
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -3705,5 +3969,62 @@ mod tests {
             "Esc on permission denies without cancelling the turn"
         );
         assert!(app.front_permission().is_none());
+    }
+
+    /// A slash command that returns a prompt still prints for the user:
+    /// `/review` announces which target it resolved. That line has to
+    /// reach the transcript and land *before* the turn it explains —
+    /// the Prompt arm used to discard captured stdout, leaving the
+    /// modern TUI with no indication of what was under review.
+    #[test]
+    fn a_prompt_returning_command_still_surfaces_what_it_printed() {
+        use crate::ui::modern::app::TranscriptItem;
+
+        let mut app = App::new("m", "/tmp", "s");
+        let resolved = agent_code_lib::review::resolve(
+            agent_code_lib::review::ReviewTarget::BaseBranch {
+                base: "main".into(),
+            },
+            std::path::Path::new("/tmp"),
+        )
+        .expect("a plain branch name is a valid target");
+        // What the `/review` arm prints, colour codes and all.
+        let captured = format!("\u{1b}[2mReviewing {}…\u{1b}[0m\n", resolved.hint);
+
+        apply_command_result(
+            &mut app,
+            crate::commands::CommandResult::Prompt(resolved.prompt),
+            &captured,
+            "/review base main",
+        );
+
+        let note = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::System(t) if t.contains("changes vs main")));
+        let turn = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::User(_)));
+        let note = note.unwrap_or_else(|| {
+            panic!(
+                "review target hint never reached the transcript: {:?}",
+                app.transcript
+            )
+        });
+        let turn = turn.expect("the prompt was not enqueued as a turn");
+        assert!(
+            note < turn,
+            "the hint must precede the turn it explains: {:?}",
+            app.transcript
+        );
+        // ANSI is stripped for the transcript view, as on the Handled path.
+        let TranscriptItem::System(text) = &app.transcript[note] else {
+            unreachable!()
+        };
+        assert!(
+            !text.contains('\u{1b}'),
+            "escape sequences reached the transcript: {text:?}"
+        );
     }
 }

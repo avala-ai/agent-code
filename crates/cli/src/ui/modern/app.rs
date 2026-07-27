@@ -433,6 +433,8 @@ pub struct App {
     pub queue_selected: usize,
     /// Selected row in the tasks pane, for drill-in.
     pub tasks_selected: usize,
+    /// Groups folded to their heading in the tasks pane.
+    pub collapsed_groups: Vec<super::tasks::TaskSource>,
     /// The model's current checklist, from the latest `TodoWrite`.
     pub todos: Vec<super::tasks::TodoItem>,
     /// Which conversation `todos` describes. Bumped whenever the
@@ -460,6 +462,28 @@ pub struct App {
     /// Notes reported before a resume replaces the transcript, re-emitted
     /// afterwards so the swap does not erase them.
     pub resume_notices: Vec<String>,
+    /// Images mentioned in the prompt, attached to the next turn. Held as
+    /// open descriptors from the moment their mention was validated, so
+    /// starting the turn needs no second look at any path.
+    pub pending_images: Vec<super::mentions::StagedImage>,
+    /// The same images once read and encoded off the UI thread, waiting for
+    /// the turn they belong to to start.
+    pub pending_attachments: Vec<agent_code_lib::llm::message::ContentBlock>,
+    /// Prompts whose images were already read when another prompt took
+    /// the turn, each held with its own images so it can be sent as it
+    /// was. Never queued as text: the queue re-expands what it holds,
+    /// which would resolve the mention a second time and read the file
+    /// again. A deque because a second one can be held before the first
+    /// has gone, and the order they were submitted in is the order they
+    /// must be sent in.
+    /// Set when a cancel was asked for *in order to send something else*
+    /// (interject, queue send-now). A staged prompt alone cannot tell the
+    /// difference: a slash command can stage one at any moment, including
+    /// while the user is pressing Ctrl+C to stop everything.
+    pub cancel_is_interject: bool,
+    #[allow(clippy::type_complexity)]
+    pub deferred_prompts:
+        std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
     /// Whether `ui.edit_mode` asked for vi bindings.
     pub vi_mode: bool,
     /// Composer mode when `vi_mode` is on.
@@ -638,6 +662,7 @@ impl App {
             show_queue_pane: false,
             queue_selected: 0,
             tasks_selected: 0,
+            collapsed_groups: Vec::new(),
             todos: Vec::new(),
             conversation_epoch: 0,
             pending_task_output: None,
@@ -648,6 +673,10 @@ impl App {
             pending_session_list: false,
             deferred_sessions: None,
             resume_notices: Vec::new(),
+            pending_images: Vec::new(),
+            pending_attachments: Vec::new(),
+            cancel_is_interject: false,
+            deferred_prompts: std::collections::VecDeque::new(),
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
             vi_pending_d: false,
@@ -968,6 +997,7 @@ impl App {
                 description,
                 origin,
                 input_preview,
+                suggested_prefix,
                 respond,
             } => {
                 // FIFO: concurrent asks (e.g. lead + background subagent)
@@ -977,6 +1007,7 @@ impl App {
                     description,
                     origin,
                     input_preview,
+                    suggested_prefix,
                     respond,
                 }));
                 // HITL always wins: drop the Ctrl+P palette and the
@@ -1788,6 +1819,15 @@ impl App {
     /// Resolve user text into a turn: expand `/skill` invocations the same
     /// way slash dispatch does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
+        // Attachments belong to exactly one prompt. A staged prompt can be
+        // replaced before it starts (two interjections while a turn is
+        // cancelling), and only the mention branch assigns `pending_images`
+        // — so clear here, or the replacement turn would carry the previous
+        // prompt's image and disclose a file the user did not mean to send.
+        // Both stages are cleared: one holds descriptors, the other the
+        // bytes already read from them.
+        self.pending_images.clear();
+        self.pending_attachments.clear();
         let mut mention_notes: Vec<String> = Vec::new();
         let (display, prompt) =
             match try_expand_skill_slash_full(&text, &self.cwd, self.disable_skill_shell) {
@@ -1836,6 +1876,7 @@ impl App {
                     ) {
                         Some(expansion) => {
                             mention_notes = expansion.notes;
+                            self.pending_images = expansion.images;
                             expansion.prompt
                         }
                         None => text.clone(),
@@ -2110,6 +2151,7 @@ impl App {
             ));
             // enqueue_turn clears input (already empty) and sets pending_submit.
             self.enqueue_turn(text);
+            self.cancel_is_interject = true;
             self.request_cancel();
         } else {
             self.enqueue_turn(text);
@@ -2352,6 +2394,7 @@ impl App {
                     .position(|t| t.task_id.as_deref() == Some(tid.as_str()))
             {
                 self.tasks_selected = idx;
+                self.snap_selection_to_selectable();
                 return;
             }
             if let Some(idx) = self
@@ -2360,20 +2403,75 @@ impl App {
                 .position(|t| t.agent_id == id && t.source == src)
             {
                 self.tasks_selected = idx;
+                self.snap_selection_to_selectable();
                 return;
             }
         }
         self.tasks_selected = self.tasks_selected.min(self.tasks.len().saturating_sub(1));
+        self.snap_selection_to_selectable();
     }
 
     /// Move the tasks-pane selection, clamped to the row count.
     pub fn tasks_select(&mut self, delta: i32) {
-        if self.tasks.is_empty() {
+        // A collapsed group's members are not on screen, so the
+        // selection steps over them and lands on the heading row that
+        // stands in for the group.
+        let selectable = super::tasks::selectable_indices(&self.tasks, &self.collapsed_groups);
+        if selectable.is_empty() {
             return;
         }
-        let n = self.tasks.len() as i32;
-        self.tasks_selected = (self.tasks_selected as i32 + delta).rem_euclid(n) as usize;
+        let here = selectable
+            .iter()
+            .position(|i| *i == self.tasks_selected)
+            .unwrap_or(0);
+        let n = selectable.len() as i32;
+        let next = (here as i32 + delta).rem_euclid(n) as usize;
+        self.tasks_selected = selectable[next];
         self.dirty = true;
+    }
+
+    /// Fold or unfold the group the selection is in.
+    ///
+    /// Folding keeps the selection on the group, moved to the row its
+    /// heading stands in for. Moving it into a *different* group would
+    /// strand the folded one: Up/Down only walks selectable rows, so
+    /// the heading could never be reached to unfold it again.
+    pub fn toggle_selected_group(&mut self) {
+        let Some(source) = self.tasks.get(self.tasks_selected).map(|t| t.source) else {
+            return;
+        };
+        if let Some(pos) = self.collapsed_groups.iter().position(|s| *s == source) {
+            self.collapsed_groups.remove(pos);
+        } else {
+            self.collapsed_groups.push(source);
+            if let Some(first) = self.tasks.iter().position(|t| t.source == source) {
+                self.tasks_selected = first;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Pull the selection onto a selectable row.
+    ///
+    /// A re-sort can leave `tasks_selected` on a folded group's second
+    /// or later row, which no longer has a row of its own on screen;
+    /// snap it to the heading that represents it.
+    fn snap_selection_to_selectable(&mut self) {
+        if self.tasks.is_empty() {
+            self.tasks_selected = 0;
+            return;
+        }
+        let selectable = super::tasks::selectable_indices(&self.tasks, &self.collapsed_groups);
+        if selectable.contains(&self.tasks_selected) {
+            return;
+        }
+        if let Some(source) = self.tasks.get(self.tasks_selected).map(|t| t.source)
+            && let Some(first) = self.tasks.iter().position(|t| t.source == source)
+        {
+            self.tasks_selected = first;
+            return;
+        }
+        self.tasks_selected = selectable.first().copied().unwrap_or(0);
     }
 
     /// One (label, body) card per captured inline result.
@@ -2404,6 +2502,14 @@ impl App {
     /// manager (`run_in_background`). An inline subagent row has no
     /// output file — say so rather than opening an empty pane.
     pub fn drill_into_selected_task(&mut self) {
+        // On a folded heading the selection stands for the whole group,
+        // not for the one row underneath it — opening that row's output
+        // would act on something the user cannot see. Unfold instead.
+        if super::tasks::is_folded_heading(&self.tasks, &self.collapsed_groups, self.tasks_selected)
+        {
+            self.toggle_selected_group();
+            return;
+        }
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
@@ -2493,7 +2599,23 @@ impl App {
     pub fn new_conversation(&mut self) {
         self.conversation_epoch = self.conversation_epoch.wrapping_add(1);
         self.todos.clear();
+        // Anything staged belonged to the conversation being replaced.
+        // Sending it into the new one would attach a file to a thread the
+        // user never attached it to.
+        self.deferred_prompts.clear();
+        self.pending_images.clear();
+        self.pending_attachments.clear();
         self.dirty = true;
+    }
+
+    /// Whether an unmodified Space belongs to the pane's fold binding
+    /// rather than to the composer.
+    ///
+    /// Two dispatch sites need this answer — the fold arm claims the
+    /// key, and vi normal mode's bare-character arm has to fall through
+    /// for it — so they share one predicate instead of drifting apart.
+    pub fn space_folds_group(&self) -> bool {
+        self.tasks_nav_active() && !self.show_queue_pane && self.input.is_empty()
     }
 
     /// Whether the pane's arrow/Enter bindings may claim the key. Visible
@@ -2726,6 +2848,7 @@ impl App {
                 "queue send-now — cancelling turn…".into(),
             ));
             self.enqueue_turn(text);
+            self.cancel_is_interject = true;
             self.request_cancel();
         } else {
             self.enqueue_turn(text);
@@ -2778,6 +2901,100 @@ impl App {
         self.dirty = true;
     }
 
+    /// Take a prompt's images once they have been read and encoded.
+    ///
+    /// Another prompt can arrive while the read is running — a slash
+    /// command that produces a prompt is staged directly rather than
+    /// queued — and that one has its own attachments staged with it.
+    /// Overwriting it would lose it silently; keeping it and attaching
+    /// *these* blocks would be worse still, putting one prompt's image on
+    /// another's turn. So the newer prompt keeps its turn and this one is
+    /// held aside *with its blocks* until the turn frees up — not queued
+    /// as text, which would re-expand the mention and read the file a
+    /// second time, sending bytes the staged turn never had.
+    pub fn accept_encoded_attachments(
+        &mut self,
+        prompt: String,
+        blocks: Vec<agent_code_lib::llm::message::ContentBlock>,
+    ) {
+        if self.pending_submit.is_some() {
+            self.transcript.push(TranscriptItem::System(
+                "another prompt was sent first — sending this one with its images next".into(),
+            ));
+            self.deferred_prompts.push_back((prompt, blocks));
+            self.dirty = true;
+            return;
+        }
+        self.pending_attachments = blocks;
+        self.pending_submit = Some(prompt);
+        self.dirty = true;
+    }
+
+    /// Drop anything that would send itself after a cancel.
+    ///
+    /// Interject and queue send-now cancel the live turn *in order to*
+    /// send something else, and say so; a held prompt then keeps its place
+    /// behind that. Every other cancel is a stop, and nothing may follow
+    /// it on its own — a prompt merely sitting in `pending_submit` proves
+    /// nothing, since a slash command can stage one at any moment,
+    /// including while the user is pressing Ctrl+C.
+    pub fn cancel_pending_followups(&mut self) {
+        if !std::mem::take(&mut self.cancel_is_interject) {
+            self.deferred_prompts.clear();
+        }
+    }
+
+    /// Send a deferred prompt once the turn it was waiting behind is gone.
+    ///
+    /// Restored with the blocks it was encoded with, so the file is never
+    /// read again. Held back while another prompt's descriptors are still
+    /// staged, so the two cannot be mixed.
+    pub fn rearm_deferred_prompt(&mut self) {
+        if self.pending_submit.is_some() || !self.pending_images.is_empty() {
+            return;
+        }
+        if let Some((prompt, blocks)) = self.deferred_prompts.pop_front() {
+            self.pending_attachments = blocks;
+            self.pending_submit = Some(prompt);
+            self.phase = Phase::Streaming;
+            self.dirty = true;
+        }
+    }
+
+    /// Give up on a prompt whose attachments were still being read when the
+    /// user cancelled.
+    ///
+    /// No turn was ever spawned for it, so nothing else will leave the
+    /// streaming phase, and every later prompt would queue behind a turn
+    /// that does not exist. Deliberately not `mark_turn_idle`: that
+    /// announces a *finished* turn, and this one never started.
+    ///
+    /// Only the cancelled prompt is abandoned. Its own descriptors went
+    /// into the read that is being discarded, so anything staged here now
+    /// belongs to a prompt the user submitted *after* the cancel — an
+    /// interjection with its own images — and clearing that would send it
+    /// as a text-only turn.
+    pub fn abandon_staged_attachments(&mut self) {
+        // Held prompts are not touched here: whether they survive is the
+        // cancel policy's call (`cancel_pending_followups`), and an
+        // interject reaching this path still means only that *this* read
+        // is being dropped.
+        self.turn_live = false;
+        self.turn_started_at = None;
+        self.phase = if self.pending_submit.is_some() {
+            // A replacement prompt is already waiting; it still has a turn
+            // coming, so the streaming phase is still true.
+            Phase::Streaming
+        } else if self.modals.is_empty() {
+            Phase::Idle
+        } else {
+            Phase::Permission
+        };
+        self.cancel_requested = false;
+        self.status_message = "cancelled".into();
+        self.dirty = true;
+    }
+
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         if let Some((_, ref mut left)) = self.toast {
@@ -2792,6 +3009,12 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
     use super::*;
     use agent_code_lib::tools::PermissionResponse;
 
@@ -3850,6 +4073,163 @@ mod tests {
         }
     }
 
+    /// Two groups, so folding one leaves somewhere else for the
+    /// selection to run off to.
+    fn app_with_two_groups() -> App {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a2", "working", "audit");
+        crate::ui::modern::tasks::upsert_with_source(
+            &mut app.tasks,
+            "b1",
+            "working",
+            "build",
+            TaskSource::Background,
+        );
+        app
+    }
+
+    fn first_of(app: &App, source: crate::ui::modern::tasks::TaskSource) -> usize {
+        app.tasks.iter().position(|t| t.source == source).unwrap()
+    }
+
+    /// Folding used to push the selection into the *other* group, and
+    /// Up/Down only walked unfolded rows — so the group the user had
+    /// just folded could never be selected again and Space could not
+    /// unfold it.
+    #[test]
+    fn a_folded_group_can_still_be_selected_and_unfolded() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = app_with_two_groups();
+        app.tasks_selected = first_of(&app, TaskSource::Subagent);
+        app.toggle_selected_group();
+
+        assert!(app.collapsed_groups.contains(&TaskSource::Subagent));
+        assert_eq!(
+            app.tasks[app.tasks_selected].source,
+            TaskSource::Subagent,
+            "selection left the group it folded"
+        );
+        assert!(
+            crate::ui::modern::tasks::is_folded_heading(
+                &app.tasks,
+                &app.collapsed_groups,
+                app.tasks_selected,
+            ),
+            "selection is not on the folded heading"
+        );
+        // Space unfolds it again without any intervening navigation.
+        app.toggle_selected_group();
+        assert!(
+            app.collapsed_groups.is_empty(),
+            "could not unfold the group that was just folded"
+        );
+    }
+
+    /// Moving away from a folded heading and back must return to it,
+    /// not skip the group entirely.
+    #[test]
+    fn navigation_returns_to_a_folded_heading() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = app_with_two_groups();
+        app.tasks_selected = first_of(&app, TaskSource::Subagent);
+        app.toggle_selected_group();
+        let heading = app.tasks_selected;
+
+        // Two selectable rows now: the folded heading and the one
+        // background row. Down then Down wraps back to the heading.
+        app.tasks_select(1);
+        assert_eq!(app.tasks[app.tasks_selected].source, TaskSource::Background);
+        app.tasks_select(1);
+        assert_eq!(
+            app.tasks_selected, heading,
+            "navigation skipped the folded heading"
+        );
+        app.tasks_select(-1);
+        assert_eq!(app.tasks[app.tasks_selected].source, TaskSource::Background);
+    }
+
+    /// The folded rows themselves stay unreachable.
+    #[test]
+    fn selection_steps_over_a_folded_groups_members() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = app_with_two_groups();
+        app.collapsed_groups.push(TaskSource::Subagent);
+        let hidden = first_of(&app, TaskSource::Subagent) + 1;
+        assert_eq!(app.tasks[hidden].source, TaskSource::Subagent);
+
+        app.tasks_selected = first_of(&app, TaskSource::Background);
+        for _ in 0..6 {
+            app.tasks_select(1);
+            assert_ne!(
+                app.tasks_selected, hidden,
+                "selection landed on a row that is folded away"
+            );
+        }
+    }
+
+    /// Enter on a folded heading must not open the output of the one
+    /// row hiding underneath it — the selection stands for the group.
+    #[test]
+    fn drill_in_on_a_folded_heading_unfolds_instead() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = app_with_two_groups();
+        app.tasks[0].task_id = Some("t-1".to_string());
+        app.tasks_selected = first_of(&app, TaskSource::Subagent);
+        app.toggle_selected_group();
+
+        app.drill_into_selected_task();
+        assert!(
+            app.pending_task_output.is_none(),
+            "drilled into a row the user cannot see"
+        );
+        assert!(
+            app.collapsed_groups.is_empty(),
+            "Enter on a folded heading should unfold the group"
+        );
+    }
+
+    /// A re-sort can move the selected task off its group's first row
+    /// while the group is folded; the selection has to snap back to the
+    /// heading rather than sit on a row with nothing on screen.
+    #[test]
+    fn a_resort_keeps_a_folded_selection_on_the_heading() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = app_with_two_groups();
+        app.tasks_selected = first_of(&app, TaskSource::Subagent);
+        app.toggle_selected_group();
+        let selected_id = app.tasks[app.tasks_selected].agent_id.clone();
+
+        // The selected agent finishes, so it sorts below its sibling.
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: selected_id,
+            state: "done".to_string(),
+            headline: "explore".to_string(),
+        });
+
+        assert!(
+            crate::ui::modern::tasks::is_folded_heading(
+                &app.tasks,
+                &app.collapsed_groups,
+                app.tasks_selected,
+            ),
+            "selection was left on a folded row with no row on screen"
+        );
+        assert_eq!(app.tasks[app.tasks_selected].source, TaskSource::Subagent);
+    }
+
+    #[test]
+    fn unfolding_restores_the_group() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.toggle_selected_group();
+        assert!(app.collapsed_groups.contains(&TaskSource::Subagent));
+        app.toggle_selected_group();
+        assert!(app.collapsed_groups.is_empty());
+    }
+
     #[test]
     fn task_selection_wraps_and_clamps() {
         let mut app = App::new("m", "/tmp", "s");
@@ -4519,6 +4899,7 @@ mod tests {
         ));
     }
 
+    #[test]
     fn copy_reports_no_assistant_when_empty() {
         let mut app = App::new("m", "/tmp", "s");
         app.copy_last_assistant();
@@ -4655,6 +5036,7 @@ mod tests {
             description: "rm -rf build".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond,
         }
     }
@@ -4776,6 +5158,7 @@ mod tests {
             description: "d".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond,
         });
         assert_eq!(app.waiting_on, WaitingOn::UserInput);
@@ -4841,6 +5224,7 @@ mod tests {
             description: "Bash: run `cargo test`".into(),
             origin: Some("subagent-3".into()),
             input_preview: Some("{\"command\": \"cargo test\"}".into()),
+            suggested_prefix: None,
             respond,
         });
         assert_eq!(app.phase, Phase::Permission);
@@ -4937,6 +5321,7 @@ mod tests {
             description: "lead".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond: r1,
         });
         app.apply_engine(EngineEvent::PermissionAsk {
@@ -4944,6 +5329,7 @@ mod tests {
             description: "subagent".into(),
             origin: Some("subagent-1".into()),
             input_preview: None,
+            suggested_prefix: None,
             respond: r2,
         });
         // Both are queued; front is the first, badge shows 1 behind.
@@ -4972,6 +5358,7 @@ mod tests {
                 description: name.into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond,
             });
         }
@@ -5108,5 +5495,409 @@ mod tests {
         type_input(&mut app, "hello there");
         app.submit();
         assert_eq!(app.pending_submit.as_deref(), Some("hello there"));
+    }
+
+    fn write_png(app: &App, name: &str) {
+        std::fs::write(
+            std::path::Path::new(&app.cwd).join(name),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn submitting_an_image_mention_stages_it_for_the_turn() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "image was not staged");
+    }
+
+    /// Replacing a staged prompt must drop its attachments: the second
+    /// prompt would otherwise ship the first one's image and disclose a
+    /// file the user never meant to send with it.
+    #[test]
+    fn replacing_a_staged_prompt_drops_its_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        // Interject again with a prompt that mentions nothing.
+        type_input(&mut app, "actually never mind");
+        app.interject();
+        assert_eq!(app.pending_submit.as_deref(), Some("actually never mind"));
+        assert!(
+            app.pending_images.is_empty(),
+            "stale image carried onto the replacement prompt"
+        );
+    }
+
+    /// The skill branch never touches `pending_images` either, so a skill
+    /// prompt must not inherit the previous prompt's attachment.
+    #[test]
+    fn a_replacement_slash_command_drops_staged_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.enqueue_turn_from_command("summarize the repo".into());
+        assert!(
+            app.pending_images.is_empty(),
+            "stale image carried onto a command-produced turn"
+        );
+    }
+
+    /// Cancelling while the attachments are being read leaves no turn to
+    /// finish, so the phase has to be reset here or every later prompt
+    /// queues behind one that never existed.
+    #[test]
+    fn cancelling_during_attachment_encoding_returns_to_idle() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.phase, Phase::Streaming, "precondition");
+
+        // The run loop takes the prompt *and* its descriptors to start the
+        // encode; the user cancels before the read comes back.
+        let _ = app.pending_submit.take();
+        let _ = std::mem::take(&mut app.pending_images);
+        app.abandon_staged_attachments();
+
+        assert_eq!(
+            app.phase,
+            Phase::Idle,
+            "stuck in streaming after a cancelled encode"
+        );
+        assert!(app.pending_images.is_empty());
+        assert!(app.pending_attachments.is_empty());
+
+        // And the next prompt starts a turn instead of queueing behind the
+        // turn that never was.
+        type_input(&mut app, "next");
+        app.submit();
+        assert_eq!(app.pending_submit.as_deref(), Some("next"));
+        assert!(app.queue.is_empty(), "prompt was queued, not sent");
+    }
+
+    /// A filename is attacker-controlled text that this feature puts in
+    /// the transcript. It reaches the screen as a `System` item, which
+    /// `render_item` scrubs — this pins that end to end, so the note can
+    /// never be routed around the sink.
+    #[test]
+    fn an_image_note_cannot_smuggle_deceptive_characters() {
+        let (_dir, mut app) = app_in_workspace();
+        let name = "sh\u{202e}gnp.png";
+        write_png(&app, name);
+        type_input(&mut app, &format!("look at @{name}"));
+        app.submit();
+
+        let note = app
+            .transcript
+            .iter()
+            .find_map(|i| match i {
+                TranscriptItem::System(s) if s.contains("@mentions:") => Some(i.clone()),
+                _ => None,
+            })
+            .expect("no mention note in the transcript");
+        let rendered: String = super::super::layout::render_item(&note, true, false)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "a filename put a bidi override on the screen: {rendered:?}"
+        );
+        assert!(rendered.contains("<U+202E>"), "not escaped: {rendered:?}");
+    }
+
+    fn png_block() -> agent_code_lib::llm::message::ContentBlock {
+        agent_code_lib::llm::message::ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }
+    }
+
+    #[test]
+    fn encoded_attachments_arm_their_own_prompt() {
+        let (_dir, mut app) = app_in_workspace();
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(app.pending_attachments.len(), 1);
+    }
+
+    /// A slash command that produces a prompt is staged directly, not
+    /// queued, so it can land while the images are still being read. It
+    /// must not be overwritten — and must not inherit the other prompt's
+    /// image either.
+    #[test]
+    fn a_prompt_sent_while_encoding_is_not_overwritten() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("show me the diff".into());
+        assert_eq!(app.pending_submit.as_deref(), Some("show me the diff"));
+
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("show me the diff"),
+            "the newer prompt was overwritten"
+        );
+        assert!(
+            app.pending_attachments.is_empty(),
+            "the newer prompt inherited another prompt's image"
+        );
+        assert!(
+            !app.deferred_prompts.is_empty(),
+            "the superseded prompt was dropped"
+        );
+        assert!(
+            app.queue.iter().all(|q| q != "look at @shot.png"),
+            "the expanded prompt was queued as text and would re-expand"
+        );
+    }
+
+    /// The deferred prompt comes back with the blocks it was encoded
+    /// with. Queuing it as text would re-run `expand_mentions`, reading
+    /// the file a second time and sending bytes the staged turn never had
+    /// — after telling the user it had already been read.
+    #[test]
+    fn a_deferred_prompt_returns_with_its_original_blocks() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("show me the diff".into());
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+
+        // The turn it was waiting behind starts and finishes.
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+
+        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(
+            app.pending_attachments.len(),
+            1,
+            "the deferred prompt lost its images"
+        );
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "deferred prompt sent twice"
+        );
+    }
+
+    /// Re-arming must not race another prompt's staged descriptors: those
+    /// belong to a different turn.
+    #[test]
+    fn a_deferred_prompt_waits_for_staged_descriptors_to_clear() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        write_png(&app, "later.png");
+        type_input(&mut app, "later @later.png");
+        app.submit();
+        let _ = app.pending_submit.take();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.rearm_deferred_prompt();
+        assert!(
+            app.pending_submit.is_none(),
+            "sent a deferred prompt while another's descriptors were staged"
+        );
+        assert!(!app.deferred_prompts.is_empty(), "deferred prompt lost");
+    }
+
+    /// Ctrl+C on the turn a prompt is waiting behind must stop that prompt
+    /// too — otherwise the file goes out after the user stopped the flow.
+    #[test]
+    fn cancelling_a_turn_drops_a_prompt_waiting_behind_it() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        // A bare cancel: nothing staged to send.
+        app.cancel_pending_followups();
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "an image prompt would have sent itself after a cancel"
+        );
+    }
+
+    /// Interject cancels the live turn in order to send something else, so
+    /// the held prompt keeps its place behind the interjection.
+    #[test]
+    fn interjecting_keeps_a_prompt_waiting_behind_it() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        // Interject only cancels when there is a turn to cancel.
+        app.phase = Phase::Streaming;
+        type_input(&mut app, "do this instead");
+        app.interject();
+        assert_eq!(app.pending_submit.as_deref(), Some("do this instead"));
+
+        app.cancel_pending_followups();
+        assert!(
+            !app.deferred_prompts.is_empty(),
+            "interject dropped a prompt it only meant to go ahead of"
+        );
+    }
+
+    /// A staged prompt proves nothing on its own: a slash command can put
+    /// one there at any moment, including while the user is pressing
+    /// Ctrl+C to stop everything. Only an interject says it cancelled in
+    /// order to send.
+    #[test]
+    fn a_bare_cancel_drops_held_prompts_even_with_a_command_staged() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        // A slash command stages its prompt directly, without interjecting.
+        app.enqueue_turn_from_command("show me the diff".into());
+        assert!(app.pending_submit.is_some(), "precondition");
+
+        app.cancel_pending_followups();
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "a bare cancel let an image prompt follow on its own"
+        );
+    }
+
+    /// Queue send-now is the same bargain as interject: it cancels in
+    /// order to send, so held prompts keep their place.
+    #[test]
+    fn queue_send_now_keeps_held_prompts() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.queue.push_back("queued work".into());
+        app.phase = Phase::Streaming;
+        app.queue_send_selected();
+
+        app.cancel_pending_followups();
+        assert!(
+            !app.deferred_prompts.is_empty(),
+            "queue send-now dropped a held prompt"
+        );
+    }
+
+    /// Dropping the read in flight says nothing about prompts already
+    /// held: whether those survive is the cancel policy's call, and an
+    /// interject that lands mid-encode must not lose them.
+    #[test]
+    fn abandoning_a_read_leaves_held_prompts_alone() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.phase = Phase::Streaming;
+        type_input(&mut app, "do this instead");
+        app.interject();
+
+        app.cancel_pending_followups();
+        app.abandon_staged_attachments();
+
+        assert_eq!(
+            app.deferred_prompts.len(),
+            1,
+            "an interject during an encode lost a held prompt"
+        );
+    }
+
+    /// Held prompts are sent in the order they were submitted, so a second
+    /// one cannot overwrite the first.
+    #[test]
+    fn held_prompts_keep_their_order() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("busy".into());
+        app.accept_encoded_attachments("first @a.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments("second @b.png".into(), vec![png_block()]);
+        assert_eq!(app.deferred_prompts.len(), 2, "a held prompt was dropped");
+
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+        assert_eq!(app.pending_submit.as_deref(), Some("first @a.png"));
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+        assert_eq!(app.pending_submit.as_deref(), Some("second @b.png"));
+    }
+
+    /// A cleared, resumed or rewound conversation takes its attachments
+    /// with it: a file staged for the old thread must not surface in the
+    /// new one.
+    #[test]
+    fn a_replaced_conversation_drops_staged_attachments() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.pending_attachments = vec![png_block()];
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.new_conversation();
+
+        assert!(app.deferred_prompts.is_empty(), "held prompt survived");
+        assert!(app.pending_images.is_empty(), "descriptors survived");
+        assert!(app.pending_attachments.is_empty(), "blocks survived");
+    }
+
+    /// A cancel abandons only the prompt that was being read for. If the
+    /// user interjected with another image in the meantime, that prompt is
+    /// still coming and must keep its own attachment — clearing it would
+    /// send the interjection as a text-only turn.
+    #[test]
+    fn abandoning_a_cancelled_encode_keeps_a_replacement_prompts_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "first.png");
+        write_png(&app, "second.png");
+        type_input(&mut app, "look at @first.png");
+        app.submit();
+
+        // The run loop takes the first prompt and its descriptors.
+        let _ = app.pending_submit.take();
+        let _ = std::mem::take(&mut app.pending_images);
+
+        // The user interjects with a second image-bearing prompt, then the
+        // discarded first read lands.
+        type_input(&mut app, "actually @second.png");
+        app.interject();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+        app.abandon_staged_attachments();
+
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("actually @second.png"),
+            "replacement prompt lost"
+        );
+        assert_eq!(
+            app.pending_images.len(),
+            1,
+            "replacement prompt was stripped of its image"
+        );
+        assert_eq!(
+            app.phase,
+            Phase::Streaming,
+            "a prompt is still waiting for its turn"
+        );
+    }
+
+    /// Encoded bytes are staged separately from the descriptors, so a
+    /// replaced prompt has to drop both — otherwise an image that had
+    /// already been read would still ride along with the new prompt.
+    #[test]
+    fn replacing_a_prompt_drops_already_encoded_attachments() {
+        let (_dir, mut app) = app_in_workspace();
+        app.pending_attachments = vec![agent_code_lib::llm::message::ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }];
+        type_input(&mut app, "a different prompt");
+        app.submit();
+        assert!(
+            app.pending_attachments.is_empty(),
+            "encoded image carried onto the replacement prompt"
+        );
     }
 }
