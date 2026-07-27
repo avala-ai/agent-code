@@ -704,28 +704,30 @@ fn shell_statements(raw: &str) -> Vec<String> {
     while i < text.len() {
         let c = text[i];
         // The line has ended and a heredoc was declared on it: the
-        // body is skipped whole, while the declaration line itself
-        // still ends here.
+        // body is data the command reads, so it is skipped whole while
+        // the declaration line itself still ends here.
         //
-        // Unless the body expands. An unquoted delimiter leaves a
-        // substitution in it live, and what it runs is statements —
-        // `cat <<EOF\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF` selects
-        // a config and runs git during the expansion. Holding that
-        // back would keep it from every walk that reads statements,
-        // so a body that can run something is read as one.
+        // An expansion in the body is the exception. An unquoted
+        // delimiter leaves it live, so
+        // `cat <<EOF\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF` selects a
+        // config and runs git during the expansion. What each
+        // expansion contains is code and is split as such, while the
+        // body around it stays data.
         if c == '\n' && !pending_heredocs.is_empty() {
-            let pending = std::mem::take(&mut pending_heredocs);
-            let executes = pending.iter().any(|(delimiter, strip_tabs, expands)| {
-                *expands && body_expands(&text, i, delimiter, *strip_tabs)
-            });
-            if !executes {
-                for (delimiter, strip_tabs, _) in pending {
-                    i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+            let mut expanded: Vec<String> = Vec::new();
+            for (delimiter, strip_tabs, expands) in std::mem::take(&mut pending_heredocs) {
+                let end = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+                if expands {
+                    for inner in heredoc_expansions(&text[i..end.min(text.len())]) {
+                        expanded.extend(shell_statements(&inner));
+                    }
                 }
+                i = end;
             }
             if stack.is_empty() {
                 statements.push(std::mem::take(&mut current));
             }
+            statements.extend(expanded);
             at_word_start = true;
             i += 1;
             continue;
@@ -1060,12 +1062,11 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             for (delimiter, strip_tabs, expands) in std::mem::take(&mut pending_heredocs) {
                 let end = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
                 if expands {
-                    // Only a body that expands something can run
-                    // anything; plain text stays the data it looks
-                    // like, so `$\"` in it is still literal.
-                    if body_expands(&text, i, &delimiter, strip_tabs) {
-                        let body: String = text[i..end.min(text.len())].iter().collect();
-                        let inner = shell_text_facts(&body);
+                    // Only what an expansion contains is code; the
+                    // body around it stays the data it looks like, so
+                    // a bare `$\"` in it is still literal.
+                    for expansion in heredoc_expansions(&text[i..end.min(text.len())]) {
+                        let inner = shell_text_facts(&expansion);
                         facts.control_operator |= inner.control_operator;
                         facts.locale_quote |= inner.locale_quote;
                     }
@@ -1219,14 +1220,107 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     facts
 }
 
-/// True when a heredoc body, already known to be open to expansion by
-/// its delimiter, actually expands something. Plain text runs nothing
-/// however unquoted it is, so only a body carrying a substitution or a
-/// parameter is code rather than the data it looks like.
-fn body_expands(text: &[char], newline: usize, delimiter: &str, strip_tabs: bool) -> bool {
-    let end = skip_heredoc_body(text, newline, delimiter, strip_tabs);
-    let body: String = text[newline..end.min(text.len())].iter().collect();
-    body.contains("$(") || body.contains('`') || body.contains("${")
+/// What the expansions in a heredoc body contain, for a body its
+/// delimiter left open to expansion.
+///
+/// Quoting inside a body is data — only the delimiter decides whether
+/// the body expands at all, so `'$(git p)'` in one still runs. The
+/// expansions are therefore found by reading the body as text, never
+/// as shell syntax; reading it as syntax would let a literal quote
+/// swallow the substitution it surrounds. What each expansion contains
+/// *is* code, and is returned for the caller to read as such.
+fn heredoc_expansions(body: &[char]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            // In a body a backslash still escapes what would otherwise
+            // start an expansion, so the next character starts none.
+            '\\' => i += 1,
+            '$' if body.get(i + 1) == Some(&'(') => {
+                let (inner, next) = read_expansion(body, i + 2, '(', ')');
+                found.push(inner);
+                i = next;
+                continue;
+            }
+            '`' => {
+                let (inner, next) = read_backquote(body, i + 1);
+                found.push(inner);
+                i = next;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Read to the close of an expansion already opened, returning what it
+/// contains and the index past its close. The contents are code, so
+/// quoting in them can hide a close and nesting has to be counted.
+fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (String, usize) {
+    let mut inner = String::new();
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut i = start;
+    while i < text.len() {
+        let c = text[i];
+        // A backslash escapes the next character everywhere but inside
+        // single quotes, where bash takes it literally.
+        if c == '\\' && quote != Some('\'') {
+            inner.push(c);
+            if let Some(&escaped) = text.get(i + 1) {
+                inner.push(escaped);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == open => depth += 1,
+            None if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return (inner, i + 1);
+                }
+            }
+            None => {}
+        }
+        inner.push(c);
+        i += 1;
+    }
+    (inner, i)
+}
+
+/// Read to the close of a backquoted substitution, returning what it
+/// contains and the index past the closing backquote.
+fn read_backquote(text: &[char], start: usize) -> (String, usize) {
+    let mut inner = String::new();
+    let mut i = start;
+    while i < text.len() {
+        let c = text[i];
+        if c == '\\' {
+            inner.push(c);
+            if let Some(&escaped) = text.get(i + 1) {
+                inner.push(escaped);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '`' {
+            return (inner, i + 1);
+        }
+        inner.push(c);
+        i += 1;
+    }
+    (inner, i)
 }
 
 /// Read a heredoc's delimiter word, given the index just past its
@@ -2571,6 +2665,13 @@ mod tests {
             // so the substitution runs during it: the selector and the
             // git it configures are statements, not text.
             "cat <<EOF\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF",
+            // Quotes in a body are data, not syntax — only the
+            // delimiter closes a body — so a quote around the
+            // substitution hides nothing.
+            "cat <<EOF\n'$(GIT_CONFIG_GLOBAL=/tmp/g git p)'\nEOF",
+            "cat <<EOF\n\"$(GIT_CONFIG_GLOBAL=/tmp/g git p)\"\nEOF",
+            // A backquoted substitution runs just as readily.
+            "cat <<EOF\n`GIT_CONFIG_GLOBAL=/tmp/g git p`\nEOF",
             // A later assignment cannot argue an opaque config back to
             // safety: a subshell keeps its own copy, and a `#` in the
             // middle of a word is not a comment.
@@ -2629,6 +2730,8 @@ mod tests {
             // so a substitution in it runs and the translation inside
             // decides what that is.
             "cat <<EOF\n$($\"safe\")\nEOF",
+            // A quote around it is body text, so it hides nothing.
+            "cat <<EOF\n'$($\"safe\")'\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
@@ -2806,8 +2909,11 @@ mod tests {
             // example inside one is not a statement that sets anything.
             "cat <<EOF\nGIT_CONFIG_GLOBAL=/tmp/g\nEOF\ngit status",
             // Quoting the delimiter closes the body, so even a
-            // substitution in it is text `cat` prints.
+            // substitution in it is text `cat` prints — with or
+            // without quotes of its own, which are body text too.
             "cat <<'EOF'\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF",
+            "cat <<'EOF'\n'$(GIT_CONFIG_GLOBAL=/tmp/g git p)'\nEOF",
+            "cat <<'EOF'\n`GIT_CONFIG_GLOBAL=/tmp/g git p`\nEOF",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
