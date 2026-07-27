@@ -630,7 +630,10 @@ impl Theme {
     /// standard palette ids, then any user palette ids. Drives the
     /// onboarding picker and the `/color` slash command.
     pub fn all_names() -> Vec<String> {
-        let mut names = vec!["auto".to_string()];
+        // `dark` / `light` are aliases `from_name` already resolves, and
+        // the docs advertise them. Without them here `/color dark` was
+        // rejected as unknown even though the theme it names works.
+        let mut names = vec!["auto".to_string(), "dark".to_string(), "light".to_string()];
         names.extend(standard_palettes().into_iter().map(|p| p.id.into_owned()));
         names.extend(user_palettes().into_iter().map(|p| p.id.into_owned()));
         names
@@ -639,7 +642,17 @@ impl Theme {
     /// `(id, label)` pairs in display order, for pickers that show a
     /// human-facing name. Mirrors [`Self::all_names`].
     pub fn all_options() -> Vec<(String, String)> {
-        let mut opts = vec![("auto".to_string(), "Auto (match terminal)".to_string())];
+        let mut opts = vec![
+            ("auto".to_string(), "Auto (match terminal)".to_string()),
+            (
+                "dark".to_string(),
+                "Dark (default dark palette)".to_string(),
+            ),
+            (
+                "light".to_string(),
+                "Light (default light palette)".to_string(),
+            ),
+        ];
         for p in standard_palettes() {
             opts.push((p.id.into_owned(), p.label.into_owned()));
         }
@@ -974,5 +987,40 @@ mod accessibility_tests {
                 t.accent
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod documented_names {
+    /// Every identifier `docs/configuration/themes.mdx` advertises must be
+    /// accepted, or the docs are promising a theme `/color` will reject.
+    #[test]
+    fn every_documented_theme_name_is_accepted() {
+        let accepted = super::Theme::all_names();
+        let documented = [
+            "auto",
+            "dark",
+            "light",
+            "monokai",
+            "dracula",
+            "nord",
+            "gruvbox",
+            "one-dark",
+            "solarized-dark",
+            "solarized-light",
+            "dark-colorblind",
+            "light-colorblind",
+            "dark-ansi",
+            "light-ansi",
+        ];
+        let missing: Vec<&str> = documented
+            .iter()
+            .copied()
+            .filter(|d| !accepted.iter().any(|a| a == d))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "documented but not accepted by /color: {missing:?}\naccepted: {accepted:?}"
+        );
     }
 }

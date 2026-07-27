@@ -6265,6 +6265,54 @@ fn execute_settings(args: Option<&str>, engine: &QueryEngine) {
 
 #[cfg(test)]
 mod tests {
+    /// Every `/command` the reference documents must actually exist.
+    ///
+    /// This repo has shipped several advertised-but-absent features —
+    /// a theme picker that was unreachable, `/vim` that set a key nothing
+    /// read, keybindings listed as active that never fired. Docs are the
+    /// promise; this makes the promise checkable.
+    ///
+    /// Commands are extracted from the table rows, so prose mentioning a
+    /// slash command in passing does not count as a claim.
+    #[test]
+    fn every_documented_command_exists() {
+        let doc = include_str!("../../../../docs/reference/commands.mdx");
+        let mut claimed: Vec<String> = Vec::new();
+        for line in doc.lines() {
+            let line = line.trim_start();
+            // Table rows only: `| `/foo` | description |`
+            if !line.starts_with("| `/") {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("| `/") else {
+                continue;
+            };
+            let Some(name) = rest.split('`').next() else {
+                continue;
+            };
+            // `/model <name>` documents the command `model`.
+            let head = name.split_whitespace().next().unwrap_or("");
+            if !head.is_empty() && !claimed.iter().any(|c| c == head) {
+                claimed.push(head.to_string());
+            }
+        }
+        assert!(
+            claimed.len() > 20,
+            "extraction found only {} commands — the table format probably changed, \
+             which would make this test vacuous",
+            claimed.len()
+        );
+
+        let missing: Vec<&String> = claimed
+            .iter()
+            .filter(|c| !is_builtin_command(c) && !is_interactive_slash(&format!("/{c}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "documented but not implemented: {missing:?}"
+        );
+    }
+
     use super::*;
 
     // Serialize tests that mutate the global VISUAL/EDITOR env vars so
