@@ -122,7 +122,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // Palette / model picker / help never draw over HITL.
-    if app.model_picker_open() && app.phase != Phase::Permission {
+    if app.session_picker_open() && app.phase != Phase::Permission {
+        draw_session_picker(frame, area, app);
+    } else if app.model_picker_open() && app.phase != Phase::Permission {
         draw_model_picker(frame, area, app);
     } else if app.theme_picker_open() && app.phase != Phase::Permission {
         draw_theme_picker(frame, area, app);
@@ -371,6 +373,66 @@ fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         palette().accent,
         Some(key_hint_line(
             "[\u{2191}\u{2193}] preview   [Enter] keep   [Esc] revert",
+        )),
+    );
+}
+
+fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use super::session_picker::summary_line;
+    let Some(p) = app.session_picker.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("filter: {}", p.query),
+        Style::default()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let filtered = p.filtered();
+    const MAX_ROWS: usize = 12;
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching sessions",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let start = p
+            .selected
+            .saturating_sub(MAX_ROWS.saturating_sub(1).min(p.selected));
+        let end = (start + MAX_ROWS).min(filtered.len());
+        for (i, (_, s)) in filtered.iter().enumerate().take(end).skip(start) {
+            let is_sel = i == p.selected;
+            let marker = if is_sel { "\u{276f}" } else { " " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} {}", summary_line(s)),
+                style,
+            )));
+        }
+        if filtered.len() > MAX_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("  \u{2026} {} more", filtered.len() - MAX_ROWS),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    draw_modal_box(
+        frame,
+        area,
+        lines,
+        " resume session ",
+        palette().accent,
+        Some(key_hint_line(
+            "[\u{2191}\u{2193}] move   [Enter] resume   [Esc] cancel",
         )),
     );
 }
@@ -1679,6 +1741,44 @@ mod tests {
             corners_before,
             "search bar must not eat a border row:\n{s}"
         );
+    }
+
+    #[test]
+    fn session_picker_lists_sessions_with_their_labels() {
+        use agent_code_lib::services::session::SessionSummary;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_session_picker(vec![
+            SessionSummary {
+                id: "aaa11111-2222".into(),
+                cwd: "/home/u/api".into(),
+                model: "test-model".into(),
+                turn_count: 3,
+                message_count: 6,
+                updated_at: "2026-07-25T10:00:00Z".into(),
+                label: Some("auth work".into()),
+                tags: Vec::new(),
+            },
+            SessionSummary {
+                id: "bbb22222-3333".into(),
+                cwd: "/home/u/webapp".into(),
+                model: "test-model".into(),
+                turn_count: 1,
+                message_count: 2,
+                updated_at: "2026-07-24T09:00:00Z".into(),
+                label: None,
+                tags: Vec::new(),
+            },
+        ]);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("resume session"), "buffer:\n{s}");
+        assert!(s.contains("auth work"), "label missing:\n{s}");
+        // Unlabelled sessions fall back to the directory name, which is
+        // the next most recognisable thing about them.
+        assert!(s.contains("webapp"), "cwd fallback missing:\n{s}");
+        assert!(s.contains("aaa11111"), "short id missing:\n{s}");
     }
 
     #[test]

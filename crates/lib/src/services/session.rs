@@ -514,7 +514,7 @@ pub(crate) fn prune_older_than_in(
 }
 
 /// Brief summary of a session for listing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
     pub cwd: String,

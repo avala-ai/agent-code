@@ -423,6 +423,10 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
+    /// `/resume` in-TUI session picker.
+    pub session_picker: Option<super::session_picker::SessionPicker>,
+    /// Session id the run loop should load.
+    pub pending_resume: Option<String>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -597,6 +601,8 @@ impl App {
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
+            session_picker: None,
+            pending_resume: None,
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
@@ -1338,6 +1344,20 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
+            return;
+        }
+        if text == "/resume" {
+            // Bare `/resume` opens the picker. `/resume <id>` is left to
+            // the command bridge, which already loads by id.
+            let sessions = agent_code_lib::services::session::list_sessions(50);
+            if sessions.is_empty() {
+                self.transcript
+                    .push(TranscriptItem::System("no saved sessions found".into()));
+            } else {
+                self.open_session_picker(sessions);
+            }
+            self.input.clear();
+            self.cursor = 0;
             return;
         }
         if text == "/theme" {

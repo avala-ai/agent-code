@@ -403,6 +403,44 @@ pub(super) async fn event_loop(
             }
         }
 
+        // Load a session chosen in the picker: engine state *and* the
+        // visible transcript, so the user can see what they resumed.
+        if let Some(id) = app.pending_resume.take() {
+            match agent_code_lib::services::session::load_session(&id) {
+                Ok(data) => match session.engine().try_lock() {
+                    Ok(mut eng) => {
+                        let items = super::session_picker::transcript_from_messages(&data.messages);
+                        let turns = data.turn_count;
+                        let plan = data.plan_mode;
+                        {
+                            let st = eng.state_mut();
+                            st.messages = data.messages;
+                            st.turn_count = data.turn_count;
+                            st.total_cost_usd = data.total_cost_usd;
+                            st.total_usage.input_tokens = data.total_input_tokens;
+                            st.total_usage.output_tokens = data.total_output_tokens;
+                            st.plan_mode = plan;
+                            if !data.model.is_empty() {
+                                st.config.api.model = data.model.clone();
+                            }
+                        }
+                        eng.set_live_plan_mode(plan);
+                        app.restore_transcript(items, &id, turns);
+                    }
+                    // A turn holds the mutex; retry next iteration rather
+                    // than half-applying the resume.
+                    Err(_) => app.pending_resume = Some(id),
+                },
+                Err(e) => {
+                    app.transcript
+                        .push(super::app::TranscriptItem::Error(format!(
+                            "could not resume {id}: {e}"
+                        )));
+                    app.dirty = true;
+                }
+            }
+        }
+
         // Apply a deferred `/clear` to the engine conversation (classic
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
@@ -1004,6 +1042,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Search captures input when open (and no HITL modal is up).
     if app.search_open() {
         handle_search_key(app, key);
+        return;
+    }
+
+    // Session picker captures input when open.
+    if app.session_picker_open() {
+        handle_session_picker_key(app, key);
         return;
     }
 
@@ -1610,6 +1654,26 @@ fn apply_user_keybinding(app: &mut App, key: &KeyEvent) -> bool {
     app.cursor = draft_cursor;
     app.dirty = true;
     true
+}
+
+fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
+    if is_esc(&key) || is_cancel_chord(&key) {
+        app.close_session_picker();
+        return;
+    }
+    match key.code {
+        KeyCode::Up => app.session_picker_move(-1),
+        KeyCode::Down => app.session_picker_move(1),
+        KeyCode::Enter => app.session_picker_accept(),
+        KeyCode::Backspace => app.session_picker_backspace(),
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.session_picker_insert_char(c);
+        }
+        _ => {}
+    }
 }
 
 fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
