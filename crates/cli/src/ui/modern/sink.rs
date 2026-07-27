@@ -328,26 +328,31 @@ const SUBAGENT_OUTPUT_MAX_CHARS: usize = 64 * 1024;
 /// suffix off — for an ASCII body the preview alone already fills the
 /// budget — leaving drill-in showing an incomplete body with no way to
 /// reach the rest. Trim the preview instead and keep the notice.
+///
+/// A body that overflows without an upstream notice (an oversized
+/// synthetic Agent error never reaches `persist_if_large`) gets the
+/// UI's own marker instead. Either suffix is reserved out of `max`
+/// before the preview is taken, so the result stays within the ceiling
+/// whenever the suffix itself fits.
 fn bound_subagent_output(output: &str, max: usize) -> String {
-    if output.chars().count() <= max {
+    let total = output.chars().count();
+    if total <= max {
         return output.to_string();
     }
     let notice = output
         .rfind(TRUNCATION_NOTICE_PREFIX)
         .map(|idx| &output[idx..])
         .unwrap_or_default();
+    let suffix = if notice.is_empty() {
+        format!("\n\n(Output truncated for display: {total} characters total)")
+    } else {
+        notice.to_string()
+    };
     let mut bounded: String = output[..output.len() - notice.len()]
         .chars()
-        .take(max.saturating_sub(notice.chars().count()))
+        .take(max.saturating_sub(suffix.chars().count()))
         .collect();
-    if notice.is_empty() {
-        bounded.push_str(&format!(
-            "\n\n(Output truncated for display: {} characters total)",
-            output.chars().count()
-        ));
-    } else {
-        bounded.push_str(notice);
-    }
+    bounded.push_str(&suffix);
     bounded
 }
 
@@ -425,17 +430,26 @@ mod tests {
     }
 
     /// Nothing upstream truncated, but the body still overflows the UI
-    /// budget: say so rather than clipping silently.
+    /// budget: say so rather than clipping silently. The marker is paid
+    /// for out of the budget, not added on top of it — an oversized
+    /// synthetic Agent error never passes through `persist_if_large`, so
+    /// this is the path that actually holds the ceiling.
     #[test]
-    fn bounding_an_unmarked_overflow_marks_it() {
+    fn an_unmarked_overflow_is_marked_within_the_budget() {
         let bounded = bound_subagent_output(&"b".repeat(200), 100);
-        assert!(bounded.starts_with(&"b".repeat(100)));
+        assert!(
+            bounded.chars().count() <= 100,
+            "the display marker pushed the body past the ceiling: {} chars",
+            bounded.chars().count()
+        );
+        assert!(bounded.starts_with("bbb"), "the preview itself was dropped");
         assert!(bounded.contains("truncated for display"));
         assert!(bounded.contains("200 characters total"));
     }
 
-    /// Degenerate budget: the notice is what matters, so it survives even
-    /// when nothing of the preview can.
+    /// Degenerate budget, unreachable with the real ceiling: the notice
+    /// is the only pointer to the full result, so it is kept whole even
+    /// when it alone exceeds the budget and nothing of the preview fits.
     #[test]
     fn a_tiny_budget_still_keeps_the_notice() {
         let notice = format!("{TRUNCATION_NOTICE_PREFIX}: 999999 bytes total)");

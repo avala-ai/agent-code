@@ -60,13 +60,18 @@ pub fn resolve_subagent_id(input: &serde_json::Value) -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Phrase the tool emits when it really did dispatch a background task.
+/// The three fixed segments of the tool's background-dispatch
+/// acknowledgement, in order.
 ///
-/// Shared with the query loop so the two cannot drift. It confirms a
-/// dispatch that the call's `run_in_background` flag already claimed —
-/// it is never the sole evidence, because a subagent's own answer can
-/// contain any phrase at all.
-pub(crate) const BACKGROUND_LAUNCH_PHRASE: &str = "started in the background";
+/// The acknowledgement is assembled from these and matched back against
+/// them, so the emitter and the query loop cannot drift. They are used
+/// as a *skeleton* — anchored at the start, in order, and closed by the
+/// tail — never as a phrase searched for anywhere in the body: a
+/// foreground subagent's own answer is free to contain any wording,
+/// including a description of background launches.
+const ACK_HEAD: &str = "Agent (";
+const ACK_DISPATCH: &str = ") started in the background as task ";
+const ACK_TAIL: &str = "Its result surfaces automatically when it completes — do not wait on it.";
 
 /// Whether an Agent tool call asked to be run in the background.
 ///
@@ -83,9 +88,19 @@ pub fn requested_background(input: &serde_json::Value) -> bool {
 /// Whether a result body is the tool's own background-dispatch
 /// acknowledgement rather than a subagent's answer.
 ///
-/// Only meaningful for a call whose input [`requested_background`].
+/// Matches the acknowledgement's structure: it opens with the tool's
+/// header, carries the dispatch clause and the task's `subagent_id`
+/// after it, and closes with the fixed tail. A body that merely mentions
+/// background launches does not match.
 pub fn is_background_launch_ack(content: &str) -> bool {
-    content.contains(BACKGROUND_LAUNCH_PHRASE)
+    let content = content.trim_end();
+    let Some(rest) = content.strip_prefix(ACK_HEAD) else {
+        return false;
+    };
+    let Some((_, after_dispatch)) = rest.split_once(ACK_DISPATCH) else {
+        return false;
+    };
+    after_dispatch.contains("(subagent_id=") && content.ends_with(ACK_TAIL)
 }
 
 pub struct AgentTool;
@@ -264,9 +279,8 @@ impl Tool for AgentTool {
             )
             .await;
             return Ok(ToolResult::success(format!(
-                "Agent ({description}, type={subagent_type}) {BACKGROUND_LAUNCH_PHRASE} as task \
-                 {id} (subagent_id={subagent_id}). Its result surfaces automatically when it \
-                 completes — do not wait on it."
+                "{ACK_HEAD}{description}, type={subagent_type}{ACK_DISPATCH}{id} \
+                 (subagent_id={subagent_id}). {ACK_TAIL}"
             )));
         }
 
@@ -1059,6 +1073,57 @@ mod tests {
 
         // Don't leave the child running past the test.
         let _ = tm.kill(&id).await;
+    }
+}
+
+#[cfg(test)]
+mod background_ack_tests {
+    use super::{is_background_launch_ack, requested_background};
+    use serde_json::json;
+
+    /// Pinned by hand rather than rebuilt from the segment constants, so
+    /// a change to the emitted wording that the matcher does not follow
+    /// fails here instead of silently stranding a background row.
+    const REAL_ACK: &str = "Agent (sweep the repo, type=general-purpose) started in the background \
+                            as task bg-7 (subagent_id=sweep the repo). Its result surfaces \
+                            automatically when it completes — do not wait on it.";
+
+    #[test]
+    fn the_tools_own_acknowledgement_matches() {
+        assert!(is_background_launch_ack(REAL_ACK));
+        assert!(
+            is_background_launch_ack(&format!("{REAL_ACK}\n")),
+            "a trailing newline must not defeat the match"
+        );
+    }
+
+    /// The reason this is a structural match and not a phrase search: a
+    /// background request runs in the foreground when no `TaskManager`
+    /// is available, and that child's answer may say anything at all.
+    #[test]
+    fn a_subagent_answer_about_background_launches_is_not_an_acknowledgement() {
+        assert!(!is_background_launch_ack(
+            "Agent (…) started in the background as task N is what you get with run_in_background."
+        ));
+        assert!(!is_background_launch_ack(
+            "The Agent tool reports that work started in the background as task 3 (subagent_id=x)."
+        ));
+        assert!(!is_background_launch_ack(
+            "Its result surfaces automatically when it completes — do not wait on it."
+        ));
+        assert!(!is_background_launch_ack("found three call sites"));
+        assert!(!is_background_launch_ack(""));
+    }
+
+    #[test]
+    fn requested_background_reads_the_structured_flag() {
+        assert!(requested_background(&json!({"run_in_background": true})));
+        assert!(!requested_background(&json!({"run_in_background": false})));
+        assert!(!requested_background(&json!({"description": "x"})));
+        assert!(
+            !requested_background(&json!({"run_in_background": "true"})),
+            "a non-boolean must not be read as a background request"
+        );
     }
 }
 

@@ -2498,11 +2498,34 @@ mod tests {
             serde_json::json!({"description": "sweep", "run_in_background": true}),
             crate::tools::ToolResult::success(
                 "Agent (sweep, type=general-purpose) started in the background as task b7 \
-                 (subagent_id=sweep).",
+                 (subagent_id=sweep). Its result surfaces automatically when it completes — do \
+                 not wait on it.",
             ),
         );
         assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "working");
         assert!(sink.outputs.lock().unwrap().is_empty());
+    }
+
+    /// The remaining gap once the structured flag is honoured: a
+    /// background request falls through to a foreground run when no
+    /// `TaskManager` exists, and that child's answer may itself talk
+    /// about background launches. Only the tool's own acknowledgement
+    /// counts, so this run is finished, not pending.
+    #[test]
+    fn a_foreground_fallthrough_answer_mentioning_the_phrase_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success(
+                "The Agent tool reports that work started in the background as task 3 when you \
+                 pass run_in_background.",
+            ),
+        );
+        assert_eq!(
+            sink.updates.lock().unwrap().first().unwrap().1,
+            "done",
+            "a foreground fall-through was mistaken for a background dispatch"
+        );
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
     }
 
     /// A background request runs in the foreground when no `TaskManager`
