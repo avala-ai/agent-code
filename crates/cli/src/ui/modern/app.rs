@@ -417,6 +417,12 @@ pub struct App {
     pub queue_selected: usize,
     /// Selected row in the tasks pane, for drill-in.
     pub tasks_selected: usize,
+    /// The model's current checklist, from the latest `TodoWrite`.
+    pub todos: Vec<super::tasks::TodoItem>,
+    /// Which conversation `todos` describes. Bumped whenever the
+    /// conversation is cleared, replaced or rewritten; see
+    /// [`App::new_conversation`].
+    pub conversation_epoch: u64,
     /// Task id whose output the run loop should fetch and show.
     pub pending_task_output: Option<String>,
     /// Ctrl+P command palette (slash command picker).
@@ -601,6 +607,8 @@ impl App {
             show_queue_pane: false,
             queue_selected: 0,
             tasks_selected: 0,
+            todos: Vec::new(),
+            conversation_epoch: 0,
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
@@ -735,6 +743,22 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
+            EngineEvent::TodoUpdate { epoch, items } => {
+                // A turn outlives the conversation that started it. When
+                // `/clear`, `/resume`, `/rewind` or `/snip` lands mid-turn,
+                // the turn keeps running and its queued events are drained
+                // afterwards -- potentially *after* the checklist has been
+                // cleared or rebuilt. Matching the epoch decides that by
+                // provenance rather than by drain order, so a plan from a
+                // conversation that is gone cannot win the race.
+                if epoch == self.conversation_epoch {
+                    self.todos = items
+                        .into_iter()
+                        .map(super::tasks::TodoItem::from_fields)
+                        .collect();
+                    self.dirty = true;
+                }
+            }
             EngineEvent::ToolStart {
                 call_id,
                 name,
@@ -1251,6 +1275,11 @@ impl App {
             // context. The run loop applies this under try_lock.
             self.pending_clear = true;
             self.ctx_meter = None;
+            // The checklist belongs to the conversation being discarded;
+            // keeping it would hold the pane open on work that no longer
+            // exists. Bumping the epoch also disowns anything the
+            // still-running turn writes from here on.
+            self.new_conversation();
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
@@ -2307,7 +2336,30 @@ impl App {
 
     /// Whether the tasks pane should render (has tasks and is toggled on).
     pub fn tasks_visible(&self) -> bool {
-        self.show_tasks && !self.tasks.is_empty()
+        // The pane shows work in flight: agents, background jobs, and the
+        // model's checklist. A plan with no tasks is still worth showing.
+        self.show_tasks && (!self.tasks.is_empty() || !self.todos.is_empty())
+    }
+
+    /// Declare that the conversation on screen has been cleared,
+    /// replaced or rewritten: drop the checklist and stop accepting
+    /// updates stamped for the previous one.
+    ///
+    /// Callers that know the new conversation's checklist (`/resume` and
+    /// friends, which can read it back out of the restored messages)
+    /// assign `todos` afterwards.
+    pub fn new_conversation(&mut self) {
+        self.conversation_epoch = self.conversation_epoch.wrapping_add(1);
+        self.todos.clear();
+        self.dirty = true;
+    }
+
+    /// Whether the pane's arrow/Enter bindings may claim the key. Visible
+    /// is not enough: a checklist-only pane has nothing to select, and
+    /// swallowing the keys there would make prompt history unreachable
+    /// until the user hid the pane.
+    pub fn tasks_nav_active(&self) -> bool {
+        self.tasks_visible() && !self.tasks.is_empty()
     }
 
     /// Force a full repaint (Ctrl+L). Drops the layout cache so every block
@@ -2591,12 +2643,20 @@ impl App {
     /// streaming phase, and every later prompt would queue behind a turn
     /// that does not exist. Deliberately not `mark_turn_idle`: that
     /// announces a *finished* turn, and this one never started.
+    ///
+    /// Only the cancelled prompt is abandoned. Its own descriptors went
+    /// into the read that is being discarded, so anything staged here now
+    /// belongs to a prompt the user submitted *after* the cancel — an
+    /// interjection with its own images — and clearing that would send it
+    /// as a text-only turn.
     pub fn abandon_staged_attachments(&mut self) {
-        self.pending_images.clear();
-        self.pending_attachments.clear();
         self.turn_live = false;
         self.turn_started_at = None;
-        self.phase = if self.modals.is_empty() {
+        self.phase = if self.pending_submit.is_some() {
+            // A replacement prompt is already waiting; it still has a turn
+            // coming, so the streaming phase is still true.
+            Phase::Streaming
+        } else if self.modals.is_empty() {
             Phase::Idle
         } else {
             Phase::Permission
@@ -3233,6 +3293,151 @@ mod tests {
         app.submit();
         assert!(app.pending_clear, "engine clear deferred to run loop");
         assert!(app.transcript.is_empty());
+    }
+
+    /// `/clear` discards the conversation; the checklist describes that
+    /// conversation's work, so leaving it behind would hold the pane open
+    /// on a plan for a session that no longer exists.
+    #[test]
+    fn clear_drops_the_checklist() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        assert!(app.tasks_visible());
+
+        app.input = "/clear".into();
+        app.cursor = 6;
+        app.submit();
+
+        assert!(app.todos.is_empty(), "stale checklist survived /clear");
+        assert!(
+            !app.tasks_visible(),
+            "the pane stayed open on a cleared conversation"
+        );
+    }
+
+    /// `submit` intercepts `/clear` only on an exact match, so the
+    /// argument form falls through to the slash bridge — where `execute`
+    /// empties the messages just the same. This pins that routing, which
+    /// is why `slash_rewrites_conversation` has to claim `clear`: without
+    /// it the epoch is never bumped and the pane keeps a checklist for
+    /// history that is gone.
+    #[test]
+    fn clear_with_an_argument_goes_through_the_slash_bridge() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/clear anything".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(
+            !app.pending_clear,
+            "the exact-match /clear path should not have fired"
+        );
+        assert_eq!(
+            app.pending_slash.as_deref(),
+            Some("/clear anything"),
+            "the argument form did not reach the bridge"
+        );
+        assert!(
+            crate::commands::slash_rewrites_conversation("/clear anything"),
+            "the bridge would not rebuild the checklist for this form"
+        );
+    }
+
+    /// The run loop rebuilds the checklist when a command replaces the
+    /// conversation, but the finished turn's queued events are drained
+    /// *after* that point. Provenance, not drain order, has to decide:
+    /// a stale event arriving late must not overwrite the rebuild.
+    #[test]
+    fn a_late_event_from_the_old_conversation_cannot_overwrite_the_rebuild() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "the plan being replaced".into(), "done".into())],
+        });
+        let stale = app.conversation_epoch;
+
+        // `/resume` (or `/rewind`, `/snip`) lands: the run loop declares a
+        // new conversation and assigns the restored checklist.
+        app.new_conversation();
+        app.todos = vec![crate::ui::modern::tasks::TodoItem::from_fields((
+            "7".into(),
+            "the restored plan".into(),
+            "in_progress".into(),
+        ))];
+
+        // Only now is the old turn's queued event drained.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: stale,
+            items: vec![("1".into(), "the plan being replaced".into(), "done".into())],
+        });
+        assert_eq!(app.todos.len(), 1);
+        assert_eq!(
+            app.todos[0].content, "the restored plan",
+            "a stale event overwrote the restored checklist"
+        );
+        assert_ne!(stale, app.conversation_epoch);
+    }
+
+    /// `/clear` typed mid-turn cannot take the engine lock, so the turn
+    /// runs on and may still finish a `TodoWrite`. That checklist belongs
+    /// to the conversation being discarded and must not repopulate the
+    /// pane behind the clear the user asked for.
+    #[test]
+    fn a_checklist_written_after_clear_does_not_revive_the_pane() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "the old plan".into(), "in_progress".into())],
+        });
+        app.input = "/clear".into();
+        app.cursor = 6;
+        app.submit();
+        assert!(
+            app.pending_clear,
+            "the engine clear should still be pending"
+        );
+
+        // The in-flight turn writes a checklist before the run loop wins
+        // the lock.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![(
+                "9".into(),
+                "work from the discarded turn".into(),
+                "done".into(),
+            )],
+        });
+        assert!(
+            app.todos.is_empty(),
+            "a discarded turn's checklist repopulated the pane: {:?}",
+            app.todos
+        );
+        assert!(!app.tasks_visible());
+
+        // The old turn stays disowned even after the deferred clear has
+        // been applied — it is still writing about the discarded
+        // conversation. The `pending_clear` window this used to key on
+        // would have reopened here and let it back in.
+        app.pending_clear = false;
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("9".into(), "still the discarded turn".into(), "done".into())],
+        });
+        assert!(
+            app.todos.is_empty(),
+            "the discarded turn was readmitted once the clear applied: {:?}",
+            app.todos
+        );
+
+        // A turn started against the new conversation lands normally.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: app.conversation_epoch,
+            items: vec![("1".into(), "the new plan".into(), "in_progress".into())],
+        });
+        assert_eq!(app.todos.len(), 1, "the pane stayed deaf after the clear");
+        assert_eq!(app.todos[0].content, "the new plan");
     }
 
     #[test]
@@ -4605,9 +4810,10 @@ mod tests {
         app.submit();
         assert_eq!(app.phase, Phase::Streaming, "precondition");
 
-        // The run loop takes the prompt to start encoding; the user cancels
-        // before the read comes back.
+        // The run loop takes the prompt *and* its descriptors to start the
+        // encode; the user cancels before the read comes back.
         let _ = app.pending_submit.take();
+        let _ = std::mem::take(&mut app.pending_images);
         app.abandon_staged_attachments();
 
         assert_eq!(
@@ -4624,6 +4830,77 @@ mod tests {
         app.submit();
         assert_eq!(app.pending_submit.as_deref(), Some("next"));
         assert!(app.queue.is_empty(), "prompt was queued, not sent");
+    }
+
+    /// A filename is attacker-controlled text that this feature puts in
+    /// the transcript. It reaches the screen as a `System` item, which
+    /// `render_item` scrubs — this pins that end to end, so the note can
+    /// never be routed around the sink.
+    #[test]
+    fn an_image_note_cannot_smuggle_deceptive_characters() {
+        let (_dir, mut app) = app_in_workspace();
+        let name = "sh\u{202e}gnp.png";
+        write_png(&app, name);
+        type_input(&mut app, &format!("look at @{name}"));
+        app.submit();
+
+        let note = app
+            .transcript
+            .iter()
+            .find_map(|i| match i {
+                TranscriptItem::System(s) if s.contains("@mentions:") => Some(i.clone()),
+                _ => None,
+            })
+            .expect("no mention note in the transcript");
+        let rendered: String = super::super::layout::render_item(&note, true, false)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "a filename put a bidi override on the screen: {rendered:?}"
+        );
+        assert!(rendered.contains("<U+202E>"), "not escaped: {rendered:?}");
+    }
+
+    /// A cancel abandons only the prompt that was being read for. If the
+    /// user interjected with another image in the meantime, that prompt is
+    /// still coming and must keep its own attachment — clearing it would
+    /// send the interjection as a text-only turn.
+    #[test]
+    fn abandoning_a_cancelled_encode_keeps_a_replacement_prompts_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "first.png");
+        write_png(&app, "second.png");
+        type_input(&mut app, "look at @first.png");
+        app.submit();
+
+        // The run loop takes the first prompt and its descriptors.
+        let _ = app.pending_submit.take();
+        let _ = std::mem::take(&mut app.pending_images);
+
+        // The user interjects with a second image-bearing prompt, then the
+        // discarded first read lands.
+        type_input(&mut app, "actually @second.png");
+        app.interject();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+        app.abandon_staged_attachments();
+
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("actually @second.png"),
+            "replacement prompt lost"
+        );
+        assert_eq!(
+            app.pending_images.len(),
+            1,
+            "replacement prompt was stripped of its image"
+        );
+        assert_eq!(
+            app.phase,
+            Phase::Streaming,
+            "a prompt is still waiting for its turn"
+        );
     }
 
     /// Encoded bytes are staged separately from the descriptors, so a

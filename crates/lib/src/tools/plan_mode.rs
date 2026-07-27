@@ -490,8 +490,21 @@ mod tests {
         );
     }
 
+    /// Serializes tests that read or write the **process-wide** plan
+    /// pointers (the pid-scoped file and the legacy shared name).
+    ///
+    /// `clear_active_plan_path` deliberately removes both of those in
+    /// addition to the session pointer, so any ExitPlanMode call wipes
+    /// state another test is midway through asserting on. Session-scoped
+    /// paths are unique per test and need no lock.
+    /// Async-aware so the tool tests can hold it across their `await`
+    /// points; a `std` guard there is a clippy error and risks blocking
+    /// a runtime worker.
+    static SHARED_POINTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn plan_pointer_roundtrip_and_pid_fallback() {
+        let _guard = SHARED_POINTER_LOCK.blocking_lock();
         let sid = format!("test-sess-{}", std::process::id());
         let plan = plan_dir().join("roundtrip-test.md");
 
@@ -567,6 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_plan_emits_plan_proposed_on_event_channel() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         // The plan-approval modal is driven by this event. The query loop's
         // streaming fast-path must hand ExitPlanMode a live event channel
         // (it is read-only + concurrency-safe, so it never reaches the
@@ -608,6 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn enter_then_exit_returns_plan_content() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         let ctx = test_ctx();
         let enter = EnterPlanModeTool
             .call(json!({}), &ctx)
@@ -659,6 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_with_plan_arg_writes_file_without_prior_filewrite() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         let ctx = test_ctx();
         let enter = EnterPlanModeTool.call(json!({}), &ctx).await.unwrap();
         let path = plan_path_from_enter(&enter.content);
@@ -687,6 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_warns_on_unfilled_template() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         let ctx = test_ctx();
         // Isolate from concurrent plan-mode tests: unique name under the
         // jailed plan directory (ExitPlanMode refuses paths outside it).
@@ -713,6 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_missing_plan_path_errors() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         let ctx = test_ctx();
         // Unique non-existent path *inside* the plan dir so concurrent tests
         // cannot create it and the jail check still passes.
@@ -737,6 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_plan_rejects_write_outside_plan_dir() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         let ctx = test_ctx();
         let outside = std::env::temp_dir().join(format!(
             "agent-code-plan-escape-{}.md",
@@ -757,6 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_plan_rejects_read_outside_plan_dir() {
+        let _guard = SHARED_POINTER_LOCK.lock().await;
         // ExitPlanMode is read-only (no write prompt). Without a jail on the
         // read path, plan_path=/etc/passwd (or a repo .env) would be returned
         // as the "plan" body when no `plan` argument is supplied.
