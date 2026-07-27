@@ -577,8 +577,33 @@ pub(crate) fn catalog_ids(user: Vec<(String, String)>) -> Vec<String> {
 /// The runtime facade intercepts `auto` before any palette lookup, so it
 /// has to ask this before doing so — otherwise a user's `auto.toml` is
 /// advertised by the catalog but never actually applied.
+///
+/// A palette's id is its file stem, so this opens the one candidate file
+/// rather than loading the directory: startup takes this path on the
+/// default `theme = "auto"`, and it must not depend on unrelated entries
+/// in the themes directory being readable or well-formed.
 pub fn user_palette_exists(id: &str) -> bool {
-    user_palettes().iter().any(|p| p.id == id)
+    user_themes_dir().is_some_and(|dir| palette_file_exists(&dir, id))
+}
+
+/// Pure over the directory, like [`load_palettes_dir`], so the candidate
+/// rules are testable without a real themes directory.
+fn palette_file_exists(dir: &Path, id: &str) -> bool {
+    // `id` reaches the filesystem, so it has to name a file *in* `dir`
+    // and not a path that walks out of it.
+    if Path::new(id).components().count() != 1 || id.starts_with('.') {
+        return false;
+    }
+    let path = dir.join(format!("{id}.toml"));
+    // Stat before reading: a `.toml` FIFO (or a symlink to one) is not a
+    // regular file, and `read_to_string` on it would block startup.
+    if !std::fs::metadata(&path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    load_palette_file(&path, id).is_some()
 }
 
 fn user_palettes() -> Vec<Palette> {
@@ -951,10 +976,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn user_palette_loads_from_toml_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = r##"
+    /// A palette file with every required slot filled.
+    const MINIMAL_PALETTE: &str = r##"
 label = "My Theme"
 dark = false
 bg = "#101010"
@@ -971,7 +994,11 @@ purple = "#8800ff"
 pink = "#ff00ff"
 accent = "#00ffff"
 "##;
-        std::fs::write(dir.path().join("mytheme.toml"), toml).unwrap();
+
+    #[test]
+    fn user_palette_loads_from_toml_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mytheme.toml"), MINIMAL_PALETTE).unwrap();
         // A malformed file must be skipped, not panic.
         std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
 
@@ -993,6 +1020,59 @@ accent = "#00ffff"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(load_palettes_dir(&missing).is_empty());
+    }
+
+    #[test]
+    fn palette_lookup_reads_only_its_own_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        // Neither of these is the candidate, so neither may be opened.
+        std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
+        std::fs::create_dir(dir.path().join("nested.toml")).unwrap();
+
+        assert!(palette_file_exists(dir.path(), "auto"));
+        assert!(!palette_file_exists(dir.path(), "absent"));
+        assert!(!palette_file_exists(dir.path(), "broken"), "malformed");
+        assert!(!palette_file_exists(dir.path(), "nested"), "not a file");
+    }
+
+    #[test]
+    fn palette_lookup_rejects_ids_that_leave_the_themes_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        let outside = dir.path().parent().unwrap().join("escaped.toml");
+        std::fs::write(&outside, MINIMAL_PALETTE).unwrap();
+
+        for id in ["../escaped", "sub/auto", "/etc/passwd", "", "."] {
+            assert!(!palette_file_exists(dir.path(), id), "{id:?}");
+        }
+        let _ = std::fs::remove_file(outside);
+    }
+
+    /// The default `theme = "auto"` runs this lookup during startup, so a
+    /// non-regular `.toml` must be rejected by a stat rather than opened:
+    /// reading a FIFO with no writer never returns. Run off-thread so a
+    /// regression fails this test instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn palette_lookup_does_not_block_on_a_fifo() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto.toml");
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let probe = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(palette_file_exists(&probe, "auto"));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert!(!found, "a FIFO is not a palette"),
+            Err(_) => panic!("palette lookup blocked on a FIFO"),
+        }
     }
 }
 
