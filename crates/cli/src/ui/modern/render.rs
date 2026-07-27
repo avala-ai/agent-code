@@ -79,7 +79,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // the transcript keeps at least half the area; the pane
             // shows a "+n more" line when it still cannot fit.
             // +1 for the block title row the pane spends.
-            let needed = super::tasks::pane_rows(&app.tasks) as u16 + 1;
+            // Saturating, not `as u16`: a model-authored checklist has no
+            // length limit, and a truncating cast would wrap a huge plan
+            // round to a one-row request.
+            let needed = u16::try_from(
+                super::tasks::pane_rows_with_todos(&app.tasks, &app.todos).saturating_add(1),
+            )
+            .unwrap_or(u16::MAX);
             let strip = needed
                 .min(chunks[1].height / 2)
                 .min(chunks[1].height.saturating_sub(3));
@@ -729,6 +735,77 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Line index of each task's last row, for the overflow count below.
     let mut task_ends: Vec<usize> = Vec::new();
     let inner_w = (inner.width as usize).saturating_sub(1);
+    let max_rows = inner.height as usize;
+    // Checklist first: it is what the model says it is doing, which
+    // frames everything below it. The list is model-authored and can be
+    // any length, so cap the rows it may claim — all of the strip when
+    // it is the only thing here, at most half once tasks compete for the
+    // space — and window the items inside that cap. Bounding it here is
+    // what keeps the task rows and the overflow footer on screen.
+    if !app.todos.is_empty() {
+        let (done, total) = super::tasks::todo_progress(&app.todos);
+        // Rows the whole plan block may occupy, chrome included.
+        let allowance = if app.tasks.is_empty() {
+            max_rows
+        } else {
+            max_rows / 2
+        };
+        // Chrome: the heading, plus the blank separator when tasks
+        // follow. Counting the separator here is what keeps the block
+        // inside its allowance on a short pane.
+        let separator = usize::from(!app.tasks.is_empty());
+        let mut budget = allowance.saturating_sub(1 + separator);
+        // One more row goes to the "+n more" footer when items are elided.
+        if app.todos.len() > budget {
+            budget = budget.saturating_sub(1);
+        }
+        let (start, shown) = super::tasks::todo_window(&app.todos, budget);
+        let block_start = lines.len();
+        lines.push(Line::from(Span::styled(
+            format!("plan  {done}/{total}"),
+            Style::default()
+                .fg(palette().muted)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for todo in &app.todos[start..start + shown] {
+            let p = palette();
+            let (color, modifier) = match todo.status {
+                super::tasks::TodoStatus::Done => (p.success, Modifier::DIM),
+                super::tasks::TodoStatus::InProgress => (p.accent, Modifier::BOLD),
+                super::tasks::TodoStatus::Pending => (p.inactive, Modifier::empty()),
+            };
+            // Model-authored text on its way to the terminal: scrub bidi
+            // overrides and zero-width characters like every other
+            // surface that renders untrusted content, before truncating
+            // so the escape markers are what gets measured. Line breaks
+            // collapse to spaces because one item must stay one row —
+            // the height budget above is counted in items.
+            let text: String = escape_deceptive(&todo.content)
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(inner_w.saturating_sub(4).max(4))
+                .collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {} {text}", todo.status.glyph()),
+                Style::default().fg(color).add_modifier(modifier),
+            )));
+        }
+        let hidden = app.todos.len() - shown;
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{hidden} more"),
+                Style::default().fg(palette().muted),
+            )));
+        }
+        if separator == 1 {
+            lines.push(Line::from(""));
+        }
+        // Backstop: on a pane too short for even the chrome, the block is
+        // trimmed to its allowance so it cannot crowd out the task rows.
+        // Ordering puts the separator last, so it is the first thing lost.
+        lines.truncate(block_start + allowance);
+    }
+
     let mut last_source: Option<super::tasks::TaskSource> = None;
     for (idx, t) in app.tasks.iter().enumerate() {
         let p = palette();
@@ -781,8 +858,9 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // When the area is still too short (many tasks, tiny terminal),
     // window the rows around the selection — Up/Down cycles the whole
     // list, so the marked task must stay on screen — and say how many
-    // tasks are hidden rather than silently truncating mid-task.
-    let max_rows = inner.height as usize;
+    // tasks are hidden rather than silently truncating mid-task. The
+    // checklist above is already bounded and carries its own count, so
+    // this footer speaks only for the rows the arrows navigate.
     if lines.len() > max_rows && max_rows > 0 {
         let sel_end = task_ends.get(app.tasks_selected).copied().unwrap_or(0);
         // The status row (with the ❯ marker) sits directly above the
@@ -796,21 +874,32 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or_else(|| Line::from("…"));
             lines = vec![row];
         } else {
-            let visible_h = max_rows - 1;
-            let anchor = if visible_h >= 2 { sel_end } else { sel_start };
-            let offset = anchor
-                .saturating_sub(visible_h - 1)
-                .min(lines.len() - visible_h);
-            let shown = task_ends
-                .iter()
-                .filter(|&&e| e >= offset && e < offset + visible_h)
-                .count();
-            let hidden = app.tasks.len().saturating_sub(shown);
-            lines = lines.into_iter().skip(offset).take(visible_h).collect();
-            lines.push(Line::from(Span::styled(
-                format!("… +{hidden} more (↑/↓)"),
-                Style::default().fg(palette().muted),
-            )));
+            let total = lines.len();
+            let window = |visible_h: usize| {
+                let anchor = if visible_h >= 2 { sel_end } else { sel_start };
+                let offset = anchor.saturating_sub(visible_h - 1).min(total - visible_h);
+                let shown = task_ends
+                    .iter()
+                    .filter(|&&e| e >= offset && e < offset + visible_h)
+                    .count();
+                (offset, app.tasks.len().saturating_sub(shown))
+            };
+            // The footer costs a row, so it has to earn it. When every
+            // task is already on screen there is nothing to announce —
+            // the rows lost are checklist chrome, which carries its own
+            // count — and a "+0 more (↑/↓)" would be an invitation to
+            // press arrows that reveal nothing.
+            let (offset, hidden) = window(max_rows - 1);
+            if hidden == 0 {
+                let (offset, _) = window(max_rows);
+                lines = lines.into_iter().skip(offset).take(max_rows).collect();
+            } else {
+                lines = lines.into_iter().skip(offset).take(max_rows - 1).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("… +{hidden} more (↑/↓)"),
+                    Style::default().fg(palette().muted),
+                )));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1682,6 +1771,148 @@ mod tests {
         );
     }
 
+    /// The checklist was only ever visible as the text of a tool card,
+    /// which scrolls away. The pane keeps it in front of the user.
+    #[test]
+    fn the_plan_checklist_renders_in_the_tasks_pane() {
+        use crate::ui::modern::sink::EngineEvent;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![
+                ("1".into(), "read the parser".into(), "done".into()),
+                ("2".into(), "add the guard".into(), "in_progress".into()),
+                ("3".into(), "write tests".into(), "pending".into()),
+            ],
+        });
+        assert!(
+            app.tasks_visible(),
+            "a plan with no tasks should still show the pane"
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("plan  1/3"), "progress missing:\n{s}");
+        assert!(s.contains("add the guard"), "item missing:\n{s}");
+        assert!(s.contains("✔"), "done glyph missing:\n{s}");
+        assert!(s.contains("◐"), "in-progress glyph missing:\n{s}");
+        assert!(s.contains("□"), "pending glyph missing:\n{s}");
+    }
+
+    /// Checklist text is model-authored and can carry text the model
+    /// copied out of an untrusted repository. Like the transcript, the
+    /// tool cards and the permission modal, this pane must not hand bidi
+    /// overrides or zero-width characters straight to the terminal.
+    #[test]
+    fn checklist_content_is_scrubbed_of_deceptive_unicode() {
+        use crate::ui::modern::sink::EngineEvent;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![(
+                "1".into(),
+                "delete \u{202e}sredro\u{202c} safely".into(),
+                "in_progress".into(),
+            )],
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            s.contains("<U+202E>"),
+            "bidi override was not escaped:\n{s}"
+        );
+        assert!(
+            !s.contains('\u{202e}') && !s.contains('\u{202c}'),
+            "raw bidi control reached the terminal:\n{s}"
+        );
+    }
+
+    /// A model can emit a checklist of any length. The pane caps the rows
+    /// it draws and says how many it held back — the previous code
+    /// appended every entry and then reported "+0 more", which both
+    /// overflowed the strip and lied about it.
+    #[test]
+    fn a_long_checklist_is_windowed_and_reports_what_it_hid() {
+        use crate::ui::modern::sink::EngineEvent;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        let items: Vec<(String, String, String)> = (0..60)
+            .map(|i| {
+                let status = match i {
+                    n if n < 40 => "done",
+                    40 => "in_progress",
+                    _ => "pending",
+                };
+                // Zero-padded so no label is a prefix of another and the
+                // "drawn" count below cannot double-count.
+                (
+                    format!("{i}"),
+                    format!("checklist entry {i:02}"),
+                    status.into(),
+                )
+            })
+            .collect();
+        app.apply_engine(EngineEvent::TodoUpdate { epoch: 0, items });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+
+        assert!(s.contains("plan  40/60"), "progress missing:\n{s}");
+        assert!(
+            s.contains("checklist entry 40"),
+            "the in-progress item was windowed out:\n{s}"
+        );
+        assert!(
+            !s.contains("+0 more"),
+            "reported zero hidden while hiding entries:\n{s}"
+        );
+        // Everything it did not draw is accounted for in one honest count.
+        let hidden: usize = s
+            .split("+")
+            .find_map(|seg| seg.split(" more").next()?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no hidden count rendered:\n{s}"));
+        let drawn = (0..60)
+            .filter(|i| s.contains(&format!("checklist entry {i:02}")))
+            .count();
+        assert_eq!(hidden + drawn, 60, "hidden + drawn did not cover the list");
+
+        // The pane must not have eaten the transcript's half of the screen.
+        assert!(drawn < 60 && drawn > 0, "drew {drawn} of 60 rows:\n{s}");
+    }
+
+    /// A checklist and tasks competing for a short strip must never
+    /// produce "+0 more (↑/↓)": the arrows navigate tasks, so promising
+    /// hidden rows when every task is already drawn sends the user
+    /// pressing keys that do nothing. Swept across heights because the
+    /// failure only appeared at particular pane sizes.
+    #[test]
+    fn a_cramped_pane_never_promises_rows_the_arrows_cannot_reach() {
+        use crate::ui::modern::sink::EngineEvent;
+        for height in 8..=30u16 {
+            for todo_count in [1usize, 2, 3, 8, 40] {
+                let backend = TestBackend::new(60, height);
+                let mut term = Terminal::new(backend).unwrap();
+                let mut app = App::new("m", "/tmp", "s");
+                crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+                app.apply_engine(EngineEvent::TodoUpdate {
+                    epoch: 0,
+                    items: (0..todo_count)
+                        .map(|i| (format!("{i}"), format!("entry {i:02}"), "pending".into()))
+                        .collect(),
+                });
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                let s = buffer_to_string(term.backend().buffer());
+                assert!(
+                    !s.contains("+0 more"),
+                    "empty overflow promise at {height} rows with {todo_count} todos:\n{s}"
+                );
+            }
+        }
+    }
+
     /// A frame exercising the chrome most tempting to hand-colour: an
     /// error, a warning, thinking, the tasks pane, a failed tool, and
     /// assistant markdown carrying both inline code and a fenced,
@@ -1720,6 +1951,17 @@ mod tests {
             "call `run()` first\n\n```rust\nfn main() { let x = 1; }\n```\n".into(),
         ));
         crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        // The checklist is the other half of the tasks pane, so this
+        // guard should cover its rows too, not only the agent rows.
+        // Exactly one item: the strip this frame affords is short enough
+        // that a longer checklist windows down to its heading and a
+        // "+n more", leaving no item row on screen to inspect. `done`
+        // puts the success colour in the frame, which the working agent
+        // row above does not.
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            epoch: app.conversation_epoch,
+            items: vec![("1".into(), "read the parser".into(), "done".into())],
+        });
         app
     }
 
