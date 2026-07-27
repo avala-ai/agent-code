@@ -22,7 +22,6 @@ pub struct SessionPicker {
     /// "resume" never looks like it might land somewhere else.
     /// Sessions with a cached view — returning to one of these keeps
     /// where you were instead of rebuilding from the conversation.
-    pub visited: std::collections::HashSet<String>,
     /// Filter over id, label, cwd and model.
     pub query: String,
     /// Highlighted row into the filtered list.
@@ -287,7 +286,6 @@ impl App {
         self.command_palette = None;
         self.show_shortcuts = false;
         self.session_picker = Some(SessionPicker {
-            visited: self.session_views.visited().map(str::to_string).collect(),
             query: String::new(),
             selected: 0,
             entries,
@@ -565,6 +563,12 @@ impl App {
             // it left the run loop free to apply that earlier
             // destination — while this message claimed nothing happened.
             self.status_message = if self.pending_resume.take().is_some() {
+                // Taking the gate is not enough: work staged against the
+                // session that was loading is held *because* a resume is
+                // outstanding, so releasing the gate without releasing
+                // that work lets the run loop apply a `/clear` meant for
+                // a session we are no longer going to.
+                self.cancel_deferred_resume_work();
                 "already in this session — cancelled the resume in progress".to_string()
             } else {
                 "already in this session".to_string()
@@ -844,7 +848,6 @@ mod tests {
     #[test]
     fn filtering_matches_id_label_cwd_and_model() {
         let picker = SessionPicker {
-            visited: Default::default(),
             query: String::new(),
             selected: 0,
             entries: vec![
@@ -1972,6 +1975,32 @@ work",
             app.status_message.contains("already in this session"),
             "status: {}",
             app.status_message
+        );
+    }
+
+    /// Work staged against the session that was loading is held
+    /// *because* a resume is outstanding. Releasing the gate without
+    /// releasing that work let the run loop apply a `/clear` meant for a
+    /// session the user just decided not to go to.
+    #[test]
+    fn staying_put_also_releases_work_held_for_the_abandoned_resume() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.session_id = "current-session".to_string();
+        app.pending_resume = Some("other-session".to_string());
+        app.pending_clear = true;
+        app.resume_notices.push("stale notice".into());
+        app.open_session_picker(vec![summary("current-session", None, "/a")]);
+
+        app.session_picker_accept();
+
+        assert!(app.pending_resume.is_none(), "gate not released");
+        assert!(
+            !app.pending_clear,
+            "a /clear staged for the abandoned resume would land on this session"
+        );
+        assert!(
+            app.resume_notices.is_empty(),
+            "notices for a swap that never happens would resurface on the next one"
         );
     }
 }

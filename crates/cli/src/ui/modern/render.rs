@@ -400,7 +400,7 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let visited_here = p
         .entries
         .iter()
-        .filter(|s| p.visited.contains(&s.id) || s.id == app.session_id)
+        .filter(|s| app.session_views.is_visited(&s.id) || s.id == app.session_id)
         .count();
     lines.push(Line::from(Span::styled(
         format!(
@@ -443,7 +443,7 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             // just departed wearing the `●`.
             let badge = if s.id == app.session_id {
                 "● "
-            } else if p.visited.contains(&s.id) {
+            } else if app.session_views.is_visited(&s.id) {
                 "◆ "
             } else {
                 "  "
