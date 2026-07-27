@@ -688,6 +688,11 @@ pub fn slash_rewrites_conversation(cmd: &str) -> bool {
         "resume" | "session" | "pick-session"
         // Truncation and deletion (`/undo` resolves to `rewind`).
         | "rewind" | "snip"
+        // `App::submit` intercepts a bare `/clear`, but only on an exact
+        // match: `/clear anything` falls through to this bridge, where
+        // the `clear` arm empties the messages just the same. Listed
+        // here so that form is not a hole.
+        | "clear"
     )
 }
 
@@ -882,6 +887,10 @@ mod slash_lookup_tests {
             "/rewind 3",
             "/undo",
             "/snip 3-7",
+            // `App::submit` only intercepts an exact `/clear`; the
+            // argument form reaches the bridge and empties history there.
+            "/clear",
+            "/clear anything",
         ] {
             assert!(
                 slash_rewrites_conversation(cmd),
@@ -893,7 +902,6 @@ mod slash_lookup_tests {
         // intent -- see `slash_rewrites_conversation`.
         for cmd in [
             "/sessions",
-            "/clear",
             "/compact",
             "/model",
             "/cd /tmp",

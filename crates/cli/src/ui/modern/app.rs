@@ -3269,6 +3269,33 @@ mod tests {
         );
     }
 
+    /// `submit` intercepts `/clear` only on an exact match, so the
+    /// argument form falls through to the slash bridge — where `execute`
+    /// empties the messages just the same. This pins that routing, which
+    /// is why `slash_rewrites_conversation` has to claim `clear`: without
+    /// it the epoch is never bumped and the pane keeps a checklist for
+    /// history that is gone.
+    #[test]
+    fn clear_with_an_argument_goes_through_the_slash_bridge() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/clear anything".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(
+            !app.pending_clear,
+            "the exact-match /clear path should not have fired"
+        );
+        assert_eq!(
+            app.pending_slash.as_deref(),
+            Some("/clear anything"),
+            "the argument form did not reach the bridge"
+        );
+        assert!(
+            crate::commands::slash_rewrites_conversation("/clear anything"),
+            "the bridge would not rebuild the checklist for this form"
+        );
+    }
+
     /// The run loop rebuilds the checklist when a command replaces the
     /// conversation, but the finished turn's queued events are drained
     /// *after* that point. Provenance, not drain order, has to decide:
