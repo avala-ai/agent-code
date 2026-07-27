@@ -994,15 +994,47 @@ fn sync_edit_mode(app: &mut App, edit_mode: &str) {
     app.dirty = true;
 }
 
+/// A key that types a character: the only thing vi normal mode reads as
+/// a command. Shift is allowed — it is what tells `D` from `d` — but
+/// Control, Alt and the platform modifier make it a chord, which the
+/// insertion path also refuses to treat as text.
+fn bare_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SUPER) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return;
+    }
+    // Whether this key could be a motion has to be judged before
+    // dispatch, since dispatch is what arms `d`.
+    let is_motion = bare_char(&key).is_some();
+
     handle_key_inner(app, key);
-    // Normal mode has no cursor position after the last character, but
-    // the keys that fall through to the composer — arrows, Home/End, a
-    // user binding — move with insert-mode semantics and can park there,
-    // where `x` and `D` find nothing. Clamp once, centrally, rather than
-    // at each of those call sites. A key that switched to insert mode is
-    // left alone: `A` parks past the last character on purpose.
+
     if app.in_normal_mode() {
+        // Anything that is not a motion aborts a half-typed operator, as
+        // vi does. This sits after dispatch so the branches that return
+        // early — Ctrl+C arming quit or cancelling a turn, Esc, a user
+        // binding — cannot carry a stale `d` into the next key.
+        if !is_motion {
+            app.reset_vi_operator();
+        }
+        // Normal mode has no cursor position after the last character,
+        // but the keys that fall through to the composer — arrows,
+        // Home/End, a binding — move with insert-mode semantics and can
+        // park there, where `x` and `D` find nothing. A key that entered
+        // insert mode is left alone: `A` parks past the last character
+        // on purpose.
         app.clamp_cursor_to_normal_mode();
     }
 }
@@ -1265,21 +1297,11 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
     // Placed before the global chord match so `t`, `p` and friends edit
     // rather than firing a shortcut.
     if app.in_normal_mode() {
-        // Anything that is not a motion aborts a half-typed operator, as
-        // vi does. The draft-lifecycle methods clear it too, but this
-        // catches the keys that never reach them — an arrow, a chord, a
-        // binding — before one of them acts as a stale motion.
-        let is_motion = matches!(key.code, KeyCode::Char(_))
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
-        if !is_motion {
-            app.reset_vi_operator();
-        }
         match key.code {
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            // A platform-modified character (Cmd+X) is a chord, not the
+            // vi command `x`; the wrapper drops any pending operator for
+            // it, and it falls through to the chord dispatch below.
+            KeyCode::Char(c) if bare_char(&key) == Some(c) => {
                 app.vi_normal_key(c);
                 return;
             }
@@ -1527,11 +1549,7 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
         }
         // Only plain / shifted characters type into the prompt; Ctrl/Alt/Super
         // chords must not fall through as literal input.
-        (m, KeyCode::Char(c))
-            if !m.contains(KeyModifiers::CONTROL)
-                && !m.contains(KeyModifiers::ALT)
-                && !m.contains(KeyModifiers::SUPER) =>
-        {
+        (_, KeyCode::Char(c)) if bare_char(&key) == Some(c) => {
             app.insert_char(c);
         }
         _ => {}
@@ -2387,6 +2405,52 @@ mod tests {
             app.input, "Xone\ntwo",
             "the stale operator turned the next key into a line delete"
         );
+    }
+
+    /// Ctrl+C returns from an early branch, so the operator reset has to
+    /// happen after dispatch or a stale `d` eats the next key.
+    #[test]
+    fn ctrl_c_drops_a_pending_operator() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d);
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit_armed, "Ctrl+C stopped arming quit");
+        assert!(!app.vi_pending_d, "the operator survived Ctrl+C");
+    }
+
+    /// A platform-modified character is a chord, not a vi command: Cmd+X
+    /// must not delete and Cmd+D must not arm `dd`.
+    #[test]
+    fn platform_modified_chars_are_not_vi_commands() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 0;
+        handle_key(&mut app, super_key('x'));
+        assert_eq!(app.input, "abc", "Cmd+X deleted as the vi command `x`");
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        handle_key(&mut app, super_key('d'));
+        assert!(!app.vi_pending_d, "Cmd+D armed the delete operator");
+
+        // Shift is still part of a command: `D` differs from `d`.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello world".into();
+        app.cursor = 5;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.input, "hello", "Shift+D stopped deleting to line end");
     }
 
     /// `/emacs` must not advertise composer bindings that do not exist.
