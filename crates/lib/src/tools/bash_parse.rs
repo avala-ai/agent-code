@@ -892,6 +892,24 @@ pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
     })
 }
 
+/// True when some invocation runs a command whose identity this parser
+/// cannot pin down: run-time expansion decides it (`env -S '${CMD} -rf
+/// x'`), or the wrapper chain ran past [`MAX_UNWRAP_HOPS`] before the
+/// command was reached. The command text a gate would match is
+/// unknowable either way, so widening rules must fail closed rather than
+/// treat the invocation as "nothing wrapped".
+///
+/// Restored on this branch's richer [`Unwrap`] representation: `main`
+/// expressed this state as a single `Unwrap::Dynamic`, which became
+/// [`Unresolved`] here. Every `Unresolved` reason is dynamic in the sense
+/// the callers care about, so both map to `true`.
+pub fn has_dynamic_wrapper(parsed: &ParsedCommand) -> bool {
+    parsed
+        .invocations
+        .iter()
+        .any(|argv| matches!(unwrapped_tokens(argv), Unwrap::Unresolved(_)))
+}
+
 /// Check a parsed command against security rules.
 /// Returns a list of security violations found.
 pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {

@@ -380,9 +380,17 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             env_unread = env_unread || !read_fully;
         }
         if env_unread {
+            // `Risky`, not `Destructive`: this says "I cannot prove what
+            // this runs", which is a reason to withhold automatic
+            // approval — not a reason to refuse a command the user is
+            // willing to confirm. `find_destructive` feeds
+            // `BashTool::validate_input`, which rejects outright, so a
+            // `Destructive` finding here would make `env
+            // --default-signal git status` unrunnable even with consent.
             findings.push(DestructiveFinding {
-                level: DestructivenessLevel::Destructive,
-                reason: "an env option this does not model decides the environment; what it runs                          cannot be determined"
+                level: DestructivenessLevel::Risky,
+                reason: "an env option this does not model decides the environment; what it runs \
+                         cannot be determined"
                     .to_string(),
             });
         }
@@ -1638,6 +1646,16 @@ fn skip_heredoc_body(text: &[char], mut i: usize, delimiter: &str, strip_tabs: b
     text.len()
 }
 
+/// Shell keywords that introduce or continue a construct whose
+/// statements the flat `;`-split walk cannot attribute: a branch may or
+/// may not run, and a loop body runs an unknown number of times.
+/// Listed as *structure*, so no judgement about what they contain is
+/// needed — their presence alone is what makes the state unreadable.
+const SHELL_CONTROL_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "{", "}", "(", ")",
+];
+
 /// True when the command does something the statement walk cannot
 /// follow: a branch whose statements may not run, a heredoc whose body
 /// is data rather than statements, or a `set` carrying operands whose
@@ -1648,6 +1666,21 @@ fn skip_heredoc_body(text: &[char], mut i: usize, delimiter: &str, strip_tabs: b
 /// git log` is untouched.
 fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
     if shell_text_facts(raw).control_operator {
+        return true;
+    }
+    // Control flow splits at `;` like anything else, so `if true; then
+    // export GIT_CONFIG_GLOBAL=…; fi; git p` reaches the walk as the
+    // fragments `if true`, `then export …`, `fi`, `git p`. The carrier
+    // sits inside a `then` fragment that the assignment walk does not
+    // recognise, and the final `git` then looks unconfigured. Whether a
+    // branch runs is not decidable here, so its presence alone makes the
+    // state unresolved.
+    if statements.iter().any(|statement| {
+        split_alias_value(statement)
+            .first()
+            .map(|word| base_name(&unquote_token(word)).to_lowercase())
+            .is_some_and(|word| SHELL_CONTROL_KEYWORDS.contains(&word.as_str()))
+    }) {
         return true;
     }
     statements.iter().any(|statement| {
@@ -1666,6 +1699,21 @@ fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
         }
         false
     })
+}
+
+/// A statement with any leading control-flow keywords removed:
+/// `then export FOO=bar` is the statement `export FOO=bar`, introduced
+/// by a keyword that assigns nothing itself. Repeated because a
+/// fragment can carry more than one (`do if …`).
+fn strip_control_prefix(statement: &str) -> &str {
+    let mut rest = statement.trim();
+    loop {
+        let head = rest.split_whitespace().next().unwrap_or("");
+        if head.is_empty() || !SHELL_CONTROL_KEYWORDS.contains(&head.to_lowercase().as_str()) {
+            return rest;
+        }
+        rest = rest[head.len()..].trim_start();
+    }
 }
 
 /// True when a statement could run git, so configuration reaching it
@@ -1742,6 +1790,11 @@ fn any_statement_runs_git(statements: &[String]) -> bool {
 /// shell scopes to the command it introduces.
 fn carries_git_config(statements: &[String]) -> bool {
     statements.iter().any(|statement| {
+        // `if true; then export GIT_CONFIG_GLOBAL=…; fi` splits at the
+        // semicolons, so the carrier arrives as `then export …`. The
+        // keyword is not part of the assignment it introduces, and
+        // leaving it on hid the selector from every check below.
+        let statement = strip_control_prefix(statement);
         let Some(parsed) = parse_bash(statement) else {
             return false;
         };
@@ -1967,25 +2020,46 @@ fn env_option_is_modelled(option: &str) -> bool {
 fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
     let mut unreadable = false;
     let mut pairs: Vec<(String, String)> = Vec::new();
-    let head = invocation
+    let name_of = |t: &String| base_name(&unquote_token(t)).to_lowercase();
+    // A head whose operands are text names nothing it runs: `echo env
+    // FOO=bar git p` prints those words, it does not set anything.
+    if invocation
         .first()
-        .map(|t| base_name(&unquote_token(t)).to_lowercase());
-    if !head.is_some_and(|h| COMMAND_RUNNER_WRAPPERS.contains(&h.as_str())) {
+        .is_some_and(|t| DATA_COMMANDS.contains(&name_of(t).as_str()))
+    {
         return (pairs, true);
     }
-    let mut idx = 1;
+    // The wrapper is not always argv[0]. `timeout 5 env -S'GIT_CONFIG_GLOBAL=… git p'`
+    // puts it behind a runner whose own grammar this does not model, and
+    // reading only position zero missed the environment entirely. Start
+    // from wherever the modelled wrapper actually is; the outer runner's
+    // own operands set nothing, so skipping them loses nothing.
+    let Some(wrapper_at) = invocation
+        .iter()
+        .position(|t| COMMAND_RUNNER_WRAPPERS.contains(&name_of(t).as_str()))
+    else {
+        return (pairs, true);
+    };
+    // Which wrapper's grammar is being walked right now. `env` is the
+    // only one whose options this models; the others are recognised so
+    // the walk can continue through them, not parsed.
+    let mut wrapper = name_of(&invocation[wrapper_at]);
+    let mut idx = wrapper_at + 1;
     while let Some(token) = invocation.get(idx) {
         let unquoted = unquote_token(token);
         // `env -S 'FOO=bar git p'` packs the assignments into one
         // word, and the wrapper parser consumes them rather than
         // handing them back, so neither view lists them separately.
         // Split that payload the way env does.
-        let attached_split = unquoted.starts_with('-')
-            && !unquoted.starts_with("--")
-            && unquoted.len() > 2
-            && unquoted.contains('S')
-            || unquoted.starts_with("--split-string=");
-        if let Some(payload) = split_string_payload(&unquoted, invocation.get(idx + 1)) {
+        let attached_split = wrapper == "env"
+            && (unquoted.starts_with('-')
+                && !unquoted.starts_with("--")
+                && unquoted.len() > 2
+                && unquoted.contains('S')
+                || unquoted.starts_with("--split-string="));
+        if let Some(payload) =
+            split_string_payload(&unquoted, invocation.get(idx + 1)).filter(|_| wrapper == "env")
+        {
             // env's own splitting rules, not an approximation of them:
             // an unquoted `\_` separates words while a quoted one is a
             // literal space, and getting that backwards merges the
@@ -2001,6 +2075,15 @@ fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
             continue;
         }
         if unquoted.starts_with('-') {
+            // `env`'s option grammar belongs to `env` alone. Applying it
+            // to every wrapper made valid options of other tools look
+            // like unknown `env` ones — `command -p git status` documents
+            // `-p` as selecting a default PATH, and refusing it here cost
+            // a legitimate command its classification.
+            if wrapper != "env" {
+                idx += 1;
+                continue;
+            }
             // An option this does not model changes the grammar of
             // everything after it, so the environment past here was not
             // read. Say so rather than walking on as though the rest
@@ -2023,7 +2106,9 @@ fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
             // Another wrapper: its own operands are still environment
             // for whatever runs at the end of the chain, so keep
             // walking. `env env FOO=bar git p` sets FOO.
-            if COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquoted).to_lowercase().as_str()) {
+            let nested = base_name(&unquoted).to_lowercase();
+            if COMMAND_RUNNER_WRAPPERS.contains(&nested.as_str()) {
+                wrapper = nested;
                 idx += 1;
                 continue;
             }
@@ -2880,9 +2965,6 @@ mod tests {
             // An attached `-S` operand is the whole of its token, so
             // the assignment after it is still read.
             "env -S'HOME=/dev/null' HOME=/tmp/evil git p",
-            // An env option whose grammar this does not model leaves
-            // the environment unread, which is not an empty one.
-            "env --frobnicate FOO=bar git status",
             "env -X GIT_CONFIG_GLOBAL=/tmp/g git status",
             "env -S'HOME=/tmp/h' git p",
             "env -S'XDG_CONFIG_HOME=/tmp/h' git p",
@@ -3553,6 +3635,103 @@ mod tests {
         assert_eq!(
             classify_str("echo a; psql -c 'TRUNCATE users'"),
             DestructivenessLevel::Destructive
+        );
+    }
+
+    /// A branch's statements may or may not run, and the flat `;`-split
+    /// walk cannot attribute them: `if true; then export …; fi` reaches
+    /// it as `if true` / `then export …` / `fi`, so the carrier hid in a
+    /// fragment the assignment walk does not read and the trailing `git`
+    /// looked unconfigured.
+    #[test]
+    fn a_config_selector_set_inside_a_branch_is_not_treated_as_absent() {
+        for cmd in [
+            "if true; then export GIT_CONFIG_GLOBAL=/tmp/evil; fi; git p",
+            "for i in 1; do export GIT_CONFIG_GLOBAL=/tmp/evil; done; git p",
+            "while true; do GIT_DIR=/tmp/evil.git; done; git p",
+        ] {
+            assert_ne!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "a selector set inside control flow passed as safe: {cmd}"
+            );
+        }
+    }
+
+    /// The wrapper is not always argv[0]. Reading only position zero let
+    /// an `env` behind an unmodelled runner hand git a configuration
+    /// file while the walk reported the environment fully read.
+    #[test]
+    fn an_env_behind_an_unmodelled_runner_is_still_read() {
+        for cmd in [
+            "timeout 5 env -S'GIT_CONFIG_GLOBAL=/tmp/evil git p'",
+            "timeout 5 env GIT_CONFIG_GLOBAL=/tmp/evil git p",
+            "stdbuf -oL env GIT_DIR=/tmp/evil.git git p",
+        ] {
+            assert_ne!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "env behind a runner was skipped: {cmd}"
+            );
+        }
+    }
+
+    /// `env`'s option grammar is `env`'s alone. Applying it to every
+    /// wrapper made other tools' documented options look like unknown
+    /// `env` ones.
+    #[test]
+    fn another_wrappers_options_are_not_judged_as_env_grammar() {
+        for cmd in ["command -p git status", "command -pv git"] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "a valid wrapper option was read as unknown env grammar: {cmd}"
+            );
+        }
+    }
+
+    /// "I cannot prove what this runs" withholds automatic approval; it
+    /// is not grounds to refuse a command the user is willing to
+    /// confirm. `find_destructive` feeds `BashTool::validate_input`,
+    /// which rejects outright, so this must stay below `Destructive`.
+    #[test]
+    fn an_unmodelled_env_option_is_risky_but_still_runnable() {
+        for cmd in [
+            // Documented options this does not model...
+            "env --default-signal git status",
+            // ...and undocumented ones: both leave the environment
+            // unread, which is still not an empty one.
+            "env --frobnicate FOO=bar git status",
+        ] {
+            let level = classify_str(cmd);
+            assert_ne!(
+                level,
+                DestructivenessLevel::Safe,
+                "an unread environment must not be auto-approved: {cmd}"
+            );
+            assert_ne!(
+                level,
+                DestructivenessLevel::Destructive,
+                "an unread environment must remain runnable after confirmation: {cmd}"
+            );
+        }
+        let level = classify_str("env --default-signal git status");
+        assert_ne!(
+            level,
+            DestructivenessLevel::Safe,
+            "an unread environment must not be auto-approved"
+        );
+        assert_ne!(
+            level,
+            DestructivenessLevel::Destructive,
+            "an unread environment must remain runnable after confirmation"
+        );
+        let parsed = parse_bash("env --default-signal git status").expect("parses");
+        assert!(
+            find_destructive(&parsed)
+                .iter()
+                .all(|f| f.level != DestructivenessLevel::Destructive),
+            "validate_input would reject this before any prompt"
         );
     }
 }
