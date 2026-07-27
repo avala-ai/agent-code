@@ -282,7 +282,16 @@ impl QueryEngine {
         // A cursor into the message vector we are replacing: left alone
         // it either skips the restored session's messages or reprocesses
         // an unrelated suffix of them.
-        *self.extraction_state.lock().await = crate::memory::extraction::ExtractionState::new();
+        //
+        // A *new* Arc, not a new value inside the old one. An extraction
+        // spawned by the previous conversation is fire-and-forget and
+        // holds its own clone; it releases the mutex across the provider
+        // call and writes the old transcript's cursor back when it
+        // returns. Detaching the Arc leaves that write landing somewhere
+        // nothing reads, instead of on top of the reset.
+        self.extraction_state = Arc::new(tokio::sync::Mutex::new(
+            crate::memory::extraction::ExtractionState::new(),
+        ));
         // Denials recorded in the old conversation would otherwise fire
         // hooks stamped with the restored session's id.
         self.denial_tracker.lock().await.clear();
@@ -3544,6 +3553,30 @@ mod tests {
             engine.extraction_state.lock().await.last_processed_index(),
             0,
             "the cursor still points into the discarded conversation"
+        );
+    }
+
+    /// The previous conversation's extraction task holds its own clone
+    /// of the Arc and writes its cursor back after the swap. Replacing
+    /// the value inside the shared Arc would let that write land on top
+    /// of the reset; replacing the Arc leaves it landing nowhere.
+    #[tokio::test]
+    async fn a_session_swap_detaches_the_extraction_state_arc() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        // Stand in for the in-flight background task.
+        let in_flight = engine.extraction_state.clone();
+
+        engine.reset_for_session_swap().await;
+
+        assert!(
+            !Arc::ptr_eq(&in_flight, &engine.extraction_state),
+            "the old extraction task can still write into the live state"
+        );
+        in_flight.lock().await.set_last_processed_index(400);
+        assert_eq!(
+            engine.extraction_state.lock().await.last_processed_index(),
+            0,
+            "a late write from the previous conversation reached the reset state"
         );
     }
 

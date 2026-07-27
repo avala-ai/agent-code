@@ -12,7 +12,7 @@
 
 use agent_code_lib::services::session::SessionSummary;
 
-use super::app::{App, TranscriptItem};
+use super::app::{App, Phase, TranscriptItem};
 use super::mode::SessionMode;
 
 /// Overlay state for the session picker.
@@ -367,6 +367,17 @@ impl App {
         }
         if !carried.is_empty() {
             spill.push(format!("{header}\n{}", carried.join("\n")));
+        }
+        // Submitting during the resume window moved the phase to
+        // Streaming, but the gate stopped any turn from spawning, so
+        // nothing will ever reap it back to Idle — and a stuck Streaming
+        // phase makes every later Enter queue instead of send. No turn
+        // can be live here (spawning is blocked for the whole window).
+        // A HITL modal keeps the phase it owns.
+        if self.modals.is_empty() && self.phase != Phase::Idle {
+            self.phase = Phase::Idle;
+            self.turn_live = false;
+            self.dirty = true;
         }
     }
 
@@ -1261,6 +1272,37 @@ mod tests {
         );
         assert_eq!(app.input, "check the parser", "the typed prompt was lost");
         assert_eq!(app.cursor, "check the parser".len());
+    }
+
+    /// Submitting during the load moves the phase to Streaming, but the
+    /// gate stops any turn spawning, so nothing reaps it — leaving every
+    /// later Enter queueing instead of sending.
+    #[test]
+    fn reclaiming_a_load_time_prompt_returns_the_app_to_idle() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("abcdef123456".into());
+        app.input = "check the parser".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert_eq!(app.phase, Phase::Streaming, "submit did not stage a turn");
+
+        app.adopt_restored_session(&restored());
+
+        assert_eq!(
+            app.phase,
+            Phase::Idle,
+            "the app is stuck mid-turn with no turn to end it"
+        );
+    }
+
+    /// ...but a HITL modal still owns the phase.
+    #[test]
+    fn reclaiming_does_not_steal_the_phase_from_a_modal() {
+        let mut app = App::new("m", "/tmp", "s");
+        let _rx = a_modal(&mut app);
+        app.pending_submit = Some("staged".into());
+        app.adopt_restored_session(&restored());
+        assert_eq!(app.phase, Phase::Permission, "the modal lost its phase");
     }
 
     /// ...unless the composer already holds a draft, which must not be
