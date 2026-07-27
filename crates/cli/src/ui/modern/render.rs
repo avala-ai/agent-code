@@ -744,17 +744,23 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // what keeps the task rows and the overflow footer on screen.
     if !app.todos.is_empty() {
         let (done, total) = super::tasks::todo_progress(&app.todos);
-        let heading_and_footer = 1;
-        let mut budget = if app.tasks.is_empty() {
-            max_rows.saturating_sub(heading_and_footer)
+        // Rows the whole plan block may occupy, chrome included.
+        let allowance = if app.tasks.is_empty() {
+            max_rows
         } else {
-            (max_rows / 2).saturating_sub(heading_and_footer)
+            max_rows / 2
         };
+        // Chrome: the heading, plus the blank separator when tasks
+        // follow. Counting the separator here is what keeps the block
+        // inside its allowance on a short pane.
+        let separator = usize::from(!app.tasks.is_empty());
+        let mut budget = allowance.saturating_sub(1 + separator);
         // One more row goes to the "+n more" footer when items are elided.
         if app.todos.len() > budget {
             budget = budget.saturating_sub(1);
         }
         let (start, shown) = super::tasks::todo_window(&app.todos, budget);
+        let block_start = lines.len();
         lines.push(Line::from(Span::styled(
             format!("plan  {done}/{total}"),
             Style::default()
@@ -791,9 +797,13 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        if !app.tasks.is_empty() {
+        if separator == 1 {
             lines.push(Line::from(""));
         }
+        // Backstop: on a pane too short for even the chrome, the block is
+        // trimmed to its allowance so it cannot crowd out the task rows.
+        // Ordering puts the separator last, so it is the first thing lost.
+        lines.truncate(block_start + allowance);
     }
 
     let mut last_source: Option<super::tasks::TaskSource> = None;
@@ -864,21 +874,32 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or_else(|| Line::from("…"));
             lines = vec![row];
         } else {
-            let visible_h = max_rows - 1;
-            let anchor = if visible_h >= 2 { sel_end } else { sel_start };
-            let offset = anchor
-                .saturating_sub(visible_h - 1)
-                .min(lines.len() - visible_h);
-            let shown = task_ends
-                .iter()
-                .filter(|&&e| e >= offset && e < offset + visible_h)
-                .count();
-            let hidden = app.tasks.len().saturating_sub(shown);
-            lines = lines.into_iter().skip(offset).take(visible_h).collect();
-            lines.push(Line::from(Span::styled(
-                format!("… +{hidden} more (↑/↓)"),
-                Style::default().fg(Color::DarkGray),
-            )));
+            let total = lines.len();
+            let window = |visible_h: usize| {
+                let anchor = if visible_h >= 2 { sel_end } else { sel_start };
+                let offset = anchor.saturating_sub(visible_h - 1).min(total - visible_h);
+                let shown = task_ends
+                    .iter()
+                    .filter(|&&e| e >= offset && e < offset + visible_h)
+                    .count();
+                (offset, app.tasks.len().saturating_sub(shown))
+            };
+            // The footer costs a row, so it has to earn it. When every
+            // task is already on screen there is nothing to announce —
+            // the rows lost are checklist chrome, which carries its own
+            // count — and a "+0 more (↑/↓)" would be an invitation to
+            // press arrows that reveal nothing.
+            let (offset, hidden) = window(max_rows - 1);
+            if hidden == 0 {
+                let (offset, _) = window(max_rows);
+                lines = lines.into_iter().skip(offset).take(max_rows).collect();
+            } else {
+                lines = lines.into_iter().skip(offset).take(max_rows - 1).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("… +{hidden} more (↑/↓)"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1857,6 +1878,35 @@ mod tests {
 
         // The pane must not have eaten the transcript's half of the screen.
         assert!(drawn < 60 && drawn > 0, "drew {drawn} of 60 rows:\n{s}");
+    }
+
+    /// A checklist and tasks competing for a short strip must never
+    /// produce "+0 more (↑/↓)": the arrows navigate tasks, so promising
+    /// hidden rows when every task is already drawn sends the user
+    /// pressing keys that do nothing. Swept across heights because the
+    /// failure only appeared at particular pane sizes.
+    #[test]
+    fn a_cramped_pane_never_promises_rows_the_arrows_cannot_reach() {
+        use crate::ui::modern::sink::EngineEvent;
+        for height in 8..=30u16 {
+            for todo_count in [1usize, 2, 3, 8, 40] {
+                let backend = TestBackend::new(60, height);
+                let mut term = Terminal::new(backend).unwrap();
+                let mut app = App::new("m", "/tmp", "s");
+                crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+                app.apply_engine(EngineEvent::TodoUpdate {
+                    items: (0..todo_count)
+                        .map(|i| (format!("{i}"), format!("entry {i:02}"), "pending".into()))
+                        .collect(),
+                });
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                let s = buffer_to_string(term.backend().buffer());
+                assert!(
+                    !s.contains("+0 more"),
+                    "empty overflow promise at {height} rows with {todo_count} todos:\n{s}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -225,22 +225,32 @@ impl StreamSink for ChannelSink {
     fn on_tool_call_start(&self, call_id: &str, tool_name: &str, input: &serde_json::Value) {
         // The checklist is the point of a TodoWrite call, so surface it
         // as state rather than leaving it buried in a tool card.
+        //
+        // This fires before the engine validates the input and before
+        // the user approves anything, so it accepts an update only when
+        // every entry has the three fields TodoWrite declares required,
+        // each a string. Filling missing fields with empty strings would
+        // let one malformed call replace a good checklist with blank
+        // pending rows — the pane would then describe work the model
+        // never asked for. A rejected call leaves the old list standing.
+        //
+        // The `status` *value* is deliberately not checked against the
+        // schema's enum: `TodoStatus::parse` already treats anything it
+        // does not recognise as pending, and dropping a whole update
+        // over one unexpected word would strand the pane on stale work.
         if tool_name == "TodoWrite"
             && let Some(todos) = input.get("todos").and_then(|v| v.as_array())
         {
-            let items = todos
+            let items: Option<Vec<(String, String, String)>> = todos
                 .iter()
                 .map(|t| {
-                    let get = |k: &str| {
-                        t.get(k)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    };
-                    (get("id"), get("content"), get("status"))
+                    let field = |k: &str| t.get(k)?.as_str().map(str::to_string);
+                    Some((field("id")?, field("content")?, field("status")?))
                 })
                 .collect();
-            self.send(EngineEvent::TodoUpdate { items });
+            if let Some(items) = items {
+                self.send(EngineEvent::TodoUpdate { items });
+            }
         }
         let detail = tool_detail(tool_name, input);
         self.send(EngineEvent::ToolStart {
@@ -368,6 +378,57 @@ mod tests {
         match rx.try_recv().unwrap() {
             EngineEvent::Text(t) => assert_eq!(t, "hello"),
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// `on_tool_call_start` runs before the engine validates the call and
+    /// before the user approves it, so a malformed `TodoWrite` must not
+    /// be allowed to overwrite a good checklist. Filling the missing
+    /// fields with empty strings would blank the pane into pending rows
+    /// describing work the model never wrote.
+    #[test]
+    fn a_malformed_todo_write_leaves_the_checklist_alone() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+
+        let todos = |v: serde_json::Value| serde_json::json!({ "todos": v });
+        let rejected = [
+            // Missing each required field in turn.
+            serde_json::json!([{ "content": "a", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "content": "a" }]),
+            // Right keys, wrong types.
+            serde_json::json!([{ "id": 1, "content": "a", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "content": null, "status": "pending" }]),
+            // One bad entry poisons the batch: a partial checklist would
+            // misdescribe the plan just as badly as a blank one.
+            serde_json::json!([
+                { "id": "1", "content": "a", "status": "done" },
+                { "id": "2", "status": "pending" },
+            ]),
+            // Not objects at all.
+            serde_json::json!(["just a string"]),
+        ];
+        for input in rejected {
+            sink.on_tool_call_start("c1", "TodoWrite", &todos(input.clone()));
+            let got_update = std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|ev| matches!(ev, EngineEvent::TodoUpdate { .. }));
+            assert!(
+                !got_update,
+                "malformed input replaced the checklist: {input}"
+            );
+        }
+
+        // A well-formed call still lands, and an empty list is a valid
+        // "no plan" signal rather than a malformed one.
+        for input in [
+            serde_json::json!([{ "id": "1", "content": "a", "status": "pending" }]),
+            serde_json::json!([]),
+        ] {
+            sink.on_tool_call_start("c1", "TodoWrite", &todos(input.clone()));
+            let got_update = std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|ev| matches!(ev, EngineEvent::TodoUpdate { .. }));
+            assert!(got_update, "valid input was dropped: {input}");
         }
     }
 
