@@ -429,6 +429,11 @@ impl App {
         // silently, which is the one thing this function exists to
         // prevent.
         if let Some(text) = self.encoding_display.take() {
+            // Reporting the text is only half of it: the encode is still
+            // running, and its result must not re-arm the prompt we have
+            // just told the user was not sent — which is what happened
+            // when a restore failed, or when the encode won the race.
+            self.encode_abandoned = true;
             self.remove_staged_row(&text);
             carried.push(text);
         }
@@ -1829,6 +1834,11 @@ work",
         assert!(
             app.encoding_display.is_none(),
             "the stash must be consumed, or it would be reported twice"
+        );
+        assert!(
+            app.encode_abandoned,
+            "the encode must be invalidated too, or its result re-arms a \
+             prompt the user was told was not sent"
         );
     }
 }

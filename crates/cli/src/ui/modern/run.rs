@@ -848,6 +848,13 @@ pub(super) async fn event_loop(
                 app.abandon_staged_attachments();
             }
         }
+        // A picker accept can abandon an encode without the conversation
+        // having changed yet — the restore may still fail, and the epoch
+        // only moves when one succeeds. Dropping the id here is what
+        // makes the `img_rx` arm treat the result as belonging to nobody.
+        if std::mem::take(&mut app.encode_abandoned) && active_encode.take().is_some() {
+            app.abandon_staged_attachments();
+        }
 
         // A prompt that was held aside for a turn that has since gone can
         // send now, with the blocks it was already encoded with. Not while

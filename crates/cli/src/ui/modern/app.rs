@@ -484,6 +484,16 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pub deferred_prompts:
         std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
+    /// Set when a picker accept abandons a prompt whose images were
+    /// still encoding.
+    ///
+    /// The read itself cannot be stopped, and `active_encode` lives in
+    /// the run loop, so the UI cannot clear it directly. This says "that
+    /// encode belongs to nobody now"; the loop drops it on its next
+    /// pass. Without it, a restore that failed — or an encode that won
+    /// the race against one that succeeded — re-armed a prompt the user
+    /// had already been told was cancelled.
+    pub encode_abandoned: bool,
     /// The display text of a prompt whose images are being encoded off
     /// this thread.
     ///
@@ -694,6 +704,7 @@ impl App {
             pending_attachments: Vec::new(),
             cancel_is_interject: false,
             deferred_prompts: std::collections::VecDeque::new(),
+            encode_abandoned: false,
             encoding_display: None,
             mode_chosen: false,
             vi_mode: false,
