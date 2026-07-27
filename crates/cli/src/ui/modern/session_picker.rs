@@ -20,7 +20,6 @@ use super::mode::SessionMode;
 pub struct SessionPicker {
     /// The session the user is in right now. Marked in the list so
     /// "resume" never looks like it might land somewhere else.
-    pub current_id: String,
     /// Sessions with a cached view — returning to one of these keeps
     /// where you were instead of rebuilding from the conversation.
     pub visited: std::collections::HashSet<String>,
@@ -288,7 +287,6 @@ impl App {
         self.command_palette = None;
         self.show_shortcuts = false;
         self.session_picker = Some(SessionPicker {
-            current_id: self.session_id.clone(),
             visited: self.session_views.visited().map(str::to_string).collect(),
             query: String::new(),
             selected: 0,
@@ -561,7 +559,16 @@ impl App {
         // work and rebuild the transcript to arrive exactly where it
         // started — the user would lose queued prompts for nothing.
         if id == self.session_id {
-            self.status_message = "already in this session".to_string();
+            // Choosing to stay must also *stop* a resume already in
+            // flight. `/resume` can be reopened while an earlier
+            // selection is still loading, and returning without clearing
+            // it left the run loop free to apply that earlier
+            // destination — while this message claimed nothing happened.
+            self.status_message = if self.pending_resume.take().is_some() {
+                "already in this session — cancelled the resume in progress".to_string()
+            } else {
+                "already in this session".to_string()
+            };
             self.dirty = true;
             return;
         }
@@ -837,7 +844,6 @@ mod tests {
     #[test]
     fn filtering_matches_id_label_cwd_and_model() {
         let picker = SessionPicker {
-            current_id: String::new(),
             visited: Default::default(),
             query: String::new(),
             selected: 0,
@@ -1943,5 +1949,29 @@ work",
             app.transcript.last(),
             Some(TranscriptItem::System(t)) if t.contains("abcdef12")
         ));
+    }
+
+    /// `/resume` can be reopened while an earlier selection is still
+    /// loading. Choosing the session you are already in must stop that
+    /// earlier resume too — otherwise the run loop applies it while the
+    /// status line claims nothing happened.
+    #[test]
+    fn staying_put_cancels_a_resume_already_in_flight() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.session_id = "current-session".to_string();
+        app.pending_resume = Some("other-session".to_string());
+        app.open_session_picker(vec![summary("current-session", None, "/a")]);
+
+        app.session_picker_accept();
+
+        assert!(
+            app.pending_resume.is_none(),
+            "the in-flight resume survived the decision to stay"
+        );
+        assert!(
+            app.status_message.contains("already in this session"),
+            "status: {}",
+            app.status_message
+        );
     }
 }

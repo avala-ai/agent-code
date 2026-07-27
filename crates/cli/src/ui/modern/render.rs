@@ -400,7 +400,7 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let visited_here = p
         .entries
         .iter()
-        .filter(|s| p.visited.contains(&s.id) || s.id == p.current_id)
+        .filter(|s| p.visited.contains(&s.id) || s.id == app.session_id)
         .count();
     lines.push(Line::from(Span::styled(
         format!(
@@ -437,7 +437,11 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
             // have already visited and can return to without a rebuild.
             // Without these the list cannot answer "which of these am I
             // in", which is the first thing you ask of it.
-            let badge = if s.id == p.current_id {
+            // Read live, not from a snapshot taken when the picker
+            // opened: a resume started before this one can land while
+            // the list is still up, and a frozen id left the session
+            // just departed wearing the `●`.
+            let badge = if s.id == app.session_id {
                 "● "
             } else if p.visited.contains(&s.id) {
                 "◆ "
