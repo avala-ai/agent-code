@@ -6303,14 +6303,27 @@ mod tests {
             claimed.len()
         );
 
-        let missing: Vec<&String> = claimed
-            .iter()
-            .filter(|c| !is_builtin_command(c) && !is_interactive_slash(&format!("/{c}")))
-            .collect();
+        // Registration in COMMANDS is what makes `execute` dispatch a
+        // command. `is_interactive_slash` only classifies how a name is
+        // run, and it carries its own hard-coded list — so accepting it
+        // as proof of implementation let a command stay "documented and
+        // implemented" after its COMMANDS entry was dropped or misspelled.
+        let missing: Vec<&String> = claimed.iter().filter(|c| !is_builtin_command(c)).collect();
         assert!(
             missing.is_empty(),
-            "documented but not implemented: {missing:?}"
+            "documented but not registered in COMMANDS: {missing:?}"
         );
+
+        // The interactive list names commands too; every one of those must
+        // be registered as well, or `execute` will never reach it.
+        for name in ["theme", "model", "scroll", "editor", "open"] {
+            if is_interactive_slash(&format!("/{name}")) {
+                assert!(
+                    is_builtin_command(name),
+                    "/{name} is classified interactive but is not registered in COMMANDS"
+                );
+            }
+        }
     }
 
     use super::*;

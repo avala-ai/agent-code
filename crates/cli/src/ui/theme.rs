@@ -636,6 +636,11 @@ impl Theme {
         let mut names = vec!["auto".to_string(), "dark".to_string(), "light".to_string()];
         names.extend(standard_palettes().into_iter().map(|p| p.id.into_owned()));
         names.extend(user_palettes().into_iter().map(|p| p.id.into_owned()));
+        // A user palette literally named `dark`/`light` is resolved by
+        // `from_name` ahead of the alias, so listing both would offer the
+        // same identifier twice — the alias row is the one that never wins.
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|n| seen.insert(n.clone()));
         names
     }
 
@@ -659,6 +664,22 @@ impl Theme {
         for p in user_palettes() {
             opts.push((p.id.into_owned(), p.label.into_owned()));
         }
+        // Drop the alias row when a user palette owns the same id (see
+        // `all_names`): keep the entry that `from_name` actually resolves.
+        let shadowed: std::collections::HashSet<String> = user_palettes()
+            .into_iter()
+            .map(|p| p.id.into_owned())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        opts.retain(|(id, label)| {
+            let is_alias = (id == "dark" || id == "light")
+                && (label.contains("default dark palette")
+                    || label.contains("default light palette"));
+            if is_alias && shadowed.contains(id) {
+                return false;
+            }
+            seen.insert(id.clone())
+        });
         opts
     }
 
@@ -997,26 +1018,51 @@ mod documented_names {
     #[test]
     fn every_documented_theme_name_is_accepted() {
         let accepted = super::Theme::all_names();
-        let documented = [
-            "auto",
-            "dark",
-            "light",
-            "monokai",
-            "dracula",
-            "nord",
-            "gruvbox",
-            "one-dark",
-            "solarized-dark",
-            "solarized-light",
-            "dark-colorblind",
-            "light-colorblind",
-            "dark-ansi",
-            "light-ansi",
-        ];
-        let missing: Vec<&str> = documented
+        // Read the identifiers out of the docs rather than restating
+        // them: a copied list keeps passing when the docs add or rename
+        // a theme, which is exactly the drift this test exists to catch.
+        let doc = include_str!("../../../../docs/configuration/themes.mdx");
+        // Only the theme-name table: the page also documents colour keys
+        // in backticked tables, and those are not theme identifiers. The
+        // table is the contiguous run of `|` rows containing `auto`.
+        let lines: Vec<&str> = doc.lines().collect();
+        let anchor = lines
             .iter()
-            .copied()
-            .filter(|d| !accepted.iter().any(|a| a == d))
+            .position(|l| l.starts_with('|') && l.contains("`auto`"))
+            .expect("themes.mdx must document the `auto` theme in a table");
+        let start = lines[..anchor]
+            .iter()
+            .rposition(|l| !l.starts_with('|'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = lines[anchor..]
+            .iter()
+            .position(|l| !l.starts_with('|'))
+            .map(|i| anchor + i)
+            .unwrap_or(lines.len());
+        let documented: Vec<String> = lines[start..end]
+            .iter()
+            .filter_map(|l| l.split('|').nth(1))
+            .flat_map(|cell| {
+                cell.split('/')
+                    .filter_map(|part| {
+                        let t = part.trim();
+                        t.strip_prefix('`')
+                            .and_then(|t| t.strip_suffix('`'))
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            documented.len() >= 10,
+            "parsed only {} names from the themes.mdx table — the format \
+             probably changed, which would make this test vacuous",
+            documented.len()
+        );
+        let missing: Vec<&String> = documented
+            .iter()
+            .filter(|d| !accepted.iter().any(|a| a == *d))
             .collect();
         assert!(
             missing.is_empty(),
