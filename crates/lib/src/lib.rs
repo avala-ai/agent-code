@@ -77,6 +77,7 @@ pub mod memory;
 pub mod output_styles;
 pub mod permissions;
 pub mod query;
+pub mod review;
 pub mod sandbox;
 pub mod schedule;
 pub mod services;

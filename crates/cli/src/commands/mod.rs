@@ -1308,11 +1308,17 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
-        Some("review") => CommandResult::Prompt(
-            "Review the current git diff. Look for bugs, security issues, \
-                 code quality problems, and suggest improvements."
-                .to_string(),
-        ),
+        Some("review") => {
+            // The target decides how the reviewer finds the change, and
+            // the rubric decides what counts as a finding. Both beat the
+            // single sentence this used to send.
+            use agent_code_lib::review;
+            let target = review::parse_target(args);
+            let cwd = std::path::PathBuf::from(&engine.state().cwd);
+            let resolved = review::resolve(target, &cwd);
+            println!("Reviewing {}…", resolved.hint);
+            CommandResult::Prompt(format!("{}\n\n{}", review::RUBRIC, resolved.prompt))
+        }
         Some("doctor") => {
             // Run the full async diagnostics synchronously via a blocking call.
             let cwd = std::path::Path::new(&engine.state().cwd).to_path_buf();
