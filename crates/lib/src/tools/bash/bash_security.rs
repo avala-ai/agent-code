@@ -1030,16 +1030,31 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     let mut stack: Vec<Context> = Vec::new();
     let mut at_word_start = true;
     // Heredocs declared on the current line, in the order their
-    // bodies will follow it.
-    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    // bodies will follow it, each with whether its delimiter left the
+    // body open to expansion.
+    let mut pending_heredocs: Vec<(String, bool, bool)> = Vec::new();
     let mut i = 0;
     while i < text.len() {
         let c = text[i];
         // The line has ended and a heredoc was declared on it: its
         // body is data the command receives, so it is skipped whole.
+        // Under an unquoted delimiter the body is still expanded, so
+        // an expansion inside it is code and is read before the skip.
         if c == '\n' && !pending_heredocs.is_empty() {
-            for (delimiter, strip_tabs) in std::mem::take(&mut pending_heredocs) {
-                i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+            for (delimiter, strip_tabs, expands) in std::mem::take(&mut pending_heredocs) {
+                let end = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+                if expands {
+                    let body: String = text[i..end.min(text.len())].iter().collect();
+                    // Only a body that expands something can run
+                    // anything; plain text stays the data it looks
+                    // like, so `$\"` in it is still literal.
+                    if body.contains("$(") || body.contains('`') || body.contains("${") {
+                        let inner = shell_text_facts(&body);
+                        facts.control_operator |= inner.control_operator;
+                        facts.locale_quote |= inner.locale_quote;
+                    }
+                }
+                i = end;
             }
             at_word_start = true;
             i += 1;
@@ -1133,7 +1148,13 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                     }
                     let delimiter = unquote_token(&word);
                     if !delimiter.is_empty() {
-                        pending_heredocs.push((delimiter, strip_tabs));
+                        // Quoting any part of the delimiter turns the
+                        // body into literal data. Leave it unquoted and
+                        // bash still expands the body, so a
+                        // substitution in it runs and its syntax is
+                        // code rather than text.
+                        let expands = !word.contains(['\'', '"', '\\']);
+                        pending_heredocs.push((delimiter, strip_tabs, expands));
                     }
                     i = next.saturating_sub(1);
                 } else {
@@ -1340,18 +1361,32 @@ fn statement_runs_git(parsed: &ParsedCommand) -> bool {
         .flatten()
         .any(|tokens| {
             tokens.iter().enumerate().any(|(index, token)| {
-                split_alias_value(&unquote_token(token))
-                    .iter()
-                    .any(|word| base_name(word).to_lowercase() == "git")
+                let words = split_alias_value(&unquote_token(token));
+                words.iter().enumerate().any(|(word_index, word)| {
+                    if base_name(word).to_lowercase() != "git" {
+                        return false;
+                    }
+                    // Whether git dispatches anything is decided by the
+                    // words after it, and inside a payload token those
+                    // are the payload's own: `bash -c 'git p'
+                    // --version` hands `--version` to the script's
+                    // `$0`, not to git, so reading the launcher's
+                    // remaining argv would call this a version print
+                    // and leave an alias from an unreadable config
+                    // unchecked.
+                    let following: Vec<String> = if words.len() > 1 {
+                        words[word_index + 1..].to_vec()
+                    } else {
+                        tokens[index + 1..]
+                            .iter()
+                            .map(|t| unquote_token(t))
+                            .collect()
+                    };
                     // `git --version` prints and exits without
                     // dispatching anything, so no alias of any
                     // origin can run.
-                    && !dispatches_no_subcommand(
-                        &tokens[index + 1..]
-                            .iter()
-                            .map(|t| unquote_token(t))
-                            .collect::<Vec<_>>(),
-                    )
+                    !dispatches_no_subcommand(&following)
+                })
             })
         })
     })
@@ -2485,6 +2520,10 @@ mod tests {
             // A git invocation in reach of state the walk cannot
             // follow is still refused.
             "GIT_CONFIG_GLOBAL=/tmp/g; git status && echo y",
+            // What follows a payload's git is the payload's own: the
+            // launcher's trailing `--version` becomes the script's
+            // `$0`, so it does not make this a version print.
+            "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git p' --version",
             // `HOME` and `XDG_CONFIG_HOME` choose where git reads its
             // config, aliases and all.
             "HOME=/tmp/h git p",
@@ -2543,6 +2582,10 @@ mod tests {
             "true >(true)#x; $\"cat\"",
             // A command after the heredoc redirect still runs.
             "cat <<EOF; $\"safe\"\nbody\nEOF",
+            // An unquoted delimiter leaves the body open to expansion,
+            // so a substitution in it runs and the translation inside
+            // decides what that is.
+            "cat <<EOF\n$($\"safe\")\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
@@ -2625,6 +2668,9 @@ mod tests {
             "(true)# $\"cat\"",
             // A heredoc body is data: nothing in it is translated.
             "cat <<'EOF'\n$\"cat\"\nEOF",
+            // Quoting the delimiter closes the body to expansion, so
+            // even a substitution in it is the text `cat` receives.
+            "cat <<'EOF'\n$($\"safe\")\nEOF",
             // A `$\"` protected by other quoting is a literal
             // delimiter, not a translation.
             "cat <<'$\"SAFE\"'\nbody\n$\"SAFE\"",
@@ -2710,6 +2756,9 @@ mod tests {
             // invocation can read it; nothing here consumes the
             // variable.
             "GIT_CONFIG_GLOBAL=/tmp/g; echo x && echo y",
+            // The payload's own words say this git only reports its
+            // version, so no alias of any origin dispatches.
+            "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git --version'",
             // A heredoc body is data the command receives, so a config
             // example inside one is not a statement that sets anything.
             "cat <<EOF\nGIT_CONFIG_GLOBAL=/tmp/g\nEOF\ngit status",
