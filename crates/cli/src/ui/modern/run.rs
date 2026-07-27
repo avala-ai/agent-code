@@ -150,25 +150,17 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
 /// Read the destination project's config without committing to it.
 ///
-/// `Config::load` layers from the *process* working directory, and this
-/// has to answer "would this project's settings parse" before anything
-/// moves — a destination whose settings are broken must fail the resume
-/// while refusing is still free, not after the session has been adopted.
-/// So the directory is entered briefly and left again.
+/// Answers "would this project's settings parse" before anything moves —
+/// a destination whose settings are broken must fail the resume while
+/// refusing is still free, not after the session has been adopted.
 ///
-/// Safe at this one call site and nowhere else: the restore only runs
-/// with no turn in flight, so nothing is resolving a relative path
-/// underneath it. A `Config::load_from(&Path)` in the library would make
-/// that structural rather than situational; this is the smaller change.
+/// Reads the layers *from* the directory rather than entering it. The
+/// previous version chdir-ed in and back, which mutates global state for
+/// every thread and, if the return trip failed, left the process inside
+/// the destination while the caller believed the resume had been safely
+/// refused — source hooks would then run in the destination project.
 fn load_project_config(dir: &str) -> Result<agent_code_lib::config::Config, String> {
-    let previous = std::env::current_dir().map_err(|e| e.to_string())?;
-    std::env::set_current_dir(dir).map_err(|e| e.to_string())?;
-    let loaded = agent_code_lib::config::Config::load().map_err(|e| e.to_string());
-    // Restore before reporting either way: leaving the process in the
-    // destination after refusing the resume is the exact mismatch this
-    // whole path exists to avoid.
-    std::env::set_current_dir(&previous).map_err(|e| e.to_string())?;
-    loaded
+    agent_code_lib::config::Config::load_from(std::path::Path::new(dir)).map_err(|e| e.to_string())
 }
 
 /// Whether a restored session's directory can be entered, without

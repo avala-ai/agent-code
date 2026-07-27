@@ -33,12 +33,36 @@ impl Config {
         if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(Config::default());
         }
-        let result = Self::load_inner();
+        let result = Self::load_inner(None);
         LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
-    fn load_inner() -> Result<Config, ConfigError> {
+    /// Load configuration as it would be seen *from* `dir`, without
+    /// entering it.
+    ///
+    /// The project and project-local layers are discovered by walking up
+    /// from the working directory, so reading another project's settings
+    /// otherwise meant chdir-ing into it and back — which mutates global
+    /// state for every thread and leaves the process in the wrong place
+    /// if the return trip fails. Resuming a session saved elsewhere needs
+    /// to answer "would this project's settings parse" before committing
+    /// to it, so it needs this.
+    ///
+    /// User-level and environment layers are unchanged: they are not
+    /// per-project.
+    pub fn load_from(dir: &Path) -> Result<Config, ConfigError> {
+        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Config::default());
+        }
+        let result = Self::load_inner(Some(dir));
+        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    /// `start` is the directory the project layers are discovered from;
+    /// `None` means the process working directory.
+    fn load_inner(start: Option<&Path>) -> Result<Config, ConfigError> {
         let mut layers: Vec<String> = Vec::new();
 
         // Layer 1: User-level config (lowest priority file).
@@ -49,7 +73,11 @@ impl Config {
         }
 
         // Layer 2: Project-level config (overrides user config).
-        if let Some(path) = find_project_config() {
+        let project = match start {
+            Some(dir) => find_project_config_from(dir),
+            None => find_project_config(),
+        };
+        if let Some(path) = project {
             layers.push(read_layer_through_migrations(&path)?);
         }
 
@@ -58,7 +86,11 @@ impl Config {
         // `settings.local.toml` in the same `.agent/` directory; only
         // the one closest to cwd is used, matching the project-config
         // walk so sub-packages inherit the repo-root settings.local.
-        if let Some(path) = find_project_local_config() {
+        let project_local = match start {
+            Some(dir) => find_local_config_in_ancestors(dir),
+            None => find_project_local_config(),
+        };
+        if let Some(path) = project_local {
             layers.push(read_layer_through_migrations(&path)?);
         }
 
@@ -1267,5 +1299,34 @@ action = "ask"
         // some encoded tokens) must be preserved.
         let key = resolve_api_key_from_helper("printf '  part1\\npart2  '").unwrap();
         assert_eq!(key, "part1\npart2");
+    }
+
+    /// Reading another project's settings must not move the process.
+    ///
+    /// The resume path answers "would this project's config parse" before
+    /// committing to it. Entering the directory to find out mutates
+    /// global state for every thread, and a failed return trip leaves the
+    /// process somewhere the caller does not believe it is.
+    #[test]
+    fn load_from_reads_a_project_without_entering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"deny\"\n",
+        )
+        .unwrap();
+
+        let before = std::env::current_dir().unwrap();
+        let cfg = Config::load_from(dir.path()).expect("the project's settings should parse");
+        let after = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            crate::config::PermissionMode::Deny,
+            "the target project's layer was not read"
+        );
+        assert_eq!(before, after, "loading moved the process");
     }
 }
