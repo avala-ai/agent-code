@@ -2712,6 +2712,37 @@ impl App {
         self.dirty = true;
     }
 
+    /// Take a prompt's images once they have been read and encoded.
+    ///
+    /// Another prompt can arrive while the read is running — a slash
+    /// command that produces a prompt is staged directly rather than
+    /// queued — and that one has its own attachments staged with it.
+    /// Overwriting it would lose it silently; keeping it and attaching
+    /// *these* blocks would be worse still, putting one prompt's image on
+    /// another's turn. So the newer prompt keeps its turn, this one goes
+    /// back to the head of the queue, and the user is told its images did
+    /// not come with it.
+    pub fn accept_encoded_attachments(
+        &mut self,
+        prompt: String,
+        blocks: Vec<agent_code_lib::llm::message::ContentBlock>,
+    ) {
+        if self.pending_submit.is_some() {
+            self.queue.push_front(prompt);
+            if !blocks.is_empty() {
+                self.transcript.push(TranscriptItem::System(
+                    "another prompt was sent first — the queued prompt's images were not attached"
+                        .into(),
+                ));
+            }
+            self.dirty = true;
+            return;
+        }
+        self.pending_attachments = blocks;
+        self.pending_submit = Some(prompt);
+        self.dirty = true;
+    }
+
     /// Give up on a prompt whose attachments were still being read when the
     /// user cancelled.
     ///
@@ -5191,6 +5222,55 @@ mod tests {
             "a filename put a bidi override on the screen: {rendered:?}"
         );
         assert!(rendered.contains("<U+202E>"), "not escaped: {rendered:?}");
+    }
+
+    fn png_block() -> agent_code_lib::llm::message::ContentBlock {
+        agent_code_lib::llm::message::ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }
+    }
+
+    #[test]
+    fn encoded_attachments_arm_their_own_prompt() {
+        let (_dir, mut app) = app_in_workspace();
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(app.pending_attachments.len(), 1);
+    }
+
+    /// A slash command that produces a prompt is staged directly, not
+    /// queued, so it can land while the images are still being read. It
+    /// must not be overwritten — and must not inherit the other prompt's
+    /// image either.
+    #[test]
+    fn a_prompt_sent_while_encoding_is_not_overwritten() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("show me the diff".into());
+        assert_eq!(app.pending_submit.as_deref(), Some("show me the diff"));
+
+        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+
+        assert_eq!(
+            app.pending_submit.as_deref(),
+            Some("show me the diff"),
+            "the newer prompt was overwritten"
+        );
+        assert!(
+            app.pending_attachments.is_empty(),
+            "the newer prompt inherited another prompt's image"
+        );
+        assert_eq!(
+            app.queue.front().map(String::as_str),
+            Some("look at @shot.png"),
+            "the superseded prompt was dropped instead of queued"
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(s) if s.contains("were not attached"))),
+            "no note that the images did not come along"
+        );
     }
 
     /// A cancel abandons only the prompt that was being read for. If the

@@ -921,8 +921,7 @@ pub(super) async fn event_loop(
                     for note in notes {
                         app.transcript.push(super::app::TranscriptItem::System(note));
                     }
-                    app.pending_attachments = blocks;
-                    app.pending_submit = Some(prompt);
+                    app.accept_encoded_attachments(prompt, blocks);
                 }
                 app.dirty = true;
             }
