@@ -147,6 +147,42 @@ fn resolve_executable(
     }
 }
 
+/// The search path `exec` falls back to when the environment carries no
+/// `PATH` at all.
+///
+/// `execvp` does not give up in that case — it searches
+/// `confstr(_CS_PATH)`, conventionally `/bin:/usr/bin`. Treating a
+/// missing `PATH` as unresolvable would fingerprint `|unresolved|` for a
+/// server that starts perfectly well (a session launched under
+/// `env -u PATH`), and the executable it really runs could then be
+/// repointed under an unchanged grant.
+#[cfg(not(windows))]
+fn default_search_path() -> std::ffi::OsString {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // SAFETY: `confstr` with a null buffer and zero length is the
+    // documented way to ask for the size it needs, including the NUL.
+    let needed = unsafe { libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
+    if needed > 1 {
+        let mut buf = vec![0u8; needed];
+        // SAFETY: `buf` is `needed` bytes long, exactly what the call
+        // above asked for, and is written as C chars.
+        let written = unsafe {
+            libc::confstr(
+                libc::_CS_PATH,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                needed,
+            )
+        };
+        if written > 1 && written <= needed {
+            buf.truncate(written - 1); // drop the trailing NUL
+            return OsString::from_vec(buf);
+        }
+    }
+    OsString::from("/bin:/usr/bin")
+}
+
 /// `execvp` semantics: a name containing `/` is used as given, a bare
 /// name is searched along the child's `PATH` and must be executable.
 /// The working directory is never searched.
@@ -173,7 +209,7 @@ fn resolve_executable_unix(
     // only the environment the child is given.
     let path_var = match env_lookup(env, "PATH") {
         Some(p) => std::ffi::OsString::from(p),
-        None => std::env::var_os("PATH")?,
+        None => std::env::var_os("PATH").unwrap_or_else(default_search_path),
     };
     for dir in std::env::split_paths(&path_var) {
         // A relative `PATH` entry resolves against the launch directory,
@@ -790,6 +826,20 @@ mod binding_tests {
             resolve_executable("srv", Path::new("/"), &env),
             bin.path().join("srv.exe").canonicalize().ok(),
             "the extensionless neighbour captured the binding"
+        );
+    }
+
+    /// `execvp` searches `confstr(_CS_PATH)` when the environment has no
+    /// `PATH`, so a missing one must not fingerprint as unresolvable —
+    /// the spawn still succeeds, and what it launches must stay bound.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_default_search_path_is_usable() {
+        let default = default_search_path();
+        assert!(!default.is_empty(), "no fallback search path");
+        assert!(
+            std::env::split_paths(&default).any(|p| p.is_absolute()),
+            "fallback search path has no absolute entry: {default:?}"
         );
     }
 

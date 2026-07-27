@@ -271,15 +271,14 @@ async fn execute_single_tool(
                 binding.as_ref(),
                 &destinations,
             );
+            // Both shapes are tagged, so a crafted input cannot make one
+            // spell the other. Matching stays full string equality.
+            let broad_entry = session_scope_entry(SessionKeyShape::Broad, &allow_key);
+            let exact_entry = session_scope_entry(SessionKeyShape::Exact, &grant_key);
             let session_allowed = match ctx.session_allows {
                 Some(ref allows) => {
                     let allows = allows.lock().await;
-                    // Two shapes share this set: the broad `AllowSession`
-                    // key, and the exact grant key an `AllowAlways` falls
-                    // back to when the host disabled persistence. Both are
-                    // matched by full string equality, and the two shapes
-                    // cannot be confused for one another.
-                    allows.contains(&allow_key) || allows.contains(&grant_key)
+                    allows.contains(&broad_entry) || allows.contains(&exact_entry)
                 }
                 None => false,
             };
@@ -329,7 +328,7 @@ async fn execute_single_tool(
                     }
                     super::PermissionResponse::AllowSession => {
                         if let Some(ref allows) = ctx.session_allows {
-                            allows.lock().await.insert(allow_key);
+                            allows.lock().await.insert(broad_entry);
                         }
                     }
                     super::PermissionResponse::AllowAlways => {
@@ -366,7 +365,7 @@ async fn execute_single_tool(
                             // the opt-out; losing exactness is not.
                             None => {
                                 if let Some(ref allows) = ctx.session_allows {
-                                    allows.lock().await.insert(grant_key.clone());
+                                    allows.lock().await.insert(exact_entry);
                                 }
                             }
                         }
@@ -459,6 +458,34 @@ async fn execute_single_tool(
 ///
 /// Used so "allow for session" on one bash command does not auto-allow
 /// every future Bash call.
+/// Tag a session-scope entry with which key shape it is.
+///
+/// One `HashSet` holds two kinds of key: the broad `AllowSession` shape,
+/// whose tail is raw user-controlled text (a write tool's `file_path`
+/// verbatim), and the exact durable key an `AllowAlways` falls back to
+/// when the host disabled persistence. Untagged they share a namespace,
+/// and a `file_path` can be *crafted* to spell another call's exact key —
+/// approve that unwritable path "for the session" once and the call it
+/// impersonates never prompts again. The two tags differ in their first
+/// byte, so no entry of one shape can equal one of the other regardless
+/// of what the input contains.
+fn session_scope_entry(shape: SessionKeyShape, key: &str) -> String {
+    let tag = match shape {
+        SessionKeyShape::Broad => "session",
+        SessionKeyShape::Exact => "exact",
+    };
+    format!("{tag}\0{key}")
+}
+
+/// Which of the two key shapes a session-scope entry carries.
+#[derive(Clone, Copy)]
+enum SessionKeyShape {
+    /// `session_allow_key` — one `AllowSession` answer.
+    Broad,
+    /// `persistent_grant_key` — an `AllowAlways` that could not persist.
+    Exact,
+}
+
 pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
     let shape = match tool {
         "Bash" | "PowerShell" => input
@@ -1798,6 +1825,106 @@ mod parallel_batch_tests {
             "the approved call was re-prompted"
         );
         assert_eq!(ran.load(Ordering::SeqCst), 3);
+    }
+
+    struct SessionPrompter {
+        asked: Arc<AtomicUsize>,
+    }
+    impl PermissionPrompter for SessionPrompter {
+        fn ask(
+            &self,
+            _tool_name: &str,
+            _description: &str,
+            _input_preview: Option<&str>,
+            _origin: Option<&str>,
+        ) -> PermissionResponse {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            PermissionResponse::AllowSession
+        }
+    }
+
+    /// The session set holds two key shapes, and one of them ends in raw
+    /// user-controlled text. A `file_path` can therefore be *crafted* to
+    /// spell another call's exact durable key: approve that path "for the
+    /// session" — the write itself fails, the key stays — and the call it
+    /// impersonates would never prompt again. Tagging the shapes has to
+    /// keep them in separate namespaces.
+    #[tokio::test]
+    async fn a_crafted_session_key_cannot_impersonate_an_exact_grant() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tool = WriteLikeTool { ran: ran.clone() };
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.persistent_grants = None;
+        ctx.session_allows = Some(Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )));
+        let checker = crate::permissions::PermissionChecker::allow_all();
+
+        // The call the attacker wants to slip through unprompted.
+        let target = serde_json::json!({"file_path": "/tmp/victim", "content": "payload"});
+        let target_key = persistent_grant_key(
+            "FileWrite",
+            &target,
+            &sandbox_grant_state(None),
+            &ctx.cwd,
+            None,
+            &tool.grant_destinations(&target),
+        );
+        // `session_allow_key` is "FileWrite\0{file_path}", so a path of
+        // exactly the target key's tail makes the two strings equal.
+        let forged_path = target_key
+            .strip_prefix("FileWrite\0")
+            .expect("grant keys lead with the tool name");
+        assert_eq!(
+            session_allow_key(
+                "FileWrite",
+                &serde_json::json!({ "file_path": forged_path })
+            ),
+            target_key,
+            "precondition: the forged session key equals the exact key"
+        );
+
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tool)];
+        ctx.permission_prompter = Some(Arc::new(SessionPrompter {
+            asked: asked.clone(),
+        }));
+
+        // Approve the forged path for the session.
+        execute_tool_calls(
+            &[PendingToolCall {
+                id: "c1".into(),
+                name: "FileWrite".into(),
+                input: serde_json::json!({ "file_path": forged_path, "content": "x" }),
+            }],
+            &tools,
+            &ctx,
+            &checker,
+        )
+        .await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // The impersonated call must still be asked about.
+        execute_tool_calls(
+            &[PendingToolCall {
+                id: "c2".into(),
+                name: "FileWrite".into(),
+                input: target,
+            }],
+            &tools,
+            &ctx,
+            &checker,
+        )
+        .await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "a forged session key impersonated an exact grant"
+        );
     }
 
     /// A mutating concurrency-safe tool must NOT ride the parallel branch
