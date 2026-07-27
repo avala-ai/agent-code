@@ -504,10 +504,13 @@ impl QueryEngine {
     /// not to the directory it lives in.
     /// Returns how many MCP proxy tools were dropped, so the caller can
     /// tell the user why a server they were using has gone.
+    /// `drop_mcp` is false when the project root has not actually
+    /// changed — a resume within the same repository keeps its servers.
     pub fn adopt_project(
         &mut self,
         project_root: &std::path::Path,
         cfg: crate::config::Config,
+        drop_mcp: bool,
     ) -> usize {
         self.rescope_persistent_grants(project_root);
         self.permissions
@@ -537,6 +540,9 @@ impl QueryEngine {
         // longer exist. The destination's own list takes its place —
         // empty unless it configures servers, and its proxies are not
         // connected either, so it stays empty until a restart.
+        if !drop_mcp {
+            return 0;
+        }
         self.state.config.mcp_servers.clear();
         // MCP proxies belong to the project that configured them. A
         // visibility filter would only hide them; they would still be

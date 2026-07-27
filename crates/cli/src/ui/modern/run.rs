@@ -61,6 +61,21 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
+/// The next terminal event, taking anything buffered during work the
+/// loop could not interrupt before reading the stream again.
+///
+/// Keeps replayed input on exactly the same path as live input, so the
+/// handling never diverges between the two.
+async fn next_terminal_event(
+    buffered: &mut std::collections::VecDeque<Event>,
+    stream: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
+) -> Option<std::io::Result<Event>> {
+    if let Some(ev) = buffered.pop_front() {
+        return Some(Ok(ev));
+    }
+    stream.next().await
+}
+
 /// Whether moving from `current` to `candidate` relaxes the default.
 ///
 /// Only used to decide what a project that forbids bypassing will accept
@@ -333,7 +348,16 @@ async fn finish_cwd_adoption(
     // subdirectory leaves `/repo/.agent/team-memory` outside the root —
     // unprotected exactly where a resume crossed into it.
     let project_root = agent_code_lib::services::session_env::project_root_for(dir).await;
-    let dropped_mcp = eng.adopt_project(&project_root, cfg.clone());
+    // Same repository, different directory (`/repo` → `/repo/crate`) is a
+    // routine resume: the `.agent` config is the same one, and the MCP
+    // servers connected for it are still the right ones. Only a genuine
+    // change of project justifies dropping them, since they cannot be
+    // reconnected without a restart.
+    let previous_root =
+        agent_code_lib::services::session_env::project_root_for(std::path::Path::new(previous_cwd))
+            .await;
+    let drop_mcp = previous_root != project_root;
+    let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
     if dropped_mcp > 0 {
         app.transcript
             .push(super::app::TranscriptItem::System(format!(
@@ -530,6 +554,11 @@ pub(super) async fn event_loop(
 ) -> anyhow::Result<()> {
     let mut turn: Option<TurnHandle> = None;
     let mut loop_err: Option<anyhow::Error> = None;
+    // Terminal events that arrived while the loop was busy with work it
+    // could not interrupt (session teardown). Replayed through the same
+    // path as live events, so a slow hook delays input instead of
+    // swallowing it.
+    let mut pending_events: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
 
     // Spinner animation (~12 fps) and coalescer flush deadline (~10 fps).
     // Both are only *polled* while a turn is live / text is buffered, so an
@@ -776,16 +805,60 @@ pub(super) async fn event_loop(
                         // and no lifecycle at all for the restored session.
                         {
                             let engine_arc = session.engine();
+                            // Teardown runs as its own task and the loop
+                            // keeps painting while it does. Awaiting the
+                            // hooks here suspended the single future that
+                            // drives redraws and input, so a slow
+                            // `SessionStop` hook froze the TUI — including
+                            // the Ctrl+C that would have escaped it — for
+                            // up to the hook timeout.
+                            //
+                            // Keys that arrive meanwhile are buffered, not
+                            // dropped: the loop replays them from
+                            // `pending_events` as soon as it is free, so
+                            // the only cost of a slow hook is that input
+                            // lands late rather than vanishing.
+                            let quiesce = tokio::spawn(async move {
+                                let mut eng = engine_arc.lock().await;
+                                // A cancelled turn leaves `cancel`
+                                // cancelled until the next `begin_turn`,
+                                // and `run_hooks` refuses a cancelled
+                                // scope — so resuming after a cancel would
+                                // have dropped both lifecycle events,
+                                // which is precisely when a teardown hook
+                                // matters most. No turn is in flight here,
+                                // so renewing is safe.
+                                eng.renew_cancel_scope();
+                                let _ = eng.fire_session_stop_hooks().await;
+                            });
+                            tokio::pin!(quiesce);
+                            loop {
+                                tokio::select! {
+                                    done = &mut quiesce => {
+                                        if let Err(e) = done {
+                                            tracing::warn!("session teardown task failed: {e}");
+                                        }
+                                        break;
+                                    }
+                                    maybe_ev = term_events.next() => {
+                                        match maybe_ev {
+                                            Some(Ok(ev)) => pending_events.push_back(ev),
+                                            Some(Err(_)) | None => break,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(
+                                        std::time::Duration::from_millis(80),
+                                    ) => {
+                                        app.dirty = true;
+                                    }
+                                }
+                                if app.dirty {
+                                    let _ = draw(app);
+                                    app.dirty = false;
+                                }
+                            }
+                            let engine_arc = session.engine();
                             let mut eng = engine_arc.lock().await;
-                            // A cancelled turn leaves `cancel` cancelled
-                            // until the next `begin_turn`, and `run_hooks`
-                            // refuses a cancelled scope — so resuming
-                            // after a cancel would have dropped both
-                            // lifecycle events, which is precisely when a
-                            // teardown hook matters most. No turn is in
-                            // flight here, so renewing is safe.
-                            eng.renew_cancel_scope();
-                            let _ = eng.fire_session_stop_hooks().await;
                             // Also here, and for the same reason: this
                             // tears down the departing session — grants,
                             // `/add-dir` paths, the prompt cache, the
@@ -1455,7 +1528,7 @@ pub(super) async fn event_loop(
 
         tokio::select! {
             // Terminal input.
-            maybe_ev = term_events.next() => {
+            maybe_ev = next_terminal_event(&mut pending_events, term_events) => {
                 match maybe_ev {
                     Some(Ok(Event::Key(key))) => {
                         // Disarm a stale quit before routing the key so a late
