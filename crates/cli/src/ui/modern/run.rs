@@ -347,9 +347,14 @@ pub(super) async fn event_loop(
         tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
     // `/resume` session discovery, same shape: the scan runs on a blocking
     // thread and the rows come back here (see the select arms).
-    let (session_list_tx, mut session_list_rx) = tokio::sync::mpsc::unbounded_channel::<
+    let (session_list_tx, mut session_list_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        u64,
         Vec<agent_code_lib::services::session::SessionSummary>,
-    >();
+    )>();
+    // Bumped per scan so a result from a superseded `/resume` cannot
+    // reset a filtered picker, or reopen one the user has already
+    // dismissed or selected from.
+    let mut session_scan_generation: u64 = 0;
     // Loading the *selected* session is the heavier half — a whole
     // transcript read and deserialized — so it is detached too. The
     // payload is boxed because a full conversation is far too big to pass
@@ -1024,6 +1029,8 @@ pub(super) async fn event_loop(
             // to a blocking thread and returns through the arm below.
             _ = std::future::ready(()), if app.pending_session_list => {
                 app.pending_session_list = false;
+                session_scan_generation = session_scan_generation.wrapping_add(1);
+                let generation = session_scan_generation;
                 let tx = session_list_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     // Summary-only listing: it is index-cached and skips
@@ -1032,11 +1039,16 @@ pub(super) async fn event_loop(
                     let rows = agent_code_lib::services::session::list_session_summaries(
                         SESSION_PICKER_LIMIT,
                     );
-                    let _ = tx.send(rows);
+                    let _ = tx.send((generation, rows));
                 });
             }
-            Some(rows) = session_list_rx.recv() => {
-                app.show_session_picker(rows);
+            Some((generation, rows)) = session_list_rx.recv() => {
+                // A second `/resume` submitted while this scan was
+                // running supersedes it; showing the older result would
+                // reopen or re-filter the picker behind the user.
+                if generation == session_scan_generation {
+                    app.show_session_picker(rows);
+                }
             }
             // Read and rebuild the selected session off-thread: a long
             // conversation is megabytes of JSON, and deserializing it on
