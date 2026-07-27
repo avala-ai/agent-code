@@ -40,14 +40,62 @@ pub enum EmitMode {
 
 static EMIT_MODE: OnceLock<EmitMode> = OnceLock::new();
 
+// Test-only emit-mode override. Thread-local rather than global: the
+// test harness runs each test on its own thread, so a test that pins
+// Mono cannot bleed into a frame another test is rendering in parallel.
+#[cfg(test)]
+thread_local! {
+    static TEST_MODE: std::cell::Cell<Option<EmitMode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_override() -> Option<EmitMode> {
+    TEST_MODE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn test_override() -> Option<EmitMode> {
+    None
+}
+
+/// Pin the emit mode on this thread until the returned guard drops.
+///
+/// Without this a test cannot reach any mode but truecolor (see
+/// [`current`]), which makes "does the UI actually go monochrome under
+/// `NO_COLOR`?" untestable — the one question the palette routing exists
+/// to answer.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn pin_mode(mode: EmitMode) -> ModeGuard {
+    TEST_MODE.with(|m| m.set(Some(mode)));
+    ModeGuard
+}
+
+/// Restores the ambient emit mode on drop, including on panic — a failed
+/// assertion must not leave the rest of the thread's tests in Mono.
+#[cfg(test)]
+pub(crate) struct ModeGuard;
+
+#[cfg(test)]
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        TEST_MODE.with(|m| m.set(None));
+    }
+}
+
 /// Returns the cached emit mode, initializing it on first call.
 ///
-/// Under `cfg(test)` this is pinned to [`EmitMode::Truecolor`]: rendered
-/// frames — the golden snapshots above all — must be identical on every
-/// runner, not a function of the ambient `NO_COLOR` / `CLICOLOR` /
-/// `FORCE_COLOR` / `TERM` environment the tests happen to inherit.
-/// Detection itself stays covered through the pure [`detect_from_env`].
+/// Under `cfg(test)` this is pinned to [`EmitMode::Truecolor`] unless a
+/// test asked for something else via [`pin_mode`]: rendered frames — the
+/// golden snapshots above all — must be identical on every runner, not a
+/// function of the ambient `NO_COLOR` / `CLICOLOR` / `FORCE_COLOR` /
+/// `TERM` environment the tests happen to inherit. Detection itself
+/// stays covered through the pure [`detect_from_env`].
 pub fn current() -> EmitMode {
+    if let Some(mode) = test_override() {
+        return mode;
+    }
     if cfg!(test) {
         return EmitMode::Truecolor;
     }
@@ -201,6 +249,55 @@ pub fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     let b6 = cube_step(b);
     16 + 36 * r6 + 6 * g6 + b6
 }
+
+/// Inverse of [`quantize_to_ansi256`]: the RGB an ANSI-256 index
+/// stands for.
+///
+/// Exact for the colour cube and the greyscale ramp, and canonical
+/// xterm values for the 16 system slots (which a terminal may
+/// nonetheless redefine). Needed because the 256-colour downgrade turns
+/// every palette slot into an index, and code that has to reason about
+/// a colour — how legible text will be on top of it — otherwise sees
+/// nothing it can measure.
+pub fn ansi256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    /// The six cube levels, per channel.
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match idx {
+        0..=15 => SYSTEM_RGB[idx as usize],
+        16..=231 => {
+            let n = idx - 16;
+            (
+                LEVELS[(n / 36) as usize],
+                LEVELS[((n % 36) / 6) as usize],
+                LEVELS[(n % 6) as usize],
+            )
+        }
+        232..=255 => {
+            let v = 8 + 10 * (idx - 232);
+            (v, v, v)
+        }
+    }
+}
+
+/// Canonical xterm RGB for the 16 system colours, in index order.
+const SYSTEM_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
 
 /// Map a 0..=255 channel value to a 0..=5 cube step. The cube levels
 /// are 0, 95, 135, 175, 215, 255 — non-linear, so we pick the closest

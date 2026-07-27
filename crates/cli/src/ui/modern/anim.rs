@@ -5,6 +5,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use super::colors::palette;
+
 /// Braille spinner frames (same family as production agent screens).
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -43,10 +45,10 @@ pub fn pulse_style(tick: u64, base: Color) -> Style {
 pub fn toast_style(remaining: u8) -> Style {
     if remaining <= 4 {
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(palette().muted)
             .add_modifier(Modifier::DIM)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().inactive)
     }
 }
 
