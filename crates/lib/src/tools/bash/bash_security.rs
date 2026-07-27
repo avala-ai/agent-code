@@ -185,7 +185,10 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         if head_is_data {
             continue;
         }
-        let normalized = invocation
+        // Only the words that can name a command: a pathspec after `--`
+        // is a path, however much it reads like one.
+        let scanned = executable_tokens(invocation);
+        let normalized = scanned
             .iter()
             .map(|t| unquote_token(t).replace(' ', "\u{0}"))
             .collect::<Vec<_>>()
@@ -200,7 +203,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         // Decoded whitespace is whitespace: `$'DROP\tTABLE users'`
         // reaches the database as a statement with a tab where the
         // pattern has a space, so runs of it read as one space.
-        let per_token: Vec<String> = invocation
+        let per_token: Vec<String> = scanned
             .iter()
             .map(|t| canonical_whitespace(&unquote_token(t)).to_lowercase())
             .collect();
@@ -539,7 +542,15 @@ const DESTRUCTIVE_GIT_FLAGS: &[(&str, &[char], &[&str])] = &[
 /// spelled `git` sits in front of the real one in
 /// `find … -exec echo git \; -exec git push -uf … \;`.
 fn clustered_git_flag(invocation: &[String]) -> Option<String> {
-    let tokens: Vec<String> = invocation.iter().map(|t| unquote_token(t)).collect();
+    // Only the words that can name a command. This scans *every* token
+    // spelled `git`, and a pathspec unquotes to one just as well:
+    // `git log -- g'it' push --force` shows a file's history, but the
+    // second `git` was read as a command and rebuilt as `git push
+    // --force`.
+    let tokens: Vec<String> = executable_tokens(invocation)
+        .iter()
+        .map(|t| unquote_token(t))
+        .collect();
     let head_is_data = tokens
         .first()
         .is_some_and(|t| DATA_COMMANDS.contains(&base_name(t).to_lowercase().as_str()));
@@ -1716,6 +1727,36 @@ fn strip_control_prefix(statement: &str) -> &str {
     }
 }
 
+/// The prefix of `invocation` whose tokens can name something
+/// executable.
+///
+/// `--` ends the options of the command that owns it; everything after
+/// it is that command's operands. `git log -- git push --force` names
+/// paths and pushes nothing, and reading those words as commands made
+/// three separate checks call a read-only command destructive — which
+/// `validate_input` refuses outright, so the command could not be run
+/// even with confirmation.
+///
+/// A wrapper head keeps every token: there `--` is part of the wrapper's
+/// own grammar, and `env -- GIT_CONFIG_GLOBAL=… git p` really does hand
+/// git that configuration. Bounding it there would turn a false positive
+/// into a bypass.
+///
+/// One rule with one home, because every caller that reads tokens as
+/// commands needs it and each of the three found it separately.
+fn executable_tokens(invocation: &[String]) -> &[String] {
+    let head_is_wrapper = invocation.first().is_some_and(|t| {
+        COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+    });
+    if head_is_wrapper {
+        return invocation;
+    }
+    match invocation.iter().position(|t| unquote_token(t) == "--") {
+        Some(end) => &invocation[..end],
+        None => invocation,
+    }
+}
+
 /// True when a statement could run git, so configuration reaching it
 /// from the environment decides what it does.
 ///
@@ -1968,18 +2009,7 @@ fn statement_mentions_unaccounted_git_config(
         // reading them as an unaccounted selector made a plain status
         // destructive. A wrapper head keeps its own grammar, where `--`
         // still precedes assignments it really does apply.
-        let head_is_wrapper = invocation.first().is_some_and(|t| {
-            COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
-        });
-        let end = if head_is_wrapper {
-            invocation.len()
-        } else {
-            invocation
-                .iter()
-                .position(|t| unquote_token(t) == "--")
-                .unwrap_or(invocation.len())
-        };
-        invocation.iter().take(end).skip(1).any(|token| {
+        executable_tokens(invocation).iter().skip(1).any(|token| {
             split_alias_value(&unquote_token(token)).iter().any(|word| {
                 let name = word.split('=').next().unwrap_or(word);
                 // Every selector, not just the `GIT_CONFIG…` ones: a
@@ -2062,17 +2092,7 @@ fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
     // wrapper's own grammar otherwise, and `env -- GIT_CONFIG_GLOBAL=…
     // git p` really does run git with that configuration, so truncating
     // there would hide it.
-    let head_is_wrapper = invocation
-        .first()
-        .is_some_and(|t| COMMAND_RUNNER_WRAPPERS.contains(&name_of(t).as_str()));
-    let scan_end = if head_is_wrapper {
-        invocation.len()
-    } else {
-        invocation
-            .iter()
-            .position(|t| unquote_token(t) == "--")
-            .unwrap_or(invocation.len())
-    };
+    let scan_end = executable_tokens(invocation).len();
     let mut unreadable = false;
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (at, token) in invocation.iter().enumerate().take(scan_end) {
@@ -3745,6 +3765,53 @@ mod tests {
                 classify_str(cmd),
                 DestructivenessLevel::Safe,
                 "an earlier wrapper-shaped token hid the real one: {cmd}"
+            );
+        }
+    }
+
+    /// The destructive-pattern scan reads tokens as commands too, so it
+    /// needs the same boundary: `git log -- g'it' push --force` names a
+    /// path whose spelling normalizes to `git push --force`, and reading
+    /// it as executable made a read-only log refuse to run at all.
+    #[test]
+    fn a_pathspec_is_not_scanned_as_a_destructive_command() {
+        for cmd in [
+            "git log -- g'it' push --force",
+            "git log -- g'it' reset --hard",
+        ] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "a pathspec was scanned as a command: {cmd}"
+            );
+        }
+    }
+
+    /// Known limitation, stated rather than silently accepted: the
+    /// untokenized backstop scan over the whole command string still
+    /// flags an *unquoted* pathspec — `git log -- git push --force` —
+    /// because it has no token structure in which `--` means anything.
+    /// Bounding it there would exempt everything after any `--` from the
+    /// one net that catches what the parser mis-tokenizes, which trades
+    /// a bypass for an over-block. Left as an over-block deliberately.
+    #[test]
+    fn the_raw_backstop_still_over_blocks_an_unquoted_pathspec() {
+        assert_eq!(
+            classify_str("git log -- git push --force"),
+            DestructivenessLevel::Destructive,
+            "if this changes, the raw scan was bounded — check it was not weakened"
+        );
+    }
+
+    /// The same boundary must not apply under a wrapper head, where
+    /// `--` is the wrapper's own grammar and what follows really runs.
+    #[test]
+    fn a_separator_does_not_hide_a_wrapped_destructive_command() {
+        for cmd in ["env -- rm -rf /tmp/x", "command -- rm -rf /tmp/x"] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Destructive,
+                "a separator hid a command that really runs: {cmd}"
             );
         }
     }
