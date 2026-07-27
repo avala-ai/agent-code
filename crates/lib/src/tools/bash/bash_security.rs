@@ -10,8 +10,8 @@
 //! invocations are blocked.
 
 use crate::tools::bash_parse::{
-    DATA_COMMANDS, ParsedCommand, base_name, env_split_string, is_env_assignment, parse_bash,
-    unquote_token, unwrapped_argv,
+    DATA_COMMANDS, ParsedCommand, base_name, env_split_string, executable_tokens,
+    is_env_assignment, parse_bash, unquote_token, unwrapped_argv,
 };
 
 /// Severity of a destructive-command finding.
@@ -484,7 +484,9 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         }
         let unwrapped = unwrapped_argv(invocation);
         let tokens = unwrapped.as_ref().unwrap_or(&unquoted);
-        for payload in shell_payloads(tokens) {
+        // `git log -- bash -c "'rm' -rf /tmp/x"` names pathspecs; no
+        // nested shell runs, so its apparent payload is not one.
+        for payload in shell_payloads(executable_tokens(tokens)) {
             // Out of budget with a shell payload still in hand: what
             // it runs is unknown, and an unknown nested command cannot
             // be waved through. Refusing here over-blocks deeply
@@ -1724,36 +1726,6 @@ fn strip_control_prefix(statement: &str) -> &str {
             return rest;
         }
         rest = rest[head.len()..].trim_start();
-    }
-}
-
-/// The prefix of `invocation` whose tokens can name something
-/// executable.
-///
-/// `--` ends the options of the command that owns it; everything after
-/// it is that command's operands. `git log -- git push --force` names
-/// paths and pushes nothing, and reading those words as commands made
-/// three separate checks call a read-only command destructive — which
-/// `validate_input` refuses outright, so the command could not be run
-/// even with confirmation.
-///
-/// A wrapper head keeps every token: there `--` is part of the wrapper's
-/// own grammar, and `env -- GIT_CONFIG_GLOBAL=… git p` really does hand
-/// git that configuration. Bounding it there would turn a false positive
-/// into a bypass.
-///
-/// One rule with one home, because every caller that reads tokens as
-/// commands needs it and each of the three found it separately.
-fn executable_tokens(invocation: &[String]) -> &[String] {
-    let head_is_wrapper = invocation.first().is_some_and(|t| {
-        COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
-    });
-    if head_is_wrapper {
-        return invocation;
-    }
-    match invocation.iter().position(|t| unquote_token(t) == "--") {
-        Some(end) => &invocation[..end],
-        None => invocation,
     }
 }
 
@@ -3783,6 +3755,43 @@ mod tests {
                 classify_str(cmd),
                 DestructivenessLevel::Safe,
                 "a pathspec was scanned as a command: {cmd}"
+            );
+        }
+    }
+
+    /// `--` does not mean the same thing to every head. `xargs --help`
+    /// documents `xargs [OPTION]... COMMAND [INITIAL-ARGS]...`, so a
+    /// command after the separator really runs — treating every
+    /// non-wrapper head as operand-terminating skipped it from every
+    /// scan, which is the fail-open direction.
+    #[test]
+    fn a_separator_does_not_hide_a_command_that_really_runs() {
+        for cmd in [
+            "xargs -- git push -uf origin main",
+            "xargs -- rm -rf /tmp/x",
+            "timeout 5 -- rm -rf /tmp/x",
+        ] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Destructive,
+                "a command after -- was skipped: {cmd}"
+            );
+        }
+    }
+
+    /// The other direction, for the head that does terminate: a
+    /// wrapper-shaped pathspec is neither a wrapper to resolve nor a
+    /// launcher whose payload should be parsed.
+    #[test]
+    fn a_pathspec_is_neither_resolved_nor_recursed_into() {
+        for cmd in [
+            "git log -- env -S '${CMD}'",
+            "git log -- bash -c \"'rm' -rf /tmp/x\"",
+        ] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "a pathspec was read as something executable: {cmd}"
             );
         }
     }

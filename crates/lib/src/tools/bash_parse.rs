@@ -880,6 +880,10 @@ pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
         // from every one copies the whole suffix each time, which is
         // quadratic in the argument count for arguments that could
         // never resolve to anything.
+        // Only tokens that can be in command position: `git log -- env
+        // -S '${CMD}'` names a pathspec, and resolving it reported an
+        // unresolved expansion that rejected a read-only command.
+        let argv = executable_tokens(argv);
         argv.iter()
             .enumerate()
             .filter(|(_, word)| {
@@ -890,6 +894,39 @@ pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
                 _ => None,
             })
     })
+}
+
+/// Heads whose `--` ends the options and introduces *operands* rather
+/// than a command. `git` documents its tail as `[[--] <path>...]`, so a
+/// subcommand name after the separator is a path.
+///
+/// Deliberately a short allowlist rather than "any head that is not a
+/// wrapper". `xargs --help` documents `xargs [OPTION]... COMMAND
+/// [INITIAL-ARGS]...`, so `xargs -- git push -uf` really does run the
+/// push; treating every unlisted head as operand-terminating skipped
+/// exactly that from every scan. Unlisted heads therefore keep all their
+/// tokens, which can only ever over-block.
+const OPERAND_TERMINATOR_HEADS: &[&str] = &["git"];
+
+/// The prefix of `invocation` whose tokens can name something
+/// executable — everything, unless the head is one that turns `--` into
+/// operands.
+///
+/// One rule with one home: the destructive-pattern scan, the environment
+/// walk, the unaccounted-mention check, the git subcommand scan, the
+/// wrapper-suffix scan and the nested-payload scan all need it, and each
+/// that grew its own copy got it subtly wrong.
+pub(crate) fn executable_tokens(invocation: &[String]) -> &[String] {
+    let terminates = invocation.first().is_some_and(|t| {
+        OPERAND_TERMINATOR_HEADS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+    });
+    if !terminates {
+        return invocation;
+    }
+    match invocation.iter().position(|t| unquote_token(t) == "--") {
+        Some(end) => &invocation[..end],
+        None => invocation,
+    }
 }
 
 /// True when some invocation runs a command whose identity this parser
