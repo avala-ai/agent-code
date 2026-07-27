@@ -611,6 +611,102 @@ fn user_themes_dir() -> Option<PathBuf> {
 
 /// Load every user palette from disk. Best-effort: a missing directory
 /// yields no themes; malformed files are logged and skipped.
+/// Build the display catalog from the user palettes on disk.
+///
+/// Pure, so the ordering rules are testable without a themes directory.
+///
+/// A user palette that owns an alias id takes that row *in place*
+/// rather than the alias being dropped and the palette appended: the
+/// aliases lead the catalog and `all_names().first()` is relied on as
+/// `auto`, so dropping the row moved the id to the end and made that
+/// ordering depend on whether a themes/auto.toml happened to exist.
+fn catalog(user: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut opts: Vec<(String, String)> = [
+        ("auto", "Auto (match terminal)"),
+        ("dark", "Dark (default dark palette)"),
+        ("light", "Light (default light palette)"),
+    ]
+    .into_iter()
+    .map(|(id, label)| match user.iter().find(|(uid, _)| uid == id) {
+        // Keep the user's label so the row names what it applies.
+        Some((uid, ulabel)) => (uid.clone(), ulabel.clone()),
+        None => (id.to_string(), label.to_string()),
+    })
+    .collect();
+
+    for p in standard_palettes() {
+        opts.push((p.id.into_owned(), p.label.into_owned()));
+    }
+    opts.extend(user);
+
+    // One row per id: the first occurrence wins, so an alias row a user
+    // palette already claimed is not repeated at the end, and a user
+    // palette shadowing a standard id keeps the standard slot.
+    let mut seen = std::collections::HashSet::new();
+    opts.retain(|(id, _)| seen.insert(id.clone()));
+    opts
+}
+
+/// The catalog ids for a given set of user palettes — the hermetic
+/// half of [`Theme::all_names`], which reads the user's themes
+/// directory. Tests that assert on the *built-in* catalog use this with
+/// an empty input rather than traversing whatever the developer (or a
+/// CI image) happens to have on disk: a stray `.toml` there changes the
+/// answer, and a special file such as a FIFO can block the read.
+pub(crate) fn catalog_ids(user: Vec<(String, String)>) -> Vec<String> {
+    catalog(user).into_iter().map(|(id, _)| id).collect()
+}
+
+/// Whether a user palette file owns `id`.
+///
+/// The runtime facade intercepts `auto` before any palette lookup, so it
+/// has to ask this before doing so — otherwise a user's `auto.toml` is
+/// advertised by the catalog but never actually applied.
+pub fn user_palette_exists(id: &str) -> bool {
+    user_palette(id).is_some()
+}
+
+/// The user palette that owns `id`, if any.
+///
+/// Resolving a *single* id never loads the directory: a palette's id is
+/// its file stem, so there is exactly one candidate file. Startup takes
+/// this path for whatever `[ui].theme` names — including the default
+/// `auto` — and must not depend on unrelated entries in the themes
+/// directory being readable, well-formed, or even openable.
+/// [`load_palettes_dir`] stays for the pickers, which do want them all.
+fn user_palette(id: &str) -> Option<Palette> {
+    user_palette_in(&user_themes_dir()?, id)
+}
+
+/// Pure over the directory, like [`load_palettes_dir`], so the candidate
+/// rules are testable without a real themes directory.
+fn user_palette_in(dir: &Path, id: &str) -> Option<Palette> {
+    // `id` reaches the filesystem, so it has to name a file *in* `dir`
+    // and not a path that walks out of it. `Normal` is what excludes the
+    // traversal components: `.` and `..` are each a single component too,
+    // so counting them is not enough. A leading dot is fine — a stem like
+    // `.foo` is a legitimate id that `load_palettes_dir` advertises, and
+    // rejecting it here would leave a picker entry that never resolves.
+    let mut components = Path::new(id).components();
+    match components.next() {
+        Some(std::path::Component::Normal(only)) if only == std::ffi::OsStr::new(id) => {}
+        _ => return None,
+    }
+    if components.next().is_some() {
+        return None;
+    }
+    let path = dir.join(format!("{id}.toml"));
+    // Stat before reading: a `.toml` FIFO (or a symlink to one) is not a
+    // regular file, and `read_to_string` on it would block startup.
+    if !std::fs::metadata(&path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    load_palette_file(&path, id)
+}
+
 fn user_palettes() -> Vec<Palette> {
     user_themes_dir()
         .map(|d| load_palettes_dir(&d))
@@ -682,7 +778,7 @@ fn lookup_palette(id: &str) -> Option<Palette> {
     standard_palettes()
         .into_iter()
         .find(|p| p.id.as_ref() == id)
-        .or_else(|| user_palettes().into_iter().find(|p| p.id.as_ref() == id))
+        .or_else(|| user_palette(id))
 }
 
 impl Theme {
@@ -715,23 +811,26 @@ impl Theme {
     /// standard palette ids, then any user palette ids. Drives the
     /// onboarding picker and the `/color` slash command.
     pub fn all_names() -> Vec<String> {
-        let mut names = vec!["auto".to_string()];
-        names.extend(standard_palettes().into_iter().map(|p| p.id.into_owned()));
-        names.extend(user_palettes().into_iter().map(|p| p.id.into_owned()));
-        names
+        Self::all_options().into_iter().map(|(id, _)| id).collect()
     }
 
-    /// `(id, label)` pairs in display order, for pickers that show a
-    /// human-facing name. Mirrors [`Self::all_names`].
+    /// `(id, label)` pairs in display order — the single catalog both
+    /// [`Self::all_names`] and the pickers read, so the two can never
+    /// disagree about which ids exist or where they sit.
+    ///
+    /// `auto` / `dark` / `light` are aliases [`Self::from_name`]
+    /// resolves, and the docs advertise them, so they lead the list.
+    /// A user palette file named after an alias is resolved *first* by
+    /// `from_name`, so in that case the alias row is dropped and the
+    /// user palette keeps the id — listing both would offer the same
+    /// identifier twice with only one of them reachable.
     pub fn all_options() -> Vec<(String, String)> {
-        let mut opts = vec![("auto".to_string(), "Auto (match terminal)".to_string())];
-        for p in standard_palettes() {
-            opts.push((p.id.into_owned(), p.label.into_owned()));
-        }
-        for p in user_palettes() {
-            opts.push((p.id.into_owned(), p.label.into_owned()));
-        }
-        opts
+        catalog(
+            user_palettes()
+                .into_iter()
+                .map(|p| (p.id.into_owned(), p.label.into_owned()))
+                .collect(),
+        )
     }
 
     /// Get a subagent color by index (wraps around).
@@ -959,9 +1058,41 @@ mod tests {
         assert_eq!(as_rgb(dark.accent), as_rgb(one_dark.accent));
     }
 
+    /// A user palette owning an alias id must take that row in place:
+    /// the aliases lead the catalog, and dropping the row moved the id
+    /// to the end — which made ordering depend on whether the developer
+    /// happened to have a themes/auto.toml.
+    #[test]
+    fn a_shadowing_user_palette_keeps_the_alias_position() {
+        let user = vec![("auto".to_string(), "My Auto (custom)".to_string())];
+        let opts = super::catalog(user);
+        assert_eq!(opts[0].0, "auto", "auto must stay first: {opts:?}");
+        assert_eq!(
+            opts[0].1, "My Auto (custom)",
+            "the row must name the palette that actually applies"
+        );
+        assert_eq!(
+            opts.iter().filter(|(id, _)| id == "auto").count(),
+            1,
+            "the id must not appear twice"
+        );
+        assert_eq!(opts[1].0, "dark");
+        assert_eq!(opts[2].0, "light");
+
+        // Without a shadowing palette the built-in labels stand.
+        let plain = super::catalog(Vec::new());
+        assert_eq!(
+            plain[0],
+            ("auto".to_string(), "Auto (match terminal)".to_string())
+        );
+    }
+
     #[test]
     fn all_names_starts_with_auto_and_lists_standard_ids() {
-        let names = Theme::all_names();
+        // The built-in catalog, not the disk: `all_names()` traverses the
+        // user's themes directory, so asserting on it here would depend
+        // on the developer's machine.
+        let names = super::catalog_ids(Vec::new());
         assert_eq!(names.first().map(String::as_str), Some("auto"));
         for id in [
             "monokai",
@@ -978,7 +1109,9 @@ mod tests {
 
     #[test]
     fn every_named_theme_resolves_with_populated_slots() {
-        for name in Theme::all_names() {
+        // Built-ins only: a malformed palette in the developer's themes
+        // directory is not this test's subject.
+        for name in super::catalog_ids(Vec::new()) {
             let t = Theme::from_name(&name);
             assert!(
                 !matches!(t.accent, Color::Reset),
@@ -996,10 +1129,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn user_palette_loads_from_toml_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = r##"
+    /// A palette file with every required slot filled.
+    const MINIMAL_PALETTE: &str = r##"
 label = "My Theme"
 dark = false
 bg = "#101010"
@@ -1016,7 +1147,11 @@ purple = "#8800ff"
 pink = "#ff00ff"
 accent = "#00ffff"
 "##;
-        std::fs::write(dir.path().join("mytheme.toml"), toml).unwrap();
+
+    #[test]
+    fn user_palette_loads_from_toml_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mytheme.toml"), MINIMAL_PALETTE).unwrap();
         // A malformed file must be skipped, not panic.
         std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
 
@@ -1039,6 +1174,119 @@ accent = "#00ffff"
         let missing = dir.path().join("does-not-exist");
         assert!(load_palettes_dir(&missing).is_empty());
     }
+
+    #[test]
+    fn palette_lookup_reads_only_its_own_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        // Neither of these is the candidate, so neither may be opened.
+        std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
+        std::fs::create_dir(dir.path().join("nested.toml")).unwrap();
+
+        assert!(user_palette_in(dir.path(), "auto").is_some());
+        assert!(user_palette_in(dir.path(), "absent").is_none());
+        assert!(user_palette_in(dir.path(), "broken").is_none(), "malformed");
+        assert!(
+            user_palette_in(dir.path(), "nested").is_none(),
+            "not a file"
+        );
+    }
+
+    #[test]
+    fn palette_lookup_rejects_ids_that_leave_the_themes_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        let outside = dir.path().parent().unwrap().join("escaped.toml");
+        std::fs::write(&outside, MINIMAL_PALETTE).unwrap();
+
+        for id in [
+            "../escaped",
+            "sub/auto",
+            "/etc/passwd",
+            "",
+            ".",
+            "..",
+            "auto/",
+        ] {
+            assert!(user_palette_in(dir.path(), id).is_none(), "{id:?}");
+        }
+        let _ = std::fs::remove_file(outside);
+    }
+
+    /// `load_palettes_dir` takes the id from the file stem, so `.foo.toml`
+    /// is advertised as `.foo`. Resolution has to accept the same ids the
+    /// catalog offers, or the picker lists a theme that silently falls
+    /// back to the default when chosen.
+    #[test]
+    fn palette_lookup_accepts_a_dot_prefixed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".foo.toml"), MINIMAL_PALETTE).unwrap();
+
+        let advertised: Vec<String> = load_palettes_dir(dir.path())
+            .into_iter()
+            .map(|p| p.id.into_owned())
+            .collect();
+        assert_eq!(advertised, vec![".foo".to_string()], "catalog id");
+        assert!(
+            user_palette_in(dir.path(), ".foo").is_some(),
+            "every advertised id must resolve"
+        );
+    }
+
+    /// The default `theme = "auto"` runs this lookup during startup, so a
+    /// non-regular `.toml` must be rejected by a stat rather than opened:
+    /// reading a FIFO with no writer never returns. Run off-thread so a
+    /// regression fails this test instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn palette_lookup_does_not_block_on_a_fifo() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto.toml");
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let probe = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(user_palette_in(&probe, "auto").is_some());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert!(!found, "a FIFO is not a palette"),
+            Err(_) => panic!("palette lookup blocked on a FIFO"),
+        }
+    }
+
+    /// Resolving one id must not depend on the *other* entries: a valid
+    /// `auto.toml` still resolves with an unreadable sibling alongside
+    /// it. Both the runtime's existence check and `lookup_palette` go
+    /// through this function, so a reintroduced directory scan on either
+    /// path fails here. Off-thread with a timeout for the same reason as
+    /// above — a scan would block on the sibling FIFO, not just be slow.
+    #[cfg(unix)]
+    #[test]
+    fn resolving_one_palette_ignores_its_siblings() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        let sibling = dir.path().join("hostile.toml");
+        let c_path = CString::new(sibling.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let probe = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(user_palette_in(&probe, "auto").map(|p| p.label.into_owned()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert_eq!(found.as_deref(), Some("My Theme")),
+            Err(_) => panic!("resolving one palette read the whole directory"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1051,7 +1299,7 @@ mod accessibility_tests {
     /// the first-run config after the palettes were rewritten.
     #[test]
     fn shipped_default_theme_ids_resolve() {
-        let names = Theme::all_names();
+        let names = super::catalog_ids(Vec::new());
         // The id the first-run config writes must be a real registry option,
         // not something that silently falls back to the default.
         assert!(
@@ -1074,7 +1322,7 @@ mod accessibility_tests {
     /// affordances, not cosmetics: they must stay in the registry.
     #[test]
     fn accessibility_themes_are_registered() {
-        let names = Theme::all_names();
+        let names = super::catalog_ids(Vec::new());
         for id in [
             "dark-colorblind",
             "light-colorblind",
@@ -1111,5 +1359,68 @@ mod accessibility_tests {
                 t.accent
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod documented_names {
+    /// Every identifier `docs/configuration/themes.mdx` advertises must be
+    /// accepted, or the docs are promising a theme `/color` will reject.
+    #[test]
+    fn every_documented_theme_name_is_accepted() {
+        // Built-ins only: the docs advertise the shipped palettes, and
+        // reading the user's themes directory would make this depend on
+        // the developer's machine (and can block on a special file).
+        let accepted = super::catalog_ids(Vec::new());
+        // Read the identifiers out of the docs rather than restating
+        // them: a copied list keeps passing when the docs add or rename
+        // a theme, which is exactly the drift this test exists to catch.
+        let doc = include_str!("../../../../docs/configuration/themes.mdx");
+        // Only the theme-name table: the page also documents colour keys
+        // in backticked tables, and those are not theme identifiers. The
+        // table is the contiguous run of `|` rows containing `auto`.
+        let lines: Vec<&str> = doc.lines().collect();
+        let anchor = lines
+            .iter()
+            .position(|l| l.starts_with('|') && l.contains("`auto`"))
+            .expect("themes.mdx must document the `auto` theme in a table");
+        let start = lines[..anchor]
+            .iter()
+            .rposition(|l| !l.starts_with('|'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = lines[anchor..]
+            .iter()
+            .position(|l| !l.starts_with('|'))
+            .map(|i| anchor + i)
+            .unwrap_or(lines.len());
+        let documented: Vec<String> = lines[start..end]
+            .iter()
+            .filter_map(|l| l.split('|').nth(1))
+            .flat_map(|cell| {
+                cell.split('/')
+                    .filter_map(|part| {
+                        let t = part.trim();
+                        t.strip_prefix('`')
+                            .and_then(|t| t.strip_suffix('`'))
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            documented.len() >= 10,
+            "parsed only {} names from the themes.mdx table — the format \
+             probably changed, which would make this test vacuous",
+            documented.len()
+        );
+        let missing: Vec<&String> = documented
+            .iter()
+            .filter(|d| !accepted.iter().any(|a| a == *d))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "documented but not accepted by /color: {missing:?}\naccepted: {accepted:?}"
+        );
     }
 }

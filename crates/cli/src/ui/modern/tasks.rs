@@ -123,8 +123,14 @@ pub struct ManagerRow {
 /// Pane lines the grouped list needs: a heading per source group, a
 /// blank line between groups, and two lines per task. The layout uses
 /// this to size the below-transcript strip on narrow terminals.
-pub fn pane_rows_with_todos(tasks: &[TaskEntry], todos: &[TodoItem]) -> usize {
-    let mut rows = pane_rows(tasks);
+/// Rows the pane needs for the checklist and the grouped task list,
+/// with `collapsed` groups folded to their heading.
+pub fn pane_rows_with_todos(
+    tasks: &[TaskEntry],
+    todos: &[TodoItem],
+    collapsed: &[TaskSource],
+) -> usize {
+    let mut rows = pane_rows_collapsed(tasks, collapsed);
     if !todos.is_empty() {
         // heading + one row per item, plus a blank separator when tasks
         // follow it.
@@ -137,6 +143,14 @@ pub fn pane_rows_with_todos(tasks: &[TaskEntry], todos: &[TodoItem]) -> usize {
 }
 
 pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
+    pane_rows_collapsed(tasks, &[])
+}
+
+/// Row count with `collapsed` groups folded to their heading.
+///
+/// The pane is sized from this, so a collapsed group has to shrink the
+/// strip too — otherwise collapsing frees no space and buys nothing.
+pub fn pane_rows_collapsed(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> usize {
     let mut rows = 0;
     let mut last: Option<TaskSource> = None;
     for t in tasks {
@@ -147,9 +161,41 @@ pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
             rows += 1;
             last = Some(t.source);
         }
-        rows += 2;
+        if !collapsed.contains(&t.source) {
+            rows += 2;
+        }
     }
     rows
+}
+
+/// Rows the user can move a selection through.
+///
+/// An expanded group contributes every one of its rows. A collapsed
+/// group contributes exactly one: its first task, which is the index
+/// the folded heading stands in for. Dropping it instead would make the
+/// group the user just folded the one group they can no longer reach to
+/// unfold.
+pub fn selectable_indices(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut last: Option<TaskSource> = None;
+    for (i, t) in tasks.iter().enumerate() {
+        if !collapsed.contains(&t.source) || last != Some(t.source) {
+            out.push(i);
+        }
+        last = Some(t.source);
+    }
+    out
+}
+
+/// True when `idx` is the row a collapsed group's heading stands in for.
+///
+/// Rows are sorted by source, so a group is one contiguous run and its
+/// first member is the only one the heading can represent.
+pub fn is_folded_heading(tasks: &[TaskEntry], collapsed: &[TaskSource], idx: usize) -> bool {
+    let Some(t) = tasks.get(idx) else {
+        return false;
+    };
+    collapsed.contains(&t.source) && (idx == 0 || tasks[idx - 1].source != t.source)
 }
 
 /// Upsert a subagent update into `tasks`, keeping entries ordered by state
@@ -235,6 +281,138 @@ pub fn upsert_with_source(
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
+    fn two_groups() -> Vec<TaskEntry> {
+        let mut t = Vec::new();
+        upsert(&mut t, "a1", "working", "explore");
+        upsert(&mut t, "a2", "working", "audit");
+        upsert_with_source(&mut t, "b1", "working", "build", TaskSource::Background);
+        t
+    }
+
+    /// Collapsing has to shrink the pane, or it frees no space and buys
+    /// the user nothing.
+    #[test]
+    fn a_collapsed_group_costs_only_its_heading() {
+        let tasks = two_groups();
+        let open = pane_rows_collapsed(&tasks, &[]);
+        let folded = pane_rows_collapsed(&tasks, &[TaskSource::Subagent]);
+        assert!(
+            folded < open,
+            "collapsing did not shrink the pane: {folded} vs {open}"
+        );
+        // Two agent rows at 2 lines each disappear; the heading stays.
+        assert_eq!(open - folded, 4);
+    }
+
+    /// Sizing has to see both the checklist and the folded groups: the
+    /// two features landed separately, and a row count that knows about
+    /// only one of them either overshoots the strip or gives collapsing
+    /// nothing to free.
+    #[test]
+    fn collapsing_still_shrinks_the_pane_when_a_checklist_is_present() {
+        let tasks = two_groups();
+        let todos = vec![
+            TodoItem {
+                id: "1".into(),
+                content: "first".into(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: "2".into(),
+                content: "second".into(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+        let open = pane_rows_with_todos(&tasks, &todos, &[]);
+        let folded = pane_rows_with_todos(&tasks, &todos, &[TaskSource::Subagent]);
+        // The checklist costs the same either way, so folding frees
+        // exactly the two agent rows it hides.
+        assert_eq!(open - folded, 4, "{open} vs {folded}");
+        // And the checklist is still accounted for on top of the tasks.
+        assert!(
+            open > pane_rows_collapsed(&tasks, &[]),
+            "checklist rows vanished from the row count"
+        );
+    }
+
+    #[test]
+    fn pane_rows_matches_the_uncollapsed_count() {
+        let tasks = two_groups();
+        assert_eq!(pane_rows(&tasks), pane_rows_collapsed(&tasks, &[]));
+    }
+
+    /// A folded group keeps exactly one selectable row — its heading —
+    /// so the user can still reach it to unfold. The rows behind the
+    /// heading stay unreachable: landing there would look like the pane
+    /// stopped responding.
+    #[test]
+    fn a_folded_group_is_selectable_only_through_its_heading() {
+        let tasks = two_groups();
+        let sel = selectable_indices(&tasks, &[TaskSource::Subagent]);
+        let agents: Vec<usize> = sel
+            .iter()
+            .copied()
+            .filter(|i| tasks[*i].source == TaskSource::Subagent)
+            .collect();
+        assert_eq!(
+            agents.len(),
+            1,
+            "folded group must contribute exactly one selectable row"
+        );
+        assert!(
+            is_folded_heading(&tasks, &[TaskSource::Subagent], agents[0]),
+            "the selectable row is not the group's heading"
+        );
+        // The other group is untouched.
+        assert_eq!(
+            sel.iter()
+                .filter(|i| tasks[**i].source == TaskSource::Background)
+                .count(),
+            1
+        );
+        assert_eq!(selectable_indices(&tasks, &[]).len(), tasks.len());
+    }
+
+    /// Folding every group must not strand the selection with nowhere
+    /// to go — each heading stays reachable.
+    #[test]
+    fn folding_everything_leaves_one_row_per_group() {
+        let tasks = two_groups();
+        let sel = selectable_indices(&tasks, &[TaskSource::Subagent, TaskSource::Background]);
+        assert_eq!(sel.len(), 2, "expected one heading per group: {sel:?}");
+        assert!(
+            sel.iter().all(|i| is_folded_heading(
+                &tasks,
+                &[TaskSource::Subagent, TaskSource::Background],
+                *i
+            )),
+            "a non-heading row stayed selectable"
+        );
+    }
+
+    #[test]
+    fn only_a_groups_first_row_counts_as_its_heading() {
+        let tasks = two_groups();
+        let folded = [TaskSource::Subagent];
+        let agent_rows: Vec<usize> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.source == TaskSource::Subagent)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(agent_rows.len(), 2);
+        assert!(is_folded_heading(&tasks, &folded, agent_rows[0]));
+        assert!(!is_folded_heading(&tasks, &folded, agent_rows[1]));
+        // An expanded group has no folded heading at all.
+        assert!(!is_folded_heading(&tasks, &[], agent_rows[0]));
+    }
+
     /// The drill-in dead end this closes: an inline subagent finishes,
     /// has no `task_id` because it never reached the TaskManager, and so
     /// there is nothing to open. Its result is captured on the row.
@@ -631,6 +809,8 @@ pub fn todo_progress(todos: &[TodoItem]) -> (usize, usize) {
 
 #[cfg(test)]
 mod todo_tests {
+    #![deny(dead_code)]
+
     use super::*;
 
     #[test]

@@ -148,6 +148,87 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
+/// Read the destination project's config without committing to it.
+///
+/// `Config::load` layers from the *process* working directory, and this
+/// has to answer "would this project's settings parse" before anything
+/// moves — a destination whose settings are broken must fail the resume
+/// while refusing is still free, not after the session has been adopted.
+/// So the directory is entered briefly and left again.
+///
+/// Safe at this one call site and nowhere else: the restore only runs
+/// with no turn in flight, so nothing is resolving a relative path
+/// underneath it. A `Config::load_from(&Path)` in the library would make
+/// that structural rather than situational; this is the smaller change.
+fn load_project_config(dir: &str) -> Result<agent_code_lib::config::Config, String> {
+    let previous = std::env::current_dir().map_err(|e| e.to_string())?;
+    std::env::set_current_dir(dir).map_err(|e| e.to_string())?;
+    let loaded = agent_code_lib::config::Config::load().map_err(|e| e.to_string());
+    // Restore before reporting either way: leaving the process in the
+    // destination after refusing the resume is the exact mismatch this
+    // whole path exists to avoid.
+    std::env::set_current_dir(&previous).map_err(|e| e.to_string())?;
+    loaded
+}
+
+/// Whether a restored session's directory can be entered, without
+/// entering it.
+///
+/// Runs *before* any session state is replaced, because it is a
+/// precondition of the restore rather than a step in it: if the saved
+/// directory is gone, adopting the conversation anyway would leave a
+/// project-A session running against project-B's cwd — the wrong-tree
+/// hazard the whole cwd restore exists to prevent. `Ok(None)` means
+/// there is nothing to move to.
+fn check_session_cwd(
+    restored_cwd: &str,
+    previous_cwd: &str,
+) -> Result<Option<std::path::PathBuf>, std::io::Error> {
+    if restored_cwd.is_empty() || restored_cwd == previous_cwd {
+        return Ok(None);
+    }
+    let dir = std::path::PathBuf::from(restored_cwd);
+    // Deliberately does not move: the departing session's stop hooks
+    // still have to run in its own directory, and shell hooks inherit
+    // the process cwd. This only answers "could we", so the resume can
+    // be refused before any state changes.
+    let meta = std::fs::metadata(&dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "not a directory",
+        ));
+    }
+    Ok(Some(dir))
+}
+
+/// Finish moving into a directory the process has already entered:
+/// engine state, prompt cache (the cwd is baked into it), persistent
+/// grants (per-project, so approvals from the old one must stop
+/// applying) and the UI, then `CwdChanged` so watchers retune.
+async fn finish_cwd_adoption(
+    app: &mut App,
+    eng: &mut agent_code_lib::query::QueryEngine,
+    dir: &std::path::Path,
+    previous_cwd: &str,
+    cfg: agent_code_lib::config::Config,
+) {
+    let cwd = dir.display().to_string();
+    eng.state_mut().cwd = cwd.clone();
+    eng.reset_system_prompt_cache();
+    // Everything project-scoped moves together — grants, permission root,
+    // rules, tool visibility, sandbox and bypass policy, hooks — from the
+    // config the caller read before any of this began. Moving a subset
+    // left part of the policy answering for the project we left.
+    eng.adopt_project(dir, cfg.clone());
+    // The TUI keeps its own copy of one policy bit, consulted on every
+    // submit: left at the value the process started with, a project that
+    // forbids shell-executing skills inherits one that allows it.
+    app.disable_skill_shell = cfg.security.disable_skill_shell_execution;
+    app.cwd = cwd;
+    let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
+}
+
 fn probe_caps() -> TerminalCaps {
     let enhancement = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     TerminalCaps::detect(|k| std::env::var(k).ok(), enhancement)
@@ -373,6 +454,29 @@ pub(super) async fn event_loop(
     // which is what suppresses queue auto-dispatch in the meantime.
     let mut resume_loading = false;
     let mut pending_restore: Option<Box<LoadedSession>> = None;
+    // Image attachments are read and encoded the same way: detached, with
+    // the result landing in a select arm. Awaiting the work inline would
+    // park this loop — the only one there is — so a workspace on a slow
+    // mount would stop redraws and Ctrl+C until the read finished.
+    #[allow(clippy::type_complexity)]
+    let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        u64,
+        u64,
+        String,
+        Vec<agent_code_lib::llm::message::ContentBlock>,
+        Vec<String>,
+    )>();
+    // Identifies the encode in flight, if any: the turn it belongs to must
+    // not start without it, and a second one must not be queued behind it.
+    // A cancel forgets the id rather than waiting — the read cannot be
+    // stopped, so its result is recognised as stale when it lands and the
+    // staged turn is released immediately.
+    let mut encode_seq = 0u64;
+    let mut active_encode: Option<u64> = None;
+    // The conversation the loop last saw, so a `/clear`, `/resume` or
+    // `/rewind` can be noticed the moment it happens rather than when a
+    // read that may never finish comes back.
+    let mut seen_epoch = app.conversation_epoch;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -394,9 +498,10 @@ pub(super) async fn event_loop(
         // onto the conversation being replaced. The choice is not lost —
         // the restore replays it on top of the restored session, since a
         // toggle made after picking is the user's newest instruction.
-        if app.mode != last_mode && app.pending_resume.is_none() {
+        if (app.mode != last_mode || app.mode_chosen) && app.pending_resume.is_none() {
             apply_mode_to_engine(session, app.mode, base_permission_mode);
             last_mode = app.mode;
+            app.mode_chosen = false;
             app.dirty = true;
         }
 
@@ -480,12 +585,159 @@ pub(super) async fn event_loop(
             // still loading: drop it, the load arm fetches the new one.
             if app.pending_resume.as_deref() == Some(id.as_str()) {
                 match session.engine().try_lock() {
-                    Ok(mut eng) => {
+                    Ok(probe) => {
+                        // The probe only answers "is the engine free right
+                        // now"; the `Err` arm re-queues the restore for a
+                        // later pass. Release it before any `await`: the
+                        // hooks below need the lock themselves, and a
+                        // guard held across an await is how this loop
+                        // deadlocked before.
+                        drop(probe);
+                        // Enter the session's directory first. It is a
+                        // precondition, not a step: everything below
+                        // replaces the conversation, and adopting one
+                        // whose directory we could not enter leaves a
+                        // project-A session running against project-B's
+                        // cwd — the wrong-tree hazard this restore exists
+                        // to prevent. Refuse the whole resume instead.
+                        let previous_cwd = session.engine().lock().await.state().cwd.clone();
+                        // Phase A — everything that can fail, before
+                        // anything is touched. A directory that cannot be
+                        // entered and settings that will not parse are
+                        // both reasons to refuse the resume while
+                        // refusing is still free.
+                        let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
+                            None
+                        } else {
+                            match load_project_config(&data.cwd) {
+                                Ok(cfg) => Some(cfg),
+                                Err(e) => {
+                                    app.status_message.clear();
+                                    app.transcript.push(super::app::TranscriptItem::Error(
+                                        format!(
+                                            "could not resume {id}: its project settings could \
+                                             not be read ({e}) — staying in {previous_cwd}"
+                                        ),
+                                    ));
+                                    app.cancel_deferred_resume_work();
+                                    app.pending_resume = None;
+                                    app.dirty = true;
+                                    continue;
+                                }
+                            }
+                        };
+                        let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
+                            Ok(dir) => dir,
+                            Err(e) => {
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::Error(format!(
+                                        "could not resume {id}: its directory {} cannot be \
+                                         entered ({e}) — staying in {previous_cwd}",
+                                        data.cwd
+                                    )));
+                                // Same order as a failed load: release the
+                                // work held for a swap that is not going to
+                                // happen before the gate opens, or it lands
+                                // on the conversation being kept.
+                                app.cancel_deferred_resume_work();
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
+                            }
+                        };
+                        // SessionStop for the session being *left*, while
+                        // the engine still describes it — the hook context
+                        // is built from engine state, so firing after the
+                        // swap would report the restored id as having
+                        // stopped. Without this, consumers saw
+                        // SessionStart(old) followed by SessionStop(new)
+                        // and no lifecycle at all for the restored session.
+                        {
+                            let engine_arc = session.engine();
+                            let mut eng = engine_arc.lock().await;
+                            // A cancelled turn leaves `cancel` cancelled
+                            // until the next `begin_turn`, and `run_hooks`
+                            // refuses a cancelled scope — so resuming
+                            // after a cancel would have dropped both
+                            // lifecycle events, which is precisely when a
+                            // teardown hook matters most. No turn is in
+                            // flight here, so renewing is safe.
+                            eng.renew_cancel_scope();
+                            let _ = eng.fire_session_stop_hooks().await;
+                            // Also here, and for the same reason: this
+                            // tears down the departing session — grants,
+                            // `/add-dir` paths, the prompt cache, the
+                            // extraction cursor, the denial tracker — and
+                            // notifies watchers about the directories it
+                            // is dropping. Those hooks inherit the process
+                            // cwd, so running it after the move fired
+                            // project A's teardown inside project B while
+                            // its context still named project A.
+                            // Only the notification here: shell hooks
+                            // inherit the process cwd, so watchers have to
+                            // hear about the dropped `/add-dir` paths
+                            // before the move. Clearing the state waits
+                            // until the move has actually succeeded.
+                            eng.notify_working_set_dropped().await;
+                        }
+                        // Only now move. Shell hooks inherit the process
+                        // directory, so entering the destination before
+                        // the stop hooks ran executed project A's
+                        // teardown — a formatter, a cleanup, an
+                        // auto-commit — inside project B.
+                        //
+                        // The check above already refused a directory
+                        // that cannot be entered, so this fails only if
+                        // it disappeared in between; refuse the resume
+                        // then too rather than continuing half-moved.
+                        if let Some(dir) = entered.as_deref()
+                            && let Err(e) = std::env::set_current_dir(dir)
+                        {
+                            app.status_message.clear();
+                            app.transcript
+                                .push(super::app::TranscriptItem::Error(format!(
+                                    "could not resume {id}: its directory {} became unavailable \
+                                 ({e}) — staying in {previous_cwd}",
+                                    data.cwd
+                                )));
+                            // The session being kept has already been
+                            // told it stopped. Start it again so the
+                            // lifecycle stays paired: without this its
+                            // watchers and cleanup hooks stay torn down
+                            // for a session that goes on being used, and
+                            // the eventual exit emits a second stop with
+                            // no start between them.
+                            {
+                                let engine_arc = session.engine();
+                                let eng = engine_arc.lock().await;
+                                let _ = eng.fire_session_start_hooks().await;
+                            }
+                            app.cancel_deferred_resume_work();
+                            app.pending_resume = None;
+                            app.dirty = true;
+                            continue;
+                        }
+                        let engine_arc = session.engine();
+                        let mut eng = engine_arc.lock().await;
+                        // Phase D — committed. The move succeeded, so the
+                        // departing session's conversation-scoped state
+                        // can go: grants, `/add-dir` paths, the prompt
+                        // cache, the extraction cursor, the denial
+                        // tracker. Doing this before the move meant a
+                        // failed move left the session the user keeps
+                        // already torn down.
+                        eng.reset_for_session_swap().await;
                         // A mode toggled after the session was picked but
                         // before it loaded is the user's newest explicit
                         // instruction, so it is replayed on top of the
                         // restored mode rather than silently reverted.
-                        let user_mode = (app.mode != last_mode).then_some(app.mode);
+                        // What the user actually chose, not what differs
+                        // from the mode we last applied: re-picking the
+                        // mode already showing is still an instruction,
+                        // and inferring it from inequality discarded it.
+                        let user_mode =
+                            (app.mode_chosen || app.mode != last_mode).then_some(app.mode);
                         let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
@@ -517,12 +769,6 @@ pub(super) async fn event_loop(
                         // reused across the swap, so without this the
                         // resumed session inherits approvals the user
                         // never gave it and the executor skips the ask.
-                        // Permission grants, `/add-dir` paths, the prompt
-                        // cache, the memory-extraction cursor, the denial
-                        // tracker and the rest of the conversation-scoped
-                        // state the session file does not carry. One call,
-                        // so a swap cannot forget a field.
-                        eng.reset_for_session_swap().await;
                         // Built after the reset so `effort` is the value
                         // the engine actually ends up with, not the one
                         // the discarded conversation had chosen.
@@ -549,10 +795,13 @@ pub(super) async fn event_loop(
                         let mode = user_mode.unwrap_or(stored_mode);
                         app.mode = mode;
                         // Keep the loop's mode tracker in step, or the
-                        // `app.mode != last_mode` gate at the top would
-                        // re-apply (or, worse, silently skip) the mode we
-                        // are about to install.
+                        // gate at the top would re-apply (or, worse,
+                        // silently skip) the mode we are about to install.
                         last_mode = mode;
+                        // The choice has now been honoured, so it is no
+                        // longer pending; leaving it set would re-apply it
+                        // on the next pass and block the engine sync.
+                        app.mode_chosen = false;
                         let plan = mode == super::mode::SessionMode::Plan;
                         eng.state_mut().plan_mode = plan;
                         // Live handles, not just the config copy: the
@@ -562,7 +811,32 @@ pub(super) async fn event_loop(
                         let hint = mode.permission_hint().unwrap_or(base_permission_mode);
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
+                        // Move with it, the same way `/cd` does: process
+                        // cwd, engine state, prompt cache (the cwd is baked
+                        // in), and persistent grants (they are per-project,
+                        // so approvals from the old one must stop applying).
+                        //
+                        // All or nothing: if the directory cannot be entered
+                        // the engine keeps the cwd the process is actually
+                        // in, and says so. Claiming a directory we did not
+                        // move to is what would resolve paths against the
+                        // wrong tree.
+                        if let Some(dir) = entered.as_deref()
+                            && let Some(cfg) = destination_cfg.clone()
+                        {
+                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
+                        }
                         app.pending_resume = None;
+                        drop(eng);
+                        // SessionStart for the session just restored, now
+                        // that the engine describes it. Paired with the
+                        // SessionStop above, a resume reads as one session
+                        // ending and another beginning — which is what
+                        // per-session setup (watchers, audit) keys off.
+                        {
+                            let eng = engine_arc.lock().await;
+                            let _ = eng.fire_session_start_hooks().await;
+                        }
                         // Restart the loop so the handlers *above* this one
                         // get their turn now that the resume gate is open.
                         // They have already been passed this iteration, and
@@ -652,31 +926,7 @@ pub(super) async fn event_loop(
                             })
                         }
                     });
-                    match result {
-                        crate::commands::CommandResult::Exit => {
-                            app.should_quit = true;
-                        }
-                        crate::commands::CommandResult::Prompt(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Passthrough(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Handled => {
-                            let text = captured.trim();
-                            if !text.is_empty() {
-                                for line in text.lines() {
-                                    // Strip ANSI for the transcript view.
-                                    let plain = strip_ansi_simple(line);
-                                    if !plain.is_empty() {
-                                        app.transcript
-                                            .push(super::app::TranscriptItem::System(plain));
-                                    }
-                                }
-                            }
-                            app.status_message = format!("ran {slash}");
-                        }
-                    }
+                    apply_command_result(app, result, &captured, &slash);
                     // Keep TUI header/path and `!` shell in sync with engine
                     // after `/cd` (and any other cwd-changing command).
                     app.cwd = eng.state().cwd.clone();
@@ -791,6 +1041,69 @@ pub(super) async fn event_loop(
             }
         }
 
+        // A replaced conversation invalidates a read in flight at once:
+        // waiting for it would hold every prompt in the new conversation
+        // behind an encode that belongs to a conversation nobody is
+        // looking at any more.
+        if app.conversation_epoch != seen_epoch {
+            seen_epoch = app.conversation_epoch;
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
+            }
+        }
+        // A picker accept can abandon an encode without the conversation
+        // having changed yet — the restore may still fail, and the epoch
+        // only moves when one succeeds. Dropping the id here is what
+        // makes the `img_rx` arm treat the result as belonging to nobody.
+        if std::mem::take(&mut app.encode_abandoned) && active_encode.take().is_some() {
+            app.abandon_staged_attachments();
+        }
+
+        // A prompt that was held aside for a turn that has since gone can
+        // send now, with the blocks it was already encoded with. Not while
+        // a resume is outstanding: it would be staged against the
+        // conversation the restore is about to replace.
+        if turn.is_none() && active_encode.is_none() && app.pending_resume.is_none() {
+            app.rearm_deferred_prompt();
+        }
+
+        // Hand a prompt's images to the blocking pool. The descriptors were
+        // opened when their mentions were validated, so nothing is resolved
+        // here; the result comes back through `img_rx` and re-arms the
+        // prompt, which keeps this loop free to redraw and to take a Ctrl+C
+        // while a slow mount is being read.
+        //
+        // Gated on `pending_resume` for the same reason the turn start
+        // below is: taking the prompt here would encode it for the
+        // conversation being thrown away.
+        if turn.is_none()
+            && active_encode.is_none()
+            && app.pending_resume.is_none()
+            && !app.pending_images.is_empty()
+            && let Some(prompt) = app.pending_submit.take()
+        {
+            let images = std::mem::take(&mut app.pending_images);
+            // Keep the user's own words where the UI can still reach
+            // them: `prompt` is about to move into the blocking task,
+            // and a resume accepted before it lands drops the result.
+            app.encoding_display = app
+                .pending_submit_display
+                .take()
+                .or_else(|| Some(prompt.clone()));
+            let tx = img_tx.clone();
+            encode_seq += 1;
+            let id = encode_seq;
+            active_encode = Some(id);
+            // Stamped with the conversation it was submitted in: the engine
+            // lock is free while this runs, so `/clear`, `/resume` or
+            // `/rewind` can replace the conversation underneath it.
+            let epoch = app.conversation_epoch;
+            tokio::task::spawn_blocking(move || {
+                let (blocks, notes) = super::mentions::encode_staged_images(images);
+                let _ = tx.send((id, epoch, prompt, blocks, notes));
+            });
+        }
+
         // Start a pending turn if idle.
         //
         // Not while a resume is outstanding. The composer stays live
@@ -800,10 +1113,19 @@ pub(super) async fn event_loop(
         // would then wipe the transcript that recorded it. The prompt is
         // handed back to the composer when the restore lands.
         if turn.is_none()
+            && active_encode.is_none()
             && app.pending_resume.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
             app.pending_submit_display = None;
+            let blocks = std::mem::take(&mut app.pending_attachments);
+            // Set unconditionally, awaiting the lock rather than skipping on
+            // contention: an empty set clears anything a previous attempt
+            // staged, so no turn can inherit another turn's attachment.
+            {
+                let engine = session.engine();
+                engine.lock().await.set_pending_attachments(blocks.clone());
+            }
             let sink = ChannelSink::new(eng_tx.clone(), app.conversation_epoch);
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {
@@ -812,8 +1134,10 @@ pub(super) async fn event_loop(
                 }
                 Err(e) => {
                     // Should be rare: TUI serializes turns. Put the prompt
-                    // back so the next idle loop can retry.
+                    // and its attachments back so the next idle loop retries
+                    // them together.
                     app.pending_submit = Some(prompt);
+                    app.pending_attachments = blocks;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
                 }
@@ -824,6 +1148,17 @@ pub(super) async fn event_loop(
         if app.cancel_requested {
             if let Some(ref h) = turn {
                 h.cancel();
+            }
+            // Nothing may follow on its own after a cancel — including a
+            // prompt held aside behind the turn being cancelled. Interject
+            // is the exception and says so by having staged its own prompt.
+            app.cancel_pending_followups();
+            // A read already handed to the blocking pool cannot be stopped.
+            // Forget its id instead: the result is stale when it lands, and
+            // the staged turn is released now rather than after a read that
+            // may never finish.
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
             }
             app.cancel_requested = false;
         }
@@ -867,7 +1202,7 @@ pub(super) async fn event_loop(
                         // (EnterPlanMode/ExitPlanMode tools). Sync the badge
                         // — and the permission override — back from the
                         // engine, unless the user has a newer pending switch.
-                        if app.mode == last_mode {
+                        if app.mode == last_mode && !app.mode_chosen {
                             let engine_plan = eng.state().plan_mode;
                             let ui_plan = app.mode == super::mode::SessionMode::Plan;
                             if engine_plan != ui_plan {
@@ -897,6 +1232,12 @@ pub(super) async fn event_loop(
                     }
                 }
                 app.mark_turn_idle();
+
+                // A prompt held aside with its images was submitted before
+                // anything in the queue, so it goes first — and it goes now
+                // rather than waiting for whatever event next wakes the
+                // loop, since nothing else would arm it.
+                app.rearm_deferred_prompt();
 
                 // Queue handling (plan §M5): auto-send the head on a clean
                 // finish; on abort/error keep the queue and tell the user.
@@ -1131,6 +1472,34 @@ pub(super) async fn event_loop(
                     }
                 }
             }
+            // Encoded image attachments coming back from the blocking pool.
+            // The prompt is re-armed with them so the turn starts on the
+            // next pass through the loop above.
+            Some((id, epoch, prompt, blocks, notes)) = img_rx.recv() => {
+                if active_encode != Some(id) {
+                    // Cancelled while this read was in flight: the state it
+                    // belonged to was released then, so the bytes are simply
+                    // dropped rather than sent with a turn nobody asked for.
+                } else if epoch != app.conversation_epoch {
+                    // The conversation it was submitted in has been cleared,
+                    // resumed or rewound. Starting it now would attach the
+                    // file to a thread the user never attached it to.
+                    active_encode = None;
+                    // Its text was handed back when the conversation was
+                    // replaced, so it is not lost with the bytes.
+                    app.encoding_display = None;
+                    app.abandon_staged_attachments();
+                } else {
+                    active_encode = None;
+                    // It arrived, so nothing needs reclaiming on its behalf.
+                    app.encoding_display = None;
+                    for note in notes {
+                        app.transcript.push(super::app::TranscriptItem::System(note));
+                    }
+                    app.accept_encoded_attachments(prompt, blocks);
+                }
+                app.dirty = true;
+            }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             // Gated on work that can still change: polling while any
             // rows exist at all would tick forever once a subagent row
@@ -1216,6 +1585,51 @@ async fn manager_rows(
             .then_with(|| a.id.cmp(&b.id))
     });
     rows
+}
+
+/// Apply a slash command's outcome to the app.
+///
+/// The captured stdout is emitted for *every* outcome, not just
+/// `Handled`. A command that returns a prompt still prints for the user
+/// — `/review` announces which target it resolved — and that line is
+/// the only feedback they get in the modern TUI. It goes in before the
+/// turn is enqueued so the note precedes the turn it explains.
+fn apply_command_result(
+    app: &mut App,
+    result: crate::commands::CommandResult,
+    captured: &str,
+    slash: &str,
+) {
+    push_captured_output(app, captured);
+    match result {
+        crate::commands::CommandResult::Exit => {
+            app.should_quit = true;
+        }
+        crate::commands::CommandResult::Prompt(p)
+        | crate::commands::CommandResult::Passthrough(p) => {
+            app.enqueue_turn_from_command(p);
+        }
+        crate::commands::CommandResult::Handled => {
+            app.status_message = format!("ran {slash}");
+        }
+    }
+}
+
+/// Push stdout captured from a slash command into the transcript, one
+/// `System` line per non-empty line.
+fn push_captured_output(app: &mut App, captured: &str) {
+    let text = captured.trim();
+    if text.is_empty() {
+        return;
+    }
+    for line in text.lines() {
+        // Strip ANSI for the transcript view.
+        let plain = strip_ansi_simple(line);
+        if !plain.is_empty() {
+            app.transcript
+                .push(super::app::TranscriptItem::System(plain));
+        }
+    }
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
@@ -1499,6 +1913,16 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('A')) | (_, KeyCode::Char('4')) => {
                     app.resolve_permission(PermissionResponse::AllowAlways);
                 }
+                // `P` grants the offered prefix. Only bound when one is
+                // offered, so it cannot fire for a command the gate could
+                // not reason about.
+                (_, KeyCode::Char('P')) | (_, KeyCode::Char('5'))
+                    if app.suggested_prefix().is_some() =>
+                {
+                    if let Some(prefix) = app.suggested_prefix() {
+                        app.resolve_permission(PermissionResponse::AllowAlwaysPrefix { prefix });
+                    }
+                }
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);
                 }
@@ -1615,7 +2039,13 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
             // A platform-modified character (Cmd+X) is a chord, not the
             // vi command `x`; the wrapper drops any pending operator for
             // it, and it falls through to the chord dispatch below.
-            KeyCode::Char(c) if bare_char(&key) == Some(c) => {
+            // Space on an empty composer is the pane's fold key, like
+            // Backspace and Enter below. As a vi motion it moves right,
+            // which does nothing on an empty line, so falling through
+            // costs normal mode nothing.
+            KeyCode::Char(c)
+                if bare_char(&key) == Some(c) && !(c == ' ' && app.space_folds_group()) =>
+            {
                 app.vi_normal_key(c);
                 return;
             }
@@ -1720,6 +2150,15 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
                 && app.input.is_empty() =>
         {
             app.tasks_select(1);
+        }
+        // Space folds/unfolds the selected group. Safe to claim here
+        // because this branch only runs with an empty composer, so it is
+        // not a space the user is trying to type. Gated on there being a
+        // group to fold: a pane showing only the model's checklist has
+        // none, and swallowing the key there would lose a keystroke the
+        // composer should have had.
+        (m, KeyCode::Char(' ')) if m.is_empty() && app.space_folds_group() => {
+            app.toggle_selected_group();
         }
         // Retained prompts win the empty Enter: after an aborted turn the
         // UI promises "press Enter to send", so drill-in only claims the
@@ -2271,6 +2710,12 @@ fn apply_mode_to_engine(
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
     use super::*;
     use crate::ui::modern::app::Phase;
 
@@ -2299,6 +2744,89 @@ mod tests {
             app.status_message.contains("not produced output yet"),
             "pane did not act on Enter: {}",
             app.status_message
+        );
+    }
+
+    /// Vi normal mode owns bare characters, so it swallowed the fold
+    /// key: `vi_normal_key(' ')` is a no-op and returned before the
+    /// pane arm, leaving vi users a documented key that did nothing
+    /// while their arrows and Enter still drove the pane.
+    #[test]
+    fn vi_normal_mode_still_folds_with_space() {
+        use crate::ui::modern::app::ComposerMode;
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.vi_mode = true;
+        app.composer_mode = ComposerMode::Normal;
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        assert!(app.in_normal_mode());
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.collapsed_groups.contains(&TaskSource::Subagent),
+            "vi normal mode swallowed the fold key"
+        );
+        assert!(app.input.is_empty(), "the space leaked into the composer");
+
+        // And it still unfolds.
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(app.collapsed_groups.is_empty());
+    }
+
+    /// With text in the composer, Space is a vi motion again — the
+    /// fold binding only ever claimed the empty-composer case.
+    #[test]
+    fn vi_normal_mode_keeps_space_as_a_motion_with_text() {
+        use crate::ui::modern::app::ComposerMode;
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.vi_mode = true;
+        app.input = "hello".into();
+        app.composer_mode = ComposerMode::Normal;
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.collapsed_groups.is_empty(),
+            "a vi motion folded the pane"
+        );
+        assert_eq!(app.input, "hello", "normal mode inserted text");
+    }
+
+    /// Space is the fold key, but a checklist-only pane has no group to
+    /// fold. The guard has to stand aside there like the arrows do, or
+    /// the keystroke is silently dropped instead of reaching the
+    /// composer.
+    #[test]
+    fn a_checklist_only_pane_passes_space_to_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        assert!(app.tasks_visible(), "the checklist should show the pane");
+        assert!(app.tasks.is_empty());
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.input, " ",
+            "the checklist-only pane swallowed the space"
+        );
+
+        // With a real task present Space is the pane's again.
+        app.input.clear();
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.input.is_empty(),
+            "a selectable pane should still claim Space"
+        );
+        assert!(
+            app.collapsed_groups
+                .contains(&crate::ui::modern::tasks::TaskSource::Subagent),
+            "Space did not fold the group"
         );
     }
 
@@ -3105,6 +3633,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3146,6 +3675,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3170,6 +3700,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3263,6 +3794,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3295,6 +3827,7 @@ mod tests {
                 description: "run".into(),
                 origin: None,
                 input_preview: None,
+                suggested_prefix: None,
                 respond: tx,
             },
         ));
@@ -3694,6 +4227,7 @@ mod tests {
                     description: "d".into(),
                     origin: None,
                     input_preview: None,
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -3705,5 +4239,94 @@ mod tests {
             "Esc on permission denies without cancelling the turn"
         );
         assert!(app.front_permission().is_none());
+    }
+
+    /// A slash command that returns a prompt still prints for the user:
+    /// `/review` announces which target it resolved. That line has to
+    /// reach the transcript and land *before* the turn it explains —
+    /// the Prompt arm used to discard captured stdout, leaving the
+    /// modern TUI with no indication of what was under review.
+    #[test]
+    fn a_prompt_returning_command_still_surfaces_what_it_printed() {
+        use crate::ui::modern::app::TranscriptItem;
+
+        let mut app = App::new("m", "/tmp", "s");
+        let resolved = agent_code_lib::review::resolve(
+            agent_code_lib::review::ReviewTarget::BaseBranch {
+                base: "main".into(),
+            },
+            std::path::Path::new("/tmp"),
+        )
+        .expect("a plain branch name is a valid target");
+        // What the `/review` arm prints, colour codes and all.
+        let captured = format!("\u{1b}[2mReviewing {}…\u{1b}[0m\n", resolved.hint);
+
+        apply_command_result(
+            &mut app,
+            crate::commands::CommandResult::Prompt(resolved.prompt),
+            &captured,
+            "/review base main",
+        );
+
+        let note = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::System(t) if t.contains("changes vs main")));
+        let turn = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::User(_)));
+        let note = note.unwrap_or_else(|| {
+            panic!(
+                "review target hint never reached the transcript: {:?}",
+                app.transcript
+            )
+        });
+        let turn = turn.expect("the prompt was not enqueued as a turn");
+        assert!(
+            note < turn,
+            "the hint must precede the turn it explains: {:?}",
+            app.transcript
+        );
+        // ANSI is stripped for the transcript view, as on the Handled path.
+        let TranscriptItem::System(text) = &app.transcript[note] else {
+            unreachable!()
+        };
+        assert!(
+            !text.contains('\u{1b}'),
+            "escape sequences reached the transcript: {text:?}"
+        );
+    }
+
+    /// The saved directory is a *precondition* of the restore. If it
+    /// cannot be entered the resume must be refused outright — adopting
+    /// the conversation anyway would leave a project-A session running
+    /// against project-B's cwd, which is the wrong-tree hazard restoring
+    /// the cwd exists to prevent.
+    ///
+    /// Only the refusal is covered: entering a directory calls
+    /// `set_current_dir`, which is process-global, and a test that moved
+    /// the whole test binary's cwd would flake every other test beside
+    /// it.
+    #[test]
+    fn a_missing_session_directory_refuses_the_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("no-such-project");
+
+        let err = check_session_cwd(&gone.display().to_string(), "/tmp/original")
+            .expect_err("a directory that does not exist must not be entered");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // Nothing to move to is not a failure — it just means stay put.
+        assert!(
+            check_session_cwd("", "/tmp/original").unwrap().is_none(),
+            "an empty saved cwd should be a no-op, not an error"
+        );
+        assert!(
+            check_session_cwd("/tmp/original", "/tmp/original")
+                .unwrap()
+                .is_none(),
+            "already being there should be a no-op, not a move"
+        );
     }
 }

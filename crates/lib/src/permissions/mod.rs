@@ -35,11 +35,22 @@ pub struct PermissionChecker {
     /// AcceptEdits / Plan / Ask mid-turn without rebuilding the checker
     /// or waiting on the query-engine mutex (M0 mid-turn mode).
     default_mode: std::sync::RwLock<PermissionMode>,
-    rules: Vec<PermissionRule>,
+    /// Behind a lock for the same reason as `default_mode` and
+    /// `project_root`: rules come from the project's config, so adopting
+    /// a session from another project has to move them on the live
+    /// checker rather than leave the old project's allow/deny list
+    /// deciding.
+    rules: std::sync::RwLock<Vec<PermissionRule>>,
     /// Project root used for runtime checks (e.g. team-memory).
     /// `None` means "no project root known" — runtime checks that
     /// require it become best-effort.
-    project_root: Option<PathBuf>,
+    ///
+    /// Behind a lock for the same reason as `default_mode`: resuming a
+    /// session from another project has to move it on the live checker.
+    /// Left pinned to the root the process started in, the canonical
+    /// team-memory check compares against the wrong tree and stops
+    /// catching writes in the project actually in use.
+    project_root: std::sync::RwLock<Option<PathBuf>>,
     /// When set, read-only tools may only touch paths inside this root.
     /// `None` (the default) leaves reads unrestricted, preserving the
     /// interactive agent's behavior. Set for confined workers such as the
@@ -53,8 +64,8 @@ impl PermissionChecker {
     pub fn from_config(config: &PermissionsConfig) -> Self {
         Self {
             default_mode: std::sync::RwLock::new(config.default_mode),
-            rules: config.rules.clone(),
-            project_root: None,
+            rules: std::sync::RwLock::new(config.rules.clone()),
+            project_root: std::sync::RwLock::new(None),
             read_scope: None,
         }
     }
@@ -63,8 +74,8 @@ impl PermissionChecker {
     pub fn allow_all() -> Self {
         Self {
             default_mode: std::sync::RwLock::new(PermissionMode::Allow),
-            rules: Vec::new(),
-            project_root: None,
+            rules: std::sync::RwLock::new(Vec::new()),
+            project_root: std::sync::RwLock::new(None),
             read_scope: None,
         }
     }
@@ -84,13 +95,32 @@ impl PermissionChecker {
         }
     }
 
+    /// Replace the rule list on a checker already shared behind an
+    /// `Arc`. A poisoned lock leaves the previous rules in place.
+    pub fn set_rules(&self, rules: Vec<PermissionRule>) {
+        if let Ok(mut guard) = self.rules.write() {
+            *guard = rules;
+        }
+    }
+
+    /// Move the project root on a checker already shared behind an
+    /// `Arc` — used when a resume adopts a session from another project.
+    /// A poisoned lock leaves the previous root in place: that is the
+    /// stricter of the two, since checks fall back to best-effort only
+    /// when no root is known at all.
+    pub fn set_project_root(&self, project_root: PathBuf) {
+        if let Ok(mut guard) = self.project_root.write() {
+            *guard = Some(project_root);
+        }
+    }
+
     /// Builder: pin the project root used for runtime path checks
     /// (currently the team-memory write protection). The model's
     /// write tools refuse any path that resolves inside
     /// `<project_root>/.agent/team-memory/`.
     #[must_use]
-    pub fn with_project_root(mut self, project_root: PathBuf) -> Self {
-        self.project_root = Some(project_root);
+    pub fn with_project_root(self, project_root: PathBuf) -> Self {
+        self.set_project_root(project_root);
         self
     }
 
@@ -225,7 +255,13 @@ impl PermissionChecker {
         // because a tacked-on `&& rm` broke its every-segment match,
         // exposing a broader Allow behind it).
         let mut winner: Option<PermissionDecision> = None;
-        for rule in &self.rules {
+        let rules = self
+            .rules
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for rule in &rules {
             if !matches_tool(&rule.tool, tool_name) {
                 continue;
             }
@@ -263,7 +299,13 @@ impl PermissionChecker {
     /// Check for read-only operations (always allowed).
     pub fn check_read(&self, tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
         // Read operations use a relaxed check — only explicit deny rules block.
-        for rule in &self.rules {
+        let rules = self
+            .rules
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for rule in &rules {
             // Only `deny` can block a read, so anything else is skipped
             // before matching — that also keeps the pattern match on the
             // restricting side of the allow/deny asymmetry.
@@ -292,7 +334,8 @@ impl PermissionChecker {
         if raw.is_empty() {
             return None;
         }
-        if is_team_memory_write_target(Path::new(raw), self.project_root.as_deref()) {
+        let project_root = self.project_root.read().ok().and_then(|g| g.clone());
+        if is_team_memory_write_target(Path::new(raw), project_root.as_deref()) {
             return Some(
                 "Write to team-memory is blocked. The `.agent/team-memory/` directory \
                  is read-only to the agent — use the `/team-remember` slash command \
@@ -451,7 +494,7 @@ fn matches_input_pattern(
 ///
 /// The asymmetry is the safety property: a wrapper or an extra segment
 /// can only ever cost you permissions, never grant them.
-fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
+pub(crate) fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
     let parsed = crate::tools::bash_parse::parse_bash(command);
 
     if !widening {
@@ -483,9 +526,10 @@ fn matches_shell_command(pattern: &str, command: &str, widening: bool) -> bool {
     let Some(parsed) = parsed else {
         return false;
     };
-    // `env -S '${CMD} -rf x'` runs whatever CMD expands to; there is
-    // no text to vouch for.
-    if crate::tools::bash_parse::has_dynamic_wrapper(&parsed) {
+    // `env -S '${CMD} -rf x'` runs whatever CMD expands to, and a
+    // wrapper chain past the unwrap budget hides whatever sits at its
+    // end; either way there is no text to vouch for.
+    if crate::tools::bash_parse::unresolved_wrapper(&parsed).is_some() {
         return false;
     }
     if parsed.has_parse_error
@@ -1399,6 +1443,39 @@ mod tests {
         );
     }
 
+    /// Nor can a chain long enough to outrun the unwrap budget: the
+    /// command at its end was never reached, so `Allow("env *")` has
+    /// nothing to vouch for. A chain the budget does cover still
+    /// resolves, and an `rm` behind it keeps costing permissions.
+    #[test]
+    fn wrapper_chain_past_the_budget_fails_closed_against_widening_rule() {
+        let c = checker(vec![rule("Bash", "env *", PermissionMode::Allow)]);
+        for depth in [9usize, 12] {
+            let cmd = format!("{}$'rm' -rf /tmp/x", "env ".repeat(depth));
+            assert!(
+                !matches!(
+                    c.check("Bash", &bash_input(&cmd)),
+                    PermissionDecision::Allow
+                ),
+                "a chain past the unwrap budget must not be auto-allowed: {cmd}"
+            );
+        }
+        let c = checker(vec![
+            rule("Bash", "rm *", PermissionMode::Ask),
+            rule("Bash", "*", PermissionMode::Allow),
+        ]);
+        assert!(
+            matches!(
+                c.check(
+                    "Bash",
+                    &bash_input("env env env env env env env env $'rm' /tmp/victim")
+                ),
+                PermissionDecision::Ask(_)
+            ),
+            "a chain at the budget must still un-hide its command from a restrictive rule"
+        );
+    }
+
     #[test]
     fn decision_severity_orders_deny_ask_allow() {
         let deny = PermissionDecision::Deny("d".into());
@@ -1538,6 +1615,84 @@ mod tests {
             }
             other => panic!("expected Deny for {tool} {file_path} (team-memory), got {other:?}"),
         }
+    }
+
+    /// Rules are project config too. While they stayed as built at
+    /// startup, a resume into another project ran under the *old*
+    /// project's allow/deny list: its denials still applied here, and
+    /// this project's never did.
+    #[test]
+    fn moving_the_rules_moves_which_project_decides() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("git *".into()),
+                action: PermissionMode::Allow,
+            }],
+            ..Default::default()
+        });
+        let git = serde_json::json!({"command": "git status"});
+        assert!(
+            matches!(checker.check("Bash", &git), PermissionDecision::Allow),
+            "precondition: the starting project allows git"
+        );
+
+        // The destination project does not.
+        checker.set_rules(vec![PermissionRule {
+            tool: "Bash".into(),
+            pattern: Some("cargo *".into()),
+            action: PermissionMode::Allow,
+        }]);
+
+        assert!(
+            !matches!(checker.check("Bash", &git), PermissionDecision::Allow),
+            "the project we left was still deciding"
+        );
+        assert!(
+            matches!(
+                checker.check("Bash", &serde_json::json!({"command": "cargo test"})),
+                PermissionDecision::Allow
+            ),
+            "this project's own rules never applied"
+        );
+    }
+
+    /// Resuming a session from another project moves the checker's root.
+    ///
+    /// Only the canonical check depends on the root — a path that
+    /// literally spells `.agent/team-memory` is caught by the component
+    /// fallback whatever the root is. So this uses the case that
+    /// actually needs it: a symlink that *resolves* into the restored
+    /// project's team-memory while naming none of its components. With
+    /// the root left pinned to the project the process started in, that
+    /// write was allowed.
+    #[cfg(unix)]
+    #[test]
+    fn moving_the_project_root_moves_canonical_team_memory_protection() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let team = new.path().join(".agent").join("team-memory");
+        std::fs::create_dir_all(&team).unwrap();
+        // The file has to exist for the canonical check to resolve the
+        // link at all — this is the overwrite-an-existing-note case.
+        std::fs::write(team.join("shared.md"), "").unwrap();
+        let link = new.path().join("notes");
+        std::os::unix::fs::symlink(&team, &link).unwrap();
+        let through_link = link.join("shared.md").display().to_string();
+
+        let checker = PermissionChecker::allow_all().with_project_root(old.path().to_path_buf());
+        assert!(
+            matches!(
+                checker.check("FileWrite", &serde_json::json!({"file_path": through_link})),
+                PermissionDecision::Allow
+            ),
+            "precondition: with the old root this symlinked write is not caught"
+        );
+
+        checker.set_project_root(new.path().to_path_buf());
+
+        assert_write_denied(&checker, "FileWrite", &through_link);
     }
 
     #[test]

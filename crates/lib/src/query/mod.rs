@@ -74,6 +74,9 @@ pub struct QueryEngine {
     last_seen_denial_total: usize,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Content blocks to prepend to the next user message (images from
+    /// the composer). Consumed by the turn that follows.
+    pending_attachments: Vec<crate::llm::message::ContentBlock>,
     /// Grants that persist across sessions. `None` until a host opts in
     /// via [`Self::set_persistent_grants`] — library embedders get the
     /// previous behaviour (session-scoped only) unless they ask for it.
@@ -255,6 +258,7 @@ impl QueryEngine {
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             initial_disk_output_style: initial_disk_output_style.clone(),
             initial_effort: initial_effort.clone(),
+            pending_attachments: Vec::new(),
             persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
@@ -290,6 +294,19 @@ impl QueryEngine {
     /// This is deliberately one call rather than a checklist at the call
     /// site — a swap that forgets a field is exactly the bug this
     /// prevents, and new session-local state should be added here.
+    /// Start a fresh cancellation scope.
+    ///
+    /// `cancel` stays cancelled after an aborted turn until the next
+    /// `begin_turn`, and everything that consults it — `run_hooks` above
+    /// all — refuses to start while it is. A session swap is a new scope
+    /// in its own right, so it renews the token rather than inheriting
+    /// the cancellation of the turn the user abandoned. Safe only with
+    /// no turn in flight, which is what the caller waits for.
+    pub fn renew_cancel_scope(&mut self) {
+        self.cancel = CancellationToken::new();
+        *self.cancel_shared.lock().unwrap() = self.cancel.clone();
+    }
+
     pub async fn reset_for_session_swap(&mut self) {
         // The executor consults this store *before* prompting, so a
         // carried-over entry silently skips the ask.
@@ -350,18 +367,31 @@ impl QueryEngine {
         // --clear` is, and external watchers and indexers subscribe to
         // it. Silently dropping the paths would leave them tracking
         // directories this engine no longer has in scope.
-        if dropped_dirs {
-            let cwd = self.state.cwd.clone();
-            // A scope of its own, never the turn's. A swap happens
-            // between turns, and after an aborted one `self.cancel` stays
-            // cancelled until the next `begin_turn` — passing it would
-            // have `run_hooks` reject every hook before it started, so
-            // watchers would silently never hear about the dropped
-            // directories.
-            let swap_cancel = CancellationToken::new();
-            self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
-                .await;
+        let _ = dropped_dirs;
+    }
+
+    /// Tell watchers the `/add-dir` working set is going away.
+    ///
+    /// Separate from [`Self::reset_for_session_swap`] because the two
+    /// have opposite timing constraints: these are shell hooks, and they
+    /// inherit the process working directory, so they must run *before* a
+    /// resume moves it — otherwise the departing session's teardown fires
+    /// inside the project being entered. Clearing the state must happen
+    /// *after* the move succeeds, so a failed move leaves the session the
+    /// user keeps still intact.
+    pub async fn notify_working_set_dropped(&mut self) {
+        if self.state.additional_dirs.is_empty() {
+            return;
         }
+        let cwd = self.state.cwd.clone();
+        // A scope of its own, never the turn's. A swap happens between
+        // turns, and after an aborted one `self.cancel` stays cancelled
+        // until the next `begin_turn` — passing it would have `run_hooks`
+        // reject every hook before it started, so watchers would silently
+        // never hear about the dropped directories.
+        let swap_cancel = CancellationToken::new();
+        self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
+            .await;
     }
 
     /// Set plan mode for the next permission / executor check without
@@ -395,6 +425,14 @@ impl QueryEngine {
         sink.on_context_usage(used, DEFAULT_CONTEXT_WINDOW);
     }
 
+    /// Attach content blocks to the next user turn.
+    ///
+    /// Replaces rather than appends, so a cancelled composer cannot
+    /// accumulate images across attempts.
+    pub fn set_pending_attachments(&mut self, blocks: Vec<crate::llm::message::ContentBlock>) {
+        self.pending_attachments = blocks;
+    }
+
     /// Install the interactive permission prompter.
     ///
     /// Without this, an `Ask` permission decision falls through to auto-allow
@@ -422,6 +460,50 @@ impl QueryEngine {
         &self,
     ) -> Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>> {
         self.persistent_grants.clone()
+    }
+
+    /// Adopt `project_root` as this engine's project: grant store,
+    /// permission root, permission *rules*, and hooks.
+    ///
+    /// Every one of these is per-project and every one is consulted when
+    /// a tool runs, so moving a subset leaves part of the policy
+    /// answering for the project the process just left — the
+    /// destination's deny rules never apply, or the source's hooks keep
+    /// firing in a tree they were not written for. Resuming a session
+    /// from another project is the case that needs this.
+    ///
+    /// Takes an already-loaded config so the caller can read it *before*
+    /// anything is touched: a destination whose settings will not parse
+    /// must fail the resume while it is still cheap to refuse, not after
+    /// the session has moved.
+    ///
+    /// Only policy is taken from that config: the model, modes and the
+    /// rest of the runtime state belong to the session being restored,
+    /// not to the directory it lives in.
+    pub fn adopt_project(&mut self, project_root: &std::path::Path, cfg: crate::config::Config) {
+        self.rescope_persistent_grants(project_root);
+        self.permissions
+            .set_project_root(project_root.to_path_buf());
+        self.permissions.set_rules(cfg.permissions.rules.clone());
+        self.hooks.replace(cfg.hooks.clone());
+        // Tool visibility is policy too: `allowed_tools` /
+        // `disallowed_tools` decide what the model is even shown, and the
+        // filter installed at startup belongs to the project we left.
+        self.tools
+            .set_visibility(crate::tools::registry::ToolVisibilityFilter::new(
+                cfg.permissions.allowed_tools.clone(),
+                cfg.permissions.disallowed_tools.clone(),
+            ));
+        // Sandbox and bypass policy are read from `state.config` on every
+        // turn, so leaving the old project's values here would let a
+        // project that forbids bypassing permissions inherit one that
+        // allows it.
+        self.state.config.security = cfg.security;
+        self.state.config.sandbox = cfg.sandbox;
+        self.state.config.permissions.rules = cfg.permissions.rules;
+        self.state.config.permissions.allowed_tools = cfg.permissions.allowed_tools;
+        self.state.config.permissions.disallowed_tools = cfg.permissions.disallowed_tools;
+        self.state.config.hooks = cfg.hooks;
     }
 
     /// Re-scope persistent grants to a new project root. Must be called
@@ -916,14 +998,49 @@ impl QueryEngine {
         user_input: &str,
         sink: &dyn StreamSink,
     ) -> crate::error::Result<()> {
-        // Add the user message to history.
-        let user_msg = user_message(user_input);
+        // Add the user message to history, with anything the caller
+        // attached for this turn. Taken rather than read: an attachment
+        // belongs to exactly one turn, and leaking it into the next one
+        // would re-send an image the user already shared.
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        // Described for the hooks below before the blocks are moved into
+        // the message. A `UserPromptSubmit` hook exists to see everything
+        // the turn sends; an image that only showed up as silence there
+        // would slip past exactly the audit it was configured for.
+        let attachment_info = crate::llm::message::describe_attachments(&attachments);
+        let user_msg = if attachments.is_empty() {
+            user_message(user_input)
+        } else {
+            crate::llm::message::user_message_with_attachments(user_input, attachments)
+        };
         self.state.push_message(user_msg);
+        // Images are the one block a token threshold cannot see: each is
+        // charged a flat vision estimate, so compaction never fires on the
+        // megabytes they actually add to every later request. Bound what
+        // history retains here instead, once the new turn's own images are
+        // in and counted as the most recent.
+        let dropped = compact::evict_old_images(
+            &mut self.state.messages,
+            compact::MAX_RETAINED_IMAGE_BYTES,
+            compact::MAX_RETAINED_IMAGES,
+        );
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "evicted image payloads beyond the retention budget"
+            );
+        }
 
         // UserPromptSubmit fires once per user turn, as soon as the
         // prompt is in history and before any PreTurn / LLM work. Hooks
         // at this event see the FULL prompt (no truncation) so they can
         // do content scanning, redaction logging, or compliance audits.
+        //
+        // Observation only: unlike PreToolUse, a non-zero exit here does
+        // not veto the turn. Wiring that up would start blocking prompts
+        // for every deployment whose prompt hook happens to exit non-zero
+        // today — a `grep` that finds nothing is enough — so it is a
+        // deliberate change for its own PR, not a side effect of this one.
         let _user_prompt_submit_results = self
             .hooks
             .run_hooks(
@@ -931,6 +1048,7 @@ impl QueryEngine {
                 None,
                 &serde_json::json!({
                     "user_input": user_input,
+                    "attachments": attachment_info,
                     "turn": self.state.turn_count + 1,
                 }),
                 Some(&self.cancel),
@@ -951,6 +1069,7 @@ impl QueryEngine {
                 &serde_json::json!({
                     "turn": self.state.turn_count + 1,
                     "user_input_preview": user_input.chars().take(200).collect::<String>(),
+                    "attachments": attachment_info,
                 }),
                 Some(&self.cancel),
             )
@@ -3867,6 +3986,11 @@ mod tests {
     /// dispatching the cwd-change event on the turn's token had
     /// `run_hooks` reject it before it started, and watchers were never
     /// told the tracked directories had gone.
+    // Spawns a real shell hook, and hooks run through `bash -c`, which
+    // Windows CI has no usable bash for (the same reason `hooks::tests`
+    // is `#[cfg(all(test, unix))]`). Gated rather than rewritten: the
+    // point of the test is that a real hook process actually runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_session_swap_notifies_cwd_hooks_after_an_aborted_turn() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -3885,6 +4009,11 @@ mod tests {
         // The previous turn was cancelled and no new one has begun.
         engine.cancel.cancel();
 
+        // The notification is its own step now — it must run before a
+        // resume moves the process, while the state clearing must run
+        // after it. The guarantee here is unchanged: watchers hear about
+        // the dropped directories even after an aborted turn.
+        engine.notify_working_set_dropped().await;
         engine.reset_for_session_swap().await;
 
         assert!(

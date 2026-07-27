@@ -702,24 +702,30 @@ pub fn slash_rewrites_conversation(cmd: &str) -> bool {
 ///
 /// List-only commands (`/sessions`, `/mcp`, `/plugin list`, …) stay on the
 /// captured path so their output lands in the modern transcript.
+/// Commands that take over the terminal (pickers, pagers, `$EDITOR`).
+///
+/// Exposed so tests can assert every one of them is actually registered
+/// in `COMMANDS` — a restated copy of this list would drift the moment a
+/// name is added here, which is the drift the test exists to catch.
+pub const INTERACTIVE_SLASH_NAMES: &[&str] = &[
+    // Session picker (not `/sessions`, which only prints a list).
+    "session",
+    // Scrollback pager.
+    "scroll",
+    // `$EDITOR` owners — must keep a real TTY on stdout (no pipe tee).
+    "editor",
+    "open",
+    // Theme / model / tutorial pickers.
+    "theme",
+    "model",
+    "powerup",
+    // Full interactive uninstall flow.
+    "uninstall",
+];
+
 pub fn is_interactive_slash(cmd: &str) -> bool {
     let name = resolve_slash_name(cmd);
-    matches!(
-        name.as_str(),
-        // Session picker (not `/sessions`, which only prints a list).
-        "session"
-            // Scrollback pager.
-            | "scroll"
-            // `$EDITOR` owners — must keep a real TTY on stdout (no pipe tee).
-            | "editor"
-            | "open"
-            // Theme / model / tutorial pickers.
-            | "theme"
-            | "model"
-            | "powerup"
-            // Full interactive uninstall flow.
-            | "uninstall"
-    ) || slash_needs_stdin_prompt(cmd)
+    INTERACTIVE_SLASH_NAMES.contains(&name.as_str()) || slash_needs_stdin_prompt(cmd)
 }
 
 /// True when the interactive slash must keep a real TTY on stdout (no pipe
@@ -1383,11 +1389,29 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             }
             CommandResult::Handled
         }
-        Some("review") => CommandResult::Prompt(
-            "Review the current git diff. Look for bugs, security issues, \
-                 code quality problems, and suggest improvements."
-                .to_string(),
-        ),
+        Some("review") => {
+            // The target decides how the reviewer finds the change, and
+            // the rubric decides what counts as a finding. Both beat the
+            // single sentence this used to send.
+            use agent_code_lib::review;
+            let target = review::parse_target(args);
+            let cwd = std::path::PathBuf::from(&engine.state().cwd);
+            match review::resolve(target, &cwd) {
+                Ok(resolved) => {
+                    println!("Reviewing {}…", resolved.hint);
+                    CommandResult::Prompt(format!("{}\n\n{}", review::RUBRIC, resolved.prompt))
+                }
+                // Spending a turn reviewing the wrong thing is worse than
+                // saying no: report and stop.
+                Err(invalid) => {
+                    println!("Cannot review '{}': {}", invalid.input, invalid.reason);
+                    println!(
+                        "Usage: /review [uncommitted | base <branch> | commit <sha> | <instructions>]"
+                    );
+                    CommandResult::Handled
+                }
+            }
+        }
         Some("doctor") => {
             // Run the full async diagnostics synchronously via a blocking call.
             let cwd = std::path::Path::new(&engine.state().cwd).to_path_buf();
@@ -6389,6 +6413,67 @@ fn execute_settings(args: Option<&str>, engine: &QueryEngine) {
 
 #[cfg(test)]
 mod tests {
+    /// Every `/command` the reference documents must actually exist.
+    ///
+    /// This repo has shipped several advertised-but-absent features —
+    /// a theme picker that was unreachable, `/vim` that set a key nothing
+    /// read, keybindings listed as active that never fired. Docs are the
+    /// promise; this makes the promise checkable.
+    ///
+    /// Commands are extracted from the table rows, so prose mentioning a
+    /// slash command in passing does not count as a claim.
+    #[test]
+    fn every_documented_command_exists() {
+        let doc = include_str!("../../../../docs/reference/commands.mdx");
+        let mut claimed: Vec<String> = Vec::new();
+        for line in doc.lines() {
+            let line = line.trim_start();
+            // Table rows only: `| `/foo` | description |`
+            if !line.starts_with("| `/") {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("| `/") else {
+                continue;
+            };
+            let Some(name) = rest.split('`').next() else {
+                continue;
+            };
+            // `/model <name>` documents the command `model`.
+            let head = name.split_whitespace().next().unwrap_or("");
+            if !head.is_empty() && !claimed.iter().any(|c| c == head) {
+                claimed.push(head.to_string());
+            }
+        }
+        assert!(
+            claimed.len() > 20,
+            "extraction found only {} commands — the table format probably changed, \
+             which would make this test vacuous",
+            claimed.len()
+        );
+
+        // Registration in COMMANDS is what makes `execute` dispatch a
+        // command. `is_interactive_slash` only classifies how a name is
+        // run, and it carries its own hard-coded list — so accepting it
+        // as proof of implementation let a command stay "documented and
+        // implemented" after its COMMANDS entry was dropped or misspelled.
+        let missing: Vec<&String> = claimed.iter().filter(|c| !is_builtin_command(c)).collect();
+        assert!(
+            missing.is_empty(),
+            "documented but not registered in COMMANDS: {missing:?}"
+        );
+
+        // Every interactive-classified name must be registered too, or
+        // `execute` never reaches it. Read the classifier's own list
+        // rather than restating a subset: a copy here would silently
+        // stop covering names added there.
+        for name in INTERACTIVE_SLASH_NAMES {
+            assert!(
+                is_builtin_command(name),
+                "/{name} is classified interactive but is not registered in COMMANDS"
+            );
+        }
+    }
+
     use super::*;
 
     // Serialize tests that mutate the global VISUAL/EDITOR env vars so

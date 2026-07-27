@@ -144,8 +144,16 @@ impl Tool for BashTool {
         // Destructive-command classifier. Mirrors the historical inline
         // checks (substring match, piped destructive base, chained
         // segments) but lives in a single named helper.
+        // Only `Destructive` blocks. A `Risky` finding means the
+        // classifier could not prove what the command does, which
+        // withholds automatic approval (see `permissions::auto`) but
+        // must still leave the command runnable once the user confirms
+        // it — this validator refuses outright, before any prompt.
         let findings = bash_security::find_destructive(&parsed);
-        if let Some(first) = findings.first() {
+        if let Some(first) = findings
+            .iter()
+            .find(|f| f.level == bash_security::DestructivenessLevel::Destructive)
+        {
             return Err(ToolError::InvalidInput(format!(
                 "Potentially destructive command detected: {}. \
                  This command could cause data loss or system damage. \
