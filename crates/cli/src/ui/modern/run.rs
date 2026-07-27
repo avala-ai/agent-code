@@ -53,7 +53,41 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
-pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
+/// The permission policy the *operator* set on the command line.
+///
+/// Applied at startup on top of the file and environment layers. A
+/// cross-project resume reloads those layers from the destination, so
+/// without reapplying this on top, a project whose own config says
+/// `allow` silently discards `--permission-mode deny` or a deny-rule
+/// overlay. The CLI layer belongs to the process, not to a directory.
+#[derive(Clone, Default)]
+pub struct CliPermissionOverride {
+    /// From `--permission-mode` / `--dangerously-skip-permissions`.
+    pub default_mode: Option<agent_code_lib::config::PermissionMode>,
+    /// The `[permissions]` section of `--permissions-overlay`.
+    pub overlay: Option<agent_code_lib::config::PermissionsConfig>,
+}
+
+impl CliPermissionOverride {
+    /// Re-apply in the same order startup does: the mode first, then the
+    /// overlay composed on top, so a deny rule in the overlay still wins.
+    fn apply(&self, cfg: &mut agent_code_lib::config::Config) {
+        if let Some(mode) = self.default_mode {
+            cfg.permissions.default_mode = mode;
+        }
+        if let Some(overlay) = &self.overlay {
+            cfg.permissions = agent_code_lib::services::coordinator::compose_permissions_overlay(
+                &cfg.permissions,
+                overlay,
+            );
+        }
+    }
+}
+
+pub async fn run_modern_tui(
+    mut engine: QueryEngine,
+    cli_permissions: CliPermissionOverride,
+) -> anyhow::Result<()> {
     let model = engine.state().config.api.model.clone();
     let cwd = engine.state().cwd.clone();
     let session_id = engine.state().session_id.clone();
@@ -123,6 +157,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
         eng_tx,
         eng_rx,
         base_permission_mode,
+        &cli_permissions,
         &notifier,
         &mut term_events,
         &mut draw,
@@ -159,8 +194,18 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 /// every thread and, if the return trip failed, left the process inside
 /// the destination while the caller believed the resume had been safely
 /// refused — source hooks would then run in the destination project.
-fn load_project_config(dir: &str) -> Result<agent_code_lib::config::Config, String> {
-    agent_code_lib::config::Config::load_from(std::path::Path::new(dir)).map_err(|e| e.to_string())
+fn load_project_config(
+    dir: &str,
+    cli_permissions: &CliPermissionOverride,
+) -> Result<agent_code_lib::config::Config, String> {
+    let mut cfg = agent_code_lib::config::Config::load_from(std::path::Path::new(dir))
+        .map_err(|e| e.to_string())?;
+    // The command line is a layer above the files, and it belongs to the
+    // process rather than to any directory. Reloading only the file and
+    // environment layers would let a destination whose own config says
+    // `allow` discard the operator's `--permission-mode deny`.
+    cli_permissions.apply(&mut cfg);
+    Ok(cfg)
 }
 
 /// Whether a restored session's directory can be entered, without
@@ -402,6 +447,7 @@ pub(super) async fn event_loop(
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     mut base_permission_mode: PermissionMode,
+    cli_permissions: &CliPermissionOverride,
     notifier: &NotifierService,
     term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
@@ -608,7 +654,7 @@ pub(super) async fn event_loop(
                         let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
                             None
                         } else {
-                            match load_project_config(&data.cwd) {
+                            match load_project_config(&data.cwd, cli_permissions) {
                                 Ok(cfg) => Some(cfg),
                                 Err(e) => {
                                     app.status_message.clear();
@@ -4346,6 +4392,74 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "already being there should be a no-op, not a move"
+        );
+    }
+
+    /// The command line is a layer above the files and belongs to the
+    /// process, not to a directory. A cross-project resume reloads the
+    /// file layers from the destination, so without reapplying it a
+    /// project whose own config says `allow` silently discards the
+    /// operator's `--permission-mode deny`.
+    #[test]
+    fn the_operators_command_line_survives_a_project_reload() {
+        use agent_code_lib::config::{PermissionMode, PermissionRule};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"allow\"\n",
+        )
+        .unwrap();
+
+        // Without the operator's layer, the destination decides.
+        let plain = load_project_config(
+            &dir.path().display().to_string(),
+            &CliPermissionOverride::default(),
+        )
+        .expect("settings parse");
+        assert_eq!(plain.permissions.default_mode, PermissionMode::Allow);
+
+        // Mode-only: the operator's default must outlive the reload.
+        let deny_mode = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            overlay: None,
+        };
+        let guarded = load_project_config(&dir.path().display().to_string(), &deny_mode)
+            .expect("settings parse");
+        assert_eq!(
+            guarded.permissions.default_mode,
+            PermissionMode::Deny,
+            "the destination project overrode --permission-mode deny"
+        );
+
+        // With an overlay, startup composes it *over* the mode, so the
+        // overlay's own default governs — mirrored here deliberately
+        // rather than improved, so the resumed session and a freshly
+        // started one answer identically.
+        let with_overlay = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            overlay: Some(agent_code_lib::config::PermissionsConfig {
+                default_mode: PermissionMode::Deny,
+                rules: vec![PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: Some("rm *".into()),
+                    action: PermissionMode::Deny,
+                }],
+                ..Default::default()
+            }),
+        };
+        let guarded = load_project_config(&dir.path().display().to_string(), &with_overlay)
+            .expect("settings parse");
+        assert_eq!(guarded.permissions.default_mode, PermissionMode::Deny);
+        assert!(
+            guarded
+                .permissions
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
+            "the operator's deny rule did not survive the reload"
         );
     }
 }
