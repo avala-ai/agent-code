@@ -597,8 +597,17 @@ fn user_palette(id: &str) -> Option<Palette> {
 /// rules are testable without a real themes directory.
 fn user_palette_in(dir: &Path, id: &str) -> Option<Palette> {
     // `id` reaches the filesystem, so it has to name a file *in* `dir`
-    // and not a path that walks out of it.
-    if Path::new(id).components().count() != 1 || id.starts_with('.') {
+    // and not a path that walks out of it. `Normal` is what excludes the
+    // traversal components: `.` and `..` are each a single component too,
+    // so counting them is not enough. A leading dot is fine — a stem like
+    // `.foo` is a legitimate id that `load_palettes_dir` advertises, and
+    // rejecting it here would leave a picker entry that never resolves.
+    let mut components = Path::new(id).components();
+    match components.next() {
+        Some(std::path::Component::Normal(only)) if only == std::ffi::OsStr::new(id) => {}
+        _ => return None,
+    }
+    if components.next().is_some() {
         return None;
     }
     let path = dir.join(format!("{id}.toml"));
@@ -1053,10 +1062,38 @@ accent = "#00ffff"
         let outside = dir.path().parent().unwrap().join("escaped.toml");
         std::fs::write(&outside, MINIMAL_PALETTE).unwrap();
 
-        for id in ["../escaped", "sub/auto", "/etc/passwd", "", "."] {
+        for id in [
+            "../escaped",
+            "sub/auto",
+            "/etc/passwd",
+            "",
+            ".",
+            "..",
+            "auto/",
+        ] {
             assert!(user_palette_in(dir.path(), id).is_none(), "{id:?}");
         }
         let _ = std::fs::remove_file(outside);
+    }
+
+    /// `load_palettes_dir` takes the id from the file stem, so `.foo.toml`
+    /// is advertised as `.foo`. Resolution has to accept the same ids the
+    /// catalog offers, or the picker lists a theme that silently falls
+    /// back to the default when chosen.
+    #[test]
+    fn palette_lookup_accepts_a_dot_prefixed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".foo.toml"), MINIMAL_PALETTE).unwrap();
+
+        let advertised: Vec<String> = load_palettes_dir(dir.path())
+            .into_iter()
+            .map(|p| p.id.into_owned())
+            .collect();
+        assert_eq!(advertised, vec![".foo".to_string()], "catalog id");
+        assert!(
+            user_palette_in(dir.path(), ".foo").is_some(),
+            "every advertised id must resolve"
+        );
     }
 
     /// The default `theme = "auto"` runs this lookup during startup, so a
