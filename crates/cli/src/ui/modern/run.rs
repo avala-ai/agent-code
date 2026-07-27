@@ -333,6 +333,22 @@ pub(super) async fn event_loop(
     // back here, so a slow filesystem never blocks the event loop.
     let (task_out_tx, mut task_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
+    // Image attachments are read and encoded the same way: detached, with
+    // the result landing in a select arm. Awaiting the work inline would
+    // park this loop — the only one there is — so a workspace on a slow
+    // mount would stop redraws and Ctrl+C until the read finished.
+    #[allow(clippy::type_complexity)]
+    let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        Vec<agent_code_lib::llm::message::ContentBlock>,
+        Vec<String>,
+    )>();
+    // Set while an encode is in flight: the turn it belongs to must not
+    // start without it, and a second one must not be queued behind it.
+    let mut encoding = false;
+    // A cancel that lands mid-encode cannot stop the read, so the result
+    // is dropped when it arrives instead.
+    let mut discard_encoding = false;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -566,40 +582,37 @@ pub(super) async fn event_loop(
             }
         }
 
-        // Start a pending turn if idle.
+        // Hand a prompt's images to the blocking pool. The descriptors were
+        // opened when their mentions were validated, so nothing is resolved
+        // here; the result comes back through `img_rx` and re-arms the
+        // prompt, which keeps this loop free to redraw and to take a Ctrl+C
+        // while a slow mount is being read.
         if turn.is_none()
+            && !encoding
+            && !app.pending_images.is_empty()
             && let Some(prompt) = app.pending_submit.take()
         {
-            // Encode this turn's images. The descriptors were opened when
-            // their mentions were validated, so nothing is resolved here —
-            // and the read runs on the blocking pool, because a workspace
-            // on a slow mount would otherwise stall the event loop (and
-            // with it redraws and cancellation) for the whole read.
             let images = std::mem::take(&mut app.pending_images);
-            let restore = images.clone();
-            let blocks = if images.is_empty() {
-                Vec::new()
-            } else {
-                let (blocks, notes) = match tokio::task::spawn_blocking(move || {
-                    super::mentions::encode_staged_images(images)
-                })
-                .await
-                {
-                    Ok(out) => out,
-                    Err(e) => (Vec::new(), vec![format!("could not attach images: {e}")]),
-                };
-                for note in notes {
-                    app.transcript
-                        .push(super::app::TranscriptItem::System(note));
-                }
-                blocks
-            };
+            let tx = img_tx.clone();
+            encoding = true;
+            tokio::task::spawn_blocking(move || {
+                let (blocks, notes) = super::mentions::encode_staged_images(images);
+                let _ = tx.send((prompt, blocks, notes));
+            });
+        }
+
+        // Start a pending turn if idle.
+        if turn.is_none()
+            && !encoding
+            && let Some(prompt) = app.pending_submit.take()
+        {
+            let blocks = std::mem::take(&mut app.pending_attachments);
             // Set unconditionally, awaiting the lock rather than skipping on
             // contention: an empty set clears anything a previous attempt
             // staged, so no turn can inherit another turn's attachment.
             {
                 let engine = session.engine();
-                engine.lock().await.set_pending_attachments(blocks);
+                engine.lock().await.set_pending_attachments(blocks.clone());
             }
             let sink = ChannelSink::new(eng_tx.clone());
             match session.spawn_turn(prompt.clone(), sink).await {
@@ -612,7 +625,7 @@ pub(super) async fn event_loop(
                     // and its attachments back so the next idle loop retries
                     // them together.
                     app.pending_submit = Some(prompt);
-                    app.pending_images = restore;
+                    app.pending_attachments = blocks;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
                 }
@@ -623,6 +636,11 @@ pub(super) async fn event_loop(
         if app.cancel_requested {
             if let Some(ref h) = turn {
                 h.cancel();
+            }
+            // A read already handed to the blocking pool cannot be stopped,
+            // so its result is thrown away when it lands.
+            if encoding {
+                discard_encoding = true;
             }
             app.cancel_requested = false;
         }
@@ -842,6 +860,24 @@ pub(super) async fn event_loop(
             }
             Some((id, out)) = task_out_rx.recv() => {
                 app.show_task_output(&id, out);
+            }
+            // Encoded image attachments coming back from the blocking pool.
+            // The prompt is re-armed with them so the turn starts on the
+            // next pass through the loop above.
+            Some((prompt, blocks, notes)) = img_rx.recv() => {
+                encoding = false;
+                if discard_encoding {
+                    // Cancelled while the read was in flight: the bytes are
+                    // dropped rather than sent with a turn nobody asked for.
+                    discard_encoding = false;
+                } else {
+                    for note in notes {
+                        app.transcript.push(super::app::TranscriptItem::System(note));
+                    }
+                    app.pending_attachments = blocks;
+                    app.pending_submit = Some(prompt);
+                }
+                app.dirty = true;
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             // Gated on work that can still change: polling while any

@@ -427,6 +427,9 @@ pub struct App {
     /// open descriptors from the moment their mention was validated, so
     /// starting the turn needs no second look at any path.
     pub pending_images: Vec<super::mentions::StagedImage>,
+    /// The same images once read and encoded off the UI thread, waiting for
+    /// the turn they belong to to start.
+    pub pending_attachments: Vec<agent_code_lib::llm::message::ContentBlock>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -602,6 +605,7 @@ impl App {
             command_palette: None,
             model_picker: None,
             pending_images: Vec::new(),
+            pending_attachments: Vec::new(),
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
@@ -1676,7 +1680,10 @@ impl App {
         // cancelling), and only the mention branch assigns `pending_images`
         // — so clear here, or the replacement turn would carry the previous
         // prompt's image and disclose a file the user did not mean to send.
+        // Both stages are cleared: one holds descriptors, the other the
+        // bytes already read from them.
         self.pending_images.clear();
+        self.pending_attachments.clear();
         let mut mention_notes: Vec<String> = Vec::new();
         let (display, prompt) =
             match try_expand_skill_slash_full(&text, &self.cwd, self.disable_skill_shell) {
@@ -4562,6 +4569,24 @@ mod tests {
         assert!(
             app.pending_images.is_empty(),
             "stale image carried onto a command-produced turn"
+        );
+    }
+
+    /// Encoded bytes are staged separately from the descriptors, so a
+    /// replaced prompt has to drop both — otherwise an image that had
+    /// already been read would still ride along with the new prompt.
+    #[test]
+    fn replacing_a_prompt_drops_already_encoded_attachments() {
+        let (_dir, mut app) = app_in_workspace();
+        app.pending_attachments = vec![agent_code_lib::llm::message::ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }];
+        type_input(&mut app, "a different prompt");
+        app.submit();
+        assert!(
+            app.pending_attachments.is_empty(),
+            "encoded image carried onto the replacement prompt"
         );
     }
 }

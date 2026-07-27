@@ -187,6 +187,18 @@ impl ContentBlock {
         }
     }
 
+    /// The wire `type` tag of this block, for logs and hook payloads.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::ToolUse { .. } => "tool_use",
+            ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::Thinking { .. } => "thinking",
+            ContentBlock::Image { .. } => "image",
+            ContentBlock::Document { .. } => "document",
+        }
+    }
+
     /// Extract tool use info, if this is a tool_use block.
     pub fn as_tool_use(&self) -> Option<(&str, &str, &serde_json::Value)> {
         match self {
@@ -271,6 +283,32 @@ pub fn user_message(text: impl Into<String>) -> Message {
         is_meta: false,
         is_compact_summary: false,
     })
+}
+
+/// Describe attachment blocks for hook payloads and logs.
+///
+/// Metadata, not payloads: a hook needs to know that an image of a given
+/// type and size is going out — enough to audit or refuse it — and putting
+/// megabytes of base64 into every hook invocation would serve nothing.
+pub fn describe_attachments(blocks: &[ContentBlock]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image { media_type, data } => serde_json::json!({
+                "type": "image",
+                "media_type": media_type,
+                "encoded_bytes": data.len(),
+            }),
+            ContentBlock::Document {
+                media_type, data, ..
+            } => serde_json::json!({
+                "type": "document",
+                "media_type": media_type,
+                "encoded_bytes": data.len(),
+            }),
+            other => serde_json::json!({ "type": other.kind_name() }),
+        })
+        .collect()
 }
 
 /// Media type for an image path, inferred from its extension.
@@ -577,6 +615,41 @@ mod tests {
         // The encoder this replaced only produced output from `flush()`,
         // which no caller invoked: every image shipped with empty data.
         assert_eq!(data, "iVBORw==", "image payload was not encoded");
+    }
+
+    /// A `UserPromptSubmit` hook is documented to see the whole prompt so
+    /// it can scan or audit it; an attached image that appeared nowhere in
+    /// the payload went out unexamined.
+    #[test]
+    fn attachments_are_described_for_hooks() {
+        let blocks = vec![
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "iVBORw==".into(),
+            },
+            ContentBlock::Document {
+                media_type: "application/pdf".into(),
+                data: "JVBER".into(),
+                title: None,
+            },
+            ContentBlock::Text {
+                text: "hello".into(),
+            },
+        ];
+        let described = describe_attachments(&blocks);
+        assert_eq!(described[0]["type"], "image");
+        assert_eq!(described[0]["media_type"], "image/png");
+        assert_eq!(described[0]["encoded_bytes"], 8);
+        assert_eq!(described[1]["type"], "document");
+        assert_eq!(described[1]["media_type"], "application/pdf");
+        assert_eq!(described[2]["type"], "text");
+        // Metadata only: the bytes themselves would bloat every hook call.
+        assert!(described[0].get("data").is_none());
+    }
+
+    #[test]
+    fn describing_no_attachments_is_empty() {
+        assert!(describe_attachments(&[]).is_empty());
     }
 
     /// RFC 4648 §10 test vectors — the padded remainders are exactly where

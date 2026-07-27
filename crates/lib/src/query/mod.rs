@@ -753,6 +753,11 @@ impl QueryEngine {
         // belongs to exactly one turn, and leaking it into the next one
         // would re-send an image the user already shared.
         let attachments = std::mem::take(&mut self.pending_attachments);
+        // Described for the hooks below before the blocks are moved into
+        // the message. A `UserPromptSubmit` hook exists to see everything
+        // the turn sends; an image that only showed up as silence there
+        // would slip past exactly the audit it was configured for.
+        let attachment_info = crate::llm::message::describe_attachments(&attachments);
         let user_msg = if attachments.is_empty() {
             user_message(user_input)
         } else {
@@ -771,6 +776,7 @@ impl QueryEngine {
                 None,
                 &serde_json::json!({
                     "user_input": user_input,
+                    "attachments": attachment_info,
                     "turn": self.state.turn_count + 1,
                 }),
                 Some(&self.cancel),
@@ -791,6 +797,7 @@ impl QueryEngine {
                 &serde_json::json!({
                     "turn": self.state.turn_count + 1,
                     "user_input_preview": user_input.chars().take(200).collect::<String>(),
+                    "attachments": attachment_info,
                 }),
                 Some(&self.cancel),
             )
