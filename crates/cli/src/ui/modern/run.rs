@@ -708,6 +708,15 @@ pub(super) async fn event_loop(
                                  ({e}) — staying in {previous_cwd}",
                                     data.cwd
                                 )));
+                            // The working set was announced as dropped
+                            // before the move, so every watcher has been
+                            // told to stop tracking directories this
+                            // session still uses. Announce them back.
+                            {
+                                let engine_arc = session.engine();
+                                let mut eng = engine_arc.lock().await;
+                                eng.notify_working_set_restored().await;
+                            }
                             // The session being kept has already been
                             // told it stopped. Start it again so the
                             // lifecycle stays paired: without this its
@@ -815,6 +824,17 @@ pub(super) async fn event_loop(
                         // permission-checker default has to move with the
                         // restored plan flag, or a resumed plan session
                         // answers permission checks as the old one did.
+                        // The destination's default decides unmatched tools
+                        // from here on, and it has to be in place *before*
+                        // the hint is derived: computing it from the old
+                        // base and updating afterwards left the live
+                        // checker on the previous project's default with
+                        // nothing to correct it later.
+                        if entered.is_some()
+                            && let Some(cfg) = destination_cfg.as_ref()
+                        {
+                            base_permission_mode = cfg.permissions.default_mode;
+                        }
                         let hint = mode.permission_hint().unwrap_or(base_permission_mode);
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
@@ -831,13 +851,6 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
-                            // The destination's default decides unmatched
-                            // tools from here on. Left at the value captured
-                            // from the project the process started in, a
-                            // session resumed into a project configured to
-                            // ask (or deny) kept answering with the old
-                            // project's allow.
-                            base_permission_mode = cfg.permissions.default_mode;
                             finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
                         }
                         app.pending_resume = None;

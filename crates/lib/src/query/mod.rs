@@ -370,6 +370,24 @@ impl QueryEngine {
         let _ = dropped_dirs;
     }
 
+    /// Tell watchers the `/add-dir` working set is back.
+    ///
+    /// Pairs with [`Self::notify_working_set_dropped`] when the swap it
+    /// announced does not happen: the drop was announced before the move
+    /// so watchers would stop indexing a project being left, and a move
+    /// that then fails leaves those directories still in use with every
+    /// watcher told to ignore them.
+    pub async fn notify_working_set_restored(&mut self) {
+        if self.state.additional_dirs.is_empty() {
+            return;
+        }
+        let cwd = self.state.cwd.clone();
+        let dirs = self.state.additional_dirs.clone();
+        let swap_cancel = CancellationToken::new();
+        self.run_cwd_changed_hooks_with(&cwd, "session-swap-aborted", &dirs, Some(&swap_cancel))
+            .await;
+    }
+
     /// Tell watchers the `/add-dir` working set is going away.
     ///
     /// Separate from [`Self::reset_for_session_swap`] because the two
