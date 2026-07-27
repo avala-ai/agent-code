@@ -1,5 +1,5 @@
 == glyphs ==
-agent-code 0.27.0  test-model   NORMAL   /w
+agent-code x.y.z   test-model   NORMAL   /w
 
 ────────────────────────────────────────────────────────────────────────────────
  transcript
