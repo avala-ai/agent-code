@@ -240,6 +240,29 @@ pub enum StopReason {
 }
 
 /// Helper to create a user message with text content.
+/// A user message carrying attachments alongside its text.
+///
+/// Images go *before* the text: a model reads the prompt as being about
+/// the images it has just been shown, and the reverse order reads as an
+/// afterthought.
+pub fn user_message_with_attachments(
+    text: impl Into<String>,
+    attachments: Vec<ContentBlock>,
+) -> Message {
+    let text = text.into();
+    let mut content = attachments;
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    Message::User(UserMessage {
+        uuid: Uuid::new_v4(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        content,
+        is_meta: false,
+        is_compact_summary: false,
+    })
+}
+
 pub fn user_message(text: impl Into<String>) -> Message {
     Message::User(UserMessage {
         uuid: Uuid::new_v4(),
@@ -505,6 +528,37 @@ pub fn messages_to_api_params_cached(messages: &[Message]) -> Vec<serde_json::Va
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachments_precede_the_text_in_a_user_message() {
+        let img = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "abc".into(),
+        };
+        let msg = user_message_with_attachments("what is this?", vec![img]);
+        let Message::User(u) = msg else {
+            panic!("expected a user message");
+        };
+        assert_eq!(u.content.len(), 2);
+        // Images first: the prompt reads as being about what was just
+        // shown, not as an afterthought.
+        assert!(matches!(u.content[0], ContentBlock::Image { .. }));
+        assert!(matches!(&u.content[1], ContentBlock::Text { text } if text == "what is this?"));
+        assert!(!u.is_meta, "an attachment turn is still real user input");
+    }
+
+    #[test]
+    fn an_attachment_with_no_text_carries_only_the_attachment() {
+        let img = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "abc".into(),
+        };
+        let msg = user_message_with_attachments("", vec![img]);
+        let Message::User(u) = msg else {
+            panic!("expected a user message");
+        };
+        assert_eq!(u.content.len(), 1, "an empty text block was appended");
+    }
+
     use super::*;
 
     #[test]

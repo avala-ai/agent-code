@@ -570,6 +570,30 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
+            // Load any mentioned images and hand them to the engine for
+            // this turn. Decoding here rather than at mention time keeps
+            // a big screenshot out of memory until the turn actually
+            // starts, and lets a read failure be reported as a note
+            // instead of blocking the prompt.
+            let images = std::mem::take(&mut app.pending_images);
+            if !images.is_empty() {
+                let mut blocks = Vec::new();
+                for path in images {
+                    match agent_code_lib::llm::message::image_block_from_file(&path) {
+                        Ok(block) => blocks.push(block),
+                        Err(e) => {
+                            app.transcript
+                                .push(super::app::TranscriptItem::System(format!(
+                                    "could not attach {}: {e}",
+                                    path.display()
+                                )));
+                        }
+                    }
+                }
+                if let Ok(mut eng) = session.engine().try_lock() {
+                    eng.set_pending_attachments(blocks);
+                }
+            }
             let sink = ChannelSink::new(eng_tx.clone());
             match session.spawn_turn(prompt.clone(), sink).await {
                 Ok(handle) => {

@@ -172,3 +172,10 @@ binding that runs never discards the prompt you were composing.
 
 The file is read once at startup; `/keybindings` lists the bindings active in
 the current session — after editing the file, restart to apply.
+
+## Images
+
+Mention an image the way you mention a file — `@screenshot.png` — and it is
+attached to the turn as an image rather than inlined as text. Supported:
+`png`, `jpg`/`jpeg`, `gif`, `webp`. Other binaries are still skipped with a
+reason.

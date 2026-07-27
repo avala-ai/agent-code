@@ -423,6 +423,8 @@ pub struct App {
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
     pub model_picker: Option<super::model_picker::ModelPicker>,
+    /// Image files mentioned in the prompt, attached to the next turn.
+    pub pending_images: Vec<std::path::PathBuf>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -597,6 +599,7 @@ impl App {
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
+            pending_images: Vec::new(),
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
@@ -1714,6 +1717,7 @@ impl App {
                     ) {
                         Some(expansion) => {
                             mention_notes = expansion.notes;
+                            self.pending_images = expansion.images;
                             expansion.prompt
                         }
                         None => text.clone(),

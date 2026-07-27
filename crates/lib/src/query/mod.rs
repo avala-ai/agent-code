@@ -74,6 +74,9 @@ pub struct QueryEngine {
     last_seen_denial_total: usize,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Content blocks to prepend to the next user message (images from
+    /// the composer). Consumed by the turn that follows.
+    pending_attachments: Vec<crate::llm::message::ContentBlock>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
     question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
@@ -219,6 +222,7 @@ impl QueryEngine {
                 crate::memory::extraction::ExtractionState::new(),
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_attachments: Vec::new(),
             permission_prompter: None,
             question_asker: None,
             cached_system_prompt: None,
@@ -276,6 +280,14 @@ impl QueryEngine {
     /// (see `tools::executor`), so the interactive TUI would silently execute
     /// mutating tools under `ask` mode. The CLI installs a prompter on the
     /// interactive path only; one-shot/non-interactive runs leave it unset.
+    /// Attach content blocks to the next user turn.
+    ///
+    /// Replaces rather than appends, so a cancelled composer cannot
+    /// accumulate images across attempts.
+    pub fn set_pending_attachments(&mut self, blocks: Vec<crate::llm::message::ContentBlock>) {
+        self.pending_attachments = blocks;
+    }
+
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
     }
@@ -736,8 +748,16 @@ impl QueryEngine {
         user_input: &str,
         sink: &dyn StreamSink,
     ) -> crate::error::Result<()> {
-        // Add the user message to history.
-        let user_msg = user_message(user_input);
+        // Add the user message to history, with anything the caller
+        // attached for this turn. Taken rather than read: an attachment
+        // belongs to exactly one turn, and leaking it into the next one
+        // would re-send an image the user already shared.
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        let user_msg = if attachments.is_empty() {
+            user_message(user_input)
+        } else {
+            crate::llm::message::user_message_with_attachments(user_input, attachments)
+        };
         self.state.push_message(user_msg);
 
         // UserPromptSubmit fires once per user turn, as soon as the

@@ -166,6 +166,11 @@ pub struct MentionExpansion {
     pub prompt: String,
     /// Short human-readable notes about anything skipped or truncated.
     pub notes: Vec<String>,
+    /// Image files to attach to the turn as content blocks. An image
+    /// cannot be inlined as text, so `@shot.png` used to report
+    /// "binary, skipped" — which is never what the user meant by
+    /// mentioning one.
+    pub images: Vec<PathBuf>,
 }
 
 /// Inline the contents of every `@path` mention in `text`.
@@ -182,6 +187,7 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut body = String::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut images: Vec<PathBuf> = Vec::new();
     let mut used = 0usize;
     let mut over_budget = 0usize;
 
@@ -206,6 +212,15 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
             Resolved::Dir(path) => {
                 let label = display_path(cwd, &path, &raw);
                 (label, "directory", list_dir(&path))
+            }
+            Resolved::File(path) if is_image(&path) => {
+                // Attached rather than inlined; the model receives it as
+                // an image block on the turn.
+                let label = display_path(cwd, &path, &raw);
+                notes.push(format!("@{raw} — attached as an image"));
+                images.push(path);
+                let _ = label;
+                continue;
             }
             Resolved::File(path) => match read_text_capped(&path, cap) {
                 Ok(content) => (display_path(cwd, &path, &raw), "file", content),
@@ -238,6 +253,7 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     Some(MentionExpansion {
         prompt: format!("{text}{body}"),
         notes,
+        images,
     })
 }
 
@@ -292,6 +308,18 @@ fn resolve_mention(cwd: &Path, raw: &str) -> Result<Resolved, String> {
     } else {
         Err("not a regular file".into())
     }
+}
+
+/// Extensions the model can be shown directly. Kept to the formats the
+/// API accepts, so an unsupported image still reports a clear reason
+/// rather than being attached and rejected upstream.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// True when `path` resolves inside `cwd`. Both sides are canonicalized.
@@ -662,6 +690,57 @@ mod tests {
         );
         // The first four files fit exactly; the rest are skipped.
         assert_eq!(out.prompt.matches("<file path=").count(), 4);
+    }
+
+    /// An image cannot be inlined as text, so `@shot.png` used to report
+    /// "binary, skipped" — never what mentioning an image means.
+    #[test]
+    fn an_image_mention_is_attached_not_skipped() {
+        let dir = fixture();
+        // A real PNG header, so the binary sniff would have caught it.
+        fs::write(
+            dir.path().join("shot.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2],
+        )
+        .unwrap();
+        let out = expand_mentions("look at @shot.png", dir.path()).expect("expanded");
+        assert_eq!(
+            out.images.len(),
+            1,
+            "image was not attached: {:?}",
+            out.notes
+        );
+        assert!(out.images[0].ends_with("shot.png"));
+        assert!(
+            out.notes.iter().any(|n| n.contains("attached as an image")),
+            "no note explaining the attachment: {:?}",
+            out.notes
+        );
+        assert!(
+            !out.prompt.contains("<file"),
+            "an image must not be inlined as text"
+        );
+    }
+
+    #[test]
+    fn image_extensions_are_matched_case_insensitively() {
+        let dir = fixture();
+        for name in ["a.PNG", "b.Jpeg", "c.webp"] {
+            fs::write(dir.path().join(name), [0x89, 0, 1]).unwrap();
+        }
+        let out = expand_mentions("@a.PNG @b.Jpeg @c.webp", dir.path()).expect("expanded");
+        assert_eq!(out.images.len(), 3, "{:?}", out.notes);
+    }
+
+    /// A non-image binary still reports why it was skipped, rather than
+    /// being attached as something the model cannot read.
+    #[test]
+    fn a_non_image_binary_is_still_skipped() {
+        let dir = fixture();
+        fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 9]).unwrap();
+        let out = expand_mentions("see @blob.bin", dir.path()).expect("expanded");
+        assert!(out.images.is_empty(), "attached a non-image binary");
+        assert_eq!(out.notes, vec!["@blob.bin — binary, skipped"]);
     }
 
     #[test]
