@@ -671,7 +671,15 @@ pub(super) async fn event_loop(
         }
 
         // Start a pending turn if idle.
+        //
+        // Not while a resume is outstanding. The composer stays live
+        // while the selected session loads, so a prompt submitted in that
+        // window would otherwise start a turn — tool side effects and all
+        // — against the conversation being thrown away, and the restore
+        // would then wipe the transcript that recorded it. The prompt is
+        // handed back to the composer when the restore lands.
         if turn.is_none()
+            && app.pending_resume.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
             let sink = ChannelSink::new(eng_tx.clone());

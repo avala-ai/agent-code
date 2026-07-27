@@ -380,10 +380,21 @@ impl App {
 
         // Prompts staged against the previous conversation must not be
         // auto-dispatched into the session that replaced it.
-        self.pending_submit = None;
-        let dropped = self.queue.len();
+        let mut dropped = self.queue.len();
         self.queue.clear();
         self.queue_selected = 0;
+        // A prompt submitted while the session was still loading never
+        // ran — turn spawning is blocked for exactly that window. Hand
+        // the text back to the composer rather than firing it at a
+        // conversation the user has not seen yet, or silently eating it.
+        if let Some(text) = self.pending_submit.take() {
+            if self.input.trim().is_empty() {
+                self.cursor = text.len();
+                self.input = text;
+            } else {
+                dropped += 1;
+            }
+        }
         if dropped > 0 {
             self.transcript.push(TranscriptItem::System(format!(
                 "discarded {dropped} queued prompt(s) written for the previous session"
@@ -850,6 +861,39 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("discarded 1"))),
             "prompts were dropped without telling the user"
+        );
+    }
+
+    /// A prompt submitted while the session was still loading never ran
+    /// (turn spawning is blocked for that window), so it must come back
+    /// to the composer rather than be eaten or fired at the old session.
+    #[test]
+    fn a_prompt_submitted_during_the_load_returns_to_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_submit = Some("check the parser".into());
+        app.adopt_restored_session(&restored());
+        assert!(
+            app.pending_submit.is_none(),
+            "prompt would still start a turn"
+        );
+        assert_eq!(app.input, "check the parser", "the typed prompt was lost");
+        assert_eq!(app.cursor, "check the parser".len());
+    }
+
+    /// ...unless the composer already holds a draft, which must not be
+    /// clobbered — report the staged prompt instead.
+    #[test]
+    fn a_staged_prompt_is_reported_when_the_composer_is_busy() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "half-written draft".into();
+        app.pending_submit = Some("check the parser".into());
+        app.adopt_restored_session(&restored());
+        assert_eq!(app.input, "half-written draft", "draft was clobbered");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("discarded 1"))),
+            "the staged prompt vanished without a word"
         );
     }
 
