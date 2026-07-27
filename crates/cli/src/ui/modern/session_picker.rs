@@ -296,6 +296,11 @@ impl App {
     /// user was trying to leave — a prompt or `!cmd` would take real tool
     /// and filesystem side effects there — so it is cancelled and shown.
     pub fn cancel_deferred_resume_work(&mut self) {
+        // Notices carried from the accept are already on the transcript,
+        // and the swap they were waiting for is never going to happen.
+        // Left here they would surface again — stale and attributed to
+        // the wrong resume — the next time one succeeds.
+        self.resume_notices.clear();
         // Terminal path: no restore follows, so nothing needs to survive
         // a transcript swap that will not happen.
         self.cancel_pending_session_work(
@@ -1187,6 +1192,42 @@ mod tests {
         assert!(
             app.resume_notices.is_empty(),
             "notices must not be re-emitted a second time"
+        );
+    }
+
+    /// A resume that fails after cancelling work must not leave its
+    /// report queued: the next successful resume would replay it,
+    /// stale and against the wrong session.
+    #[test]
+    fn a_failed_resume_does_not_leave_its_report_for_the_next_one() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_shell = Some("make clean".into());
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        app.session_picker_accept();
+        assert!(!app.resume_notices.is_empty(), "nothing was carried");
+
+        // The chosen session turns out to be missing or corrupt.
+        app.cancel_deferred_resume_work();
+        assert!(app.resume_notices.is_empty());
+
+        // A later, unrelated resume must not replay it.
+        app.restore_transcript(
+            vec![TranscriptItem::User("a different session".into())],
+            "bbb22222",
+            1,
+        );
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !said.contains("make clean"),
+            "a stale report resurfaced on an unrelated resume: {said}"
         );
     }
 
