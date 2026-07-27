@@ -1263,6 +1263,12 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
     let mut inner = String::new();
     let mut depth = 1usize;
     let mut quote: Option<char> = None;
+    // How many `case` constructs are open: their patterns close with a
+    // `)` that opened nothing, which a depth count alone would read as
+    // the end of the substitution.
+    let mut case_depth = 0usize;
+    // The bare word being read, to recognise `case` and `esac`.
+    let mut word = String::new();
     let mut i = start;
     while i < text.len() {
         let c = text[i];
@@ -1270,6 +1276,7 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
         // single quotes, where bash takes it literally.
         if c == '\\' && quote != Some('\'') {
             inner.push(c);
+            word.clear();
             if let Some(&escaped) = text.get(i + 1) {
                 inner.push(escaped);
                 i += 2;
@@ -1279,17 +1286,38 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
             continue;
         }
         match quote {
-            Some(q) if c == q => quote = None,
+            Some(q) if c == q => {
+                quote = None;
+                word.clear();
+            }
             Some(_) => {}
-            None if c == '\'' || c == '"' => quote = Some(c),
-            None if c == open => depth += 1,
-            None if c == close => {
-                depth -= 1;
-                if depth == 0 {
-                    return (inner, i + 1);
+            None if c.is_alphanumeric() || c == '_' => word.push(c),
+            None => {
+                // The word that just ended decides whether a `case` is
+                // open, and it has to be read before this character is.
+                match word.as_str() {
+                    "case" => case_depth += 1,
+                    "esac" => case_depth = case_depth.saturating_sub(1),
+                    _ => {}
+                }
+                word.clear();
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else if c == open {
+                    depth += 1;
+                } else if c == close {
+                    // A `case` pattern closes with `)` having opened
+                    // nothing, so at the substitution's own level that
+                    // `)` ends the pattern rather than the
+                    // substitution: `$(case x in x) …;; esac)`.
+                    if case_depth == 0 || depth > 1 {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (inner, i + 1);
+                        }
+                    }
                 }
             }
-            None => {}
         }
         inner.push(c);
         i += 1;
@@ -2732,6 +2760,11 @@ mod tests {
             "cat <<EOF\n$($\"safe\")\nEOF",
             // A quote around it is body text, so it hides nothing.
             "cat <<EOF\n'$($\"safe\")'\nEOF",
+            // A `case` pattern closes with a `)` that opened nothing,
+            // so counting parentheses alone would end the substitution
+            // early and miss what follows the pattern.
+            "cat <<EOF\n$(case x in x) $\"safe\";; esac)\nEOF",
+            "cat <<EOF\n$(case x in (x) $\"safe\";; esac)\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
@@ -2914,6 +2947,11 @@ mod tests {
             "cat <<'EOF'\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF",
             "cat <<'EOF'\n'$(GIT_CONFIG_GLOBAL=/tmp/g git p)'\nEOF",
             "cat <<'EOF'\n`GIT_CONFIG_GLOBAL=/tmp/g git p`\nEOF",
+            "cat <<'EOF'\n$(case x in x) $\"safe\";; esac)\nEOF",
+            // Only the expansion is code: the body text around it is
+            // still what the command reads, and what follows the
+            // terminator is still split.
+            "cat <<EOF\n$(echo hi) tail\nEOF\ngit status",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
