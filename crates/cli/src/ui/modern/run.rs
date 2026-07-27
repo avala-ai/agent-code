@@ -61,6 +61,38 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
+/// Whether the connected MCP proxies must be dropped when moving into a
+/// project whose configuration is `after`.
+///
+/// Two independent reasons, either of which is enough:
+///
+/// * The destination asks for different servers, so the connections in
+///   hand are not the ones it wants.
+/// * Any connected server is **stdio**. Those are spawned without
+///   `current_dir`, so the subprocess inherited the directory the process
+///   was in when it started, and a bare command or relative argument
+///   resolved there. After a move the connection is still rooted in the
+///   project being left, however identical the two config files look —
+///   which is exactly the case a textual comparison calls "the same".
+///
+/// Fail-closed when either side will not serialize: dropping costs a
+/// restart to reconnect, keeping the wrong ones leaves another project's
+/// servers reachable by the model.
+fn mcp_needs_reconnect(
+    before: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+    after: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+) -> bool {
+    // `command` is what makes an entry stdio; a `url` server is reached
+    // over the network and does not care where we stand.
+    if before.values().any(|e| e.command.is_some()) {
+        return true;
+    }
+    match (mcp_fingerprint(before), mcp_fingerprint(after)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
 /// A stable string for a set of MCP server entries, for deciding whether
 /// the destination project asks for the same servers as the one being
 /// left. Ordered so map iteration order cannot change the answer.
@@ -404,13 +436,7 @@ async fn finish_cwd_adoption(
     // `PartialEq`, and fail-closed if either side will not serialize:
     // dropping proxies costs a restart to get them back, keeping the
     // wrong ones leaves another project's servers reachable.
-    let drop_mcp = match (
-        mcp_fingerprint(&eng.state().config.mcp_servers),
-        mcp_fingerprint(&cfg.mcp_servers),
-    ) {
-        (Some(before), Some(after)) => before != after,
-        _ => true,
-    };
+    let drop_mcp = mcp_needs_reconnect(&eng.state().config.mcp_servers, &cfg.mcp_servers);
     let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
     if dropped_mcp > 0 {
         app.transcript
@@ -4608,13 +4634,6 @@ mod tests {
         );
     }
 
-    /// `Config::load*` guards against re-entrancy with a process-global
-    /// flag, and a load that finds it set returns `Config::default()`
-    /// instead of the project's settings. Two of these tests running at
-    /// once therefore made one of them silently assert against defaults
-    /// — which looked like the gate failing to fire. Serialize them.
-    static CONFIG_LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The command line is a layer above the files and belongs to the
     /// process, not to a directory. A cross-project resume reloads the
     /// file layers from the destination, so without reapplying it a
@@ -4622,7 +4641,7 @@ mod tests {
     /// operator's `--permission-mode deny`.
     #[test]
     fn the_operators_command_line_survives_a_project_reload() {
-        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ui::test_locks::env();
         use agent_code_lib::config::{PermissionMode, PermissionRule};
 
         let dir = tempfile::tempdir().unwrap();
@@ -4690,7 +4709,7 @@ mod tests {
     /// in such a project; resuming *into* one was a way around that gate.
     #[test]
     fn a_locked_destination_ignores_a_carried_overlay() {
-        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ui::test_locks::env();
         use agent_code_lib::config::{PermissionMode, PermissionRule};
 
         let dir = tempfile::tempdir().unwrap();
@@ -4764,7 +4783,7 @@ mod tests {
     /// executed on the event-loop thread.
     #[test]
     fn the_preflight_does_not_run_the_destination_key_helper() {
-        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ui::test_locks::env();
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join(".agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -4802,7 +4821,7 @@ mod tests {
     fn a_locked_destination_keeps_a_stricter_command_line() {
         use agent_code_lib::config::PermissionMode;
 
-        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ui::test_locks::env();
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join(".agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -4868,6 +4887,48 @@ mod tests {
         );
     }
 
+    /// A stdio server is spawned without `current_dir`, so it inherited
+    /// the directory the process started in and a bare command resolved
+    /// there. Identical config files therefore do *not* mean the
+    /// connection is reusable after a move — the subprocess is still
+    /// rooted in the project being left.
+    #[test]
+    fn stdio_servers_always_reconnect_after_a_move() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let stdio = |cmd: &str| {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "command": cmd, "args": [],
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+        let remote = || {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "url": "https://example.invalid/mcp",
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+
+        assert!(
+            mcp_needs_reconnect(&stdio("docs-server"), &stdio("docs-server")),
+            "an identical stdio config still points at a subprocess launched elsewhere"
+        );
+        assert!(
+            !mcp_needs_reconnect(&remote(), &remote()),
+            "a networked server does not care which directory we stand in"
+        );
+        assert!(
+            mcp_needs_reconnect(&remote(), &HashMap::new()),
+            "a destination configuring no servers must not inherit these"
+        );
+    }
     /// An entry's `env` is its own map and serializes in iteration order,
     /// so identical settings could fingerprint differently and disconnect
     /// proxies that were working — a restart to recover, for nothing.
