@@ -2584,6 +2584,28 @@ impl App {
         self.dirty = true;
     }
 
+    /// Give up on a prompt whose attachments were still being read when the
+    /// user cancelled.
+    ///
+    /// No turn was ever spawned for it, so nothing else will leave the
+    /// streaming phase, and every later prompt would queue behind a turn
+    /// that does not exist. Deliberately not `mark_turn_idle`: that
+    /// announces a *finished* turn, and this one never started.
+    pub fn abandon_staged_attachments(&mut self) {
+        self.pending_images.clear();
+        self.pending_attachments.clear();
+        self.turn_live = false;
+        self.turn_started_at = None;
+        self.phase = if self.modals.is_empty() {
+            Phase::Idle
+        } else {
+            Phase::Permission
+        };
+        self.cancel_requested = false;
+        self.status_message = "cancelled".into();
+        self.dirty = true;
+    }
+
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         if let Some((_, ref mut left)) = self.toast {
@@ -4570,6 +4592,38 @@ mod tests {
             app.pending_images.is_empty(),
             "stale image carried onto a command-produced turn"
         );
+    }
+
+    /// Cancelling while the attachments are being read leaves no turn to
+    /// finish, so the phase has to be reset here or every later prompt
+    /// queues behind one that never existed.
+    #[test]
+    fn cancelling_during_attachment_encoding_returns_to_idle() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.phase, Phase::Streaming, "precondition");
+
+        // The run loop takes the prompt to start encoding; the user cancels
+        // before the read comes back.
+        let _ = app.pending_submit.take();
+        app.abandon_staged_attachments();
+
+        assert_eq!(
+            app.phase,
+            Phase::Idle,
+            "stuck in streaming after a cancelled encode"
+        );
+        assert!(app.pending_images.is_empty());
+        assert!(app.pending_attachments.is_empty());
+
+        // And the next prompt starts a turn instead of queueing behind the
+        // turn that never was.
+        type_input(&mut app, "next");
+        app.submit();
+        assert_eq!(app.pending_submit.as_deref(), Some("next"));
+        assert!(app.queue.is_empty(), "prompt was queued, not sent");
     }
 
     /// Encoded bytes are staged separately from the descriptors, so a

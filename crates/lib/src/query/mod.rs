@@ -769,6 +769,12 @@ impl QueryEngine {
         // prompt is in history and before any PreTurn / LLM work. Hooks
         // at this event see the FULL prompt (no truncation) so they can
         // do content scanning, redaction logging, or compliance audits.
+        //
+        // Observation only: unlike PreToolUse, a non-zero exit here does
+        // not veto the turn. Wiring that up would start blocking prompts
+        // for every deployment whose prompt hook happens to exit non-zero
+        // today — a `grep` that finds nothing is enough — so it is a
+        // deliberate change for its own PR, not a side effect of this one.
         let _user_prompt_submit_results = self
             .hooks
             .run_hooks(

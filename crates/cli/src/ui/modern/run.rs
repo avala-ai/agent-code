@@ -869,7 +869,12 @@ pub(super) async fn event_loop(
                 if discard_encoding {
                     // Cancelled while the read was in flight: the bytes are
                     // dropped rather than sent with a turn nobody asked for.
+                    // The prompt was taken and no turn was ever spawned, so
+                    // nothing else will end the streaming phase — leaving it
+                    // set would queue every later prompt behind a turn that
+                    // does not exist.
                     discard_encoding = false;
+                    app.abandon_staged_attachments();
                 } else {
                     for note in notes {
                         app.transcript.push(super::app::TranscriptItem::System(note));
