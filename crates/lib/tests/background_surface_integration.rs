@@ -68,6 +68,7 @@ async fn background_agent_task_surfaces_with_localagent_envelope() {
         subagent_kind: Some("bg".into()),
         prompt: "summarize the repo".into(),
         parent_session: None,
+        subagent_id: None,
     };
     let id = mgr
         .spawn_command(

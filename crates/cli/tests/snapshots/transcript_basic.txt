@@ -1,0 +1,63 @@
+== glyphs ==
+agent-code 0.27.0  test-model   NORMAL   /w
+
+────────────────────────────────────────────────────────────────────────────────
+ transcript
+  · Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Ent
+er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
+ ❯ add a null check
+
+ Done. Added the guard.
+
+
+ ✓ ✏ edit · src/auth.rs
+   ↳ 1 edit applied
+
+
+
+
+
+
+ turn 0 │ 0 tok │ $0.0000 │  │ sid sess1234
+╭ composer ────────────────────────────────────────────────────────────────────╮
+│❯                                                                             │
+│Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+== styles ==
+aaaaaaaaaabccccccbbddddddddddbbeeeeeeeebbccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+ccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
+bffgggggggggggggggggbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bhhiiiiiiiccdddddddddddbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbddbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jaaaaaaaaaajjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+jaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbj
+jccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccj
+jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+
+== legend ==
+a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
+b fg=Reset bg=Reset mods=NONE
+c fg=DarkGray bg=Reset mods=NONE
+d fg=Gray bg=Reset mods=NONE
+e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
+f fg=Rgb(97, 175, 239) bg=Rgb(47, 60, 74) mods=BOLD
+g fg=Rgb(171, 178, 191) bg=Rgb(47, 60, 74) mods=NONE
+h fg=Green bg=Reset mods=NONE
+i fg=Green bg=Reset mods=BOLD
+j fg=Rgb(97, 175, 239) bg=Reset mods=NONE
