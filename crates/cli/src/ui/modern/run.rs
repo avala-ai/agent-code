@@ -898,6 +898,13 @@ pub(super) async fn event_loop(
                             // `pending_events` as soon as it is free, so
                             // the only cost of a slow hook is that input
                             // lands late rather than vanishing.
+                            // The token the hooks will run under, taken
+                            // before the task starts so the loop can
+                            // cancel it. Buffering Ctrl+C here would make
+                            // the chord arrive *after* the restore it was
+                            // meant to stop, where it would arm quit or
+                            // act on the session the user never chose.
+                            let (teardown_tx, teardown_rx) = tokio::sync::oneshot::channel();
                             let quiesce = tokio::spawn(async move {
                                 let mut eng = engine_arc.lock().await;
                                 // A cancelled turn leaves `cancel`
@@ -909,9 +916,14 @@ pub(super) async fn event_loop(
                                 // matters most. No turn is in flight here,
                                 // so renewing is safe.
                                 eng.renew_cancel_scope();
+                                // Hand the scope out before running
+                                // anything under it.
+                                let _ = teardown_tx.send(eng.cancel_token());
                                 let _ = eng.fire_session_stop_hooks().await;
                             });
                             tokio::pin!(quiesce);
+                            let teardown_scope = teardown_rx.await.ok();
+                            let mut teardown_cancelled = false;
                             loop {
                                 tokio::select! {
                                     done = &mut quiesce => {
@@ -922,6 +934,18 @@ pub(super) async fn event_loop(
                                     }
                                     maybe_ev = term_events.next() => {
                                         match maybe_ev {
+                                            Some(Ok(Event::Key(key))) if is_cancel_chord(&key) => {
+                                                // Acted on now, not queued:
+                                                // this is the escape from a
+                                                // hook that will not finish.
+                                                teardown_cancelled = true;
+                                                if let Some(scope) = &teardown_scope {
+                                                    scope.cancel();
+                                                }
+                                                app.status_message =
+                                                    "cancelling resume…".to_string();
+                                                app.dirty = true;
+                                            }
                                             Some(Ok(ev)) => pending_events.push_back(ev),
                                             Some(Err(_)) | None => break,
                                         }
@@ -936,6 +960,29 @@ pub(super) async fn event_loop(
                                     let _ = draw(app);
                                     app.dirty = false;
                                 }
+                            }
+                            if teardown_cancelled {
+                                // The user asked to stop while the old
+                                // session was being torn down. Its hooks
+                                // did not all run, so continuing would
+                                // adopt the destination on top of a
+                                // half-quiesced session — and it is not
+                                // what was asked for. Nothing has moved
+                                // yet, so refusing is still clean.
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::System(format!(
+                                        "resume of {id} cancelled — staying here"
+                                    )));
+                                {
+                                    let engine_arc = session.engine();
+                                    let eng = engine_arc.lock().await;
+                                    let _ = eng.fire_session_start_hooks().await;
+                                }
+                                app.cancel_deferred_resume_work();
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
                             }
                             let engine_arc = session.engine();
                             let mut eng = engine_arc.lock().await;
