@@ -1540,6 +1540,18 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
 
 /// Insert bracketed-paste text into the prompt (or ignore during modals).
 fn handle_paste(app: &mut App, text: &str) {
+    handle_paste_inner(app, text);
+    // A paste is a composer edit like any other, but the event loop
+    // calls it directly, so it misses the normalisation `handle_key`
+    // does: without this the cursor sits past the last pasted character
+    // and a pending operator survives to eat the next key.
+    if app.in_normal_mode() {
+        app.reset_vi_operator();
+        app.clamp_cursor_to_normal_mode();
+    }
+}
+
+fn handle_paste_inner(app: &mut App, text: &str) {
     // Modals own the keyboard; don't dump clipboard into the prompt behind them.
     if app.phase == super::app::Phase::Permission {
         return;
@@ -2345,6 +2357,36 @@ mod tests {
         app.cursor = 2;
         handle_key(&mut app, key(KeyCode::Char('A')));
         assert_eq!(app.cursor, 3, "A must still append after the last char");
+    }
+
+    /// Bracketed paste bypasses `handle_key`, so it needs the same
+    /// normalisation: a cursor left past the last character makes the
+    /// next `x` do nothing, and a surviving `d` eats the next key.
+    #[test]
+    fn paste_in_normal_mode_leaves_a_usable_cursor() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_paste(&mut app, "abc");
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 2, "paste left the cursor past the last char");
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.input, "ab", "x had nothing under the cursor");
+
+        // A pending operator must not survive the paste.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one\ntwo".into();
+        app.cursor = 0;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        handle_paste(&mut app, "X");
+        assert!(!app.vi_pending_d, "the operator survived the paste");
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(
+            app.input, "Xone\ntwo",
+            "the stale operator turned the next key into a line delete"
+        );
     }
 
     /// `/emacs` must not advertise composer bindings that do not exist.
