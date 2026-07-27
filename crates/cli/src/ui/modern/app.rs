@@ -1260,15 +1260,13 @@ impl App {
             return;
         }
         if text == "/clear" {
-            self.transcript.clear();
+            self.clear_transcript_view();
             // Also clear the ENGINE conversation (classic parity): clearing
             // only the view silently kept paying for the entire prior
             // context. The run loop applies this under try_lock.
             self.pending_clear = true;
-            self.ctx_meter = None;
             self.input.clear();
             self.cursor = 0;
-            self.dirty = true;
             return;
         }
         if text == "/help" {

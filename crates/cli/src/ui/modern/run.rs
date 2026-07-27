@@ -527,6 +527,11 @@ pub(super) async fn event_loop(
         {
             eng.state_mut().messages.clear();
             app.pending_clear = false;
+            // `submit` already cleared the view, but a `/clear` held back
+            // for a resume lands *after* the restore repainted the
+            // screen. Without this the restored history stays on display
+            // in front of a conversation the engine just emptied.
+            app.clear_transcript_view();
             app.status_message = "context cleared".into();
             app.dirty = true;
         }
@@ -968,7 +973,8 @@ pub(super) async fn event_loop(
             // ordered against turn teardown.
             _ = std::future::ready(()), if app.pending_resume.is_some()
                 && !resume_loading
-                && pending_restore.is_none() => {
+                && pending_restore.is_none()
+                && turn.is_none() => {
                 if let Some(id) = app.pending_resume.clone() {
                     resume_loading = true;
                     let tx = resume_tx.clone();
@@ -997,11 +1003,17 @@ pub(super) async fn event_loop(
                     match loaded {
                         Ok(l) => pending_restore = Some(l),
                         Err(e) => {
-                            app.pending_resume = None;
                             app.status_message.clear();
                             app.transcript.push(super::app::TranscriptItem::Error(
                                 format!("could not resume {id}: {e}"),
                             ));
+                            // Cancel *before* clearing `pending_resume`:
+                            // the work was deferred for a session that
+                            // never arrived, and releasing it would run it
+                            // against the conversation the user was trying
+                            // to leave.
+                            app.cancel_deferred_resume_work();
+                            app.pending_resume = None;
                             app.dirty = true;
                         }
                     }

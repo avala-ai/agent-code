@@ -260,6 +260,75 @@ impl App {
         self.open_session_picker(entries);
     }
 
+    /// The visible half of `/clear`.
+    ///
+    /// Split out because a `/clear` held back for a resume has to run it
+    /// *twice*: once when submitted, and again when the deferred engine
+    /// clear finally lands — by then the restore has repainted the
+    /// screen, and skipping this would leave the restored history on
+    /// display in front of an empty conversation.
+    pub fn clear_transcript_view(&mut self) {
+        self.transcript.clear();
+        self.expanded.clear();
+        self.selected_item = None;
+        self.layout.invalidate();
+        self.ctx_meter = None;
+        self.dirty = true;
+    }
+
+    /// A resume failed, so the session all that deferred work was meant
+    /// for never arrived. None of it may run against the conversation the
+    /// user was trying to leave — a prompt or `!cmd` would take real tool
+    /// and filesystem side effects there — so it is cancelled and shown.
+    pub fn cancel_deferred_resume_work(&mut self) {
+        let mut cancelled: Vec<String> = Vec::new();
+        if self.pending_clear {
+            self.pending_clear = false;
+            cancelled.push("/clear".into());
+        }
+        if self.pending_model.take().is_some() {
+            cancelled.push("/model".into());
+        }
+        if let Some(slash) = self.pending_slash.take() {
+            cancelled.push(slash);
+        }
+        if let Some(cmd) = self.pending_shell.take() {
+            cancelled.push(format!("!{cmd}"));
+        }
+        self.reclaim_staged_prompts("not sent — the resume failed:", &mut cancelled);
+        if !cancelled.is_empty() {
+            let body = cancelled.join("\n");
+            self.transcript.push(TranscriptItem::System(format!(
+                "cancelled — held for the session that failed to load:\n{body}"
+            )));
+            self.scroll_to_bottom();
+            self.dirty = true;
+        }
+    }
+
+    /// Take back prompts staged against the conversation being left.
+    ///
+    /// The composer gets the submitted prompt when it is free; anything
+    /// else is appended to `spill` for the caller to display verbatim.
+    /// Nothing is reduced to a count — these are the user's own words.
+    fn reclaim_staged_prompts(&mut self, header: &str, spill: &mut Vec<String>) {
+        let mut carried: Vec<String> = self.queue.drain(..).collect();
+        self.queue_selected = 0;
+        if let Some(text) = self.pending_submit.take() {
+            if self.input.trim().is_empty() {
+                self.cursor = text.len();
+                self.input = text;
+            } else {
+                // A draft already occupies the composer and must not be
+                // clobbered, so this one is displayed instead.
+                carried.insert(0, text);
+            }
+        }
+        if !carried.is_empty() {
+            spill.push(format!("{header}\n{}", carried.join("\n")));
+        }
+    }
+
     /// Open a picker whose rows arrived while a HITL modal was up.
     /// Called by the run loop once the modal queue drains.
     pub fn retry_session_picker(&mut self) {
@@ -381,30 +450,14 @@ impl App {
         // Prompts staged against the previous conversation must not be
         // auto-dispatched into the session that replaced it — but they
         // are the user's own words, so none of them is dropped silently.
-        // Whatever cannot be handed back to the composer is reproduced
-        // verbatim in the transcript, where it can still be read and
-        // copied; a bare count would eat the text.
-        let mut carried: Vec<String> = self.queue.drain(..).collect();
-        self.queue_selected = 0;
         // A prompt submitted while the session was still loading never
-        // ran — turn spawning is blocked for exactly that window. Hand
-        // the text back to the composer rather than firing it at a
-        // conversation the user has not seen yet.
-        if let Some(text) = self.pending_submit.take() {
-            if self.input.trim().is_empty() {
-                self.cursor = text.len();
-                self.input = text;
-            } else {
-                // A draft is already in the composer and must not be
-                // clobbered, so this one goes to the transcript instead.
-                carried.insert(0, text);
-            }
-        }
-        if !carried.is_empty() {
-            let body = carried.join("\n");
-            self.transcript.push(TranscriptItem::System(format!(
-                "not sent — written for the previous session:\n{body}"
-            )));
+        // ran (turn spawning is blocked for exactly that window), so it
+        // goes back to the composer; anything that cannot is reproduced
+        // verbatim, where it can still be read and copied.
+        let mut spill = Vec::new();
+        self.reclaim_staged_prompts("not sent — written for the previous session:", &mut spill);
+        for line in spill {
+            self.transcript.push(TranscriptItem::System(line));
             self.scroll_to_bottom();
         }
         self.dirty = true;
@@ -727,6 +780,84 @@ mod tests {
             "picker kept the keyboard under a HITL modal"
         );
         assert!(app.pending_resume.is_none(), "a resume was scheduled");
+    }
+
+    /// A `/clear` held back for a resume lands after the restore has
+    /// repainted the screen, so the visual clear has to run again — or
+    /// the restored history sits in front of an empty conversation.
+    #[test]
+    fn the_visual_clear_can_be_reapplied_after_a_restore() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/clear".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(app.pending_clear, "engine clear was not deferred");
+        assert!(app.transcript.is_empty());
+
+        // The restore repopulates the screen while the engine clear is
+        // still pending.
+        app.restore_transcript(
+            vec![TranscriptItem::User("restored".into())],
+            "abcdef123456",
+            2,
+        );
+        assert!(!app.transcript.is_empty());
+
+        // Applying the deferred clear must take the view with it.
+        app.clear_transcript_view();
+        assert!(
+            app.transcript.is_empty(),
+            "restored history survived the deferred /clear: {:?}",
+            app.transcript
+        );
+        assert!(app.ctx_meter.is_none());
+    }
+
+    /// A failed resume must not release work that was deferred *for* the
+    /// session that never arrived: a prompt or `!cmd` would take real
+    /// side effects in the conversation the user was trying to leave.
+    #[test]
+    fn a_failed_resume_cancels_the_work_it_deferred() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("abcdef123456".into());
+        app.pending_clear = true;
+        app.pending_slash = Some("/cost".into());
+        app.pending_shell = Some("rm -rf build".into());
+        app.pending_submit = Some("keep going".into());
+
+        app.cancel_deferred_resume_work();
+
+        assert!(!app.pending_clear, "/clear would run on the old session");
+        assert!(
+            app.pending_slash.is_none(),
+            "slash command would run on the old session"
+        );
+        assert!(
+            app.pending_shell.is_none(),
+            "shell command would run on the old session"
+        );
+        assert!(
+            app.pending_submit.is_none(),
+            "prompt would start a turn on the old session"
+        );
+        // Nothing vanishes: the prompt returns to the composer and the
+        // rest is named in full.
+        assert_eq!(app.input, "keep going");
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["/clear", "/cost", "!rm -rf build"] {
+            assert!(
+                said.contains(expected),
+                "{expected} was cancelled silently: {said}"
+            );
+        }
     }
 
     /// Put a permission modal in front. The receiver is returned so the
