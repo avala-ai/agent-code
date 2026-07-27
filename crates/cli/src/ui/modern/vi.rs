@@ -41,6 +41,14 @@ impl App {
         self.dirty = true;
     }
 
+    /// Drop a half-typed operator. A pending `d` is only meaningful
+    /// between the two keys of one command, so every path that sends,
+    /// replaces or discards the draft clears it — otherwise it is still
+    /// armed for the next draft and eats its first key.
+    pub fn reset_vi_operator(&mut self) {
+        self.vi_pending_d = false;
+    }
+
     pub fn vi_enter_insert(&mut self) {
         self.composer_mode = ComposerMode::Insert;
         self.dirty = true;
@@ -66,7 +74,14 @@ impl App {
             }
             '0' => self.cursor = start,
             '$' => self.cursor = line_last(&self.input, start, end),
-            'w' => self.cursor = word_forward(&self.input, self.cursor),
+            'w' => {
+                // With no word left, `word_forward` returns the buffer
+                // end, which is not a character the cursor may sit on in
+                // normal mode: `x` and `D` would find nothing to delete.
+                let target = word_forward(&self.input, self.cursor);
+                let (ws, we) = line_bounds(&self.input, target);
+                self.cursor = target.min(line_last(&self.input, ws, we));
+            }
             'b' => self.cursor = word_back(&self.input, self.cursor),
             'i' => self.vi_enter_insert(),
             'a' => {
@@ -361,6 +376,34 @@ mod tests {
         a.cursor = 5;
         a.vi_normal_key('A');
         assert_eq!(a.cursor, 7, "A appended past the end of the line");
+    }
+
+    /// `w` with no word left must stop on the last character, not past
+    /// it: normal mode has no position after the final character, so
+    /// `x` and `D` would have found nothing to delete there.
+    #[test]
+    fn w_stops_on_a_real_character_at_the_end() {
+        let mut a = vi_app("hello world");
+        a.cursor = 6;
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 10, "w ran past the last character");
+        a.vi_normal_key('x');
+        assert_eq!(a.input, "hello worl", "x had nothing under the cursor");
+
+        // Same on the last line of a multi-line draft.
+        let mut a = vi_app("one\ntwo");
+        a.cursor = 4;
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 6);
+        a.vi_normal_key('D');
+        assert_eq!(a.input, "one\ntw");
+
+        // A trailing space must not park the cursor on the boundary
+        // either.
+        let mut a = vi_app("hi ");
+        a.cursor = 0;
+        a.vi_normal_key('w');
+        assert!(a.cursor < a.input.len(), "w landed past the end");
     }
 
     /// `h`, `l`, `a` and `x` must not step over a newline either — vi

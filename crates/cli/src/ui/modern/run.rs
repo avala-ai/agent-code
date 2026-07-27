@@ -1252,6 +1252,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Placed before the global chord match so `t`, `p` and friends edit
     // rather than firing a shortcut.
     if app.in_normal_mode() {
+        // Anything that is not a motion aborts a half-typed operator, as
+        // vi does. The draft-lifecycle methods clear it too, but this
+        // catches the keys that never reach them — an arrow, a chord, a
+        // binding — before one of them acts as a stale motion.
+        let is_motion = matches!(key.code, KeyCode::Char(_))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        if !is_motion {
+            app.reset_vi_operator();
+        }
         match key.code {
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2254,6 +2264,27 @@ mod tests {
             !app.vi_pending_d,
             "the pending `d` survived the submit and will eat the next key"
         );
+
+        // Ctrl+Enter sends through `interject()`, Ctrl+C discards through
+        // `clear_prompt()`: neither goes via `submit()`, and both used to
+        // leave the operator armed for the next draft.
+        for send in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.vi_mode = true;
+            app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+            app.input = "hello".into();
+            app.cursor = 0;
+            handle_key(&mut app, key(KeyCode::Char('d')));
+            assert!(app.vi_pending_d);
+            handle_key(&mut app, send);
+            assert!(
+                !app.vi_pending_d,
+                "operator survived {send:?} and will eat the next key"
+            );
+        }
 
         // Esc aborts the operator rather than leaving it armed.
         let mut app = App::new("m", "/tmp", "s");

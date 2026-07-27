@@ -1238,10 +1238,7 @@ impl App {
     }
 
     pub fn submit(&mut self) {
-        // A half-typed vi operator must not outlive the draft it was
-        // aimed at, or the first key of the next one is eaten as its
-        // motion.
-        self.vi_pending_d = false;
+        self.reset_vi_operator();
         let text = self.input.trim().to_string();
         if text.is_empty() {
             // Empty-Enter while idle sends the next queued prompt — after an
@@ -1974,6 +1971,7 @@ impl App {
     /// composer text — or the head of the queue when the composer is empty.
     /// Idle with text behaves like a normal submit.
     pub fn interject(&mut self) {
+        self.reset_vi_operator();
         let text = if !self.input.trim().is_empty() {
             let t = std::mem::take(&mut self.input);
             self.cursor = 0;
@@ -2070,6 +2068,7 @@ impl App {
 
     /// Clear the prompt editor (idle interrupt with non-empty input).
     pub fn clear_prompt(&mut self) {
+        self.reset_vi_operator();
         self.input.clear();
         self.cursor = 0;
     }
