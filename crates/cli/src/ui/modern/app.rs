@@ -341,6 +341,10 @@ pub struct App {
     pub model: String,
     pub cwd: String,
     pub session_id: String,
+    /// How each session visited in this process looked on screen, so
+    /// switching back lands where you left rather than at the bottom of
+    /// a rebuilt transcript.
+    pub session_views: super::session_views::SessionViews,
     pub version: String,
     /// Mirror of `security.disable_skill_shell_execution` for skill slash
     /// expansion (must not bypass the policy that strips fenced shell).
@@ -596,6 +600,7 @@ impl App {
             model: model.into(),
             cwd: cwd.into(),
             session_id: session_id.into(),
+            session_views: Default::default(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             disable_skill_shell,
             mode: SessionMode::Normal,

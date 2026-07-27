@@ -571,6 +571,27 @@ impl App {
 
     /// Replace the visible transcript with a restored conversation.
     pub fn restore_transcript(&mut self, items: Vec<TranscriptItem>, id: &str, turns: usize) {
+        // Remember the session being left, so switching back lands where
+        // it was rather than at the bottom of a rebuilt transcript.
+        self.stash_current_view();
+
+        // Returning to a session visited earlier: restore what was on
+        // screen instead of the rebuild. The engine reloaded the
+        // conversation either way; this only decides what is shown.
+        if let Some(view) = self.session_views.take(id) {
+            self.transcript = view.transcript;
+            self.expanded = view.expanded;
+            self.selected_item = view.selected_item;
+            self.layout.invalidate();
+            self.scroll = view.scroll;
+            for note in std::mem::take(&mut self.resume_notices) {
+                self.transcript.push(TranscriptItem::System(note));
+            }
+            self.status_message.clear();
+            self.dirty = true;
+            return;
+        }
+
         self.transcript = items;
         self.expanded.clear();
         self.selected_item = None;
@@ -589,6 +610,21 @@ impl App {
         self.scroll_to_bottom();
         self.status_message.clear();
         self.dirty = true;
+    }
+
+    /// Snapshot the current session's view before switching away.
+    ///
+    /// A session with nothing on screen is not stored — see
+    /// [`super::session_views::SessionViews::save`].
+    pub fn stash_current_view(&mut self) {
+        let id = self.session_id.clone();
+        let view = super::session_views::SessionView {
+            transcript: self.transcript.clone(),
+            scroll: self.scroll,
+            expanded: self.expanded.clone(),
+            selected_item: self.selected_item,
+        };
+        self.session_views.save(&id, view);
     }
 
     /// Point every App mirror at the session just restored.
@@ -640,6 +676,83 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    /// Switching away and back must land where you left. Rebuilding is
+    /// correct but loses position and expansions, which makes moving
+    /// between sessions cost more than it saves.
+    #[test]
+    fn returning_to_a_session_restores_where_you_were() {
+        let mut app = App::new("m", "/tmp", "session-a");
+        app.transcript
+            .push(TranscriptItem::User("work in a".into()));
+        app.scroll = crate::ui::modern::scroll::ScrollState::Free { top_line: 7 };
+        app.expanded.insert(0);
+
+        // Switch to B: A's view is stashed, B is rebuilt from messages.
+        app.session_id = "session-a".into();
+        app.restore_transcript(
+            vec![TranscriptItem::User("work in b".into())],
+            "session-b",
+            1,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "work in b")),
+            "did not switch to B"
+        );
+
+        // Back to A: the stashed view wins over the rebuild, so the
+        // rebuilt items passed here must NOT be what is shown.
+        app.session_id = "session-b".into();
+        app.restore_transcript(
+            vec![TranscriptItem::User("rebuilt from disk".into())],
+            "session-a",
+            1,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "work in a")),
+            "A's view was not restored: {:?}",
+            app.transcript
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "rebuilt from disk")),
+            "the rebuild replaced a cached view"
+        );
+        assert_eq!(
+            app.scroll,
+            crate::ui::modern::scroll::ScrollState::Free { top_line: 7 },
+            "scroll position was not restored"
+        );
+        assert!(app.expanded.contains(&0), "expansions were not restored");
+    }
+
+    /// A session never visited has no cached view, so it must be built
+    /// from the conversation rather than showing someone else's.
+    #[test]
+    fn a_first_visit_uses_the_rebuilt_transcript() {
+        let mut app = App::new("m", "/tmp", "session-a");
+        app.transcript.push(TranscriptItem::User("in a".into()));
+        app.restore_transcript(
+            vec![TranscriptItem::User("fresh from disk".into())],
+            "never-seen",
+            2,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "fresh from disk"))
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "in a"))
+        );
+    }
+
     use super::*;
     use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, UserMessage};
     use agent_code_lib::tools::PermissionResponse;
