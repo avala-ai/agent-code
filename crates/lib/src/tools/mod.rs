@@ -126,7 +126,19 @@ pub trait Tool: Send + Sync {
     /// proxies return a fingerprint of their server's transport
     /// configuration, and id-addressed tools a fingerprint of the record
     /// the id currently names — both mutable between sessions.
-    fn grant_binding(&self, _input: &serde_json::Value) -> Option<GrantBinding> {
+    ///
+    /// `input` is passed because the indirection is not always in the
+    /// tool name: an argument naming a record (a routine id, a
+    /// `subagent_type`) selects something mutable, and the binding has to
+    /// describe that record *as it stands now*. `ctx` comes with it
+    /// because resolving the record can depend on the session — the
+    /// directory a project-local agent definition is loaded from, or the
+    /// configured endpoint defaults a subagent inherits.
+    fn grant_binding(
+        &self,
+        _input: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Option<GrantBinding> {
         None
     }
 

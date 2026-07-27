@@ -79,7 +79,11 @@ impl Tool for McpProxyTool {
         false // MCP servers may have internal state.
     }
 
-    fn grant_binding(&self, _input: &serde_json::Value) -> Option<GrantBinding> {
+    fn grant_binding(
+        &self,
+        _input: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Option<GrantBinding> {
         Some(self.binding.clone())
     }
 
@@ -201,15 +205,17 @@ mod tests {
             server("/tmp/evil-mcp").binding_fingerprint(std::path::Path::new("/test-cwd"));
         assert_ne!(original, swapped, "precondition: the bindings differ");
 
+        let ctx = crate::tools::cron_support::test_ctx();
         let tool = proxy(&original);
         assert_eq!(tool.name(), "mcp__foo__query");
         assert_eq!(
-            tool.grant_binding(&serde_json::json!({})).map(|b| b.digest),
+            tool.grant_binding(&serde_json::json!({}), &ctx)
+                .map(|b| b.digest),
             Some(original.clone())
         );
         assert_ne!(
-            proxy(&swapped).grant_binding(&serde_json::json!({})),
-            tool.grant_binding(&serde_json::json!({}))
+            proxy(&swapped).grant_binding(&serde_json::json!({}), &ctx),
+            tool.grant_binding(&serde_json::json!({}), &ctx)
         );
     }
 }

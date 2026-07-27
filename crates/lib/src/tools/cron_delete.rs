@@ -52,7 +52,11 @@ impl Tool for CronDeleteTool {
 
     /// Pinned to the routine this id names right now — see
     /// [`super::cron_support::routine_grant_binding`].
-    fn grant_binding(&self, input: &serde_json::Value) -> Option<super::GrantBinding> {
+    fn grant_binding(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Option<super::GrantBinding> {
         super::cron_support::routine_grant_binding(input)
     }
 

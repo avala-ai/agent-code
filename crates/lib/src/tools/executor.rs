@@ -260,7 +260,7 @@ async fn execute_single_tool(
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
             let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
-            approved_binding = tool.grant_binding(&call.input);
+            approved_binding = tool.grant_binding(&call.input, &ctx);
             let binding = approved_binding.clone();
             let destinations = tool.grant_destinations(&call.input);
             let grant_key = persistent_grant_key(
@@ -396,7 +396,7 @@ async fn execute_single_tool(
     // would run, so refuse rather than act on the replacement. The model
     // can retry, which prompts afresh against the new record.
     if let Some(ref approved) = approved_binding
-        && tool.grant_binding(&call.input).as_ref() != Some(approved)
+        && tool.grant_binding(&call.input, &ctx).as_ref() != Some(approved)
     {
         return ToolCallResult {
             tool_use_id: call.id.clone(),
@@ -1623,7 +1623,11 @@ mod parallel_batch_tests {
         fn is_read_only(&self) -> bool {
             false
         }
-        fn grant_binding(&self, _input: &serde_json::Value) -> Option<super::super::GrantBinding> {
+        fn grant_binding(
+            &self,
+            _input: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Option<super::super::GrantBinding> {
             Some(super::super::GrantBinding {
                 digest: self.digest.lock().unwrap().clone(),
                 cwd_sensitive: true,

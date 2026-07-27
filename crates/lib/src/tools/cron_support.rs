@@ -268,17 +268,17 @@ mod routine_binding_tests {
 
         let expected = routine_grant_binding(&input);
         assert_eq!(
-            crate::tools::remote_trigger::RemoteTriggerTool.grant_binding(&input),
+            crate::tools::remote_trigger::RemoteTriggerTool.grant_binding(&input, &test_ctx()),
             expected
         );
         assert_eq!(
-            crate::tools::cron_delete::CronDeleteTool.grant_binding(&input),
+            crate::tools::cron_delete::CronDeleteTool.grant_binding(&input, &test_ctx()),
             expected
         );
         // No id in the input: nothing to pin to.
         assert!(
             crate::tools::remote_trigger::RemoteTriggerTool
-                .grant_binding(&serde_json::json!({}))
+                .grant_binding(&serde_json::json!({}), &test_ctx())
                 .is_none()
         );
     }
