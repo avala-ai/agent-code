@@ -526,6 +526,42 @@ fn user_themes_dir() -> Option<PathBuf> {
 
 /// Load every user palette from disk. Best-effort: a missing directory
 /// yields no themes; malformed files are logged and skipped.
+/// Build the display catalog from the user palettes on disk.
+///
+/// Pure, so the ordering rules are testable without a themes directory.
+///
+/// A user palette that owns an alias id takes that row *in place*
+/// rather than the alias being dropped and the palette appended: the
+/// aliases lead the catalog and `all_names().first()` is relied on as
+/// `auto`, so dropping the row moved the id to the end and made that
+/// ordering depend on whether a themes/auto.toml happened to exist.
+fn catalog(user: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut opts: Vec<(String, String)> = [
+        ("auto", "Auto (match terminal)"),
+        ("dark", "Dark (default dark palette)"),
+        ("light", "Light (default light palette)"),
+    ]
+    .into_iter()
+    .map(|(id, label)| match user.iter().find(|(uid, _)| uid == id) {
+        // Keep the user's label so the row names what it applies.
+        Some((uid, ulabel)) => (uid.clone(), ulabel.clone()),
+        None => (id.to_string(), label.to_string()),
+    })
+    .collect();
+
+    for p in standard_palettes() {
+        opts.push((p.id.into_owned(), p.label.into_owned()));
+    }
+    opts.extend(user);
+
+    // One row per id: the first occurrence wins, so an alias row a user
+    // palette already claimed is not repeated at the end, and a user
+    // palette shadowing a standard id keeps the standard slot.
+    let mut seen = std::collections::HashSet::new();
+    opts.retain(|(id, _)| seen.insert(id.clone()));
+    opts
+}
+
 /// Whether a user palette file owns `id`.
 ///
 /// The runtime facade intercepts `auto` before any palette lookup, so it
@@ -653,33 +689,12 @@ impl Theme {
     /// user palette keeps the id — listing both would offer the same
     /// identifier twice with only one of them reachable.
     pub fn all_options() -> Vec<(String, String)> {
-        let user: Vec<(String, String)> = user_palettes()
-            .into_iter()
-            .map(|p| (p.id.into_owned(), p.label.into_owned()))
-            .collect();
-        let shadowed: std::collections::HashSet<&str> =
-            user.iter().map(|(id, _)| id.as_str()).collect();
-
-        let mut opts: Vec<(String, String)> = [
-            ("auto", "Auto (match terminal)"),
-            ("dark", "Dark (default dark palette)"),
-            ("light", "Light (default light palette)"),
-        ]
-        .into_iter()
-        .filter(|(id, _)| !shadowed.contains(id))
-        .map(|(id, label)| (id.to_string(), label.to_string()))
-        .collect();
-
-        for p in standard_palettes() {
-            opts.push((p.id.into_owned(), p.label.into_owned()));
-        }
-        opts.extend(user);
-
-        // A user palette sharing an id with a standard one shadows it the
-        // same way; keep the first occurrence so ordering stays stable.
-        let mut seen = std::collections::HashSet::new();
-        opts.retain(|(id, _)| seen.insert(id.clone()));
-        opts
+        catalog(
+            user_palettes()
+                .into_iter()
+                .map(|p| (p.id.into_owned(), p.label.into_owned()))
+                .collect(),
+        )
     }
 
     /// Get a subagent color by index (wraps around).
@@ -853,6 +868,35 @@ mod tests {
         let one_dark = Theme::from_name("one-dark");
         assert!(dark.is_dark);
         assert_eq!(as_rgb(dark.accent), as_rgb(one_dark.accent));
+    }
+
+    /// A user palette owning an alias id must take that row in place:
+    /// the aliases lead the catalog, and dropping the row moved the id
+    /// to the end — which made ordering depend on whether the developer
+    /// happened to have a themes/auto.toml.
+    #[test]
+    fn a_shadowing_user_palette_keeps_the_alias_position() {
+        let user = vec![("auto".to_string(), "My Auto (custom)".to_string())];
+        let opts = super::catalog(user);
+        assert_eq!(opts[0].0, "auto", "auto must stay first: {opts:?}");
+        assert_eq!(
+            opts[0].1, "My Auto (custom)",
+            "the row must name the palette that actually applies"
+        );
+        assert_eq!(
+            opts.iter().filter(|(id, _)| id == "auto").count(),
+            1,
+            "the id must not appear twice"
+        );
+        assert_eq!(opts[1].0, "dark");
+        assert_eq!(opts[2].0, "light");
+
+        // Without a shadowing palette the built-in labels stand.
+        let plain = super::catalog(Vec::new());
+        assert_eq!(
+            plain[0],
+            ("auto".to_string(), "Auto (match terminal)".to_string())
+        );
     }
 
     #[test]
