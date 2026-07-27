@@ -43,7 +43,8 @@ impl McpServerConfig {
     /// Resolution uses the *child's* effective `PATH`: `connect_stdio`
     /// applies `env` to the `Command` before spawning, so a server that
     /// sets `env.PATH` is looked up along that, not along the agent's own
-    /// `PATH`.
+    /// `PATH`. On Windows that lookup is case-insensitive, matching the
+    /// environment block the child actually receives.
     ///
     /// The resolved path is canonicalized, so flipping the symlink an
     /// entry like `/usr/bin/npx` points at also re-prompts — including a
@@ -99,28 +100,48 @@ impl McpServerConfig {
 }
 
 /// Canonical path of the executable a stdio `command` actually launches,
-/// resolved the way `Command::new` resolves it: a name containing a
-/// separator is taken relative to `launch_cwd`, a bare name is searched
-/// along the child's effective `PATH`.
+/// resolved the way `std::process::Command` resolves it on this platform.
 ///
 /// `env` is the server's configured environment, which `connect_stdio`
-/// applies before spawning — so an `env.PATH` override decides the
+/// applies before spawning — so a `PATH` override there decides the
 /// lookup, exactly as it will for the real child.
 ///
 /// `None` when nothing matches — the spawn would fail too, so the
 /// binding falls back to the configured text and launch directory.
+///
+/// Mirroring the real resolution is the whole point: a fingerprint bound
+/// to a file the child never launches would not change when the file it
+/// *does* launch is replaced, and the durable grant would keep matching.
 fn resolve_executable(
+    command: &str,
+    launch_cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    if command.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        resolve_executable_windows(command, launch_cwd, env)
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_executable_unix(command, launch_cwd, env)
+    }
+}
+
+/// `execvp` semantics: a name containing `/` is used as given, a bare
+/// name is searched along the child's `PATH` and must be executable.
+/// The working directory is never searched.
+#[cfg(not(windows))]
+fn resolve_executable_unix(
     command: &str,
     launch_cwd: &std::path::Path,
     env: &std::collections::HashMap<String, String>,
 ) -> Option<std::path::PathBuf> {
     use std::path::Path;
 
-    if command.is_empty() {
-        return None;
-    }
-    let has_separator = command.contains('/') || (cfg!(windows) && command.contains('\\'));
-    if has_separator {
+    if command.contains('/') {
         let raw = Path::new(command);
         let joined = if raw.is_absolute() {
             raw.to_path_buf()
@@ -131,17 +152,13 @@ fn resolve_executable(
     }
 
     // The child's PATH: the configured override when there is one,
-    // otherwise the one this process would pass down.
-    let path_var = match env.get("PATH") {
+    // otherwise the one this process would pass down. `exec` consults
+    // only the environment the child is given.
+    let path_var = match env_lookup(env, "PATH") {
         Some(p) => std::ffi::OsString::from(p),
         None => std::env::var_os("PATH")?,
     };
-    // Windows resolves a bare name against the working directory before
-    // walking PATH; Unix `execvp` never does.
-    let search_dirs = std::env::split_paths(&path_var);
-    #[cfg(windows)]
-    let search_dirs = std::iter::once(launch_cwd.to_path_buf()).chain(search_dirs);
-    for dir in search_dirs {
+    for dir in std::env::split_paths(&path_var) {
         // A relative `PATH` entry resolves against the launch directory,
         // exactly as the child's own lookup would.
         let dir = if dir.is_absolute() {
@@ -149,34 +166,151 @@ fn resolve_executable(
         } else {
             launch_cwd.join(dir)
         };
-        for candidate in executable_candidates(&dir, command) {
-            if is_executable_file(&candidate) {
-                return candidate.canonicalize().ok();
-            }
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return candidate.canonicalize().ok();
         }
     }
     None
 }
 
-/// Filenames a bare `command` can match in one directory.
+/// `CreateProcessW` semantics as `std::process::Command` implements them
+/// in `resolve_exe`.
 ///
-/// Windows mirrors `std::process::Command`, which appends **only** `.exe`
-/// to an extensionless program — it does not walk `PATHEXT`. Honoring
-/// `PATHEXT` here would bind the fingerprint to a `.cmd` or `.com` that
-/// the spawn never reaches, leaving the real `.exe` free to be swapped
-/// under an unchanged grant.
-fn executable_candidates(dir: &std::path::Path, command: &str) -> Vec<std::path::PathBuf> {
-    let exact = dir.join(command);
+/// Two deliberate non-behaviors, both of which would otherwise bind this
+/// fingerprint to a file the spawn never reaches — leaving the real
+/// target free to be swapped under an unchanged grant:
+///
+/// - **No `PATHEXT` walk.** `Command` appends `.exe` and nothing else,
+///   and only when the file name contains no `.` at all.
+/// - **No working-directory search.** `resolve_exe` looks in the child's
+///   `PATH`, the directory the agent itself was loaded from, the system
+///   and Windows directories, then the agent's own `PATH`. The launch
+///   directory is not among them, so an `npx.exe` dropped in the repo
+///   must not capture the binding for a `PATH`-resolved `npx`.
+#[cfg(windows)]
+fn resolve_executable_windows(
+    command: &str,
+    launch_cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    // Byte-level and case-insensitive, exactly like `resolve_exe`.
+    let bytes = command.as_bytes();
+    let has_exe_suffix = bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe");
+    let is_file_name =
+        !command.contains(['/', '\\']) && Path::new(command).components().count() == 1;
+
+    if !is_file_name {
+        // A path, not a name: no directory search happens at all.
+        let raw = Path::new(command);
+        let joined = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            launch_cwd.join(raw)
+        };
+        if has_exe_suffix {
+            return joined.canonicalize().ok();
+        }
+        // `.exe` is *appended*, not substituted (`a.b` -> `a.b.exe`),
+        // and the bare path is the fallback when that does not exist.
+        let mut with_exe = joined.clone().into_os_string();
+        with_exe.push(".exe");
+        return PathBuf::from(with_exe)
+            .canonicalize()
+            .ok()
+            .or_else(|| joined.canonicalize().ok());
+    }
+
+    // > If the file name does not contain an extension, .exe is appended.
+    //
+    // `set_extension` substitutes rather than appends, which is what
+    // `resolve_exe` does here — so an extensionless `foo` is looked up
+    // *only* as `foo.exe`, never as a bare `foo`.
+    let has_extension = command.contains('.');
+    for dir in windows_search_dirs(launch_cwd, env) {
+        let mut candidate = dir.join(command);
+        if !has_extension {
+            candidate.set_extension("exe");
+        }
+        // `program_exists` only asks whether the file opens; there is no
+        // executable bit to consult.
+        if candidate.is_file() {
+            return candidate.canonicalize().ok();
+        }
+    }
+    None
+}
+
+/// The directories `search_paths` walks, in order. Note that the agent's
+/// own `PATH` is still consulted after a configured one — a child `PATH`
+/// leads the search, it does not replace it.
+///
+/// The system directories are derived from `SystemRoot` rather than
+/// `GetSystemDirectoryW`; they are reachable only after the earlier
+/// passes miss, and writing to them already requires administrator.
+#[cfg(windows)]
+fn windows_search_dirs(
+    launch_cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push_entries = |dirs: &mut Vec<PathBuf>, raw: std::ffi::OsString| {
+        for dir in std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()) {
+            dirs.push(if dir.is_absolute() {
+                dir
+            } else {
+                launch_cwd.join(dir)
+            });
+        }
+    };
+
+    if let Some(p) = env_lookup(env, "PATH") {
+        push_entries(&mut dirs, std::ffi::OsString::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir")) {
+        let root = PathBuf::from(root);
+        dirs.push(root.join("System32"));
+        dirs.push(root);
+    }
+    if let Some(p) = std::env::var_os("PATH") {
+        push_entries(&mut dirs, p);
+    }
+    dirs
+}
+
+/// The child's value for an environment variable.
+///
+/// Windows environment blocks are case-insensitive and `Command::env`
+/// keys them that way, so a server configuring `Path` overrides `PATH`
+/// for the child. A case-sensitive lookup would miss that, resolve along
+/// the agent's own `PATH` instead, and stop tracking swaps inside the
+/// configured one.
+fn env_lookup<'a>(
+    env: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
     #[cfg(windows)]
     {
-        if std::path::Path::new(command).extension().is_none() {
-            return vec![exact, dir.join(format!("{command}.exe"))];
-        }
-        vec![exact]
+        // Several case variants leave the child's own value ambiguous —
+        // `HashMap` order decides which `Command::env` call lands last —
+        // so pick deterministically rather than let the fingerprint churn.
+        env.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .min_by(|a, b| a.0.cmp(b.0))
+            .map(|(_, v)| v)
     }
     #[cfg(not(windows))]
     {
-        vec![exact]
+        env.get(name)
     }
 }
 
@@ -550,6 +684,75 @@ mod binding_tests {
         assert_eq!(
             resolved.file_name().unwrap(),
             std::ffi::OsStr::new("srv.cmd")
+        );
+    }
+
+    /// `resolve_exe` does not search the working directory — it walks the
+    /// child's PATH, the agent's own directory, then the system ones. A
+    /// `srv.exe` dropped into the launch directory must therefore not
+    /// capture the binding, or replacing the `srv.exe` that PATH really
+    /// resolves to would leave the durable grant matching.
+    #[cfg(windows)]
+    #[test]
+    fn the_launch_directory_does_not_win_over_path() {
+        let cwd = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("srv.exe"), "planted").unwrap();
+        std::fs::write(bin.path().join("srv.exe"), "real").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), bin.path().to_str().unwrap().to_string());
+
+        assert_eq!(
+            resolve_executable("srv", cwd.path(), &env),
+            bin.path().join("srv.exe").canonicalize().ok(),
+            "a planted executable in the launch directory captured the binding"
+        );
+    }
+
+    /// An extensionless program is looked up *only* as `name.exe`:
+    /// `resolve_exe` substitutes the extension rather than trying the
+    /// bare name first, so a data file named `srv` must not resolve.
+    #[cfg(windows)]
+    #[test]
+    fn an_extensionless_neighbour_does_not_resolve() {
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("srv"), "not what spawns").unwrap();
+        std::fs::write(bin.path().join("srv.exe"), "MZ").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), bin.path().to_str().unwrap().to_string());
+
+        assert_eq!(
+            resolve_executable("srv", Path::new("/"), &env),
+            bin.path().join("srv.exe").canonicalize().ok(),
+            "the extensionless neighbour captured the binding"
+        );
+    }
+
+    /// Windows environment blocks are case-insensitive and `Command::env`
+    /// keys them that way, so `Path` in a server's env overrides `PATH`
+    /// for the child. Missing that resolves along the agent's own PATH
+    /// and stops tracking swaps inside the configured one.
+    #[cfg(windows)]
+    #[test]
+    fn a_case_insensitive_path_override_decides_the_resolution() {
+        let configured = tempfile::tempdir().unwrap();
+        let inherited = tempfile::tempdir().unwrap();
+        std::fs::write(configured.path().join("srv.exe"), "configured").unwrap();
+        std::fs::write(inherited.path().join("srv.exe"), "inherited").unwrap();
+
+        let _guard = crate::test_support::EnvGuard::set("PATH", inherited.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "Path".to_string(),
+            configured.path().to_str().unwrap().to_string(),
+        );
+
+        assert_eq!(
+            resolve_executable("srv", Path::new("/"), &env),
+            configured.path().join("srv.exe").canonicalize().ok(),
+            "a lowercase Path override was ignored"
         );
     }
 
