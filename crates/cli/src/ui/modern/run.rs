@@ -32,6 +32,15 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_millis(1500);
 /// How many recent sessions `/resume` offers.
 const SESSION_PICKER_LIMIT: usize = 50;
 
+/// A session read from disk plus the transcript rebuilt from it: the id
+/// that was asked for, the restored data, and the display items. Produced
+/// on a blocking thread, applied by the event loop.
+type LoadedSession = (
+    String,
+    agent_code_lib::services::session::SessionData,
+    Vec<super::app::TranscriptItem>,
+);
+
 use agent_code_lib::config::PermissionMode;
 use agent_code_lib::query::{QueryEngine, Session, TurnHandle};
 use agent_code_lib::services::notifier::{NotificationKind, NotifierService};
@@ -341,6 +350,18 @@ pub(super) async fn event_loop(
     let (session_list_tx, mut session_list_rx) = tokio::sync::mpsc::unbounded_channel::<
         Vec<agent_code_lib::services::session::SessionSummary>,
     >();
+    // Loading the *selected* session is the heavier half — a whole
+    // transcript read and deserialized — so it is detached too. The
+    // payload is boxed because a full conversation is far too big to pass
+    // around by value in a select arm.
+    #[allow(clippy::type_complexity)]
+    let (resume_tx, mut resume_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<Box<LoadedSession>, String>)>();
+    // Set while a load is in flight so the arm does not respawn it every
+    // pass; `app.pending_resume` stays set until the restore is applied,
+    // which is what suppresses queue auto-dispatch in the meantime.
+    let mut resume_loading = false;
+    let mut pending_restore: Option<Box<LoadedSession>> = None;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -411,9 +432,13 @@ pub(super) async fn event_loop(
             }
         }
 
-        // Load a session chosen in the picker: engine state, the visible
-        // transcript, *and* every App mirror, so the header, the mode
-        // badge and `/cost` describe what was actually restored.
+        // Open a picker whose rows landed while a HITL modal was up.
+        app.retry_session_picker();
+
+        // Apply a session loaded off-thread (see the resume select arms):
+        // engine state, the visible transcript, *and* every App mirror, so
+        // the header, the mode badge and `/cost` describe what was
+        // actually restored.
         //
         // Gated on `turn.is_none()`, not just on the engine mutex being
         // free. A finishing turn releases the mutex before the reaper
@@ -422,12 +447,14 @@ pub(super) async fn event_loop(
         // we just replaced, against the conversation we just discarded.
         // Waiting for the reap is the only ordering that cannot interleave.
         if turn.is_none()
-            && let Some(id) = app.pending_resume.take()
+            && let Some(loaded) = pending_restore.take()
         {
-            match agent_code_lib::services::session::load_session(&id) {
-                Ok(data) => match session.engine().try_lock() {
+            let (id, data, items) = *loaded;
+            // Superseded by a newer selection made while this one was
+            // still loading: drop it, the load arm fetches the new one.
+            if app.pending_resume.as_deref() == Some(id.as_str()) {
+                match session.engine().try_lock() {
                     Ok(mut eng) => {
-                        let items = super::session_picker::transcript_from_messages(&data.messages);
                         let restored = super::session_picker::RestoredState {
                             id: id.clone(),
                             model: data.model.clone(),
@@ -441,6 +468,12 @@ pub(super) async fn event_loop(
                         let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
+                            // Identity moves with the conversation. Left alone,
+                            // the engine keeps saving this restored transcript
+                            // over the *previous* session's file (and reports
+                            // the old id to hooks and telemetry) while the
+                            // header claims the restored one.
+                            st.session_id = id.clone();
                             st.messages = data.messages;
                             st.turn_count = data.turn_count;
                             st.total_cost_usd = data.total_cost_usd;
@@ -465,17 +498,11 @@ pub(super) async fn event_loop(
                         let hint = mode.permission_hint().unwrap_or(base_permission_mode);
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
+                        app.pending_resume = None;
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
-                    Err(_) => app.pending_resume = Some(id),
-                },
-                Err(e) => {
-                    app.transcript
-                        .push(super::app::TranscriptItem::Error(format!(
-                            "could not resume {id}: {e}"
-                        )));
-                    app.dirty = true;
+                    Err(_) => pending_restore = Some(Box::new((id, data, items))),
                 }
             }
         }
@@ -909,6 +936,47 @@ pub(super) async fn event_loop(
             }
             Some(rows) = session_list_rx.recv() => {
                 app.show_session_picker(rows);
+            }
+            // Read and rebuild the selected session off-thread: a long
+            // conversation is megabytes of JSON, and deserializing it on
+            // this thread froze input and repaint for its duration. Only
+            // the (cheap) apply stays on the loop, where it can be
+            // ordered against turn teardown.
+            _ = std::future::ready(()), if app.pending_resume.is_some()
+                && !resume_loading
+                && pending_restore.is_none() => {
+                if let Some(id) = app.pending_resume.clone() {
+                    resume_loading = true;
+                    let tx = resume_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let loaded = agent_code_lib::services::session::load_session(&id)
+                            .map(|data| {
+                                let items =
+                                    super::session_picker::transcript_from_messages(&data.messages);
+                                Box::new((id.clone(), data, items))
+                            });
+                        let _ = tx.send((id, loaded));
+                    });
+                }
+            }
+            Some((id, loaded)) = resume_rx.recv() => {
+                resume_loading = false;
+                // A second `/resume` while this one was loading wins; drop
+                // the stale result rather than restoring a session the
+                // user has already moved on from.
+                if app.pending_resume.as_deref() == Some(id.as_str()) {
+                    match loaded {
+                        Ok(l) => pending_restore = Some(l),
+                        Err(e) => {
+                            app.pending_resume = None;
+                            app.status_message.clear();
+                            app.transcript.push(super::app::TranscriptItem::Error(
+                                format!("could not resume {id}: {e}"),
+                            ));
+                            app.dirty = true;
+                        }
+                    }
+                }
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             // Gated on work that can still change: polling while any

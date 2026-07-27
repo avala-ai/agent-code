@@ -124,9 +124,6 @@ pub fn transcript_from_messages(
     for m in messages {
         match m {
             Message::User(u) => {
-                if u.is_meta {
-                    continue;
-                }
                 let text: String = u
                     .content
                     .iter()
@@ -136,6 +133,20 @@ pub fn transcript_from_messages(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                // A compacted session keeps its removed history *only*
+                // inside this summary. It rides in as a meta user message,
+                // so the blanket meta skip below would drop it and the
+                // resumed conversation would appear to start mid-thought
+                // while the engine still reasons from the hidden text.
+                if u.is_compact_summary {
+                    if !text.trim().is_empty() {
+                        items.push(TranscriptItem::System(format!("compacted context\n{text}")));
+                    }
+                    continue;
+                }
+                if u.is_meta {
+                    continue;
+                }
                 if !text.trim().is_empty() {
                     items.push(TranscriptItem::User(text));
                 }
@@ -215,7 +226,29 @@ impl App {
             self.dirty = true;
             return;
         }
+        // A permission / question modal owns the screen, and
+        // `open_session_picker` refuses to draw over one. Dropping the rows
+        // here would strand the request: no picker, no retry, and the
+        // status stuck on "loading sessions…" forever. Hold them until the
+        // modal clears (`retry_session_picker`).
+        if self.front_modal().is_some() {
+            self.status_message = "session list ready — answer the prompt first".into();
+            self.deferred_sessions = Some(entries);
+            self.dirty = true;
+            return;
+        }
         self.open_session_picker(entries);
+    }
+
+    /// Open a picker whose rows arrived while a HITL modal was up.
+    /// Called by the run loop once the modal queue drains.
+    pub fn retry_session_picker(&mut self) {
+        if self.front_modal().is_some() {
+            return;
+        }
+        if let Some(entries) = self.deferred_sessions.take() {
+            self.open_session_picker(entries);
+        }
     }
 
     pub fn session_picker_open(&self) -> bool {
@@ -346,6 +379,7 @@ impl App {
 mod tests {
     use super::*;
     use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, UserMessage};
+    use agent_code_lib::tools::PermissionResponse;
     use uuid::Uuid;
 
     fn summary(id: &str, label: Option<&str>, cwd: &str) -> SessionSummary {
@@ -558,6 +592,84 @@ mod tests {
 
         s.turn_count = 1;
         assert!(summary_line(&s).contains("1 turn "), "{}", summary_line(&s));
+    }
+
+    /// A compacted session's earlier turns survive only inside the
+    /// compact summary. Dropping it with the rest of the meta plumbing
+    /// leaves the resumed conversation starting mid-thought while the
+    /// engine still reasons from the hidden text.
+    #[test]
+    fn a_compact_summary_survives_into_the_restored_transcript() {
+        let messages = vec![
+            Message::User(UserMessage {
+                uuid: Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![ContentBlock::Text {
+                    text: "earlier we refactored the auth module".into(),
+                }],
+                is_meta: true,
+                is_compact_summary: true,
+            }),
+            user("now add tests"),
+        ];
+        let items = transcript_from_messages(&messages);
+        assert_eq!(items.len(), 2, "got {items:?}");
+        assert!(
+            matches!(&items[0], TranscriptItem::System(t) if t.contains("refactored the auth module")),
+            "the compact summary was dropped: {items:?}"
+        );
+        assert!(matches!(&items[1], TranscriptItem::User(t) if t == "now add tests"));
+    }
+
+    /// Put a permission modal in front. The receiver is returned so the
+    /// caller keeps the channel alive for the length of the test.
+    fn a_modal(app: &mut App) -> std::sync::mpsc::Receiver<PermissionResponse> {
+        use super::super::app::{Modal, PendingPermission, Phase};
+        let (tx, rx) = std::sync::mpsc::channel::<PermissionResponse>();
+        app.modals.push_back(Modal::Permission(PendingPermission {
+            name: "Bash".into(),
+            description: "run".into(),
+            origin: None,
+            input_preview: None,
+            respond: tx,
+        }));
+        app.phase = Phase::Permission;
+        rx
+    }
+
+    /// Rows that arrive while a permission modal owns the screen must not
+    /// be dropped: the picker would never open, nothing would retry, and
+    /// the status bar would read "loading sessions…" forever.
+    #[test]
+    fn picker_rows_arriving_under_a_modal_are_held_not_dropped() {
+        let mut app = App::new("m", "/tmp", "s");
+        let _rx = a_modal(&mut app);
+        app.show_session_picker(vec![summary("aaa11111", None, "/a")]);
+        assert!(!app.session_picker_open(), "picker drew over a HITL modal");
+        assert!(
+            app.deferred_sessions.is_some(),
+            "the session list was dropped on the floor"
+        );
+
+        // Still blocked while the modal is up.
+        app.retry_session_picker();
+        assert!(!app.session_picker_open());
+
+        // Modal answered: the held rows open the picker.
+        app.modals.pop_front();
+        app.retry_session_picker();
+        assert!(
+            app.session_picker_open(),
+            "held session list never opened the picker"
+        );
+        assert!(app.deferred_sessions.is_none());
+    }
+
+    #[test]
+    fn retrying_without_held_rows_is_a_noop() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.retry_session_picker();
+        assert!(!app.session_picker_open());
     }
 
     fn restored() -> RestoredState {

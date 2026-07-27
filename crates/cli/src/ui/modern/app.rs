@@ -431,6 +431,10 @@ pub struct App {
     /// filesystem work, so the run loop does it off this thread and
     /// hands the result back through `show_session_picker`.
     pub pending_session_list: bool,
+    /// Session rows that arrived while a HITL modal was up. The picker
+    /// will not draw over a modal, so they wait here instead of being
+    /// dropped on the floor.
+    pub deferred_sessions: Option<Vec<agent_code_lib::services::session::SessionSummary>>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -608,6 +612,7 @@ impl App {
             session_picker: None,
             pending_resume: None,
             pending_session_list: false,
+            deferred_sessions: None,
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
