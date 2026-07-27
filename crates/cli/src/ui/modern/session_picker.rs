@@ -348,8 +348,13 @@ impl App {
     /// screen, and skipping this would leave the restored history on
     /// display in front of an empty conversation.
     pub fn clear_transcript_view(&mut self) {
-        self.transcript.clear();
-        self.expanded.clear();
+        // Replaced, not `clear`ed: clearing drops the rows but keeps the
+        // buffer a long transcript grew, and that buffer then travels
+        // into the session-view cache on the next switch. Releasing it
+        // here keeps what `/clear` frees and what the cache is charged
+        // for the same number — see `session_views::view_bytes`.
+        self.transcript = Vec::new();
+        self.expanded = std::collections::HashSet::new();
         self.selected_item = None;
         self.layout.invalidate();
         self.ctx_meter = None;
@@ -1106,6 +1111,34 @@ mod tests {
             app.transcript
         );
         assert!(app.ctx_meter.is_none());
+    }
+
+    /// `/clear` frees the transcript's memory, not just its rows.
+    ///
+    /// `Vec::clear` would leave the buffer a long conversation grew still
+    /// allocated, and the next session switch moves that buffer into the
+    /// view cache — where it is correctly charged its real size and so
+    /// evicts other sessions' places to pay for rows nobody can see.
+    #[test]
+    fn clearing_the_view_releases_the_transcript_allocation() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript = (0..4096)
+            .map(|i| TranscriptItem::User(format!("row {i}")))
+            .collect();
+        app.expanded = (0..4096).collect();
+
+        app.clear_transcript_view();
+
+        assert_eq!(
+            app.transcript.capacity(),
+            0,
+            "a cleared transcript kept its buffer"
+        );
+        assert_eq!(
+            app.expanded.capacity(),
+            0,
+            "a cleared expansion set kept its buffer"
+        );
     }
 
     /// A failed resume must not release work that was deferred *for* the

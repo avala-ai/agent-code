@@ -143,28 +143,40 @@ impl SessionViews {
     }
 }
 
-/// Roughly what a view costs on the heap.
+/// What a view costs on the heap.
 ///
-/// An estimate, not an allocator-exact figure — the budget only needs
-/// the order of magnitude. String payloads dominate, but each item is
-/// also charged its own struct size so that a transcript which is huge
-/// by item count rather than by text still counts against the budget.
+/// **The invariant: the cache is charged the allocations it retains, so
+/// every measurement here is `capacity`, never `len`.** A view is moved
+/// into the cache whole, spare capacity included, and `len` can sit
+/// arbitrarily far below that — `Vec::clear` and `String::clear` drop
+/// contents while keeping the buffer, so a `/clear`ed session that
+/// afterwards holds one short row still pins the allocation the long
+/// transcript grew. Charging `len` would let exactly that case report a
+/// handful of bytes while the cache held megabytes, which is the bound
+/// failing silently rather than holding.
+///
+/// Still an estimate — it does not chase `HashMap` overhead or the
+/// allocator's rounding — but it can no longer be smaller than what is
+/// actually kept, which is the property the budget depends on.
 fn view_bytes(view: &SessionView) -> usize {
-    let per_item = std::mem::size_of::<TranscriptItem>();
-    view.transcript
-        .iter()
-        .map(|item| per_item + item_bytes(item))
-        .sum()
+    // The vector's own buffer covers every item slot it has room for,
+    // live or spare, so the items are not counted again below — only
+    // the separate heap buffers their strings own.
+    let spine = view.transcript.capacity() * std::mem::size_of::<TranscriptItem>();
+    let text: usize = view.transcript.iter().map(item_bytes).sum();
+    let expanded = view.expanded.capacity() * std::mem::size_of::<usize>();
+    spine + text + expanded
 }
 
+/// The string buffers an item owns, by capacity — see [`view_bytes`].
 fn item_bytes(item: &TranscriptItem) -> usize {
     match item {
         TranscriptItem::User(t)
         | TranscriptItem::Assistant(t)
         | TranscriptItem::System(t)
         | TranscriptItem::Error(t)
-        | TranscriptItem::Warning(t) => t.len(),
-        TranscriptItem::Thinking { text, .. } => text.len(),
+        | TranscriptItem::Warning(t) => t.capacity(),
+        TranscriptItem::Thinking { text, .. } => text.capacity(),
         TranscriptItem::Tool {
             call_id,
             name,
@@ -173,11 +185,11 @@ fn item_bytes(item: &TranscriptItem) -> usize {
             live,
             ..
         } => {
-            call_id.len()
-                + name.len()
-                + detail.len()
-                + result.as_ref().map_or(0, String::len)
-                + live.as_ref().map_or(0, String::len)
+            call_id.capacity()
+                + name.capacity()
+                + detail.capacity()
+                + result.as_ref().map_or(0, String::capacity)
+                + live.as_ref().map_or(0, String::capacity)
         }
     }
 }
@@ -353,6 +365,70 @@ mod tests {
         assert!(
             !views.contains("many"),
             "a transcript over budget by item count was cached as free"
+        );
+    }
+
+    /// The whole point of measuring capacity: `Vec::clear` drops the rows
+    /// but keeps the buffer, so a session cleared after a long
+    /// conversation and then reused for one short row still pins the
+    /// large allocation — and it is that allocation, not the one visible
+    /// row, that the cache would go on holding.
+    #[test]
+    fn a_cleared_transcript_is_charged_the_buffer_it_kept() {
+        let mut views = SessionViews::default();
+        let items = MAX_BYTES / std::mem::size_of::<TranscriptItem>() + 1;
+        let mut transcript = vec![TranscriptItem::User(String::new()); items];
+        transcript.clear();
+        transcript.push(TranscriptItem::User("one short row".into()));
+        assert_eq!(
+            transcript.len(),
+            1,
+            "a len-based estimate would see a single short row here"
+        );
+        assert!(
+            transcript.capacity() * std::mem::size_of::<TranscriptItem>() > MAX_BYTES,
+            "the cleared buffer was released, so this no longer tests retention"
+        );
+
+        views.save(
+            "cleared",
+            SessionView {
+                transcript,
+                scroll: ScrollState::Follow,
+                expanded: Default::default(),
+                selected_item: None,
+            },
+        );
+
+        assert!(
+            !views.contains("cleared"),
+            "an over-budget retained buffer was charged as one short row"
+        );
+    }
+
+    /// Same divergence one level down: a `String` cleared and reused
+    /// keeps its buffer too, so text is measured by capacity as well.
+    #[test]
+    fn a_cleared_string_is_charged_the_buffer_it_kept() {
+        let mut views = SessionViews::default();
+        let mut text = "x".repeat(MAX_BYTES + 1);
+        text.clear();
+        text.push_str("short");
+        assert!(text.capacity() > MAX_BYTES, "the buffer was released");
+
+        views.save(
+            "cleared",
+            SessionView {
+                transcript: vec![TranscriptItem::User(text)],
+                scroll: ScrollState::Follow,
+                expanded: Default::default(),
+                selected_item: None,
+            },
+        );
+
+        assert!(
+            !views.contains("cleared"),
+            "an over-budget retained string buffer was charged as five bytes"
         );
     }
 }
