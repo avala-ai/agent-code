@@ -448,13 +448,10 @@ mod tests {
             derive_prefix("cargo build --release").as_deref(),
             Some("cargo build")
         );
-        // A path-qualified binary keeps its spelling. Reducing it to
-        // `git status` would persist a grant that never matches the
-        // command it came from, because matching sees the raw text.
-        assert_eq!(
-            derive_prefix("/usr/bin/git status").as_deref(),
-            Some("/usr/bin/git status")
-        );
+        // A path-qualified binary is refused outright. The path is
+        // user-controlled and can carry a credential, and there is no
+        // safe way to fold it into a plaintext prefix.
+        assert_eq!(derive_prefix("/usr/bin/git status"), None);
     }
 
     /// The bare binary is never offered, with or without flags. The
@@ -492,10 +489,8 @@ mod tests {
             r"./\* status",
             r"'*' status",
             r"\? status",
-            // Path-qualified spellings of a tool that IS listed, so the
-            // glob rule is what rejects these rather than the tool list.
-            "/usr/*/git status",
-            "/usr/bin/gi?/git status",
+            "gi?t status",
+            "gi*t status",
         ] {
             assert_eq!(
                 derive_prefix(cmd),
@@ -551,6 +546,13 @@ mod tests {
             "./deploy.sh staging",
             "python manage.py",
             "node server.js",
+            // A listed tool followed by identifier-shaped secret data.
+            // The binary is known; the argument is not a subcommand it
+            // defines, and shape alone cannot tell it from one.
+            "git 0123456789abcdef0123456789abcdef",
+            "cargo 0123456789abcdef0123456789abcdef",
+            "docker AKIAIOSFODNN7EXAMPLE",
+            "kubectl ghp-0123456789abcdefghijklmnop",
         ] {
             assert_eq!(
                 derive_prefix(cmd),
@@ -559,11 +561,15 @@ mod tests {
             );
         }
 
-        // The listed tools still work, path-qualified or not.
+        // Real subcommands of those same tools still work.
         assert_eq!(derive_prefix("git status").as_deref(), Some("git status"));
         assert_eq!(
-            derive_prefix("/usr/local/bin/cargo test --lib").as_deref(),
-            Some("/usr/local/bin/cargo test")
+            derive_prefix("cargo test --lib").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            derive_prefix("git rev-parse --short HEAD").as_deref(),
+            Some("git rev-parse")
         );
     }
 
@@ -666,10 +672,10 @@ mod tests {
         for cmd in [
             "git status --porcelain",
             "cargo build --release",
-            "/usr/bin/git status",
             "npm run build",
             "docker compose up",
             "kubectl get pods",
+            "git rev-parse HEAD",
         ] {
             let prefix = derive_prefix(cmd).unwrap_or_else(|| panic!("no prefix for {cmd}"));
             let mut store = GrantStore::ephemeral();
@@ -681,27 +687,58 @@ mod tests {
         }
     }
 
-    /// The spelling that gets persisted has to be the spelling the
-    /// matcher will see. A path-qualified binary reduced to its base name
-    /// produced a grant that never fired — the user answered "always" and
-    /// was asked again on the identical next call.
+    /// The path an executable is invoked through is user-controlled and
+    /// can itself carry a credential, so a path-qualified spelling is
+    /// never folded into a plaintext prefix.
     #[test]
-    fn a_path_qualified_binary_keeps_its_grant() {
-        let cmd = "/usr/bin/git status";
-        let prefix = derive_prefix(cmd).expect("a prefix");
-        let mut store = GrantStore::ephemeral();
-        store.insert_prefix(&prefix, "ctx", "").unwrap();
-        assert!(
-            store.allows_prefix(cmd, "ctx"),
-            "the identical command prompted again after `always`"
-        );
-        assert!(
-            store.allows_prefix("/usr/bin/git status --porcelain", "ctx"),
-            "the grant did not extend to the same command with flags"
-        );
-        // Still bound to that spelling — it does not leak to another
-        // binary that merely shares the base name.
-        assert!(!store.allows_prefix("/opt/evil/git status", "ctx"));
+    fn derive_prefix_refuses_path_qualified_binaries() {
+        for cmd in [
+            "/tmp/AKIAIOSFODNN7EXAMPLE/git status",
+            "/usr/bin/git status",
+            "/usr/local/bin/cargo test",
+            "./git status",
+            "../bin/git status",
+            "~/bin/git status",
+        ] {
+            assert_eq!(
+                derive_prefix(cmd),
+                None,
+                "a user-controlled executable path reached the prefix for {cmd}"
+            );
+        }
+        // The bare name is still offered.
+        assert_eq!(derive_prefix("git status").as_deref(), Some("git status"));
+    }
+
+    /// The whole invariant in one assertion: every byte of an offered
+    /// prefix comes from the static table, so nothing a user or a model
+    /// controls can reach the grant file.
+    #[test]
+    fn an_offered_prefix_is_built_only_from_table_literals() {
+        let commands = [
+            "git status --porcelain",
+            "git 0123456789abcdef0123456789abcdef",
+            "/tmp/AKIAIOSFODNN7EXAMPLE/git status",
+            "cargo build --release",
+            "curl https://token@example.com",
+            "echo 0123456789abcdef0123456789abcdef",
+            "kubectl get pods -n secret-namespace",
+            "docker run --env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI",
+        ];
+        for cmd in commands {
+            let Some(prefix) = derive_prefix(cmd) else {
+                continue;
+            };
+            let (binary, sub) = prefix.split_once(' ').expect("two halves");
+            let (tool, subs) = table_entry(binary).unwrap_or_else(|| {
+                panic!("prefix `{prefix}` for {cmd} names a binary outside the table")
+            });
+            assert_eq!(tool, binary);
+            assert!(
+                subs.contains(&sub),
+                "prefix `{prefix}` for {cmd} carries a subcommand outside the table"
+            );
+        }
     }
 
     /// A project holding only prefix grants is still a project with
@@ -1293,126 +1330,366 @@ impl PrefixEntry {
     }
 }
 
-/// Executables whose first positional argument is a subcommand keyword
-/// drawn from a set the tool itself defines — `git status`,
-/// `cargo build`, `docker compose`.
+/// The complete set of prefixes this feature will ever offer: a tool
+/// name paired with the subcommand keywords that tool defines.
 ///
-/// This is the semantic knowledge that a character-shape test cannot
-/// supply. `echo 0123456789abcdef0123456789abcdef` has an argument
-/// shaped exactly like a subcommand, and an API key has that shape too;
-/// only knowing that `echo` does not take subcommands, while `git` does,
-/// separates the two. Without it, pressing `P` could write a secret into
-/// the config directory, which AGENTS.md forbids outright.
+/// Both halves of every persisted prefix are read out of this table, so
+/// a grant file can only ever contain string literals from this source
+/// file. That is the invariant, and it is what keeps the feature inside
+/// AGENTS.md's rule that credentials must never be written to the config
+/// directory. Earlier revisions asked whether a token *looked* like a
+/// subcommand, and identifier-shaped secrets look exactly like one:
+/// `git 0123456789abcdef0123456789abcdef` and
+/// `/tmp/AKIAIOSFODNN7EXAMPLE/git status` both pass every character-shape
+/// test that can be written. Recognising the token instead of its shape
+/// is the only check that holds.
 ///
-/// This is **not** an allowlist of "probably fine" tools of the kind
-/// AGENTS.md rules out. Nothing here is allowed to run, and nothing
-/// skips a prompt: the list only limits which commands may be *offered*
-/// a durable grant after the user has already approved this call by
-/// hand. An unlisted tool is simply never offered one — it can still be
-/// approved with `[y]`, `[a]` or `[A]`. Adding an entry widens nothing
-/// on its own; it lets a human be asked one fewer question about a tool
-/// whose argument grammar is known.
+/// The binary is matched by exact equality, never by base name, so a
+/// path-qualified spelling is refused rather than embedded: the path is
+/// user-controlled and can itself carry a credential.
 ///
-/// Deliberately excludes wrappers (`env`, `sudo`, `timeout`, `nohup`):
-/// their first argument is another command, so a prefix over it would
-/// cover every command that wrapper can reach.
-const SUBCOMMAND_TOOLS: &[&str] = &[
-    "apt",
-    "apt-get",
-    "aws",
-    "az",
-    "brew",
-    "bun",
-    "bundle",
-    "cargo",
-    "deno",
-    "dnf",
-    "docker",
-    "dotnet",
-    "flutter",
-    "gcloud",
-    "gem",
-    "gh",
-    "git",
-    "go",
-    "helm",
-    "kubectl",
-    "nix",
-    "npm",
-    "pip",
-    "pip3",
-    "pnpm",
-    "podman",
-    "poetry",
-    "rustup",
-    "systemctl",
-    "terraform",
-    "uv",
-    "yarn",
+/// This is **not** the "probably fine" tool allowlist AGENTS.md rules
+/// out for `auto_decision`. Nothing here is allowed to run and nothing
+/// skips a prompt: the table only limits which commands may be *offered*
+/// a durable grant after the user has already approved that call by
+/// hand. Anything absent is simply never offered one and is still
+/// approvable with `[y]`, `[a]` or `[A]`. Adding an entry widens nothing
+/// by itself.
+///
+/// Tools whose first argument is a service or resource name rather than
+/// a fixed keyword (`aws`, `gcloud`, `az`) are deliberately absent —
+/// their argument space is not a closed set, so it cannot be recognised,
+/// only shape-tested, which is what failed. Wrappers (`env`, `sudo`,
+/// `timeout`) are absent for the same reason: their first argument is
+/// another command.
+const SUBCOMMAND_TOOLS: &[(&str, &[&str])] = &[
+    (
+        "cargo",
+        &[
+            "add",
+            "bench",
+            "build",
+            "check",
+            "clean",
+            "clippy",
+            "doc",
+            "fetch",
+            "fix",
+            "fmt",
+            "install",
+            "metadata",
+            "nextest",
+            "publish",
+            "remove",
+            "run",
+            "rustc",
+            "search",
+            "test",
+            "tree",
+            "uninstall",
+            "update",
+            "vendor",
+            "version",
+        ],
+    ),
+    (
+        "docker",
+        &[
+            "attach",
+            "build",
+            "buildx",
+            "commit",
+            "compose",
+            "config",
+            "container",
+            "context",
+            "cp",
+            "create",
+            "diff",
+            "events",
+            "exec",
+            "export",
+            "history",
+            "image",
+            "images",
+            "import",
+            "info",
+            "inspect",
+            "kill",
+            "load",
+            "login",
+            "logout",
+            "logs",
+            "network",
+            "pause",
+            "port",
+            "ps",
+            "pull",
+            "push",
+            "rename",
+            "restart",
+            "rm",
+            "rmi",
+            "run",
+            "save",
+            "search",
+            "start",
+            "stats",
+            "stop",
+            "system",
+            "tag",
+            "top",
+            "unpause",
+            "update",
+            "version",
+            "volume",
+            "wait",
+        ],
+    ),
+    (
+        "gh",
+        &[
+            "alias",
+            "api",
+            "auth",
+            "browse",
+            "cache",
+            "codespace",
+            "config",
+            "extension",
+            "gist",
+            "issue",
+            "label",
+            "org",
+            "pr",
+            "project",
+            "release",
+            "repo",
+            "ruleset",
+            "run",
+            "search",
+            "secret",
+            "status",
+            "variable",
+            "workflow",
+        ],
+    ),
+    (
+        "git",
+        &[
+            "add",
+            "am",
+            "apply",
+            "archive",
+            "bisect",
+            "blame",
+            "branch",
+            "checkout",
+            "cherry-pick",
+            "clean",
+            "clone",
+            "commit",
+            "config",
+            "describe",
+            "diff",
+            "fetch",
+            "fsck",
+            "gc",
+            "grep",
+            "init",
+            "log",
+            "ls-files",
+            "ls-remote",
+            "merge",
+            "mv",
+            "notes",
+            "pull",
+            "push",
+            "rebase",
+            "reflog",
+            "remote",
+            "reset",
+            "restore",
+            "rev-list",
+            "rev-parse",
+            "revert",
+            "rm",
+            "shortlog",
+            "show",
+            "sparse-checkout",
+            "stash",
+            "status",
+            "submodule",
+            "switch",
+            "symbolic-ref",
+            "tag",
+            "worktree",
+        ],
+    ),
+    (
+        "go",
+        &[
+            "bug", "build", "clean", "doc", "env", "fix", "fmt", "generate", "get", "install",
+            "list", "mod", "run", "test", "tool", "version", "vet", "work",
+        ],
+    ),
+    (
+        "kubectl",
+        &[
+            "annotate",
+            "api-resources",
+            "api-versions",
+            "apply",
+            "attach",
+            "auth",
+            "autoscale",
+            "certificate",
+            "cluster-info",
+            "config",
+            "cordon",
+            "cp",
+            "create",
+            "debug",
+            "delete",
+            "describe",
+            "diff",
+            "drain",
+            "edit",
+            "events",
+            "exec",
+            "explain",
+            "expose",
+            "get",
+            "kustomize",
+            "label",
+            "logs",
+            "patch",
+            "port-forward",
+            "proxy",
+            "replace",
+            "rollout",
+            "run",
+            "scale",
+            "set",
+            "taint",
+            "top",
+            "uncordon",
+            "version",
+            "wait",
+        ],
+    ),
+    (
+        "npm",
+        &[
+            "audit",
+            "ci",
+            "dedupe",
+            "exec",
+            "init",
+            "install",
+            "link",
+            "ls",
+            "outdated",
+            "pack",
+            "ping",
+            "prune",
+            "publish",
+            "rebuild",
+            "run",
+            "start",
+            "stop",
+            "test",
+            "uninstall",
+            "update",
+            "version",
+            "view",
+            "why",
+        ],
+    ),
+    (
+        "pnpm",
+        &[
+            "add", "audit", "build", "dlx", "exec", "install", "link", "list", "outdated", "prune",
+            "publish", "rebuild", "remove", "run", "start", "store", "test", "update", "why",
+        ],
+    ),
+    (
+        "systemctl",
+        &[
+            "cat",
+            "daemon-reload",
+            "disable",
+            "edit",
+            "enable",
+            "is-active",
+            "is-enabled",
+            "is-failed",
+            "kill",
+            "list-timers",
+            "list-units",
+            "mask",
+            "reload",
+            "reset-failed",
+            "restart",
+            "show",
+            "start",
+            "status",
+            "stop",
+            "unmask",
+        ],
+    ),
+    (
+        "terraform",
+        &[
+            "apply",
+            "console",
+            "destroy",
+            "fmt",
+            "force-unlock",
+            "get",
+            "graph",
+            "import",
+            "init",
+            "login",
+            "logout",
+            "output",
+            "plan",
+            "providers",
+            "refresh",
+            "show",
+            "state",
+            "taint",
+            "test",
+            "untaint",
+            "validate",
+            "version",
+            "workspace",
+        ],
+    ),
+    (
+        "yarn",
+        &[
+            "add", "audit", "bin", "cache", "config", "dlx", "info", "init", "install", "link",
+            "list", "outdated", "pack", "publish", "remove", "run", "start", "test", "up",
+            "upgrade", "version", "why",
+        ],
+    ),
 ];
 
-/// True when `binary`'s first positional argument is a subcommand rather
-/// than data. Judged on the base name, so `/usr/bin/git` counts as
-/// `git` — while the prefix itself keeps the full spelling it was
-/// invoked with, which is what the matcher will see.
-fn dispatches_subcommands(binary: &str) -> bool {
-    let name = crate::tools::bash_parse::base_name(binary);
-    SUBCOMMAND_TOOLS.contains(&name.as_str())
-}
-
-/// Tokens that may be persisted as the argument half of a prefix.
+/// The table entry for `binary` — its own `&'static str` name and the
+/// subcommands it defines — or `None` when it is not a tool this feature
+/// offers prefixes for.
 ///
-/// A subcommand is a short identifier the tool itself defines — `status`,
-/// `build`, `rev-parse`. Anything else in that position is *data*: a URL,
-/// a path, a filename, a `key=value`. Persisting data would write
-/// arbitrary command-line content — including a credential-bearing URL
-/// like `https://token@example.com` — into the config directory, which
-/// AGENTS.md forbids outright, and would also record a prefix so specific
-/// it could never match twice.
-///
-/// Deliberately narrow: alphanumerics, `-` and `_` only. That excludes
-/// `/`, `.`, `:`, `@`, `=`, `~`, `%`, every quote and every non-ASCII
-/// character, so no separator, control or bidi character can ride into
-/// the stored prefix. Unrecognized shapes fail closed — see
-/// [`derive_prefix`].
-fn is_subcommand_token(tok: &str) -> bool {
-    !tok.is_empty()
-        && tok.len() <= 32
-        && tok.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && tok
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// True when `tok` may be persisted and rendered as an executable name.
-///
-/// Binaries legitimately carry `.`, `/` and `~` (`./deploy.sh`), so they
-/// cannot be held to [`is_subcommand_token`]. Three things disqualify
-/// them:
-///
-/// * **Glob metacharacters.** A stored prefix is a *pattern* to
-///   [`crate::permissions::matches_shell_command`], not a literal. `*`
-///   and `?` would therefore widen the grant past the command it was
-///   derived from, and a prefix of only `*` is short-circuited by that
-///   matcher as universal — approving `./\* --version` would suppress
-///   the prompt for every later command in the same context.
-/// * **Quoting and expansion characters.** They mean the stored spelling
-///   is not the spelling the matcher will see in the command text.
-/// * **Invisible characters.** Control, bidi and zero-width characters
-///   make the persisted bytes differ from the painted ones.
-fn is_literal_binary_token(tok: &str) -> bool {
-    !tok.is_empty()
-        && !tok.chars().any(|c| {
-            matches!(c, '*' | '?' | '\'' | '"' | '\\' | '$' | '`')
-                || c.is_control()
-                || c.is_whitespace()
-                || matches!(c,
-                    '\u{200B}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{FEFF}')
-        })
+/// Exact match on the whole token: a path-qualified spelling is a
+/// different, user-controlled string and is refused rather than reduced
+/// to its base name. The name is returned from the table rather than
+/// echoed back from the argument, so the caller cannot accidentally
+/// build a prefix out of anything but literals.
+fn table_entry(binary: &str) -> Option<(&'static str, &'static [&'static str])> {
+    SUBCOMMAND_TOOLS
+        .iter()
+        .find(|(tool, _)| *tool == binary)
+        .map(|(tool, subs)| (*tool, *subs))
 }
 
 /// True when `prefix` authorizes `command`, ignoring context.
@@ -1450,17 +1727,20 @@ fn prefix_covers(prefix: &str, command: &str) -> bool {
 ///
 /// * Commands the gate cannot reason about — multiple invocations,
 ///   substitutions, subshells, redirection, assignment.
-/// * A binary that does not take subcommands at all
-///   ([`SUBCOMMAND_TOOLS`]), including every command wrapper: `env git
-///   status` would otherwise offer `env git`, covering `env git push`.
-/// * A first non-flag argument that is data rather than a subcommand
-///   ([`is_subcommand_token`]): `curl https://token@host` must not put a
-///   credential in the config directory.
-/// * A binary that is not a literal ([`is_literal_binary_token`]).
+/// * A binary that is not, token for token, one of the tools in
+///   [`SUBCOMMAND_TOOLS`]. That excludes every command wrapper (`env git
+///   status` would otherwise offer `env git`, covering `env git push`)
+///   and every path-qualified spelling, whose path is user-controlled and
+///   can itself carry a credential (`/tmp/AKIA…/git status`).
+/// * A first non-flag argument that is not a subcommand that tool
+///   actually defines. Not a token that *looks* like one: an API key
+///   looks exactly like one, and `curl https://token@host` or
+///   `git 0123456789abcdef…` must not put a secret in the config
+///   directory.
 /// * A prefix that does not, in the end, cover the very command it was
-///   derived from ([`prefix_covers`]) — which is what stops a
-///   path-qualified or quoted spelling from being offered as a grant
-///   that would never match.
+///   derived from ([`prefix_covers`]) — which is what stops a quoted or
+///   oddly spaced spelling from being offered as a grant that would
+///   never match.
 pub fn derive_prefix(command: &str) -> Option<String> {
     let parsed = crate::tools::bash_parse::parse_bash(command)?;
     if parsed.has_parse_error
@@ -1491,26 +1771,16 @@ pub fn derive_prefix(command: &str) -> Option<String> {
     let mut tokens = invocation
         .iter()
         .map(|t| crate::tools::bash_parse::unquote_token(t));
-    // Tokens keep their full text — the binary is *not* reduced to its
-    // base name. Matching compares the stored prefix against the raw
-    // command text, so `/usr/bin/git status` reduced to `git status`
-    // would be persisted as a grant that never matches the call it came
-    // from. The same reasoning rules out base-naming arguments, which
-    // additionally hid the separators that mark an argument as data.
-    let binary = tokens.next()?;
-    if !is_literal_binary_token(&binary) {
-        return None;
-    }
-    // The one question a character-shape test cannot answer: is the next
-    // token a subcommand, or is it data?
-    if !dispatches_subcommands(&binary) {
-        return None;
-    }
+    // Both halves are looked up, never inspected. Whatever comes back is
+    // a `&'static str` from the table above, so the string this function
+    // returns — and therefore everything that can reach the grant file —
+    // is built only from literals in this source file. No spelling the
+    // user or the model controls can ride along, which is the property
+    // that keeps a credential out of the config directory.
+    let (binary, subcommands) = table_entry(&tokens.next()?)?;
     // Both halves are required: see the bare-binary note above.
-    let sub = tokens.find(|t| !t.starts_with('-'))?;
-    if !is_subcommand_token(&sub) {
-        return None;
-    }
+    let answered = tokens.find(|t| !t.starts_with('-'))?;
+    let sub = subcommands.iter().find(|known| **known == answered)?;
     let prefix = format!("{binary} {sub}");
     // Last gate: what is offered has to be what will later be honoured.
     // Any spelling the matcher would not recognise — quoting the parser

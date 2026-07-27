@@ -604,7 +604,13 @@ fn line_text(line: &Line<'_>) -> String {
 /// Rows `text` occupies when word-wrapped into `width` columns, matching
 /// `Paragraph`'s greedy wrap: words move to the next row whole, and a
 /// word wider than the line is split across rows.
+///
+/// Measured in display columns, not characters. A CJK glyph or emoji
+/// occupies two cells, so counting characters underestimates the rows a
+/// line needs and the box would be sized too short — clipping the very
+/// text the user is answering about.
 fn wrapped_rows(text: &str, width: u16) -> u16 {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if width == 0 {
         return 1;
     }
@@ -612,19 +618,25 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
     let mut rows = 1usize;
     let mut col = 0usize;
     for word in text.split_whitespace() {
-        let len = word.chars().count();
-        if col > 0 && col + 1 + len > width {
+        let w = UnicodeWidthStr::width(word);
+        if col > 0 && col + 1 + w > width {
             rows += 1;
             col = 0;
         }
-        if len > width {
-            // The check above already moved a partly-filled row on, so
-            // the split always starts at column 0.
-            let extra = (len - 1) / width;
-            rows += extra;
-            col = len - extra * width;
+        if w > width {
+            // Split by columns, not by characters: a double-width glyph
+            // straddling the edge moves to the next row whole.
+            // The check above already emptied a partly-filled row.
+            for ch in word.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + cw > width {
+                    rows += 1;
+                    col = 0;
+                }
+                col += cw;
+            }
         } else {
-            col = if col == 0 { len } else { col + 1 + len };
+            col = if col == 0 { w } else { col + 1 + w };
         }
     }
     rows.try_into().unwrap_or(u16::MAX)
@@ -1792,6 +1804,55 @@ mod tests {
         // A word wider than the line is split across rows.
         assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
         assert_eq!(wrapped_rows("ab", 0), 1);
+    }
+
+    /// Rows are display columns, not characters. A CJK glyph takes two
+    /// cells, so ten of them fill a 20-column line — counting characters
+    /// would call that one row and size the modal half as tall as it
+    /// needs to be.
+    #[test]
+    fn wrapped_rows_measures_display_width() {
+        let cjk = "日".repeat(10); // 10 chars, 20 columns
+        assert_eq!(wrapped_rows(&cjk, 20), 1);
+        assert_eq!(wrapped_rows(&cjk, 10), 2);
+        assert_eq!(wrapped_rows(&cjk, 6), 4);
+        // An odd width cannot split a double-width glyph, so the row
+        // ends one column early.
+        assert_eq!(wrapped_rows(&cjk, 5), 5);
+    }
+
+    /// The permission modal must grow for double-width text too, or the
+    /// durable-grant row is clipped exactly as it was for long prefixes.
+    #[test]
+    fn permission_modal_grows_for_double_width_text() {
+        let backend = TestBackend::new(60, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        let description = format!("Bash: {}", "日本語".repeat(20));
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: description.clone(),
+                    origin: None,
+                    input_preview: None,
+                    suggested_prefix: Some("git status".into()),
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let flat = squeeze(&s);
+        assert!(
+            flat.contains(&squeeze(&description)),
+            "double-width text was clipped:\n{s}"
+        );
+        assert!(
+            flat.contains(&squeeze("git status")),
+            "the durable-grant row was pushed out:\n{s}"
+        );
     }
 
     /// The modal title names the tool being approved. A plugin manifest or
