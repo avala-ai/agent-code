@@ -61,6 +61,16 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
+/// A stable string for a set of MCP server entries, for deciding whether
+/// the destination project asks for the same servers as the one being
+/// left. Ordered so map iteration order cannot change the answer.
+fn mcp_fingerprint(
+    servers: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+) -> Option<String> {
+    let ordered: std::collections::BTreeMap<_, _> = servers.iter().collect();
+    serde_json::to_string(&ordered).ok()
+}
+
 /// The next terminal event, taking anything buffered during work the
 /// loop could not interrupt before reading the stream again.
 ///
@@ -348,15 +358,24 @@ async fn finish_cwd_adoption(
     // subdirectory leaves `/repo/.agent/team-memory` outside the root —
     // unprotected exactly where a resume crossed into it.
     let project_root = agent_code_lib::services::session_env::project_root_for(dir).await;
-    // Same repository, different directory (`/repo` → `/repo/crate`) is a
-    // routine resume: the `.agent` config is the same one, and the MCP
-    // servers connected for it are still the right ones. Only a genuine
-    // change of project justifies dropping them, since they cannot be
-    // reconnected without a restart.
-    let previous_root =
-        agent_code_lib::services::session_env::project_root_for(std::path::Path::new(previous_cwd))
-            .await;
-    let drop_mcp = previous_root != project_root;
+    // Keep the connected servers only when the destination asks for the
+    // *same* ones. The project root is the wrong question: config
+    // discovery walks up from the session directory and takes the nearest
+    // `.agent/settings.toml`, so two directories in one repository can
+    // resolve different MCP configuration while sharing a git root — and
+    // comparing roots left the source's proxies live and callable.
+    //
+    // Compared by canonical serialization because the entries have no
+    // `PartialEq`, and fail-closed if either side will not serialize:
+    // dropping proxies costs a restart to get them back, keeping the
+    // wrong ones leaves another project's servers reachable.
+    let drop_mcp = match (
+        mcp_fingerprint(&eng.state().config.mcp_servers),
+        mcp_fingerprint(&cfg.mcp_servers),
+    ) {
+        (Some(before), Some(after)) => before != after,
+        _ => true,
+    };
     let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
     if dropped_mcp > 0 {
         app.transcript
@@ -4770,6 +4789,47 @@ mod tests {
             cfg.permissions.default_mode,
             PermissionMode::Deny,
             "the lock discarded a restrictive command line and left the project's allow"
+        );
+    }
+
+    /// Two directories in one repository can resolve *different* MCP
+    /// configuration, because config discovery takes the nearest
+    /// `.agent/settings.toml` rather than the git root. Deciding by root
+    /// therefore left the source project's proxies live and callable.
+    #[test]
+    fn mcp_is_kept_only_when_the_destination_asks_for_the_same_servers() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let entry = |cmd: &str| {
+            serde_json::from_value::<McpServerEntry>(serde_json::json!({
+                "command": cmd,
+                "args": [],
+            }))
+            .expect("entry")
+        };
+
+        let mut a: HashMap<String, McpServerEntry> = HashMap::new();
+        a.insert("docs".into(), entry("docs-server"));
+        let mut same: HashMap<String, McpServerEntry> = HashMap::new();
+        same.insert("docs".into(), entry("docs-server"));
+        let mut different: HashMap<String, McpServerEntry> = HashMap::new();
+        different.insert("docs".into(), entry("other-server"));
+
+        assert_eq!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&same),
+            "identical configuration must compare equal, or a routine resume drops its servers"
+        );
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&different),
+            "a different server must compare unequal, or the old project's proxies stay callable"
+        );
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&HashMap::new()),
+            "a destination configuring no servers must not keep the source's"
         );
     }
 }
