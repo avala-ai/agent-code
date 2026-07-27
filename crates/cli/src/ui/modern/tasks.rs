@@ -132,15 +132,34 @@ pub fn pane_rows_collapsed(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> usi
     rows
 }
 
-/// Rows the user can move a selection through: a collapsed group's
-/// members are not reachable, so the selection must skip them.
-pub fn visible_indices(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> Vec<usize> {
-    tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| !collapsed.contains(&t.source))
-        .map(|(i, _)| i)
-        .collect()
+/// Rows the user can move a selection through.
+///
+/// An expanded group contributes every one of its rows. A collapsed
+/// group contributes exactly one: its first task, which is the index
+/// the folded heading stands in for. Dropping it instead would make the
+/// group the user just folded the one group they can no longer reach to
+/// unfold.
+pub fn selectable_indices(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut last: Option<TaskSource> = None;
+    for (i, t) in tasks.iter().enumerate() {
+        if !collapsed.contains(&t.source) || last != Some(t.source) {
+            out.push(i);
+        }
+        last = Some(t.source);
+    }
+    out
+}
+
+/// True when `idx` is the row a collapsed group's heading stands in for.
+///
+/// Rows are sorted by source, so a group is one contiguous run and its
+/// first member is the only one the heading can represent.
+pub fn is_folded_heading(tasks: &[TaskEntry], collapsed: &[TaskSource], idx: usize) -> bool {
+    let Some(t) = tasks.get(idx) else {
+        return false;
+    };
+    collapsed.contains(&t.source) && (idx == 0 || tasks[idx - 1].source != t.source)
 }
 
 /// Upsert a subagent update into `tasks`, keeping entries ordered by state
@@ -216,26 +235,70 @@ mod tests {
         assert_eq!(pane_rows(&tasks), pane_rows_collapsed(&tasks, &[]));
     }
 
-    /// The selection must not be able to land on a row that is folded
-    /// away — it would look like the pane stopped responding.
+    /// A folded group keeps exactly one selectable row — its heading —
+    /// so the user can still reach it to unfold. The rows behind the
+    /// heading stay unreachable: landing there would look like the pane
+    /// stopped responding.
     #[test]
-    fn folded_rows_are_not_selectable() {
+    fn a_folded_group_is_selectable_only_through_its_heading() {
         let tasks = two_groups();
-        let visible = visible_indices(&tasks, &[TaskSource::Subagent]);
-        assert!(
-            visible
-                .iter()
-                .all(|i| tasks[*i].source == TaskSource::Background),
-            "a folded row remained selectable"
+        let sel = selectable_indices(&tasks, &[TaskSource::Subagent]);
+        let agents: Vec<usize> = sel
+            .iter()
+            .copied()
+            .filter(|i| tasks[*i].source == TaskSource::Subagent)
+            .collect();
+        assert_eq!(
+            agents.len(),
+            1,
+            "folded group must contribute exactly one selectable row"
         );
-        assert_eq!(visible_indices(&tasks, &[]).len(), tasks.len());
+        assert!(
+            is_folded_heading(&tasks, &[TaskSource::Subagent], agents[0]),
+            "the selectable row is not the group's heading"
+        );
+        // The other group is untouched.
+        assert_eq!(
+            sel.iter()
+                .filter(|i| tasks[**i].source == TaskSource::Background)
+                .count(),
+            1
+        );
+        assert_eq!(selectable_indices(&tasks, &[]).len(), tasks.len());
+    }
+
+    /// Folding every group must not strand the selection with nowhere
+    /// to go — each heading stays reachable.
+    #[test]
+    fn folding_everything_leaves_one_row_per_group() {
+        let tasks = two_groups();
+        let sel = selectable_indices(&tasks, &[TaskSource::Subagent, TaskSource::Background]);
+        assert_eq!(sel.len(), 2, "expected one heading per group: {sel:?}");
+        assert!(
+            sel.iter().all(|i| is_folded_heading(
+                &tasks,
+                &[TaskSource::Subagent, TaskSource::Background],
+                *i
+            )),
+            "a non-heading row stayed selectable"
+        );
     }
 
     #[test]
-    fn folding_everything_leaves_nothing_selectable() {
+    fn only_a_groups_first_row_counts_as_its_heading() {
         let tasks = two_groups();
-        let visible = visible_indices(&tasks, &[TaskSource::Subagent, TaskSource::Background]);
-        assert!(visible.is_empty());
+        let folded = [TaskSource::Subagent];
+        let agent_rows: Vec<usize> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.source == TaskSource::Subagent)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(agent_rows.len(), 2);
+        assert!(is_folded_heading(&tasks, &folded, agent_rows[0]));
+        assert!(!is_folded_heading(&tasks, &folded, agent_rows[1]));
+        // An expanded group has no folded heading at all.
+        assert!(!is_folded_heading(&tasks, &[], agent_rows[0]));
     }
 
     /// The pane was fed only by `EngineEvent::SubagentUpdate`, so a
