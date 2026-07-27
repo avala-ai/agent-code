@@ -268,6 +268,19 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
         });
     }
 
+    // A heredoc body that expands more times than the walk follows was
+    // not read to the end, and what went unread is what an expansion
+    // would have run. Spending the budget is the one outcome that must
+    // not read as nothing to find.
+    if shell_text_facts(&cmd.raw).unfollowed_expansions {
+        findings.push(DestructiveFinding {
+            level: DestructivenessLevel::Destructive,
+            reason: "a heredoc body expands more times than can be followed; what it runs cannot \
+                     be determined"
+                .to_string(),
+        });
+    }
+
     // Git configuration handed over through the environment never
     // appears in the argv, so an alias defined there turns the command
     // word into something this scan cannot read. Done per statement:
@@ -718,7 +731,8 @@ fn shell_statements(raw: &str) -> Vec<String> {
             for (delimiter, strip_tabs, expands) in std::mem::take(&mut pending_heredocs) {
                 let end = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
                 if expands {
-                    for inner in heredoc_expansions(&text[i..end.min(text.len())]) {
+                    let (expansions, _) = heredoc_expansions(&text[i..end.min(text.len())]);
+                    for inner in expansions {
                         expanded.extend(shell_statements(&inner));
                     }
                 }
@@ -1021,6 +1035,9 @@ struct ShellTextFacts {
     /// A locale-translated `$"…"` string, whose content the catalogue
     /// decides rather than the command text.
     locale_quote: bool,
+    /// A heredoc body expands more times than the walk will follow, so
+    /// what the body runs was not read to the end.
+    unfollowed_expansions: bool,
 }
 
 /// Read `raw` the way the shell reads it: quotes nest, a substitution
@@ -1043,6 +1060,7 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
     let mut facts = ShellTextFacts {
         control_operator: false,
         locale_quote: false,
+        unfollowed_expansions: false,
     };
     let text: Vec<char> = raw.chars().collect();
     let mut stack: Vec<Context> = Vec::new();
@@ -1065,10 +1083,13 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                     // Only what an expansion contains is code; the
                     // body around it stays the data it looks like, so
                     // a bare `$\"` in it is still literal.
-                    for expansion in heredoc_expansions(&text[i..end.min(text.len())]) {
+                    let (expansions, spent) = heredoc_expansions(&text[i..end.min(text.len())]);
+                    facts.unfollowed_expansions |= spent;
+                    for expansion in expansions {
                         let inner = shell_text_facts(&expansion);
                         facts.control_operator |= inner.control_operator;
                         facts.locale_quote |= inner.locale_quote;
+                        facts.unfollowed_expansions |= inner.unfollowed_expansions;
                     }
                 }
                 i = end;
@@ -1229,21 +1250,28 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
 /// as shell syntax; reading it as syntax would let a literal quote
 /// swallow the substitution it surrounds. What each expansion contains
 /// *is* code, and is returned for the caller to read as such.
+/// How many expansions in one body the walk will follow. Every opener
+/// is given the reading below, so the budget bounds the work; a body
+/// that spends it was not read to the end and says so.
+const MAX_HEREDOC_EXPANSIONS: usize = 64;
+
 /// Each expansion contributes two readings. The first is what the
 /// reader below says it contains. The second is the whole rest of the
 /// body from that opener, which is what makes the reader safe to be
 /// wrong: deciding an expansion ends too early would drop the code
 /// after it, and the shell has more ways to spell a `)` that does not
-/// close one — a `case` pattern, a comment — than a reader is likely to
-/// enumerate. Reading too far only offers body text to scans that then
-/// refuse more than they must, which is the safe direction; reading too
-/// little hides a command. Only the openers this covers are read that
-/// way, so the work stays linear in the body.
-const HEREDOC_EXPANSION_TAILS: usize = 8;
-
-fn heredoc_expansions(body: &[char]) -> Vec<String> {
+/// close one — a `case` pattern, a comment, a reserved word — than a
+/// reader is likely to enumerate. Reading too far only offers body text
+/// to scans that then refuse more than they must, which is the safe
+/// direction; reading too little hides a command.
+///
+/// Every opener gets both, up to [`MAX_HEREDOC_EXPANSIONS`]. The tails
+/// cost the length of the body each, so a body could otherwise spend
+/// the walk on openers alone; past the budget the body is reported
+/// unread rather than partly read, since the reading that was skipped
+/// is exactly the one that hides a command.
+fn heredoc_expansions(body: &[char]) -> (Vec<String>, bool) {
     let mut found = Vec::new();
-    let mut tails = 0;
     let mut i = 0;
     while i < body.len() {
         let opener = match body[i] {
@@ -1255,27 +1283,26 @@ fn heredoc_expansions(body: &[char]) -> Vec<String> {
             }
             '$' if body.get(i + 1) == Some(&'(') => {
                 let (inner, next) = read_expansion(body, i + 2, '(', ')');
-                found.push(inner);
-                Some((i + 2, next))
+                Some((inner, i + 2, next))
             }
             '`' => {
                 let (inner, next) = read_backquote(body, i + 1);
-                found.push(inner);
-                Some((i + 1, next))
+                Some((inner, i + 1, next))
             }
             _ => None,
         };
-        let Some((from, next)) = opener else {
+        let Some((inner, from, next)) = opener else {
             i += 1;
             continue;
         };
-        if tails < HEREDOC_EXPANSION_TAILS {
-            found.push(body[from..].iter().collect());
-            tails += 1;
+        if found.len() >= MAX_HEREDOC_EXPANSIONS * 2 {
+            return (found, true);
         }
+        found.push(inner);
+        found.push(body[from..].iter().collect());
         i = next;
     }
-    found
+    (found, false)
 }
 
 /// Read to the close of an expansion already opened, returning what it
@@ -1343,7 +1370,14 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
                             _ => {}
                         }
                     }
-                    command_position = false;
+                    // A word that only introduces a command leaves the
+                    // next one in command position too, so the `case`
+                    // in `time case y in …` is still reserved.
+                    command_position = command_position
+                        && matches!(
+                            word.as_str(),
+                            "time" | "do" | "then" | "else" | "elif" | "if" | "while" | "until"
+                        );
                     word.clear();
                 }
                 if c == '\'' || c == '"' {
@@ -2831,6 +2865,13 @@ mod tests {
             // command position closes the `case`, so the pattern after
             // it is a pattern rather than the end of the expansion.
             "cat <<EOF\n$(case y in x) echo esac;; y) $\"safe\";; esac)\nEOF",
+            // A word that only introduces a command leaves the next in
+            // command position, so this `case` is still reserved. The
+            // earlier openers cannot cover this one: a quote in the
+            // body is data to bash but syntax to a reading of the body
+            // that starts before it, so every opener is read from.
+            "cat <<EOF\n$(:)$(:)$(:)$(:)$(:)$(:)$(:)$(:)\n'\n\
+             $(time case y in x) :;; y) $\"safe\" -rf /tmp/x;; esac)\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
@@ -3162,6 +3203,24 @@ mod tests {
         assert_eq!(classify_str("ls -la"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("git status"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("cargo test"), DestructivenessLevel::Safe);
+    }
+
+    #[test]
+    fn a_body_outrunning_the_expansion_budget_is_refused() {
+        // Every opener is read, so a body can spend the walk on them
+        // alone. Spending it means the body was not read to the end,
+        // which must not read as nothing to find.
+        let body = "$(:)".repeat(MAX_HEREDOC_EXPANSIONS + 1);
+        assert_eq!(
+            classify_str(&format!("cat <<EOF\n{body}\nEOF")),
+            DestructivenessLevel::Destructive
+        );
+        // A delimiter that closes the body spends nothing: none of it
+        // expands.
+        assert_eq!(
+            classify_str(&format!("cat <<'EOF'\n{body}\nEOF")),
+            DestructivenessLevel::Safe
+        );
     }
 
     #[test]
