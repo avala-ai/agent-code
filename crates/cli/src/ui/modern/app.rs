@@ -2246,21 +2246,24 @@ impl App {
         self.dirty = true;
     }
 
-    /// Render a row's captured inline results as one body.
+    /// One (label, body) card per captured inline result.
     ///
-    /// Usually one. A row holds several only when distinct Agent calls
-    /// collapsed onto it (their descriptions share a prefix), and then
-    /// each is labelled by its tool call — showing only the last would
-    /// hide a finished agent's result and could attribute the wrong
-    /// output to the row.
-    fn captured_body(outputs: &[super::tasks::CapturedOutput]) -> String {
+    /// Usually one card. A row holds several results only when distinct
+    /// Agent calls collapsed onto it (their descriptions share a prefix),
+    /// and then each becomes its own card labelled by its tool call.
+    /// Joining them into one body instead would push the earlier results
+    /// — and their labels — out of the transcript card's line tail,
+    /// leaving a finished agent's output unreachable.
+    fn captured_cards(
+        agent_id: &str,
+        outputs: &[super::tasks::CapturedOutput],
+    ) -> Vec<(String, String)> {
         match outputs {
-            [only] => only.body.clone(),
+            [only] => vec![(agent_id.to_string(), only.body.clone())],
             many => many
                 .iter()
-                .map(|o| format!("── call {} ──\n{}", o.call_id, o.body))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+                .map(|o| (format!("{agent_id} · call {}", o.call_id), o.body.clone()))
+                .collect(),
         }
     }
 
@@ -2279,13 +2282,13 @@ impl App {
         // can fold onto a single row. Show what is already in hand *and*
         // still ask for the file, so neither source is hidden behind the
         // other.
-        let captured = (!row.outputs.is_empty())
-            .then(|| (row.agent_id.clone(), Self::captured_body(&row.outputs)));
+        let captured = Self::captured_cards(&row.agent_id, &row.outputs);
         let task_id = row.task_id.clone();
-        let had_captured = captured.is_some();
+        let had_captured = !captured.is_empty();
         // Inline results were captured when the subagent finished,
-        // because an inline run has no output file to read.
-        if let Some((id, body)) = captured {
+        // because an inline run has no output file to read. One card each,
+        // so each result gets its own line tail.
+        for (id, body) in captured {
             self.show_task_output(&id, Ok(body));
         }
         match task_id {
@@ -3525,6 +3528,21 @@ mod tests {
         );
     }
 
+    /// `(detail, body)` for every tool card in the transcript, in order.
+    /// Drill-in opens one card per captured result, so tests read the
+    /// list rather than only the last item.
+    fn tool_cards(app: &App) -> Vec<(String, String)> {
+        app.transcript
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Tool { detail, result, .. } => {
+                    Some((detail.clone(), result.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn bg(id: &str, state: &str, headline: &str) -> crate::ui::modern::tasks::ManagerRow {
         crate::ui::modern::tasks::ManagerRow {
             id: id.into(),
@@ -3614,18 +3632,53 @@ mod tests {
         app.tasks_selected = 0;
         app.drill_into_selected_task();
 
-        match app.transcript.last().expect("an item") {
-            TranscriptItem::Tool { result, .. } => {
-                let body = result.as_deref().unwrap();
-                assert!(body.contains("A found a bug"), "first result lost: {body}");
-                assert!(
-                    body.contains("B found nothing"),
-                    "second result lost: {body}"
-                );
-                assert!(body.contains("call-a") && body.contains("call-b"));
-            }
-            other => panic!("expected a tool card, got {other:?}"),
-        }
+        let cards = tool_cards(&app);
+        assert_eq!(cards.len(), 2, "one card per captured result");
+        assert!(cards[0].0.contains("call-a"), "label: {}", cards[0].0);
+        assert!(cards[0].1.contains("A found a bug"), "first result lost");
+        assert!(cards[1].0.contains("call-b"), "label: {}", cards[1].0);
+        assert!(cards[1].1.contains("B found nothing"), "second result lost");
+    }
+
+    /// Each captured result gets its own card, so the transcript's
+    /// line tail applies to each separately. Joined into one body, a long
+    /// later result would push every earlier one — and its label — out of
+    /// the tail entirely, leaving that agent's work unreachable.
+    #[test]
+    fn a_long_later_result_does_not_evict_an_earlier_one() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "done".into(),
+            headline: "audit".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-a".into(),
+            output: "A found a bug".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-b".into(),
+            output: (0..500)
+                .map(|i| format!("B line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        let cards = tool_cards(&app);
+        assert_eq!(cards.len(), 2);
+        assert!(
+            cards[0].1.contains("A found a bug"),
+            "the earlier result was tailed away by the later one: {}",
+            cards[0].1
+        );
+        assert!(cards[1].1.contains("B line 499"), "the later result's tail");
     }
 
     /// A manager-backed run and an inline one can fold onto one row when
