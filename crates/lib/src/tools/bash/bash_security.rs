@@ -1962,7 +1962,24 @@ fn statement_mentions_unaccounted_git_config(
         if head_is_data {
             return false;
         }
-        invocation.iter().skip(1).any(|token| {
+        // `--` ends the options of the command that owns it; what
+        // follows are its operands. `git status -- env
+        // GIT_CONFIG_GLOBAL=/tmp/g` names pathspecs, sets nothing, and
+        // reading them as an unaccounted selector made a plain status
+        // destructive. A wrapper head keeps its own grammar, where `--`
+        // still precedes assignments it really does apply.
+        let head_is_wrapper = invocation.first().is_some_and(|t| {
+            COMMAND_RUNNER_WRAPPERS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        let end = if head_is_wrapper {
+            invocation.len()
+        } else {
+            invocation
+                .iter()
+                .position(|t| unquote_token(t) == "--")
+                .unwrap_or(invocation.len())
+        };
+        invocation.iter().take(end).skip(1).any(|token| {
             split_alias_value(&unquote_token(token)).iter().any(|word| {
                 let name = word.split('=').next().unwrap_or(word);
                 // Every selector, not just the `GIT_CONFIG…` ones: a
@@ -2035,9 +2052,30 @@ fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
     // real one later, so every occurrence is walked and what they set is
     // pooled. An occurrence that reads to a command word simply
     // contributes nothing.
+    // `--` ends the options of the command that owns it, and what
+    // follows is that command's operands — `git status -- env
+    // GIT_CONFIG_GLOBAL=/tmp/g` names two pathspecs and runs no wrapper
+    // at all. Scanning them executed nothing but classified a harmless
+    // status as destructive, which `validate_input` then refused.
+    //
+    // Only when the head is not itself a wrapper: `--` belongs to the
+    // wrapper's own grammar otherwise, and `env -- GIT_CONFIG_GLOBAL=…
+    // git p` really does run git with that configuration, so truncating
+    // there would hide it.
+    let head_is_wrapper = invocation
+        .first()
+        .is_some_and(|t| COMMAND_RUNNER_WRAPPERS.contains(&name_of(t).as_str()));
+    let scan_end = if head_is_wrapper {
+        invocation.len()
+    } else {
+        invocation
+            .iter()
+            .position(|t| unquote_token(t) == "--")
+            .unwrap_or(invocation.len())
+    };
     let mut unreadable = false;
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for (at, token) in invocation.iter().enumerate() {
+    for (at, token) in invocation.iter().enumerate().take(scan_end) {
         if !COMMAND_RUNNER_WRAPPERS.contains(&name_of(token).as_str()) {
             continue;
         }
@@ -3707,6 +3745,47 @@ mod tests {
                 classify_str(cmd),
                 DestructivenessLevel::Safe,
                 "an earlier wrapper-shaped token hid the real one: {cmd}"
+            );
+        }
+    }
+
+    /// Operands after `--` are not commands. A pathspec that happens to
+    /// read `env FOO=bar` executes nothing, and treating it as a wrapper
+    /// made a plain `git status` destructive — which `validate_input`
+    /// refuses outright, so the command became unrunnable.
+    #[test]
+    fn a_pathspec_that_looks_like_a_wrapper_runs_nothing() {
+        for cmd in [
+            "git status -- env GIT_CONFIG_GLOBAL=/tmp/g",
+            "git log -- env GIT_DIR=/tmp/evil.git",
+        ] {
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "an inert pathspec was read as a wrapper: {cmd}"
+            );
+        }
+    }
+
+    /// ...but `--` belongs to the wrapper's own grammar when the wrapper
+    /// is the head: env documents `env [-] [NAME=VALUE]... [COMMAND]`,
+    /// so a selector after `--` is really handed to git. Truncating the
+    /// scan at every `--` would have hidden exactly this.
+    #[test]
+    fn a_separator_does_not_hide_a_wrappers_own_environment() {
+        for cmd in [
+            "env -- GIT_CONFIG_GLOBAL=/tmp/evil git p",
+            "env - GIT_CONFIG_GLOBAL=/tmp/evil git p",
+        ] {
+            // `Destructive`, not merely "not Safe": the selector really
+            // does reach git here. Truncating at every `--` would still
+            // leave this `Risky` — the environment reads as unread —
+            // so asserting the weaker property would pass either way
+            // and prove nothing about the boundary.
+            assert_eq!(
+                classify_str(cmd),
+                DestructivenessLevel::Destructive,
+                "a separator hid the wrapper's own environment: {cmd}"
             );
         }
     }
