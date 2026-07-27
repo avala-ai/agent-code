@@ -358,6 +358,10 @@ pub(super) async fn event_loop(
     // staged turn is released immediately.
     let mut encode_seq = 0u64;
     let mut active_encode: Option<u64> = None;
+    // The conversation the loop last saw, so a `/clear`, `/resume` or
+    // `/rewind` can be noticed the moment it happens rather than when a
+    // read that may never finish comes back.
+    let mut seen_epoch = app.conversation_epoch;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -600,6 +604,17 @@ pub(super) async fn event_loop(
                 Err(_) => {
                     app.pending_shell = Some(cmd);
                 }
+            }
+        }
+
+        // A replaced conversation invalidates a read in flight at once:
+        // waiting for it would hold every prompt in the new conversation
+        // behind an encode that belongs to a conversation nobody is
+        // looking at any more.
+        if app.conversation_epoch != seen_epoch {
+            seen_epoch = app.conversation_epoch;
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
             }
         }
 

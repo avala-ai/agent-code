@@ -453,6 +453,11 @@ pub struct App {
     /// again. A deque because a second one can be held before the first
     /// has gone, and the order they were submitted in is the order they
     /// must be sent in.
+    /// Set when a cancel was asked for *in order to send something else*
+    /// (interject, queue send-now). A staged prompt alone cannot tell the
+    /// difference: a slash command can stage one at any moment, including
+    /// while the user is pressing Ctrl+C to stop everything.
+    pub cancel_is_interject: bool,
     #[allow(clippy::type_complexity)]
     pub deferred_prompts:
         std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
@@ -640,6 +645,7 @@ impl App {
             model_picker: None,
             pending_images: Vec::new(),
             pending_attachments: Vec::new(),
+            cancel_is_interject: false,
             deferred_prompts: std::collections::VecDeque::new(),
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
@@ -2055,6 +2061,7 @@ impl App {
             ));
             // enqueue_turn clears input (already empty) and sets pending_submit.
             self.enqueue_turn(text);
+            self.cancel_is_interject = true;
             self.request_cancel();
         } else {
             self.enqueue_turn(text);
@@ -2677,6 +2684,7 @@ impl App {
                 "queue send-now — cancelling turn…".into(),
             ));
             self.enqueue_turn(text);
+            self.cancel_is_interject = true;
             self.request_cancel();
         } else {
             self.enqueue_turn(text);
@@ -2760,13 +2768,14 @@ impl App {
 
     /// Drop anything that would send itself after a cancel.
     ///
-    /// Interject cancels the live turn *in order to* send something it has
-    /// already staged, so a prompt waiting to submit means this is a
-    /// redirect rather than a stop — and a held prompt keeps its place
-    /// behind it. A bare Ctrl+C stages nothing, and then nothing may
-    /// follow on its own.
+    /// Interject and queue send-now cancel the live turn *in order to*
+    /// send something else, and say so; a held prompt then keeps its place
+    /// behind that. Every other cancel is a stop, and nothing may follow
+    /// it on its own — a prompt merely sitting in `pending_submit` proves
+    /// nothing, since a slash command can stage one at any moment,
+    /// including while the user is pressing Ctrl+C.
     pub fn cancel_pending_followups(&mut self) {
-        if self.pending_submit.is_none() {
+        if !std::mem::take(&mut self.cancel_is_interject) {
             self.deferred_prompts.clear();
         }
     }
@@ -5388,6 +5397,8 @@ mod tests {
         let (_dir, mut app) = app_in_workspace();
         app.deferred_prompts
             .push_back(("earlier @a.png".into(), vec![png_block()]));
+        // Interject only cancels when there is a turn to cancel.
+        app.phase = Phase::Streaming;
         type_input(&mut app, "do this instead");
         app.interject();
         assert_eq!(app.pending_submit.as_deref(), Some("do this instead"));
@@ -5399,6 +5410,44 @@ mod tests {
         );
     }
 
+    /// A staged prompt proves nothing on its own: a slash command can put
+    /// one there at any moment, including while the user is pressing
+    /// Ctrl+C to stop everything. Only an interject says it cancelled in
+    /// order to send.
+    #[test]
+    fn a_bare_cancel_drops_held_prompts_even_with_a_command_staged() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        // A slash command stages its prompt directly, without interjecting.
+        app.enqueue_turn_from_command("show me the diff".into());
+        assert!(app.pending_submit.is_some(), "precondition");
+
+        app.cancel_pending_followups();
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "a bare cancel let an image prompt follow on its own"
+        );
+    }
+
+    /// Queue send-now is the same bargain as interject: it cancels in
+    /// order to send, so held prompts keep their place.
+    #[test]
+    fn queue_send_now_keeps_held_prompts() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.queue.push_back("queued work".into());
+        app.phase = Phase::Streaming;
+        app.queue_send_selected();
+
+        app.cancel_pending_followups();
+        assert!(
+            !app.deferred_prompts.is_empty(),
+            "queue send-now dropped a held prompt"
+        );
+    }
+
     /// Dropping the read in flight says nothing about prompts already
     /// held: whether those survive is the cancel policy's call, and an
     /// interject that lands mid-encode must not lose them.
@@ -5407,6 +5456,7 @@ mod tests {
         let (_dir, mut app) = app_in_workspace();
         app.deferred_prompts
             .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.phase = Phase::Streaming;
         type_input(&mut app, "do this instead");
         app.interject();
 
