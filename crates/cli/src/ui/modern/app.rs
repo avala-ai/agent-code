@@ -1238,6 +1238,10 @@ impl App {
     }
 
     pub fn submit(&mut self) {
+        // A half-typed vi operator must not outlive the draft it was
+        // aimed at, or the first key of the next one is eaten as its
+        // motion.
+        self.vi_pending_d = false;
         let text = self.input.trim().to_string();
         if text.is_empty() {
             // Empty-Enter while idle sends the next queued prompt — after an

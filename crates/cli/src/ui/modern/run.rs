@@ -1189,6 +1189,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Esc in normal mode aborts a half-typed operator before it means
+    // anything else, as vi does. Without this the pending `d` would
+    // survive to eat the next key.
+    if app.in_normal_mode() && is_esc(&key) && app.front_modal().is_none() && app.vi_pending_d {
+        app.vi_pending_d = false;
+        app.dirty = true;
+        return;
+    }
+
     // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
     if is_esc(&key) {
         if app.selection.is_some() {
@@ -1251,8 +1260,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.vi_normal_key(c);
                 return;
             }
-            // Enter still submits from normal mode; anything else falls
-            // through so Ctrl chords, arrows and Backspace keep working.
+            // Enter submits from normal mode even when Ctrl+M multiline
+            // is on: a draft being navigated in normal mode is finished,
+            // not being newline-edited. An empty composer still falls
+            // through, so the queue pane and task drill-in keep Enter.
+            KeyCode::Enter if key.modifiers.is_empty() && !app.input.is_empty() => {
+                app.submit();
+                return;
+            }
+            // Anything else falls through so Ctrl chords, arrows,
+            // Alt/Shift+Enter and Backspace keep working.
             _ => {}
         }
     }
@@ -2173,6 +2190,81 @@ mod tests {
             !app.command_palette_open(),
             "`?` opened the palette while editing in normal mode"
         );
+    }
+
+    /// Enter submits from normal mode even with Ctrl+M multiline on.
+    /// Falling through reached the plain-Enter arm, which inserts a
+    /// newline when `multiline_mode` is set — so normal-mode users could
+    /// not submit at all without toggling multiline off.
+    #[test]
+    fn enter_submits_from_normal_mode_even_in_multiline() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.multiline_mode = true;
+        app.input = "ask something".into();
+        app.cursor = 3;
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            !app.input.contains('\n'),
+            "Enter inserted a newline instead of submitting: {:?}",
+            app.input
+        );
+        assert!(
+            app.pending_submit.is_some() || app.input.is_empty(),
+            "Enter did not submit from normal mode"
+        );
+
+        // Alt+Enter still makes a newline: only plain Enter is claimed.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one".into();
+        app.cursor = 3;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(
+            app.input.contains('\n'),
+            "Alt+Enter stopped inserting a newline in normal mode"
+        );
+
+        // An empty composer still falls through to the queue/tasks Enter.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+    }
+
+    /// A pending `d` must not outlive the draft: `d` then Enter used to
+    /// leave the operator armed, so the first key of the next prompt was
+    /// swallowed as its motion.
+    #[test]
+    fn pending_operator_does_not_survive_submit_or_escape() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello".into();
+        app.cursor = 0;
+
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d, "`d` did not arm the operator");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            !app.vi_pending_d,
+            "the pending `d` survived the submit and will eat the next key"
+        );
+
+        // Esc aborts the operator rather than leaving it armed.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello".into();
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.vi_pending_d, "Esc left the operator armed");
+        assert_eq!(app.input, "hello", "Esc cleared the draft mid-operator");
+        assert!(!app.quit_armed, "aborting an operator armed quit");
     }
 
     /// `/emacs` must not advertise composer bindings that do not exist.
