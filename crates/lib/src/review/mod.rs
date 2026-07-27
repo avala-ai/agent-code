@@ -47,6 +47,19 @@ pub struct ResolvedReview {
     pub hint: String,
 }
 
+/// A target that cannot be turned into a review.
+///
+/// Surfaced to the user instead of being reviewed anyway: a target that
+/// silently resolves to the wrong thing produces a *clean* review of
+/// code nobody asked about, which is worse than an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidTarget {
+    /// What the user typed.
+    pub input: String,
+    /// One line explaining why, for a UI.
+    pub reason: String,
+}
+
 /// Parse a `/review` argument.
 ///
 /// Bare `/review` means the working tree, which is what someone asking
@@ -79,11 +92,27 @@ pub fn parse_target(args: Option<&str>) -> ReviewTarget {
 
 /// Resolve a target into the prompt the reviewer receives.
 ///
-/// Resolution can touch git (to find a merge base). A git failure
-/// degrades to a prompt that tells the reviewer how to find the merge
-/// base itself, rather than failing the review outright — a review that
-/// runs with a slightly vaguer instruction beats no review.
-pub fn resolve(target: ReviewTarget, cwd: &Path) -> ResolvedReview {
+/// Resolution can touch git (to find a merge base). A git failure on the
+/// *merge base* degrades to a prompt that tells the reviewer how to find
+/// it, rather than failing the review outright — a review that runs with
+/// a slightly vaguer instruction beats no review.
+///
+/// A commit target gets no such benefit of the doubt: it names the one
+/// thing under review, so an unresolvable one is an error. See
+/// [`validate_revision`].
+pub fn resolve(target: ReviewTarget, cwd: &Path) -> Result<ResolvedReview, InvalidTarget> {
+    // Validate before anything is interpolated into a command.
+    let target = match target {
+        ReviewTarget::Commit { sha, title } => ReviewTarget::Commit {
+            sha: validate_commit(cwd, &sha)?,
+            title,
+        },
+        ReviewTarget::BaseBranch { base } => {
+            validate_revision(&base)?;
+            ReviewTarget::BaseBranch { base }
+        }
+        other => other,
+    };
     let hint = hint_for(&target);
     let prompt = match &target {
         ReviewTarget::Uncommitted => UNCOMMITTED_PROMPT.to_string(),
@@ -120,11 +149,52 @@ pub fn resolve(target: ReviewTarget, cwd: &Path) -> ResolvedReview {
              to ground your findings. Report prioritized, actionable findings."
         ),
     };
-    ResolvedReview {
+    Ok(ResolvedReview {
         target,
         prompt,
         hint,
+    })
+}
+
+/// Reject anything that is not a single revision word.
+///
+/// Everything here ends up interpolated into a command the reviewer is
+/// told to run, and git's own usage (`git show [<options>] <object>...`)
+/// parses a leading `-` as an option. `/review commit --no-patch` would
+/// otherwise become `git show --no-patch`, which *succeeds* — it shows
+/// HEAD with no diff — so the reviewer inspects the wrong commit and
+/// comes back clean.
+fn validate_revision(rev: &str) -> Result<(), InvalidTarget> {
+    let invalid = |reason: &str| InvalidTarget {
+        input: rev.to_string(),
+        reason: reason.to_string(),
+    };
+    if rev.starts_with('-') {
+        return Err(invalid("that is a git option, not a revision"));
     }
+    if rev.split_whitespace().count() != 1 {
+        return Err(invalid("pass exactly one revision"));
+    }
+    Ok(())
+}
+
+/// Resolve a commit target to a full SHA, or fail.
+///
+/// Unlike the merge base, this cannot degrade to a vaguer instruction:
+/// the commit *is* the thing under review, so a target git cannot name
+/// exactly one commit for is an error rather than a review of whatever
+/// git picks instead.
+fn validate_commit(cwd: &Path, sha: &str) -> Result<String, InvalidTarget> {
+    validate_revision(sha)?;
+    // `^{commit}` makes the peel explicit: a tree or blob is not a commit.
+    run_git(
+        cwd,
+        &["rev-parse", "--verify", &format!("{sha}^{{commit}}")],
+    )
+    .ok_or_else(|| InvalidTarget {
+        input: sha.to_string(),
+        reason: "no such commit in this repository".to_string(),
+    })
 }
 
 const UNCOMMITTED_PROMPT: &str = "Review the current uncommitted changes — staged, unstaged and \
@@ -250,17 +320,21 @@ mod tests {
     #[test]
     fn every_prompt_names_a_command_to_run() {
         let cwd = std::env::current_dir().unwrap();
-        for target in [
+        let mut targets = vec![
             ReviewTarget::Uncommitted,
             ReviewTarget::BaseBranch {
                 base: "main".into(),
             },
-            ReviewTarget::Commit {
-                sha: "deadbeef".into(),
+        ];
+        // A commit target must name a real commit now, so use this one.
+        if let Some(head) = run_git(&cwd, &["rev-parse", "HEAD"]) {
+            targets.push(ReviewTarget::Commit {
+                sha: head,
                 title: None,
-            },
-        ] {
-            let r = resolve(target.clone(), &cwd);
+            });
+        }
+        for target in targets {
+            let r = resolve(target.clone(), &cwd).expect("a valid target must resolve");
             assert!(
                 r.prompt.contains("git "),
                 "{target:?} produced a prompt with no command: {}",
@@ -276,16 +350,59 @@ mod tests {
     #[test]
     fn a_commit_target_mentions_the_sha_and_title() {
         let cwd = std::env::current_dir().unwrap();
+        let Some(head) = run_git(&cwd, &["rev-parse", "HEAD"]) else {
+            return; // not a git checkout; nothing to resolve against
+        };
         let r = resolve(
             ReviewTarget::Commit {
-                sha: "abc1234".into(),
+                // Abbreviated on input, full SHA in the prompt.
+                sha: head[..8].to_string(),
                 title: Some("fix the parser".into()),
             },
             &cwd,
-        );
-        assert!(r.prompt.contains("abc1234"));
+        )
+        .expect("HEAD must resolve");
+        assert!(r.prompt.contains(&head), "prompt: {}", r.prompt);
         assert!(r.prompt.contains("fix the parser"));
         assert!(r.hint.contains("fix the parser"));
+    }
+
+    /// Every value here is interpolated into a command the reviewer is
+    /// told to run. `git show --no-patch` succeeds — it shows HEAD with
+    /// no diff — so an unvalidated target yields a confident review of a
+    /// commit nobody asked about. Fail closed instead.
+    #[test]
+    fn a_commit_target_that_is_not_one_commit_is_rejected() {
+        let cwd = std::env::current_dir().unwrap();
+        for bad in ["--no-patch", "-p", "HEAD --stat", "no-such-ref-xyz"] {
+            let err = resolve(
+                ReviewTarget::Commit {
+                    sha: bad.into(),
+                    title: None,
+                },
+                &cwd,
+            )
+            .expect_err("`{bad}` was accepted as a commit");
+            assert_eq!(err.input, bad);
+            assert!(!err.reason.is_empty(), "no reason given for `{bad}`");
+        }
+        // The same goes for a base branch: it reaches `git merge-base`.
+        for bad in ["--no-patch", "main extra"] {
+            assert!(
+                resolve(ReviewTarget::BaseBranch { base: bad.into() }, &cwd).is_err(),
+                "`{bad}` was accepted as a base branch"
+            );
+        }
+        // And a valid one still works.
+        assert!(
+            resolve(
+                ReviewTarget::BaseBranch {
+                    base: "main".into()
+                },
+                &cwd
+            )
+            .is_ok()
+        );
     }
 
     /// A repo with no git (or an unknown base) must still produce a
@@ -299,7 +416,8 @@ mod tests {
                 base: "nonexistent-branch-xyz".into(),
             },
             tmp.path(),
-        );
+        )
+        .expect("an unknown base degrades, it does not fail");
         assert!(r.prompt.contains("merge-base"), "prompt: {}", r.prompt);
         assert!(r.prompt.contains("nonexistent-branch-xyz"));
     }
@@ -318,7 +436,8 @@ mod tests {
                 base: "HEAD".into(),
             },
             &cwd,
-        );
+        )
+        .expect("HEAD must resolve");
         assert!(
             r.prompt.contains(&head),
             "merge base was not resolved into the prompt: {}",
@@ -339,7 +458,8 @@ mod tests {
                     base: "HEAD".into(),
                 },
                 &cwd,
-            );
+            )
+            .expect("HEAD must resolve");
             assert!(
                 r.prompt.contains(&format!("git diff {head} HEAD")),
                 "resolved base prompt lost the two-commit diff: {}",
@@ -360,7 +480,8 @@ mod tests {
                 base: "nonexistent-branch-xyz".into(),
             },
             tmp.path(),
-        );
+        )
+        .expect("an unknown base degrades, it does not fail");
         assert!(
             d.prompt.contains("<merge-base> HEAD"),
             "degraded base prompt lost the two-commit diff: {}",

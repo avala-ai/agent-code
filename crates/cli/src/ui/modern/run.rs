@@ -2834,7 +2834,8 @@ mod tests {
                 base: "main".into(),
             },
             std::path::Path::new("/tmp"),
-        );
+        )
+        .expect("a plain branch name is a valid target");
         // What the `/review` arm prints, colour codes and all.
         let captured = format!("\u{1b}[2mReviewing {}…\u{1b}[0m\n", resolved.hint);
 

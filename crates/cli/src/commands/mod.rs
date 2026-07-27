@@ -1315,9 +1315,21 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             use agent_code_lib::review;
             let target = review::parse_target(args);
             let cwd = std::path::PathBuf::from(&engine.state().cwd);
-            let resolved = review::resolve(target, &cwd);
-            println!("Reviewing {}…", resolved.hint);
-            CommandResult::Prompt(format!("{}\n\n{}", review::RUBRIC, resolved.prompt))
+            match review::resolve(target, &cwd) {
+                Ok(resolved) => {
+                    println!("Reviewing {}…", resolved.hint);
+                    CommandResult::Prompt(format!("{}\n\n{}", review::RUBRIC, resolved.prompt))
+                }
+                // Spending a turn reviewing the wrong thing is worse than
+                // saying no: report and stop.
+                Err(invalid) => {
+                    println!("Cannot review '{}': {}", invalid.input, invalid.reason);
+                    println!(
+                        "Usage: /review [uncommitted | base <branch> | commit <sha> | <instructions>]"
+                    );
+                    CommandResult::Handled
+                }
+            }
         }
         Some("doctor") => {
             // Run the full async diagnostics synchronously via a blocking call.
