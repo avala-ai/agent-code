@@ -18,8 +18,8 @@ pub struct Theme {
     pub tool: Color,
     pub plan: Color,
     pub text: Color,
-    /// Foreground for text sitting on a filled accent/warning badge.
-    pub on_accent: Color,
+    /// The theme's own background.
+    pub bg: Color,
     /// Inline-code and code-block foreground / background.
     pub code_fg: Color,
     pub code_bg: Color,
@@ -123,7 +123,7 @@ impl From<legacy::Theme> for Theme {
             tool: theme.tool,
             plan: theme.plan,
             text: theme.text,
-            on_accent: theme.on_accent,
+            bg: theme.bg,
             code_fg: theme.code_fg,
             code_bg: theme.code_bg,
             diff_add: theme.diff_add,
@@ -357,7 +357,7 @@ fn adapt_for_emit_with(theme: Theme, mode: super::color_emit::EmitMode) -> Theme
         tool: adapt(theme.tool),
         plan: adapt(theme.plan),
         text: adapt(theme.text),
-        on_accent: adapt(theme.on_accent),
+        bg: adapt(theme.bg),
         code_fg: adapt(theme.code_fg),
         code_bg: adapt(theme.code_bg),
         diff_add: adapt(theme.diff_add),
@@ -420,7 +420,7 @@ mod tests {
             ("tool", theme.tool),
             ("plan", theme.plan),
             ("text", theme.text),
-            ("on_accent", theme.on_accent),
+            ("bg", theme.bg),
             ("code_fg", theme.code_fg),
             ("code_bg", theme.code_bg),
             ("diff_add", theme.diff_add),

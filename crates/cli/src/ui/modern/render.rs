@@ -1057,7 +1057,7 @@ fn apply_selection_highlight(
             *line = Line::from(Span::styled(
                 plain,
                 Style::default()
-                    .fg(palette().on_accent)
+                    .fg(super::colors::on_fill(accent))
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -1088,7 +1088,7 @@ fn apply_search_highlight(
         *line = Line::from(Span::styled(
             plain,
             Style::default()
-                .fg(palette().on_accent)
+                .fg(super::colors::on_fill(palette().warning))
                 .bg(palette().warning)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -1180,7 +1180,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 spans.push(Span::styled(
                     " action required ",
                     Style::default()
-                        .fg(palette().on_accent)
+                        .fg(super::colors::on_fill(warning))
                         .bg(warning)
                         .add_modifier(Modifier::BOLD),
                 ));
@@ -1873,36 +1873,42 @@ mod tests {
         );
     }
 
-    /// The two filled highlight bars used to paint `Color::Black` text on
-    /// a coloured fill. That is wrong twice over: on a light theme the
-    /// fill is dark, and under `NO_COLOR` the fill collapses to the
-    /// terminal default while the black text stays black — invisible on
-    /// any dark terminal. Both foregrounds now come from `on_accent`.
+    /// The filled highlight bars used to paint `Color::Black` text on a
+    /// coloured fill. That is wrong twice over: under `NO_COLOR` the fill
+    /// collapses to the terminal default while the black text stays
+    /// black — invisible on any dark terminal — and on a light theme the
+    /// fill is dark enough that black was already a poor choice.
+    ///
+    /// The replacement is not a fixed foreground either: `on_fill` picks
+    /// against the actual fill, so the bar clears a readable contrast
+    /// ratio on light and dark themes alike.
     #[test]
     fn filled_highlights_take_their_foreground_from_the_palette() {
         use crate::ui::color_emit::{EmitMode, pin_mode};
         use ratatui::style::Color;
         let _g = crate::ui::theme::test_lock();
 
-        // Light theme: the badge foreground must follow the theme
-        // background, not a hardcoded black.
-        crate::ui::theme::init("solarized-light");
-        let light_on_accent = palette().on_accent;
-        assert_ne!(
-            light_on_accent,
-            Color::Black,
-            "a light theme must not paint badge text black"
-        );
         let view = vec![Line::from("match here")];
         let sel = super::super::app::TextSelection {
             start_line: 0,
             end_line: 0,
         };
-        let painted = apply_selection_highlight(view.clone(), 0, Some(sel));
-        assert_eq!(painted[0].spans[0].style.fg, Some(light_on_accent));
+
+        for theme in ["one-dark", "solarized-light", "dark-ansi", "light-ansi"] {
+            crate::ui::theme::init(theme);
+            let painted = apply_selection_highlight(view.clone(), 0, Some(sel));
+            let style = painted[0].spans[0].style;
+            assert_eq!(
+                style.fg,
+                Some(crate::ui::modern::colors::on_fill(palette().accent)),
+                "{theme}: selection bar bypassed on_fill"
+            );
+            assert_ne!(style.fg, style.bg, "{theme}: selection bar is invisible");
+        }
 
         // Mono: the fill and its foreground both collapse to the default,
         // so the row stays legible instead of going black-on-black.
+        crate::ui::theme::init("one-dark");
         let _mode = pin_mode(EmitMode::Mono);
         let painted = apply_selection_highlight(view, 0, Some(sel));
         assert_eq!(painted[0].spans[0].style.fg, Some(Color::Reset));

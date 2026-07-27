@@ -36,11 +36,9 @@ pub struct Theme {
     pub plan: Color,
     /// Primary text (usually terminal default).
     pub text: Color,
-    /// Text drawn *on top of* a filled accent/warning/error badge. The
-    /// theme's own background — the colour those fills were chosen to
-    /// contrast against — so it stays legible on light themes too, where
-    /// a hardcoded black would not.
-    pub on_accent: Color,
+    /// The theme's own background. Badge foregrounds are picked against
+    /// it (see `colors::on_fill`) rather than hardcoded.
+    pub bg: Color,
     /// Inline-code and code-block foreground.
     pub code_fg: Color,
     /// Inline-code and code-block background.
@@ -261,7 +259,7 @@ fn theme_from_palette(p: &Palette) -> Theme {
         tool: p.cyan,
         plan: p.purple,
         text: p.fg,
-        on_accent: p.bg,
+        bg: p.bg,
         code_fg: p.yellow,
         // `mix` passes its *first* argument through unchanged for named
         // (non-RGB) colours, so the background is written first: on the
@@ -812,21 +810,9 @@ mod tests {
         for p in standard_palettes() {
             let t = theme_from_palette(&p);
             let id = &p.id;
-            assert!(
-                !matches!(t.on_accent, Color::Reset),
-                "{id}: on_accent unset"
-            );
+            assert!(!matches!(t.bg, Color::Reset), "{id}: bg unset");
             assert!(!matches!(t.code_fg, Color::Reset), "{id}: code_fg unset");
             assert!(!matches!(t.code_bg, Color::Reset), "{id}: code_bg unset");
-            // Text on a filled badge must not be the fill colour.
-            assert_ne!(
-                t.on_accent, t.accent,
-                "{id}: badge text invisible on the accent fill"
-            );
-            assert_ne!(
-                t.on_accent, t.warning,
-                "{id}: badge text invisible on the warning fill"
-            );
             assert_ne!(
                 t.code_fg, t.code_bg,
                 "{id}: code text invisible on its own background"
@@ -843,13 +829,13 @@ mod tests {
         }
     }
 
-    /// Badge text follows the theme background, so a light theme gets a
-    /// light foreground on its filled bars instead of a hardcoded black.
+    /// The background slot is the theme's own background, unmodified —
+    /// it is one of the two candidates `colors::on_fill` chooses between.
     #[test]
-    fn on_accent_follows_the_theme_background() {
+    fn bg_slot_is_the_theme_background() {
         let light = lookup_palette("solarized-light").expect("solarized-light exists");
         let t = theme_from_palette(&light);
-        assert_eq!(as_rgb(t.on_accent), as_rgb(light.bg));
+        assert_eq!(as_rgb(t.bg), as_rgb(light.bg));
         assert!(!t.is_dark);
     }
 

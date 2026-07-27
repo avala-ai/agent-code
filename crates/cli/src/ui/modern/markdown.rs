@@ -46,18 +46,40 @@ pub(super) fn syntax_set() -> &'static SyntaxSet {
     SS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
+/// Syntax-highlighting theme, matched to the active product theme's
+/// polarity.
+///
+/// The highlighter ships its own palette, and its foregrounds are drawn
+/// for a particular background: `base16-ocean.dark`'s pale greens and
+/// blues are illegible on the near-white `code_bg` a light theme
+/// derives. Now that the code background follows the theme, the syntax
+/// theme has to follow it too.
 pub(super) fn code_theme() -> &'static Theme {
-    static TS: OnceLock<Theme> = OnceLock::new();
-    TS.get_or_init(|| {
-        let mut set = ThemeSet::load_defaults();
-        set.themes.remove("base16-ocean.dark").unwrap_or_else(|| {
-            ThemeSet::load_defaults()
-                .themes
-                .into_values()
-                .next()
-                .unwrap()
-        })
-    })
+    static DARK: OnceLock<Theme> = OnceLock::new();
+    static LIGHT: OnceLock<Theme> = OnceLock::new();
+    if crate::ui::theme::current().is_dark {
+        DARK.get_or_init(|| load_code_theme(&["base16-ocean.dark"]))
+    } else {
+        // InspiredGitHub ahead of base16-ocean.light: the base16 light
+        // palettes are deliberately low-contrast, and their keyword
+        // purple only reaches about 2.4:1 on a cream code background.
+        LIGHT.get_or_init(|| load_code_theme(&["InspiredGitHub", "base16-ocean.light"]))
+    }
+}
+
+/// First of `names` present in syntect's defaults, or any theme at all
+/// rather than panicking on a bundled-asset change.
+fn load_code_theme(names: &[&str]) -> Theme {
+    let mut set = ThemeSet::load_defaults();
+    for name in names {
+        if let Some(t) = set.themes.remove(*name) {
+            return t;
+        }
+    }
+    set.themes
+        .into_values()
+        .next()
+        .expect("syntect ships at least one default theme")
 }
 
 /// Render markdown source to styled lines.
@@ -376,7 +398,7 @@ impl Builder {
             Span::styled(
                 format!(" {tag} "),
                 Style::default()
-                    .fg(palette().on_accent)
+                    .fg(super::colors::on_fill(accent))
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -488,6 +510,46 @@ mod tests {
             offenders.is_empty(),
             "markdown still carries colour under NO_COLOR: {offenders:?}"
         );
+    }
+
+    /// The syntax theme has to follow the product theme's polarity.
+    ///
+    /// `code_bg` now comes from the palette, so on a light theme the
+    /// code block is near-white. The highlighter kept its own fixed
+    /// `base16-ocean.dark` palette, whose pale foregrounds were drawn
+    /// for a dark background — light-on-light, unreadable. Every
+    /// highlighted run must clear a legibility floor against the
+    /// background it is actually painted on.
+    #[test]
+    fn highlighting_stays_legible_against_the_code_background() {
+        use super::super::colors::{contrast, luminance};
+        let _g = crate::ui::theme::test_lock();
+        for name in ["one-dark", "solarized-light"] {
+            crate::ui::theme::init(name);
+            let bg = palette().code_bg;
+            let bg_l = luminance(bg).expect("code_bg is rgb on these themes");
+            let md = render_markdown("```rust\nfn main() { let x = 1; }\n```\n");
+            let mut checked = 0;
+            for line in &md.lines {
+                for span in &line.spans {
+                    if span.style.bg != Some(bg) || span.content.trim().is_empty() {
+                        continue;
+                    }
+                    let Some(fg_l) = span.style.fg.and_then(luminance) else {
+                        continue;
+                    };
+                    let ratio = contrast(fg_l, bg_l);
+                    assert!(
+                        ratio >= 3.0,
+                        "{name}: {:?} reaches only {ratio:.2}:1 on {bg:?}",
+                        span.content
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "{name}: no highlighted runs were checked");
+        }
+        crate::ui::theme::init("one-dark");
     }
 
     /// The inline-code chip and the fenced block share one pair of
