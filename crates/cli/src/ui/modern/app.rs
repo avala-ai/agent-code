@@ -916,9 +916,15 @@ impl App {
                     input_preview,
                     respond,
                 }));
-                // HITL always wins: drop the Ctrl+P palette so keys reach
-                // the modal (y/a/n, Esc, Ctrl+C) instead of the filter.
+                // HITL always wins: drop the Ctrl+P palette and the
+                // `/resume` picker so keys reach the modal (y/a/n, Esc,
+                // Ctrl+C) instead of the filter. Rendering already hides
+                // both behind the modal; leaving one *open* made the
+                // visible modal look unresponsive while an invisible
+                // overlay ate the keys — and could schedule a resume the
+                // user never saw themselves choose.
                 self.command_palette = None;
+                self.close_session_picker();
                 self.show_shortcuts = false;
                 // Re-arm answer grace so in-flight typing cannot auto-allow.
                 if self.modals.len() == 1 {
@@ -940,6 +946,7 @@ impl App {
                 self.modals
                     .push_back(Modal::Plan(PlanReview { plan_md, path }));
                 self.command_palette = None;
+                self.close_session_picker();
                 self.show_shortcuts = false;
                 if self.modals.len() == 1 {
                     self.reset_hitl_answer_arm();
@@ -964,6 +971,7 @@ impl App {
                         respond,
                     }));
                     self.command_palette = None;
+                    self.close_session_picker();
                     self.show_shortcuts = false;
                     if self.modals.len() == 1 {
                         self.reset_hitl_answer_arm();

@@ -96,8 +96,14 @@ pub struct RestoredState {
 /// session shows the same cards it did live, rather than a wall of raw
 /// blocks. Meta messages (tool results, context injection) are skipped:
 /// they are conversation plumbing the user never saw the first time.
+///
+/// `show_thinking` mirrors `App::show_thinking_blocks` so stored
+/// reasoning is reconstructed on exactly the same terms it was streamed
+/// live — restoring a session must not turn thinking blocks on for a
+/// user who has them off, nor drop them for a user who has them on.
 pub fn transcript_from_messages(
     messages: &[agent_code_lib::llm::message::Message],
+    show_thinking: bool,
 ) -> Vec<TranscriptItem> {
     use agent_code_lib::llm::message::{ContentBlock, Message};
     use std::collections::HashMap;
@@ -156,6 +162,20 @@ pub fn transcript_from_messages(
                     match block {
                         ContentBlock::Text { text } if !text.trim().is_empty() => {
                             items.push(TranscriptItem::Assistant(text.clone()));
+                        }
+                        // Reasoning was on screen live via
+                        // `EngineEvent::Thinking`; the stored messages
+                        // still carry it, so a resumed transcript that
+                        // dropped it would be missing content the user
+                        // had already seen. No duration is recorded on
+                        // disk, hence `None` (renders un-timed).
+                        ContentBlock::Thinking { thinking, .. }
+                            if show_thinking && !thinking.trim().is_empty() =>
+                        {
+                            items.push(TranscriptItem::Thinking {
+                                text: thinking.clone(),
+                                duration_ms: None,
+                            });
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let (result, is_error) = results
@@ -498,7 +518,7 @@ mod tests {
             }),
         ];
 
-        let items = transcript_from_messages(&messages);
+        let items = transcript_from_messages(&messages, true);
         assert_eq!(items.len(), 3, "got {items:?}");
         assert!(matches!(&items[0], TranscriptItem::User(t) if t == "add a null check"));
         assert!(matches!(&items[1], TranscriptItem::Assistant(t) if t == "On it."));
@@ -534,7 +554,7 @@ mod tests {
             is_meta: true,
             is_compact_summary: false,
         })];
-        assert!(transcript_from_messages(&messages).is_empty());
+        assert!(transcript_from_messages(&messages, true).is_empty());
     }
 
     /// `/resume` must not scan the sessions directory on the thread that
@@ -612,13 +632,84 @@ mod tests {
             }),
             user("now add tests"),
         ];
-        let items = transcript_from_messages(&messages);
+        let items = transcript_from_messages(&messages, true);
         assert_eq!(items.len(), 2, "got {items:?}");
         assert!(
             matches!(&items[0], TranscriptItem::System(t) if t.contains("refactored the auth module")),
             "the compact summary was dropped: {items:?}"
         );
         assert!(matches!(&items[1], TranscriptItem::User(t) if t == "now add tests"));
+    }
+
+    fn thinking_turn() -> Vec<Message> {
+        vec![Message::Assistant(AssistantMessage {
+            uuid: Uuid::new_v4(),
+            timestamp: String::new(),
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "the null check belongs in the caller".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "Adding it now.".into(),
+                },
+            ],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            request_id: None,
+        })]
+    }
+
+    /// Reasoning was on screen live; the stored messages still carry it,
+    /// so a resumed transcript that drops it is missing content the user
+    /// had already read.
+    #[test]
+    fn stored_thinking_is_restored_when_thinking_blocks_are_shown() {
+        let items = transcript_from_messages(&thinking_turn(), true);
+        assert_eq!(items.len(), 2, "got {items:?}");
+        assert!(
+            matches!(&items[0], TranscriptItem::Thinking { text, duration_ms }
+                if text.contains("belongs in the caller") && duration_ms.is_none()),
+            "stored reasoning was dropped: {items:?}"
+        );
+        assert!(matches!(&items[1], TranscriptItem::Assistant(t) if t == "Adding it now."));
+    }
+
+    /// ...and restoring must not switch thinking blocks *on* for a user
+    /// who keeps them off.
+    #[test]
+    fn stored_thinking_is_omitted_when_thinking_blocks_are_hidden() {
+        let items = transcript_from_messages(&thinking_turn(), false);
+        assert_eq!(items.len(), 1, "got {items:?}");
+        assert!(matches!(&items[0], TranscriptItem::Assistant(_)));
+    }
+
+    /// Rendering hides the picker behind a HITL modal, so leaving it
+    /// *open* handed y/a/n, Esc and Enter to an invisible overlay: the
+    /// visible modal looked unresponsive, and Enter could schedule a
+    /// resume the user never saw themselves choose.
+    #[test]
+    fn a_permission_ask_closes_an_open_session_picker() {
+        use super::super::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        assert!(app.session_picker_open());
+
+        let (tx, _rx) = std::sync::mpsc::channel::<PermissionResponse>();
+        app.apply_engine(EngineEvent::PermissionAsk {
+            name: "Bash".into(),
+            description: "run".into(),
+            origin: None,
+            input_preview: None,
+            respond: tx,
+        });
+
+        assert!(
+            !app.session_picker_open(),
+            "picker kept the keyboard under a HITL modal"
+        );
+        assert!(app.pending_resume.is_none(), "a resume was scheduled");
     }
 
     /// Put a permission modal in front. The receiver is returned so the

@@ -948,11 +948,16 @@ pub(super) async fn event_loop(
                 if let Some(id) = app.pending_resume.clone() {
                     resume_loading = true;
                     let tx = resume_tx.clone();
+                    // Read the display setting here: the blocking task
+                    // cannot touch `app`.
+                    let show_thinking = app.show_thinking_blocks;
                     tokio::task::spawn_blocking(move || {
                         let loaded = agent_code_lib::services::session::load_session(&id)
                             .map(|data| {
-                                let items =
-                                    super::session_picker::transcript_from_messages(&data.messages);
+                                let items = super::session_picker::transcript_from_messages(
+                                    &data.messages,
+                                    show_thinking,
+                                );
                                 Box::new((id.clone(), data, items))
                             });
                         let _ = tx.send((id, loaded));
