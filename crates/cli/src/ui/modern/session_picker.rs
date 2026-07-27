@@ -423,6 +423,15 @@ impl App {
         let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
         if let Some(payload) = self.pending_submit.take() {
+            // Its images go back with it. The descriptors and any bytes
+            // already read from them belong to *this* prompt, and the
+            // text returned to the composer still carries the `@path`
+            // mention, so resubmitting re-stages them. Leaving them here
+            // would bind them to whatever the user types next and send a
+            // file they did not mean to attach — the same hazard
+            // `enqueue_turn` and `new_conversation` clear for.
+            self.pending_images.clear();
+            self.pending_attachments.clear();
             // The line the user typed, not the engine payload: that has
             // `@path` mentions and skill bodies already inlined, and
             // handing it back would drop a whole file into the composer
@@ -1749,5 +1758,44 @@ work",
             app.transcript.last(),
             Some(TranscriptItem::System(t)) if t.contains("abcdef12")
         ));
+    }
+
+    /// A prompt submitted while the selected session is still loading is
+    /// handed back to the composer. Its images must not stay staged: the
+    /// user edits or replaces that draft, and the run loop would bind the
+    /// descriptor left behind to the *new* prompt and send a local file
+    /// they never meant to attach. The returned text still carries the
+    /// `@path` mention, so resubmitting re-stages the image and nothing
+    /// is lost by clearing.
+    #[test]
+    fn reclaiming_a_resume_time_prompt_unstages_its_images() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_submit = Some("look at @shot.png please".into());
+        app.pending_submit_display = Some("look at @shot.png please".into());
+        app.pending_images = vec![super::super::mentions::StagedImage {
+            path: tmp.path().to_path_buf(),
+            file: std::sync::Arc::new(std::fs::File::open(tmp.path()).unwrap()),
+        }];
+        app.pending_attachments = vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }];
+
+        let mut spill = Vec::new();
+        app.reclaim_staged_prompts("not sent:", &mut spill);
+
+        assert_eq!(
+            app.input, "look at @shot.png please",
+            "the prompt should come back to the composer"
+        );
+        assert!(
+            app.pending_images.is_empty(),
+            "a descriptor stayed staged and would attach to the next prompt"
+        );
+        assert!(
+            app.pending_attachments.is_empty(),
+            "encoded bytes stayed staged and would attach to the next prompt"
+        );
     }
 }
