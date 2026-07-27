@@ -35,10 +35,18 @@ const SESSION_PICKER_LIMIT: usize = 50;
 /// A session read from disk plus the transcript rebuilt from it: the id
 /// that was asked for, the restored data, and the display items. Produced
 /// on a blocking thread, applied by the event loop.
+/// A loaded session, plus the destination project's policy when the
+/// resume changes directory.
+///
+/// The policy is read in the same blocking task as the transcript, not
+/// awaited from the loop: awaiting a `spawn_blocking` handle moves the
+/// work off a worker but still suspends the single future that drives
+/// redraws and Ctrl+C, so the freeze it was meant to fix remained.
 type LoadedSession = (
     String,
     agent_code_lib::services::session::SessionData,
     Vec<super::app::TranscriptItem>,
+    Option<Result<agent_code_lib::config::Config, String>>,
 );
 
 use agent_code_lib::config::PermissionMode;
@@ -53,6 +61,31 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
+/// Whether moving from `current` to `candidate` relaxes the default.
+///
+/// Only used to decide what a project that forbids bypassing will accept
+/// from the command line: a stricter default is always allowed through,
+/// a more permissive one is refused. `Deny` is the strictest, then `Ask`,
+/// then the edit-accepting modes, then `Allow`.
+fn loosens(
+    candidate: agent_code_lib::config::PermissionMode,
+    current: agent_code_lib::config::PermissionMode,
+) -> bool {
+    use agent_code_lib::config::PermissionMode as M;
+    fn rank(m: M) -> u8 {
+        match m {
+            M::Deny => 0,
+            // Plan blocks writes, so it sits with the asking modes.
+            M::Plan => 1,
+            M::Ask => 2,
+            M::AcceptEdits => 3,
+            M::Auto => 4,
+            M::Allow => 5,
+        }
+    }
+    rank(candidate) > rank(current)
+}
+
 /// The permission policy the *operator* set on the command line.
 ///
 /// Applied at startup on top of the file and environment layers. A
@@ -88,14 +121,25 @@ impl CliPermissionOverride {
         // *into* a project that forbids it is the case this path creates,
         // and refusing it is the only answer that keeps the lock
         // meaningful.
-        if cfg.security.disable_bypass_permissions {
-            return;
-        }
-        if self.no_sandbox {
+        // A locked destination refuses overrides that *loosen* it. It is
+        // not a reason to drop restrictive ones: returning early here
+        // discarded `--permission-mode deny` too, which left the
+        // destination's own `allow` live — the lock making the session
+        // more permissive than the operator asked for is the opposite of
+        // what it is for.
+        let locked = cfg.security.disable_bypass_permissions;
+        if self.no_sandbox && !locked {
             cfg.sandbox.enabled = false;
         }
-        if let Some(mode) = self.default_mode {
+        if let Some(mode) = self.default_mode
+            && !(locked && loosens(mode, cfg.permissions.default_mode))
+        {
             cfg.permissions.default_mode = mode;
+        }
+        // The overlay can rewrite the whole rule set, so a locked project
+        // refuses it wholesale — the same call startup makes.
+        if locked {
+            return;
         }
         if let Some(overlay) = &self.overlay {
             cfg.permissions = agent_code_lib::services::coordinator::compose_permissions_overlay(
@@ -283,7 +327,13 @@ async fn finish_cwd_adoption(
     // rules, tool visibility, sandbox and bypass policy, hooks — from the
     // config the caller read before any of this began. Moving a subset
     // left part of the policy answering for the project we left.
-    let dropped_mcp = eng.adopt_project(dir, cfg.clone());
+    // The *project root*, not the directory the session was saved in. A
+    // session saved in `/repo/crate` belongs to the project at `/repo`,
+    // and scoping grants and the canonical team-memory check to the
+    // subdirectory leaves `/repo/.agent/team-memory` outside the root —
+    // unprotected exactly where a resume crossed into it.
+    let project_root = agent_code_lib::services::session_env::project_root_for(dir).await;
+    let dropped_mcp = eng.adopt_project(&project_root, cfg.clone());
     if dropped_mcp > 0 {
         app.transcript
             .push(super::app::TranscriptItem::System(format!(
@@ -651,7 +701,7 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(loaded) = pending_restore.take()
         {
-            let (id, data, items) = *loaded;
+            let (id, data, items, loaded_cfg) = *loaded;
             // Superseded by a newer selection made while this one was
             // still loading: drop it, the load arm fetches the new one.
             if app.pending_resume.as_deref() == Some(id.as_str()) {
@@ -677,38 +727,24 @@ pub(super) async fn event_loop(
                         // entered and settings that will not parse are
                         // both reasons to refuse the resume while
                         // refusing is still free.
-                        let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
-                            None
-                        } else {
-                            // Off-thread: `.agent` files can sit on a slow
-                            // or stalled mount, and the read blocks
-                            // redraws and Ctrl+C exactly like the session
-                            // read this loop already offloads. Awaited
-                            // here because the resume cannot proceed
-                            // without the answer — the loop stays
-                            // responsive because the *work* is not on it.
-                            let cwd_for_cfg = data.cwd.clone();
-                            let cli_for_cfg = cli_permissions.clone();
-                            let loaded_cfg = tokio::task::spawn_blocking(move || {
-                                load_project_config(&cwd_for_cfg, &cli_for_cfg)
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(format!("config load panicked: {e}")));
-                            match loaded_cfg {
-                                Ok(cfg) => Some(cfg),
-                                Err(e) => {
-                                    app.status_message.clear();
-                                    app.transcript.push(super::app::TranscriptItem::Error(
-                                        format!(
-                                            "could not resume {id}: its project settings could \
+                        // Already read, in the same blocking task as the
+                        // transcript — nothing here touches the
+                        // filesystem, so the loop was never suspended
+                        // waiting for it.
+                        let destination_cfg = match loaded_cfg {
+                            None => None,
+                            Some(Ok(cfg)) => Some(cfg),
+                            Some(Err(e)) => {
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::Error(format!(
+                                        "could not resume {id}: its project settings could \
                                              not be read ({e}) — staying in {previous_cwd}"
-                                        ),
-                                    ));
-                                    app.cancel_deferred_resume_work();
-                                    app.pending_resume = None;
-                                    app.dirty = true;
-                                    continue;
-                                }
+                                    )));
+                                app.cancel_deferred_resume_work();
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
                             }
                         };
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
@@ -952,7 +988,7 @@ pub(super) async fn event_loop(
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
-                    Err(_) => pending_restore = Some(Box::new((id, data, items))),
+                    Err(_) => pending_restore = Some(Box::new((id, data, items, loaded_cfg))),
                 }
             }
         }
@@ -1539,6 +1575,8 @@ pub(super) async fn event_loop(
                     // Read the display setting here: the blocking task
                     // cannot touch `app`.
                     let show_thinking = app.show_thinking_blocks;
+                    let here = app.cwd.clone();
+                    let cli_for_cfg = cli_permissions.clone();
                     tokio::task::spawn_blocking(move || {
                         let loaded = agent_code_lib::services::session::load_session(&id)
                             .map(|data| {
@@ -1546,7 +1584,15 @@ pub(super) async fn event_loop(
                                     &data.messages,
                                     show_thinking,
                                 );
-                                Box::new((id.clone(), data, items))
+                                // Same task, same thread: the destination's
+                                // policy is filesystem work too, and the
+                                // loop must not wait on it either.
+                                let cfg = if data.cwd.is_empty() || data.cwd == here {
+                                    None
+                                } else {
+                                    Some(load_project_config(&data.cwd, &cli_for_cfg))
+                                };
+                                Box::new((id.clone(), data, items, cfg))
                             });
                         let _ = tx.send((id, loaded));
                     });
@@ -4617,6 +4663,40 @@ mod tests {
         assert!(
             !marker.exists(),
             "the destination's key helper was executed during preflight"
+        );
+    }
+
+    /// A locked project refuses overrides that loosen it, but must keep
+    /// ones that tighten it. Returning early on the lock discarded
+    /// `--permission-mode deny` as well, leaving the destination's own
+    /// `allow` live — the lock making the session *more* permissive than
+    /// the operator asked for.
+    #[test]
+    fn a_locked_destination_keeps_a_stricter_command_line() {
+        use agent_code_lib::config::PermissionMode;
+
+        let _guard = CONFIG_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"allow\"\n\n\
+             [security]\ndisable_bypass_permissions = true\n",
+        )
+        .unwrap();
+
+        let stricter = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            ..Default::default()
+        };
+        let cfg = load_project_config(&dir.path().display().to_string(), &stricter)
+            .expect("settings parse");
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Deny,
+            "the lock discarded a restrictive command line and left the project's allow"
         );
     }
 }
