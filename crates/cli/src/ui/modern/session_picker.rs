@@ -379,25 +379,31 @@ impl App {
         };
 
         // Prompts staged against the previous conversation must not be
-        // auto-dispatched into the session that replaced it.
-        let mut dropped = self.queue.len();
-        self.queue.clear();
+        // auto-dispatched into the session that replaced it — but they
+        // are the user's own words, so none of them is dropped silently.
+        // Whatever cannot be handed back to the composer is reproduced
+        // verbatim in the transcript, where it can still be read and
+        // copied; a bare count would eat the text.
+        let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
         // A prompt submitted while the session was still loading never
         // ran — turn spawning is blocked for exactly that window. Hand
         // the text back to the composer rather than firing it at a
-        // conversation the user has not seen yet, or silently eating it.
+        // conversation the user has not seen yet.
         if let Some(text) = self.pending_submit.take() {
             if self.input.trim().is_empty() {
                 self.cursor = text.len();
                 self.input = text;
             } else {
-                dropped += 1;
+                // A draft is already in the composer and must not be
+                // clobbered, so this one goes to the transcript instead.
+                carried.insert(0, text);
             }
         }
-        if dropped > 0 {
+        if !carried.is_empty() {
+            let body = carried.join("\n");
             self.transcript.push(TranscriptItem::System(format!(
-                "discarded {dropped} queued prompt(s) written for the previous session"
+                "not sent — written for the previous session:\n{body}"
             )));
             self.scroll_to_bottom();
         }
@@ -856,11 +862,16 @@ mod tests {
             "old prompt survived the resume"
         );
         assert!(app.queue.is_empty(), "old queue survived the resume");
+        // The staged prompt goes back to the (empty) composer; the queued
+        // one is reproduced verbatim rather than reduced to a count.
+        assert_eq!(app.input, "for the old session");
         assert!(
             app.transcript
                 .iter()
-                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("discarded 1"))),
-            "prompts were dropped without telling the user"
+                .any(|i| matches!(i, TranscriptItem::System(t)
+                    if t.contains("also for the old session"))),
+            "a queued prompt was eaten: {:?}",
+            app.transcript
         );
     }
 
@@ -892,8 +903,9 @@ mod tests {
         assert!(
             app.transcript
                 .iter()
-                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("discarded 1"))),
-            "the staged prompt vanished without a word"
+                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("check the parser"))),
+            "the staged prompt was reduced to a count and its text lost: {:?}",
+            app.transcript
         );
     }
 

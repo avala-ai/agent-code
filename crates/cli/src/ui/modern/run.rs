@@ -388,7 +388,18 @@ pub(super) async fn event_loop(
         // Apply deferred `/model` (list or set). try_lock so a mid-turn
         // switch does not block the UI; if the turn holds the mutex we
         // retry on the next loop iteration.
-        if let Some(action) = app.pending_model.take() {
+        // Everything below that mutates *session* state is held while a
+        // resume is outstanding. The load is asynchronous, so without this
+        // a `/clear`, `/model`, bridged slash command or `!cmd` submitted
+        // during the load would run against the conversation being
+        // replaced — reporting success, and then having its effect (and
+        // the transcript recording it) wiped by the restore. Each of these
+        // handlers is already "apply when possible", so they simply run
+        // once the restored session is in place. `/theme` is exempt: it is
+        // global UI state, not session state.
+        if app.pending_resume.is_none()
+            && let Some(action) = app.pending_model.take()
+        {
             let engine_arc = session.engine();
             match engine_arc.try_lock() {
                 Ok(mut eng) => {
@@ -511,6 +522,7 @@ pub(super) async fn event_loop(
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
         if app.pending_clear
+            && app.pending_resume.is_none()
             && let Ok(mut eng) = session.engine().try_lock()
         {
             eng.state_mut().messages.clear();
@@ -523,7 +535,9 @@ pub(super) async fn event_loop(
         // Run off the async worker via `block_in_place`: many slash arms call
         // `Handle::block_on` / spawn+join, which panic if invoked directly on
         // a Tokio worker without parking it first.
-        if let Some(slash) = app.pending_slash.take() {
+        if app.pending_resume.is_none()
+            && let Some(slash) = app.pending_slash.take()
+        {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     let interactive = crate::commands::is_interactive_slash(&slash);
@@ -611,7 +625,9 @@ pub(super) async fn event_loop(
         }
 
         // `!cmd` shell passthrough (classic parity).
-        if let Some(cmd) = app.pending_shell.take() {
+        if app.pending_resume.is_none()
+            && let Some(cmd) = app.pending_shell.take()
+        {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     use agent_code_lib::services::shell_passthrough;
