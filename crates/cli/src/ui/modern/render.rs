@@ -3280,6 +3280,12 @@ mod tests {
     #[test]
     fn context_meter_red_at_high_usage() {
         // 95% → the "ctx 95%" cells should use the theme error color.
+        //
+        // The palette is process-global and the theme tests mutate it
+        // while they run, so this compares a colour drawn under one
+        // palette against `palette().error` read under another and fails
+        // at random. Hold the same lock they do.
+        let _g = crate::ui::theme::test_lock();
         let backend = TestBackend::new(100, 24);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new("m", "/tmp", "s");
