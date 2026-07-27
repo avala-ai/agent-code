@@ -1723,16 +1723,24 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
                     .any(config_key_is_opaque);
         }
         // A config *file* can define aliases too, and its contents are
-        // not in the command at all. `/dev/null` and an empty path are
-        // the documented way to ask for no config, and define nothing.
-        // `HOME` and `XDG_CONFIG_HOME` select where git looks for its
-        // ordinary config, so redirecting them supplies aliases just
-        // as naming a config file does.
+        // not in the command at all. Naming `/dev/null` or an empty
+        // path is the documented way to ask these for no config file,
+        // and defines nothing.
         if matches!(
             name.as_str(),
-            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG" | "HOME" | "XDG_CONFIG_HOME"
+            "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG"
         ) {
             return !matches!(value.as_str(), "/dev/null" | "");
+        }
+        // `HOME` and `XDG_CONFIG_HOME` select where git looks for its
+        // ordinary config, so redirecting them supplies aliases just
+        // as naming a config file does. Emptying one disables nothing:
+        // git resolves the global config of `HOME= git p` to
+        // `/.gitconfig`, which this scan can read no better than any
+        // other file. Only a path git cannot read a config out of is
+        // an exemption.
+        if matches!(name.as_str(), "HOME" | "XDG_CONFIG_HOME") {
+            return value != "/dev/null";
         }
         // A name the shell still has to expand cannot be ruled out:
         // `GIT_CONFIG_KEY_$I=alias.p` is `GIT_CONFIG_KEY_0` by the time
@@ -2528,6 +2536,11 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
+            // Emptying them disables no file: git resolves the global
+            // config of `HOME=` to `/.gitconfig`, so an alias can still
+            // arrive from a file the command does not name.
+            "HOME= git p",
+            "XDG_CONFIG_HOME= git p",
             // A later assignment cannot argue an opaque config back to
             // safety: a subshell keeps its own copy, and a `#` in the
             // middle of a word is not a comment.
@@ -2779,6 +2792,12 @@ mod tests {
             // Asking for no config at all defines nothing.
             "GIT_CONFIG_GLOBAL=/dev/null git status",
             "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git log -p",
+            // An empty path is documented to disable these two, so no
+            // file is read and none can define an alias.
+            "GIT_CONFIG_GLOBAL= git status",
+            "GIT_CONFIG_SYSTEM= git log -p",
+            // A home git cannot read a config out of defines nothing.
+            "HOME=/dev/null git status",
             // A prefix assignment belongs to the statement it
             // introduces, not to a later one.
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true; git status",
