@@ -165,7 +165,7 @@ fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  Esc or Ctrl+. to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )),
     ];
     draw_modal_box(
@@ -204,7 +204,7 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matching commands",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     } else {
         let start = selected.saturating_sub(MAX_ROWS.saturating_sub(1).min(selected));
@@ -217,17 +217,17 @@ fn draw_command_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(palette().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(palette().inactive)
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{marker} /{name}  "), style),
-                Span::styled((*desc).to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled((*desc).to_string(), Style::default().fg(palette().muted)),
             ]));
         }
         if matches.len() > MAX_ROWS {
             lines.push(Line::from(Span::styled(
                 format!("  … {} total", matches.len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             )));
         }
     }
@@ -293,10 +293,10 @@ fn draw_search_bar(frame: &mut Frame<'_>, bar: Rect, app: &App) {
     let line = Line::from(vec![
         Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
         Span::styled(shown, Style::default().fg(p.text)),
-        Span::styled(counter, Style::default().fg(Color::DarkGray)),
+        Span::styled(counter, Style::default().fg(palette().muted)),
         Span::styled(
             "   [↓/↑] next/prev  [Enter] keep  [Esc] cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
     ]);
     frame.render_widget(Clear, bar);
@@ -324,7 +324,7 @@ fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     )));
     lines.push(Line::from(Span::styled(
         format!("active: {}", p.original),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().muted),
     )));
     lines.push(Line::from(""));
 
@@ -333,7 +333,7 @@ fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matching themes",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     } else {
         let start = p
@@ -348,18 +348,18 @@ fn draw_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(palette().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(palette().inactive)
             };
             let cur = if *id == p.original { " \u{2714}" } else { "" };
             lines.push(Line::from(vec![
                 Span::styled(format!("{marker} {id}{cur}"), style),
-                Span::styled(format!("  {label}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {label}"), Style::default().fg(palette().muted)),
             ]));
         }
         if filtered.len() > MAX_ROWS {
             lines.push(Line::from(Span::styled(
                 format!("  \u{2026} {} more", filtered.len() - MAX_ROWS),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             )));
         }
     }
@@ -403,7 +403,7 @@ fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(palette().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(palette().inactive)
             };
             let cur = if app.effort.as_deref() == Some(*level) {
                 " ✔"
@@ -434,7 +434,7 @@ fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     )));
     lines.push(Line::from(Span::styled(
         format!("current: {}", p.current),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().muted),
     )));
     lines.push(Line::from(""));
 
@@ -443,7 +443,7 @@ fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matching models",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     } else {
         let start = p
@@ -458,18 +458,18 @@ fn draw_model_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(palette().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(palette().inactive)
             };
             let cur = if *id == p.current { " ✔" } else { "" };
             lines.push(Line::from(vec![
                 Span::styled(format!("{marker} {id}{cur}  "), style),
-                Span::styled((*desc).to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled((*desc).to_string(), Style::default().fg(palette().muted)),
             ]));
         }
         if filtered.len() > MAX_ROWS {
             lines.push(Line::from(Span::styled(
                 format!("  … {} total", filtered.len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             )));
         }
     }
@@ -511,7 +511,7 @@ fn draw_plan_modal(
     if total > max_body {
         lines.push(Line::from(Span::styled(
             format!("… {} more lines", total - max_body),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     }
     let title = match &plan.path {
@@ -542,14 +542,14 @@ fn draw_question_modal(
     if q.questions.len() > 1 {
         lines.push(Line::from(Span::styled(
             format!("question {} of {}", q.current + 1, q.questions.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     }
     let cur = &q.questions[q.current];
     lines.push(Line::from(Span::styled(
         cur.question.clone(),
         Style::default()
-            .fg(Color::White)
+            .fg(palette().text)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -560,7 +560,7 @@ fn draw_question_modal(
         let style = if selected {
             Style::default().fg(accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(palette().inactive)
         };
         lines.push(Line::from(Span::styled(
             format!("{marker} {}. {opt}", i + 1),
@@ -659,12 +659,12 @@ fn draw_queue_chips(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let ellipsis = if p.chars().count() > 40 { "…" } else { "" };
         spans.push(Span::styled(
             format!("{mark} \"{text}{ellipsis}\"  "),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette().inactive),
         ));
     }
     spans.push(Span::styled(
         " Ctrl+; pane",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().muted),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -699,7 +699,7 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(accent)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(palette().inactive)
         };
         lines.push(Line::from(Span::styled(
             format!("{mark}{}. {preview}", i + 1),
@@ -709,7 +709,7 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if lines.len() < inner.height as usize {
         lines.push(Line::from(Span::styled(
             " ↑/↓ select · Enter send-now · Backspace drop · Ctrl+; close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -720,7 +720,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use super::tasks::TaskState;
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(palette().muted))
         .title(format!(" agents ({}) ", app.tasks.len()));
     // The title consumes the top row even without a top border, so
     // measure the real content box instead of the outer area.
@@ -743,13 +743,13 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(
                 t.source.heading().to_string(),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette().muted)
                     .add_modifier(Modifier::BOLD),
             )));
             last_source = Some(t.source);
         }
         let color = match t.state {
-            TaskState::Working => Color::Blue,
+            TaskState::Working => palette().accent,
             TaskState::NeedsInput => p.warning,
             TaskState::Done => p.success,
             TaskState::Failed => p.error,
@@ -774,7 +774,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect();
         lines.push(Line::from(Span::styled(
             format!("  {head}"),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(palette().inactive),
         )));
         task_ends.push(lines.len() - 1);
     }
@@ -809,7 +809,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines = lines.into_iter().skip(offset).take(visible_h).collect();
             lines.push(Line::from(Span::styled(
                 format!("… +{hidden} more (↑/↓)"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             )));
         }
     }
@@ -839,13 +839,13 @@ fn draw_permission_modal(
     // actually run, so they are made visible before display.
     lines.push(Line::from(Span::styled(
         escape_deceptive(&pending.description).into_owned(),
-        Style::default().fg(Color::White),
+        Style::default().fg(palette().text),
     )));
     if let Some(ref origin) = pending.origin {
         lines.push(Line::from(Span::styled(
             format!("from {}", escape_deceptive(origin)),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette().muted)
                 .add_modifier(Modifier::ITALIC),
         )));
     }
@@ -863,14 +863,14 @@ fn draw_permission_modal(
             lines.push(Line::from(Span::styled(
                 format!("… {scroll} earlier lines (↑ to scroll)"),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette().muted)
                     .add_modifier(Modifier::ITALIC),
             )));
         }
         for row in rows.iter().skip(scroll).take(viewport) {
             lines.push(Line::from(Span::styled(
                 escape_deceptive(row).into_owned(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             )));
         }
         let below = total.saturating_sub(scroll + viewport);
@@ -878,7 +878,7 @@ fn draw_permission_modal(
             lines.push(Line::from(Span::styled(
                 format!("… {below} more lines (↓ to scroll)"),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(palette().muted)
                     .add_modifier(Modifier::ITALIC),
             )));
         }
@@ -912,11 +912,11 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(&app.version, Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.version, Style::default().fg(palette().muted)),
         Span::raw("  "),
-        Span::styled(&app.model, Style::default().fg(Color::Gray)),
+        Span::styled(&app.model, Style::default().fg(palette().inactive)),
         if let Some(ref e) = app.effort {
-            Span::styled(format!(" ·{e}"), Style::default().fg(Color::DarkGray))
+            Span::styled(format!(" ·{e}"), Style::default().fg(palette().muted))
         } else {
             Span::raw("")
         },
@@ -925,12 +925,12 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(
             truncate_path(&app.cwd, area.width.saturating_sub(40) as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
     ]);
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(palette().muted));
     frame.render_widget(Paragraph::new(title).block(block), area);
 }
 
@@ -995,7 +995,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Phase::Permission => Style::default()
             .fg(palette().warning)
             .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(palette().muted),
     };
     let title_block = Block::default()
         .borders(Borders::NONE)
@@ -1058,7 +1058,7 @@ fn apply_selection_highlight(
             *line = Line::from(Span::styled(
                 plain,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(super::colors::on_fill(accent))
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -1068,8 +1068,8 @@ fn apply_selection_highlight(
 }
 
 /// Paint the row the `2/3` counter points at, so stepping through
-/// matches is visibly anchored. Warning-on-black to stay distinct from
-/// the accent-colored mouse selection.
+/// matches is visibly anchored. Filled with the warning colour to stay
+/// distinct from the accent-filled mouse selection.
 fn apply_search_highlight(
     mut view: Vec<Line<'static>>,
     top: usize,
@@ -1089,7 +1089,7 @@ fn apply_search_highlight(
         *line = Line::from(Span::styled(
             plain,
             Style::default()
-                .fg(Color::Black)
+                .fg(super::colors::on_fill(palette().warning))
                 .bg(palette().warning)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -1114,17 +1114,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     spans.extend([
         Span::styled(
             format!(" turn {} ", app.turn_count),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
         Span::raw("│"),
         Span::styled(
             format!(" {tokens} tok "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
         Span::raw("│"),
         Span::styled(
             format!(" ${:.4} ", app.cost_usd),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().muted),
         ),
         Span::raw("│"),
     ]);
@@ -1140,7 +1140,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else if pct >= 70 {
             p.warning
         } else {
-            Color::DarkGray
+            palette().muted
         };
         spans.push(Span::styled(
             format!(" ctx {pct}% "),
@@ -1157,7 +1157,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let glyph = spinner_glyph(app.tick);
             let (glyph_color, text_color) = match app.waiting_on {
                 super::app::WaitingOn::UserInput => (warning, warning),
-                _ => (accent, Color::Gray),
+                _ => (accent, palette().inactive),
             };
             spans.push(Span::styled(
                 format!(" {glyph} "),
@@ -1181,7 +1181,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 spans.push(Span::styled(
                     " action required ",
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(super::colors::on_fill(warning))
                         .bg(warning)
                         .add_modifier(Modifier::BOLD),
                 ));
@@ -1198,7 +1198,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 spans.push(Span::styled(
                     format!(" {} ", app.status_message),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(palette().inactive),
                 ));
             }
         }
@@ -1225,7 +1225,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     spans.push(Span::raw("│"));
     spans.push(Span::styled(
         format!(" sid {} ", truncate_mid(&app.session_id, 12)),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette().muted),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1343,7 +1343,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_mid(hint, hint_area.width as usize),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette().muted),
             ))),
             hint_area,
         );
@@ -1680,6 +1680,240 @@ mod tests {
             corners_before,
             "search bar must not eat a border row:\n{s}"
         );
+    }
+
+    /// A frame exercising the chrome most tempting to hand-colour: an
+    /// error, a warning, thinking, the tasks pane, a failed tool, and
+    /// assistant markdown carrying both inline code and a fenced,
+    /// syntax-highlighted block.
+    fn colour_probe_app() -> App {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.push(TranscriptItem::User("hello".into()));
+        app.transcript.push(TranscriptItem::Tool {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            detail: "ls".into(),
+            result: Some("a\nb".into()),
+            is_error: false,
+            live: None,
+        });
+        app.transcript
+            .push(TranscriptItem::Error("it broke".into()));
+        app.transcript
+            .push(TranscriptItem::Warning("careful".into()));
+        app.transcript.push(TranscriptItem::Thinking {
+            text: "considering".into(),
+            duration_ms: Some(1500),
+        });
+        app.transcript.push(TranscriptItem::Tool {
+            call_id: "c2".into(),
+            name: "FileEdit".into(),
+            detail: "src/x.rs".into(),
+            result: Some("boom".into()),
+            is_error: true,
+            live: None,
+        });
+        // Last, so the bottom-anchored transcript keeps it on screen:
+        // a colour test that silently scrolls its own subject out of the
+        // viewport passes for the wrong reason.
+        app.transcript.push(TranscriptItem::Assistant(
+            "call `run()` first\n\n```rust\nfn main() { let x = 1; }\n```\n".into(),
+        ));
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app
+    }
+
+    /// Guards [`colour_probe_app`] against going vacuous: both the
+    /// inline-code chip and the syntax-highlighted block must be on
+    /// screen for the colour assertions below to mean anything.
+    fn assert_probe_subject_visible(buf: &ratatui::buffer::Buffer) {
+        let s = buffer_to_string(buf);
+        assert!(s.contains("run()"), "inline code scrolled away:\n{s}");
+        assert!(s.contains("fn main"), "code block scrolled away:\n{s}");
+    }
+
+    /// Every colour on screen must come from the theme.
+    ///
+    /// The theme adapts itself for the terminal's colour depth
+    /// (`adapt_for_emit`), so a hardcoded `Color::DarkGray` in the chrome
+    /// silently opts that cell out of the adaptation — under `NO_COLOR`
+    /// it stays coloured. One-dark's slots are all RGB, so any *named*
+    /// colour in the frame is a bypass.
+    ///
+    /// This catches named literals only. A hardcoded `Color::Rgb` is
+    /// just as much a bypass and looks identical here — that is what
+    /// [`no_colour_mode_leaves_no_colour_on_screen`] is for.
+    #[test]
+    fn the_frame_uses_only_theme_colours() {
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
+        let mut offenders: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, c) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    let named = !matches!(c, Color::Rgb(..) | Color::Reset);
+                    if named {
+                        offenders.push(format!("{what}={c:?} at {x},{y}"));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup_by(|a, b| a.split(" at").next() == b.split(" at").next());
+        assert!(
+            offenders.is_empty(),
+            "{} chrome colours bypass the palette: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// `NO_COLOR` asks for *no* colour, not less of it — so in
+    /// [`EmitMode::Mono`] every cell in a rendered frame must carry the
+    /// terminal default for both foreground and background. Modifiers
+    /// (bold, dim, italic) survive; hue does not.
+    ///
+    /// This is the assertion that a hardcoded colour cannot survive,
+    /// whatever form it takes: only values that reached the screen
+    /// through a palette slot (or through
+    /// [`crate::ui::modern::colors::syntax_color`]) get adapted, so any
+    /// literal — named *or* RGB — shows up here as a coloured cell.
+    #[test]
+    fn no_colour_mode_leaves_no_colour_on_screen() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
+        // Both filled highlights (mouse selection, current search match)
+        // draw text on a coloured bar; a hardcoded black foreground there
+        // turns invisible once the fill collapses to the default.
+        app.open_search();
+        for c in "run".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
+        let mut offenders: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, c) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    if c != Color::Reset {
+                        offenders.push(format!("{what}={c:?} at {x},{y}"));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup_by(|a, b| a.split(" at").next() == b.split(" at").next());
+        assert!(
+            offenders.is_empty(),
+            "{} cells still carry colour under NO_COLOR: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// The mirror image of [`the_frame_uses_only_theme_colours`]: in
+    /// [`EmitMode::Ansi16`] every palette slot is quantized to a *named*
+    /// colour, so a surviving `Color::Rgb` is a value that never went
+    /// through the adaptation — the exact bypass a truecolor-only test
+    /// cannot see.
+    ///
+    /// Run against the `dark-ansi` accessibility palette, whose slots are
+    /// named to begin with, so the frame has to come out named end to end.
+    #[test]
+    fn ansi16_mode_quantizes_every_colour_on_screen() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("dark-ansi");
+        let _mode = pin_mode(EmitMode::Ansi16);
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
+        let mut offenders: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, c) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    if matches!(c, Color::Rgb(..)) {
+                        offenders.push(format!("{what}={c:?} at {x},{y}"));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup_by(|a, b| a.split(" at").next() == b.split(" at").next());
+        assert!(
+            offenders.is_empty(),
+            "{} cells kept 24-bit colour on a 16-colour terminal: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// The filled highlight bars used to paint `Color::Black` text on a
+    /// coloured fill. That is wrong twice over: under `NO_COLOR` the fill
+    /// collapses to the terminal default while the black text stays
+    /// black — invisible on any dark terminal — and on a light theme the
+    /// fill is dark enough that black was already a poor choice.
+    ///
+    /// The replacement is not a fixed foreground either: `on_fill` picks
+    /// against the actual fill, so the bar clears a readable contrast
+    /// ratio on light and dark themes alike.
+    #[test]
+    fn filled_highlights_take_their_foreground_from_the_palette() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+
+        let view = vec![Line::from("match here")];
+        let sel = super::super::app::TextSelection {
+            start_line: 0,
+            end_line: 0,
+        };
+
+        for theme in ["one-dark", "solarized-light", "dark-ansi", "light-ansi"] {
+            crate::ui::theme::init(theme);
+            let painted = apply_selection_highlight(view.clone(), 0, Some(sel));
+            let style = painted[0].spans[0].style;
+            assert_eq!(
+                style.fg,
+                Some(crate::ui::modern::colors::on_fill(palette().accent)),
+                "{theme}: selection bar bypassed on_fill"
+            );
+            assert_ne!(style.fg, style.bg, "{theme}: selection bar is invisible");
+        }
+
+        // Mono: the fill and its foreground both collapse to the default,
+        // so the row stays legible instead of going black-on-black.
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+        let painted = apply_selection_highlight(view, 0, Some(sel));
+        assert_eq!(painted[0].spans[0].style.fg, Some(Color::Reset));
+        assert_eq!(painted[0].spans[0].style.bg, Some(Color::Reset));
     }
 
     #[test]
