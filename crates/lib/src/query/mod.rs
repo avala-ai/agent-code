@@ -77,6 +77,10 @@ pub struct QueryEngine {
     /// Content blocks to prepend to the next user message (images from
     /// the composer). Consumed by the turn that follows.
     pending_attachments: Vec<crate::llm::message::ContentBlock>,
+    /// Grants that persist across sessions. `None` until a host opts in
+    /// via [`Self::set_persistent_grants`] — library embedders get the
+    /// previous behaviour (session-scoped only) unless they ask for it.
+    persistent_grants: Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>>,
     permission_prompter: Option<Arc<dyn crate::tools::PermissionPrompter>>,
     question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
@@ -143,6 +147,20 @@ pub trait StreamSink: Send + Sync {
 
     /// Background / typed subagent lifecycle update.
     fn on_subagent_update(&self, _agent_id: &str, _state: &str, _headline: &str) {}
+
+    /// A finished subagent's full output.
+    ///
+    /// Separate from [`Self::on_subagent_update`], which carries only a
+    /// one-line headline: a UI that lets the user open a subagent needs
+    /// the body, and the completion path already has it in hand.
+    /// Defaulted so existing sinks are unaffected.
+    ///
+    /// `call_id` is the Agent tool-call id and is the identity to key
+    /// captured output by. `agent_id` is a *display* id derived from the
+    /// call's description, so two calls whose descriptions share a
+    /// prefix collapse onto one — distinct results must not be keyed by
+    /// it or one would overwrite the other.
+    fn on_subagent_output(&self, _agent_id: &str, _call_id: &str, _output: &str) {}
 
     /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
     /// `turn` is session-cumulative, matching [`Self::on_turn_start`].
@@ -223,6 +241,7 @@ impl QueryEngine {
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             pending_attachments: Vec::new(),
+            persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
             cached_system_prompt: None,
@@ -290,6 +309,47 @@ impl QueryEngine {
     /// interactive path only; one-shot/non-interactive runs leave it unset.
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
+    }
+
+    /// Enable grants that persist across sessions, loading whatever this
+    /// project already has recorded.
+    ///
+    /// Opt-in: without this call the engine behaves as before and an
+    /// "always" answer degrades to session scope. Hosts that never call
+    /// it cannot accumulate approvals on disk.
+    pub fn enable_persistent_grants(&mut self, project_root: &std::path::Path) {
+        let store = crate::permissions::grants::GrantStore::load(project_root);
+        self.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(store)));
+    }
+
+    /// Handle to the grant store, so a caller outside the async context
+    /// (a slash command) can inspect or clear it on its own thread.
+    pub fn persistent_grants_handle(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::permissions::grants::GrantStore>>> {
+        self.persistent_grants.clone()
+    }
+
+    /// Re-scope persistent grants to a new project root. Must be called
+    /// whenever the session cwd changes (`/cd`): grants are per-project,
+    /// so an approval saved in the old project must not keep suppressing
+    /// prompts in the new one, and new grants must be written to the new
+    /// project's file. No-op when the feature was never enabled.
+    pub fn rescope_persistent_grants(&mut self, project_root: &std::path::Path) {
+        let Some(store) = self.persistent_grants.clone() else {
+            return;
+        };
+        // Mutate in place so ToolContext clones from the current turn see
+        // the new scope too. `try_lock` cannot contend in practice —
+        // slash commands run between turns — but if it ever does, swap
+        // the Arc so at minimum every future turn is scoped correctly.
+        match store.try_lock() {
+            Ok(mut guard) => guard.rescope(project_root),
+            Err(_) => {
+                let fresh = crate::permissions::grants::GrantStore::load(project_root);
+                self.persistent_grants = Some(Arc::new(tokio::sync::Mutex::new(fresh)));
+            }
+        }
     }
 
     /// Install the multi-choice question asker (modern TUI modal).
@@ -1353,6 +1413,7 @@ impl QueryEngine {
                                                                 task_manager: None,
                                                                 subagent_colors: None,
                                                                 session_allows: None,
+                                                                persistent_grants: None,
                                                                 permission_prompter: None,
                                                                 question_asker: None,
                                                                 agent_origin: None,
@@ -1615,6 +1676,7 @@ impl QueryEngine {
                 task_manager: Some(self.state.task_manager.clone()),
                 subagent_colors: Some(self.state.subagent_colors.clone()),
                 session_allows: Some(self.session_allows.clone()),
+                persistent_grants: self.persistent_grants.clone(),
                 permission_prompter: self.permission_prompter.clone(),
                 question_asker: self.question_asker.clone(),
                 agent_origin: None,
@@ -2005,18 +2067,28 @@ fn emit_agent_result_update(
     tool_calls: &[crate::tools::executor::PendingToolCall],
     tool_use_id: &str,
 ) {
+    let call = tool_calls
+        .iter()
+        .find(|c| c.id == tool_use_id && c.name == "Agent");
+    // Background-ness comes from the call's structured `run_in_background`
+    // input, not from the child's prose: a foreground subagent is free to
+    // *write about* background launches, and treating that as a launch
+    // stranded its row at "working" and swallowed its output. The tool's
+    // own acknowledgement is then required as confirmation, because a
+    // background request still runs in the foreground when no TaskManager
+    // is available.
+    let backgrounded = call.is_some_and(|c| crate::tools::agent::requested_background(&c.input))
+        && crate::tools::agent::is_background_launch_ack(&result.content);
     let state = if result.is_error {
         "failed"
-    } else if result.content.contains("started in the background") {
+    } else if backgrounded {
         "working"
     } else {
         "done"
     };
     let headline = result.content.lines().next().unwrap_or(state);
     let headline: String = headline.chars().take(120).collect();
-    let agent_id = tool_calls
-        .iter()
-        .find(|c| c.id == tool_use_id && c.name == "Agent")
+    let agent_id = call
         .map(|c| crate::tools::agent::resolve_subagent_id(&c.input))
         .or_else(|| {
             // Fallback: parse `subagent_id=…` from the tool result body.
@@ -2035,6 +2107,12 @@ fn emit_agent_result_update(
         })
         .unwrap_or_else(|| "agent".into());
     sink.on_subagent_update(&agent_id, state, &headline);
+    // The result body is discarded above in favour of a headline; hand it
+    // over intact so a UI can open the subagent's own output instead of
+    // showing a row that leads nowhere.
+    if state != "working" && !result.content.trim().is_empty() {
+        sink.on_subagent_output(&agent_id, tool_use_id, &result.content);
+    }
 }
 
 /// Look up a tool call by its use-id and return every path it mutated.
@@ -2449,6 +2527,178 @@ mod tests {
         assert!(!is_file_mutating_tool("Bash"));
         assert!(!is_file_mutating_tool("Glob"));
         assert!(!is_file_mutating_tool(""));
+    }
+
+    // ---- Subagent result classification ----
+
+    /// Records the subagent events a turn emits, so the classification
+    /// can be asserted without an engine.
+    #[derive(Default)]
+    struct SubagentSink {
+        updates: std::sync::Mutex<Vec<(String, String)>>,
+        outputs: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl StreamSink for SubagentSink {
+        fn on_text(&self, _: &str) {}
+        fn on_tool_start(&self, _: &str, _: &serde_json::Value) {}
+        fn on_tool_result(&self, _: &str, _: &crate::tools::ToolResult) {}
+        fn on_error(&self, _: &str) {}
+        fn on_subagent_update(&self, agent_id: &str, state: &str, _: &str) {
+            self.updates
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), state.to_string()));
+        }
+        fn on_subagent_output(&self, agent_id: &str, call_id: &str, output: &str) {
+            self.outputs
+                .lock()
+                .unwrap()
+                .push((format!("{agent_id}/{call_id}"), output.to_string()));
+        }
+    }
+
+    fn classify(input: serde_json::Value, result: crate::tools::ToolResult) -> SubagentSink {
+        let calls = vec![crate::tools::executor::PendingToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input,
+        }];
+        let sink = SubagentSink::default();
+        emit_agent_result_update(&sink, &result, &calls, "t1");
+        sink
+    }
+
+    /// The bug: state was inferred from the child's prose, so a
+    /// foreground subagent that merely *wrote about* background launches
+    /// was pinned to "working" and its finished output was suppressed —
+    /// drill-in then reported it had produced nothing.
+    #[test]
+    fn a_foreground_subagent_writing_about_background_launches_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "explain tasks"}),
+            crate::tools::ToolResult::success(
+                "Passing run_in_background means the agent is started in the background.",
+            ),
+        );
+        assert_eq!(
+            sink.updates.lock().unwrap().first().unwrap().1,
+            "done",
+            "a foreground run was classified from its own prose"
+        );
+        assert_eq!(
+            sink.outputs.lock().unwrap().len(),
+            1,
+            "a finished subagent's output was suppressed"
+        );
+    }
+
+    /// A genuine background dispatch is still "working", and its
+    /// acknowledgement is not the subagent's output.
+    #[test]
+    fn a_real_background_launch_stays_working_and_emits_no_output() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success(
+                "Agent (sweep, type=general-purpose) started in the background as task b7 \
+                 (subagent_id=sweep). Its result surfaces automatically when it completes — do \
+                 not wait on it.",
+            ),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "working");
+        assert!(sink.outputs.lock().unwrap().is_empty());
+    }
+
+    /// The remaining gap once the structured flag is honoured: a
+    /// background request falls through to a foreground run when no
+    /// `TaskManager` exists, and that child's answer may itself talk
+    /// about background launches. Only the tool's own acknowledgement
+    /// counts, so this run is finished, not pending.
+    #[test]
+    fn a_foreground_fallthrough_answer_mentioning_the_phrase_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success(
+                "The Agent tool reports that work started in the background as task 3 when you \
+                 pass run_in_background.",
+            ),
+        );
+        assert_eq!(
+            sink.updates.lock().unwrap().first().unwrap().1,
+            "done",
+            "a foreground fall-through was mistaken for a background dispatch"
+        );
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
+    }
+
+    /// A background request runs in the foreground when no `TaskManager`
+    /// is available. The structured flag alone would strand that run at
+    /// "working"; the tool's own acknowledgement is what confirms a real
+    /// dispatch.
+    #[test]
+    fn a_background_request_that_ran_in_the_foreground_is_done() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep", "run_in_background": true}),
+            crate::tools::ToolResult::success("found three call sites"),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "done");
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
+    }
+
+    /// Two calls whose descriptions share a 32-character prefix resolve
+    /// to the same display `agent_id`. The captured output must still be
+    /// attributable, so the tool-call id rides along with it.
+    #[test]
+    fn captured_output_carries_the_calls_own_id() {
+        let shared = "audit the authentication module for";
+        let calls = vec![
+            crate::tools::executor::PendingToolCall {
+                id: "call-a".into(),
+                name: "Agent".into(),
+                input: serde_json::json!({"description": format!("{shared} tokens")}),
+            },
+            crate::tools::executor::PendingToolCall {
+                id: "call-b".into(),
+                name: "Agent".into(),
+                input: serde_json::json!({"description": format!("{shared} sessions")}),
+            },
+        ];
+        let sink = SubagentSink::default();
+        emit_agent_result_update(
+            &sink,
+            &crate::tools::ToolResult::success("A found a bug"),
+            &calls,
+            "call-a",
+        );
+        emit_agent_result_update(
+            &sink,
+            &crate::tools::ToolResult::success("B found nothing"),
+            &calls,
+            "call-b",
+        );
+
+        let outputs = sink.outputs.lock().unwrap();
+        let keys: Vec<&str> = outputs.iter().map(|(k, _)| k.as_str()).collect();
+        let display_id = |k: &str| k.rsplit_once('/').unwrap().0.to_string();
+        assert_eq!(
+            display_id(keys[0]),
+            display_id(keys[1]),
+            "the premise: both calls resolve to one display id"
+        );
+        assert!(
+            keys[0].ends_with("/call-a") && keys[1].ends_with("/call-b"),
+            "the per-call identity was not carried: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_subagent_is_failed_and_its_error_is_still_offered() {
+        let sink = classify(
+            serde_json::json!({"description": "sweep"}),
+            crate::tools::ToolResult::error("subagent exited: started in the background"),
+        );
+        assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "failed");
+        assert_eq!(sink.outputs.lock().unwrap().len(), 1);
     }
 
     #[test]

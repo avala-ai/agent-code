@@ -331,6 +331,12 @@ pub const MAX_RETAINED_IMAGES: usize = 32;
 /// [`MAX_RETAINED_IMAGE_BYTES`] or [`MAX_RETAINED_IMAGES`] of them,
 /// oldest first.
 ///
+/// What survives is a *contiguous run of the newest* images: as soon as
+/// one does not fit, everything older goes too. Continuing to look for
+/// smaller images that would fit the remaining space would keep stale
+/// context alive while dropping something newer and more likely to be
+/// under discussion.
+///
 /// The block is replaced by text naming what was dropped, so the model
 /// still knows an image was there and the conversation stays valid;
 /// only the bytes go. Returns the number of images dropped.
@@ -357,12 +363,15 @@ pub fn evict_old_images(
     let mut kept = 0usize;
     let mut evicted = 0usize;
     let mut kept_count = 0usize;
+    let mut budget_spent = false;
     for (msg_idx, block_idx, len, media_type) in sites.into_iter().rev() {
-        if kept + len <= budget_bytes && kept_count < budget_count {
+        if !budget_spent && kept + len <= budget_bytes && kept_count < budget_count {
             kept += len;
             kept_count += 1;
             continue;
         }
+        // The first image that does not fit ends retention outright.
+        budget_spent = true;
         let placeholder = ContentBlock::Text {
             text: format!(
                 "[image dropped from context — {media_type}, {:.1} MB]",
@@ -847,6 +856,37 @@ mod tests {
         let mut messages = vec![user_with_image(600), user_with_image(600)];
         assert_eq!(evict_old_images(&mut messages, 1000, 100), 1);
         assert_eq!(evict_old_images(&mut messages, 1000, 100), 0);
+    }
+
+    /// Retention is a contiguous run of the newest images. A greedy pass
+    /// would skip an image that does not fit and then keep an older,
+    /// smaller one behind it — preserving stale context while dropping
+    /// something newer.
+    #[test]
+    fn retention_stops_at_the_first_image_that_does_not_fit() {
+        // Oldest to newest: 4, 8, 8 with room for 12.
+        let mut messages = vec![
+            user_with_image(4),
+            assistant_text("a"),
+            user_with_image(8),
+            assistant_text("b"),
+            user_with_image(8),
+        ];
+        let evicted = evict_old_images(&mut messages, 12, 100);
+        assert_eq!(evicted, 2, "an older image was kept behind a dropped one");
+        let has_image = |m: &Message| match m {
+            Message::User(u) => u
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            _ => false,
+        };
+        assert!(has_image(&messages[4]), "the newest image was dropped");
+        assert!(!has_image(&messages[2]), "middle image should be gone");
+        assert!(
+            !has_image(&messages[0]),
+            "the oldest image was kept after a newer one was dropped"
+        );
     }
 
     /// Providers cap how many images a request may carry, so a session of

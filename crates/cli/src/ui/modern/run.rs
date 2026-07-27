@@ -52,6 +52,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     let notifier_config = engine.state().config.notifier.clone();
 
     // Apply theme so any shared color helpers still resolve.
+    let engine_edit_mode = engine.state().config.ui.edit_mode.clone();
     let configured = engine.state().config.ui.theme.clone();
     let inherit_fg = engine.state().config.ui.inherit_fg;
     let theme_name = crate::ui::theme::resolve_theme(&configured);
@@ -68,6 +69,10 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     // default), which must never happen in an interactive surface.
     let (eng_tx, eng_rx) = mpsc::unbounded_channel::<EngineEvent>();
     engine.set_permission_prompter(ModernPrompter::new(eng_tx.clone()));
+    // Load this project's "always allow" grants. Interactive only: a
+    // non-interactive run has nobody to answer the prompt that would
+    // create one, and should not silently consume grants either.
+    engine.enable_persistent_grants(std::path::Path::new(&cwd));
     // Route AskUserQuestion through a UI modal instead of stdin (which would
     // hang under the alt-screen raw mode).
     engine.set_question_asker(ModernQuestionAsker::new(eng_tx.clone()));
@@ -79,6 +84,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     app.keybindings = std::sync::Arc::new(crate::ui::keybindings::KeybindingRegistry::load());
     // The picker previews by mutating the global theme, so the App has to
     // remember what the user actually configured in order to revert.
+    app.vi_mode = engine_edit_mode == "vi";
     app.theme_name = configured.clone();
     app.inherit_fg = inherit_fg;
     app.show_thinking_blocks = show_thinking_blocks;
@@ -419,6 +425,17 @@ pub(super) async fn event_loop(
             }
         }
 
+        // `/vim` and `/emacs` change config through the command bridge,
+        // so the composer picks the change up here rather than only at
+        // startup — "takes effect next session" was the old lie. The
+        // bridge itself syncs again once the command has run; this pass
+        // catches any other writer of `ui.edit_mode`.
+        if let Ok(eng) = session.engine().try_lock() {
+            let edit_mode = eng.state().config.ui.edit_mode.clone();
+            drop(eng);
+            sync_edit_mode(app, &edit_mode);
+        }
+
         // Apply a deferred `/clear` to the engine conversation (classic
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
@@ -503,6 +520,12 @@ pub(super) async fn event_loop(
                     // theme picker should treat as current.
                     let configured = eng.state().config.ui.theme.clone();
                     app.sync_theme_from_config(&configured);
+                    // And for `/vim` and `/emacs`: the loop-level check
+                    // ran before this command executed, so without a
+                    // second look the very next key would be routed with
+                    // the mode the user just changed away from.
+                    let edit_mode = eng.state().config.ui.edit_mode.clone();
+                    sync_edit_mode(app, &edit_mode);
                     // `/resume`, the session picker, `/rewind` and
                     // `/snip` all replace or rewrite the message history.
                     // The checklist is cached in the App, so rebuild it
@@ -1055,7 +1078,65 @@ fn is_esc(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Esc)
 }
 
+/// Mirror `ui.edit_mode` onto the composer.
+fn sync_edit_mode(app: &mut App, edit_mode: &str) {
+    let wants_vi = edit_mode == "vi";
+    if wants_vi == app.vi_mode {
+        return;
+    }
+    app.vi_mode = wants_vi;
+    // Turning vi off must not strand the composer in a mode that no
+    // longer accepts typing.
+    app.composer_mode = super::app::ComposerMode::Insert;
+    app.dirty = true;
+}
+
+/// A key that types a character: the only thing vi normal mode reads as
+/// a command. Shift is allowed — it is what tells `D` from `d` — but
+/// Control, Alt and the platform modifier make it a chord, which the
+/// insertion path also refuses to treat as text.
+fn bare_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SUPER) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return;
+    }
+    let was_armed = app.vi_pending_d;
+
+    handle_key_inner(app, key);
+
+    if app.in_normal_mode() {
+        // `vi_normal_key` always consumes a pending operator on its
+        // first branch, so one that was armed before dispatch and is
+        // still armed means the key never reached it — a modal answered
+        // with `y`, a chord, Ctrl+C arming quit. Dropping it here is
+        // what stops it acting as a motion for the next key. A `d` armed
+        // by this very key has `was_armed` false and survives.
+        if was_armed && app.vi_pending_d {
+            app.reset_vi_operator();
+        }
+        // Normal mode has no cursor position after the last character,
+        // but the keys that fall through to the composer — arrows,
+        // Home/End, a binding — move with insert-mode semantics and can
+        // park there, where `x` and `D` find nothing. A key that entered
+        // insert mode is left alone: `A` parks past the last character
+        // on purpose.
+        app.clamp_cursor_to_normal_mode();
+    }
+}
+
+fn handle_key_inner(app: &mut App, key: KeyEvent) {
     // Ignore key release on platforms that emit them. Accept Repeat so a
     // held Ctrl+C still counts (double-tap quit / cancel).
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
@@ -1201,6 +1282,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 (_, KeyCode::Char('y')) | (_, KeyCode::Char('1')) => {
                     app.resolve_permission(PermissionResponse::AllowOnce);
                 }
+                // Uppercase `A` for the durable grant: it outlives the
+                // session, so it should take a deliberate keypress rather
+                // than sit one typo away from "allow for session".
+                (_, KeyCode::Char('A')) | (_, KeyCode::Char('4')) => {
+                    app.resolve_permission(PermissionResponse::AllowAlways);
+                }
                 (_, KeyCode::Char('a')) | (_, KeyCode::Char('2')) => {
                     app.resolve_permission(PermissionResponse::AllowSession);
                 }
@@ -1237,6 +1324,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // prior arm state so a second Ctrl+C / Esc can act on it.
     let was_armed = app.quit_armed;
     app.quit_armed = false;
+
+    // In vi mode Esc leaves insert mode. Only when already in normal
+    // mode does it fall through to the quit-arming path, so the way out
+    // stays reachable.
+    if app.vi_mode
+        && is_esc(&key)
+        && app.composer_mode == super::app::ComposerMode::Insert
+        && app.front_modal().is_none()
+    {
+        app.vi_enter_normal();
+        return;
+    }
+
+    // Esc in normal mode aborts a half-typed operator before it means
+    // anything else, as vi does. Without this the pending `d` would
+    // survive to eat the next key.
+    if app.in_normal_mode() && is_esc(&key) && app.front_modal().is_none() && app.vi_pending_d {
+        app.vi_pending_d = false;
+        app.dirty = true;
+        return;
+    }
 
     // Esc: never cancel a turn. Clear draft, or double-press quit when idle.
     if is_esc(&key) {
@@ -1286,6 +1394,41 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             ));
         }
         return;
+    }
+
+    // Vi normal mode owns bare characters: they are motions, not text.
+    // Placed before the global chord match so `t`, `p` and friends edit
+    // rather than firing a shortcut.
+    if app.in_normal_mode() {
+        match key.code {
+            // A platform-modified character (Cmd+X) is a chord, not the
+            // vi command `x`; the wrapper drops any pending operator for
+            // it, and it falls through to the chord dispatch below.
+            KeyCode::Char(c) if bare_char(&key) == Some(c) => {
+                app.vi_normal_key(c);
+                return;
+            }
+            // Backspace moves left in normal mode, as vi does. Letting
+            // it through would delete the character before the cursor —
+            // destructive, undocumented, and there is no undo. With an
+            // empty composer there is nothing to move over, so it falls
+            // through and the queue pane keeps its delete key.
+            KeyCode::Backspace if key.modifiers.is_empty() && !app.input.is_empty() => {
+                app.vi_normal_key('h');
+                return;
+            }
+            // Enter submits from normal mode even when Ctrl+M multiline
+            // is on: a draft being navigated in normal mode is finished,
+            // not being newline-edited. An empty composer still falls
+            // through, so the queue pane and task drill-in keep Enter.
+            KeyCode::Enter if key.modifiers.is_empty() && !app.input.is_empty() => {
+                app.submit();
+                return;
+            }
+            // Anything else falls through so Ctrl chords, arrows,
+            // Alt/Shift+Enter and Backspace keep working.
+            _ => {}
+        }
     }
 
     // A user chord from `keybindings.json` wins over the built-in
@@ -1520,11 +1663,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         // Only plain / shifted characters type into the prompt; Ctrl/Alt/Super
         // chords must not fall through as literal input.
-        (m, KeyCode::Char(c))
-            if !m.contains(KeyModifiers::CONTROL)
-                && !m.contains(KeyModifiers::ALT)
-                && !m.contains(KeyModifiers::SUPER) =>
-        {
+        (_, KeyCode::Char(c)) if bare_char(&key) == Some(c) => {
             app.insert_char(c);
         }
         _ => {}
@@ -1533,6 +1672,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 /// Insert bracketed-paste text into the prompt (or ignore during modals).
 fn handle_paste(app: &mut App, text: &str) {
+    handle_paste_inner(app, text);
+    // A paste is a composer edit like any other, but the event loop
+    // calls it directly, so it misses the normalisation `handle_key`
+    // does: without this the cursor sits past the last pasted character
+    // and a pending operator survives to eat the next key.
+    if app.in_normal_mode() {
+        app.reset_vi_operator();
+        app.clamp_cursor_to_normal_mode();
+    }
+}
+
+fn handle_paste_inner(app: &mut App, text: &str) {
     // Modals own the keyboard; don't dump clipboard into the prompt behind them.
     if app.phase == super::app::Phase::Permission {
         return;
@@ -1903,9 +2054,14 @@ mod tests {
             "Ctrl+Enter was swallowed by the pane"
         );
 
-        // Plain Enter still drives the pane (subagent row → explanation).
+        // Plain Enter still drives the pane. A running inline subagent
+        // has captured no output yet, so it says so.
         handle_key(&mut app, key(KeyCode::Enter));
-        assert!(app.status_message.contains("no separate output"));
+        assert!(
+            app.status_message.contains("not produced output yet"),
+            "pane did not act on Enter: {}",
+            app.status_message
+        );
     }
 
     /// A checklist makes the pane visible with nothing selectable in it.
@@ -2199,6 +2355,385 @@ mod tests {
         handle_key(&mut app, ctrl('c'));
         assert!(app.cancel_requested, "Ctrl+C no longer cancels");
         assert!(app.pending_submit.is_none(), "Ctrl+C submitted a prompt");
+    }
+
+    /// The bug this closes: `ui.edit_mode = "vi"` was read by nothing,
+    /// so Esc did not leave insert mode and `h`/`l` typed letters.
+    #[test]
+    fn vi_mode_routes_keys_through_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.input = "hello".into();
+        app.cursor = 5;
+
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            app.composer_mode,
+            crate::ui::modern::app::ComposerMode::Normal,
+            "Esc did not leave insert mode"
+        );
+        assert!(!app.quit_armed, "Esc armed quit instead of entering normal");
+
+        handle_key(&mut app, key(KeyCode::Char('0')));
+        assert_eq!(app.cursor, 0);
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.input, "ello", "x did not delete under the cursor");
+        // A motion key must not be typed into the composer.
+        assert!(!app.input.contains('0'));
+
+        handle_key(&mut app, key(KeyCode::Char('A')));
+        assert_eq!(
+            app.composer_mode,
+            crate::ui::modern::app::ComposerMode::Insert
+        );
+        handle_key(&mut app, key(KeyCode::Char('!')));
+        assert_eq!(app.input, "ello!", "insert mode stopped accepting text");
+    }
+
+    /// Normal mode must swallow bare characters that are global chords,
+    /// or editing would fire shortcuts.
+    #[test]
+    fn normal_mode_does_not_fire_global_chords() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        assert!(
+            !app.command_palette_open(),
+            "`?` opened the palette while editing in normal mode"
+        );
+    }
+
+    /// Enter submits from normal mode even with Ctrl+M multiline on.
+    /// Falling through reached the plain-Enter arm, which inserts a
+    /// newline when `multiline_mode` is set — so normal-mode users could
+    /// not submit at all without toggling multiline off.
+    #[test]
+    fn enter_submits_from_normal_mode_even_in_multiline() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.multiline_mode = true;
+        app.input = "ask something".into();
+        app.cursor = 3;
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            !app.input.contains('\n'),
+            "Enter inserted a newline instead of submitting: {:?}",
+            app.input
+        );
+        assert!(
+            app.pending_submit.is_some() || app.input.is_empty(),
+            "Enter did not submit from normal mode"
+        );
+
+        // Alt+Enter still makes a newline: only plain Enter is claimed.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one".into();
+        app.cursor = 3;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(
+            app.input.contains('\n'),
+            "Alt+Enter stopped inserting a newline in normal mode"
+        );
+
+        // An empty composer still falls through to the queue/tasks Enter.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+    }
+
+    /// A pending `d` must not outlive the draft: `d` then Enter used to
+    /// leave the operator armed, so the first key of the next prompt was
+    /// swallowed as its motion.
+    #[test]
+    fn pending_operator_does_not_survive_submit_or_escape() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello".into();
+        app.cursor = 0;
+
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d, "`d` did not arm the operator");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            !app.vi_pending_d,
+            "the pending `d` survived the submit and will eat the next key"
+        );
+
+        // Ctrl+Enter sends through `interject()`, Ctrl+C discards through
+        // `clear_prompt()`: neither goes via `submit()`, and both used to
+        // leave the operator armed for the next draft.
+        for send in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.vi_mode = true;
+            app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+            app.input = "hello".into();
+            app.cursor = 0;
+            handle_key(&mut app, key(KeyCode::Char('d')));
+            assert!(app.vi_pending_d);
+            handle_key(&mut app, send);
+            assert!(
+                !app.vi_pending_d,
+                "operator survived {send:?} and will eat the next key"
+            );
+        }
+
+        // Esc aborts the operator rather than leaving it armed.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello".into();
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.vi_pending_d, "Esc left the operator armed");
+        assert_eq!(app.input, "hello", "Esc cleared the draft mid-operator");
+        assert!(!app.quit_armed, "aborting an operator armed quit");
+    }
+
+    /// Keys that fall through to the composer move with insert-mode
+    /// semantics, so in normal mode they could park the cursor after the
+    /// last character — where `x` and `D` silently do nothing.
+    #[test]
+    fn fallthrough_navigation_stays_on_a_character_in_normal_mode() {
+        for nav in [KeyCode::Right, KeyCode::End] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.vi_mode = true;
+            app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+            app.input = "abc".into();
+            app.cursor = 2;
+            handle_key(&mut app, key(nav));
+            assert_eq!(app.cursor, 2, "{nav:?} ran past the last character");
+            handle_key(&mut app, key(KeyCode::Char('x')));
+            assert_eq!(app.input, "ab", "x had nothing under the cursor");
+        }
+
+        // Right must not park on a newline either.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "ab\ncd".into();
+        app.cursor = 1;
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.cursor, 1, "Right stepped onto the newline");
+
+        // Insert mode keeps its past-the-end position: `A` needs it.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 2;
+        handle_key(&mut app, key(KeyCode::Char('A')));
+        assert_eq!(app.cursor, 3, "A must still append after the last char");
+    }
+
+    /// Bracketed paste bypasses `handle_key`, so it needs the same
+    /// normalisation: a cursor left past the last character makes the
+    /// next `x` do nothing, and a surviving `d` eats the next key.
+    #[test]
+    fn paste_in_normal_mode_leaves_a_usable_cursor() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_paste(&mut app, "abc");
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 2, "paste left the cursor past the last char");
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.input, "ab", "x had nothing under the cursor");
+
+        // A pending operator must not survive the paste.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one\ntwo".into();
+        app.cursor = 0;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        handle_paste(&mut app, "X");
+        assert!(!app.vi_pending_d, "the operator survived the paste");
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(
+            app.input, "Xone\ntwo",
+            "the stale operator turned the next key into a line delete"
+        );
+    }
+
+    /// Ctrl+C returns from an early branch, so the operator reset has to
+    /// happen after dispatch or a stale `d` eats the next key.
+    #[test]
+    fn ctrl_c_drops_a_pending_operator() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d);
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit_armed, "Ctrl+C stopped arming quit");
+        assert!(!app.vi_pending_d, "the operator survived Ctrl+C");
+    }
+
+    /// A platform-modified character is a chord, not a vi command: Cmd+X
+    /// must not delete and Cmd+D must not arm `dd`.
+    #[test]
+    fn platform_modified_chars_are_not_vi_commands() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 0;
+        handle_key(&mut app, super_key('x'));
+        assert_eq!(app.input, "abc", "Cmd+X deleted as the vi command `x`");
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        handle_key(&mut app, super_key('d'));
+        assert!(!app.vi_pending_d, "Cmd+D armed the delete operator");
+
+        // Shift is still part of a command: `D` differs from `d`.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "hello world".into();
+        app.cursor = 5;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.input, "hello", "Shift+D stopped deleting to line end");
+    }
+
+    /// Backspace in normal mode is a left motion, not a delete. Letting
+    /// it reach `backspace()` destroyed a character with no undo.
+    #[test]
+    fn backspace_does_not_delete_in_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 2;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.input, "abc", "Backspace deleted in normal mode");
+        assert_eq!(app.cursor, 1, "Backspace should move left");
+
+        // Insert mode still deletes.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.input = "abc".into();
+        app.cursor = 3;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.input, "ab", "Backspace stopped deleting in insert mode");
+
+        // An empty composer falls through, so the queue pane keeps its
+        // delete key while normal mode is on.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.queue.push_back("queued".into());
+        app.show_queue_pane = true;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert!(
+            app.queue.is_empty(),
+            "normal mode swallowed the queue pane's delete key"
+        );
+    }
+
+    /// A modal that answers with a bare character never reaches the vi
+    /// handler, so the operator armed before it must not survive and eat
+    /// the first key typed afterwards.
+    #[test]
+    fn a_modal_answer_does_not_leave_the_operator_armed() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one\ntwo".into();
+        app.cursor = 0;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d);
+
+        // A permission modal takes the keyboard and swallows `y`.
+        app.phase = crate::ui::modern::app::Phase::Permission;
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        app.phase = crate::ui::modern::app::Phase::Idle;
+        assert!(
+            !app.vi_pending_d,
+            "the operator survived the modal answer and will eat the next key"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(
+            app.input, "one\ntwo",
+            "the stale operator turned the next `d` into a line delete"
+        );
+    }
+
+    /// `/emacs` must not advertise composer bindings that do not exist.
+    /// This pins what those chords actually do: Ctrl+A/K/W are unbound in
+    /// the composer, Ctrl+E expands thinking blocks and Ctrl+U scrolls the
+    /// transcript. If any of them ever becomes a composer edit, update
+    /// `EMACS_EDIT_MODE_MSG` and `docs/tui/KEYBINDINGS.md` with it.
+    #[test]
+    fn emacs_mode_message_matches_the_real_bindings() {
+        let msg = crate::commands::EMACS_EDIT_MODE_MSG;
+        assert!(
+            !msg.contains("Ctrl+"),
+            "/emacs advertises composer chords: {msg}"
+        );
+
+        for c in ['a', 'k', 'w'] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.input = "hello world".into();
+            app.cursor = 6;
+            handle_key(&mut app, ctrl(c));
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("hello world", 6),
+                "Ctrl+{c} now edits the composer but is still undocumented"
+            );
+        }
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello world".into();
+        app.cursor = 6;
+        handle_key(&mut app, ctrl('e'));
+        assert_eq!(
+            (app.input.as_str(), app.cursor),
+            ("hello world", 6),
+            "Ctrl+E edited the composer"
+        );
+        assert_eq!(
+            app.status_message, "no thinking blocks",
+            "Ctrl+E no longer reaches the thinking toggle"
+        );
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello world".into();
+        app.cursor = 6;
+        handle_key(&mut app, ctrl('u'));
+        assert_eq!(
+            (app.input.as_str(), app.cursor),
+            ("hello world", 6),
+            "Ctrl+U killed the line"
+        );
+    }
+
+    /// With vi off, every key must behave exactly as before.
+    #[test]
+    fn without_vi_mode_esc_still_arms_quit() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(!app.vi_mode);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.quit_armed, "Esc stopped arming quit for non-vi users");
     }
 
     #[test]

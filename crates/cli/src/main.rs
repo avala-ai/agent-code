@@ -914,6 +914,20 @@ async fn async_main() -> anyhow::Result<()> {
             env: entry.env.clone(),
         };
 
+        // Captured before the config moves into the client: durable
+        // grants key on it, so an approval for `mcp__{name}__*` stops
+        // matching once this server name is repointed at a different
+        // command, url or environment.
+        //
+        // The process cwd, not the project root: a stdio server is
+        // spawned without `current_dir`, so that is the directory it
+        // inherits and the one a bare command resolves against.
+        let launch_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let binding = agent_code_lib::tools::GrantBinding {
+            digest: mcp_config.binding_fingerprint(&launch_cwd),
+            cwd_sensitive: mcp_config.is_cwd_sensitive(),
+        };
+
         let mut client = agent_code_lib::services::mcp::McpClient::new(mcp_config);
         match client.connect().await {
             Ok(()) => {
@@ -923,6 +937,7 @@ async fn async_main() -> anyhow::Result<()> {
                     name,
                     &discovered,
                     client_arc,
+                    &binding,
                 );
                 let count = proxies.len();
                 for proxy in proxies {
