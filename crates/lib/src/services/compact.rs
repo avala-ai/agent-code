@@ -308,6 +308,62 @@ pub fn estimate_compactable_tokens(messages: &[Message], keep_recent: usize) -> 
     freed
 }
 
+/// Encoded image bytes kept in history, newest first.
+///
+/// Images are the one block whose cost is measured in megabytes rather
+/// than tokens: a screenshot is charged a flat vision estimate, so no
+/// token threshold notices it, yet every later request reserializes and
+/// resends the whole payload. A handful of screenshots in a long session
+/// is enough to push requests past what a provider will accept. 12 MiB
+/// keeps a few recent images available to the model while bounding what
+/// the session can carry.
+pub const MAX_RETAINED_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+
+/// Drop image payloads once history holds more than
+/// [`MAX_RETAINED_IMAGE_BYTES`] of them, oldest first.
+///
+/// The block is replaced by text naming what was dropped, so the model
+/// still knows an image was there and the conversation stays valid;
+/// only the bytes go. Returns the number of images dropped.
+pub fn evict_old_images(messages: &mut [Message], budget_bytes: usize) -> usize {
+    // Newest first: recent images are the ones still being talked about.
+    let mut sites: Vec<(usize, usize, usize, String)> = Vec::new();
+    for (msg_idx, msg) in messages.iter().enumerate() {
+        let content = match msg {
+            Message::User(u) => &u.content,
+            Message::Assistant(a) => &a.content,
+            Message::System(_) => continue,
+        };
+        for (block_idx, block) in content.iter().enumerate() {
+            if let ContentBlock::Image { media_type, data } = block {
+                sites.push((msg_idx, block_idx, data.len(), media_type.clone()));
+            }
+        }
+    }
+
+    let mut kept = 0usize;
+    let mut evicted = 0usize;
+    for (msg_idx, block_idx, len, media_type) in sites.into_iter().rev() {
+        if kept + len <= budget_bytes {
+            kept += len;
+            continue;
+        }
+        let placeholder = ContentBlock::Text {
+            text: format!(
+                "[image dropped from context — {media_type}, {:.1} MB]",
+                len as f64 / (1000.0 * 1000.0)
+            ),
+        };
+        match &mut messages[msg_idx] {
+            Message::User(u) => u.content[block_idx] = placeholder,
+            Message::Assistant(a) => a.content[block_idx] = placeholder,
+            Message::System(_) => continue,
+        }
+        evicted += 1;
+    }
+    evicted
+}
+
 /// Perform microcompact: clear stale tool results to free tokens.
 ///
 /// Replaces the content of old tool_result blocks with a placeholder,
@@ -685,6 +741,106 @@ mod tests {
             stop_reason: None,
             request_id: None,
         })
+    }
+
+    fn user_with_image(bytes: usize) -> Message {
+        crate::llm::message::user_message_with_attachments(
+            "look at this",
+            vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(bytes),
+            }],
+        )
+    }
+
+    fn image_payload_bytes(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(&u.content),
+                Message::Assistant(a) => Some(&a.content),
+                Message::System(_) => None,
+            })
+            .flatten()
+            .filter_map(|b| match b {
+                ContentBlock::Image { data, .. } => Some(data.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Images are charged a flat vision estimate, so no token threshold
+    /// ever notices the megabytes they add to every later request. The
+    /// bytes have to be bounded on their own.
+    #[test]
+    fn old_image_payloads_are_evicted_beyond_the_budget() {
+        let budget = 1000;
+        let mut messages = vec![
+            user_with_image(600),
+            assistant_text("first"),
+            user_with_image(600),
+            assistant_text("second"),
+            user_with_image(600),
+        ];
+        let evicted = evict_old_images(&mut messages, budget);
+        assert_eq!(evicted, 2, "older images were kept");
+        assert!(
+            image_payload_bytes(&messages) <= budget,
+            "retained {} bytes over a {budget} budget",
+            image_payload_bytes(&messages)
+        );
+        // The newest image survives: it is the one still being discussed.
+        assert!(
+            matches!(
+                messages[4].clone(),
+                Message::User(u) if u.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }))
+            ),
+            "the newest image was dropped"
+        );
+    }
+
+    /// The block is replaced, not removed: the model still learns an image
+    /// was there, and the message keeps a valid shape.
+    #[test]
+    fn an_evicted_image_leaves_a_note_in_its_place() {
+        let mut messages = vec![user_with_image(500), user_with_image(500)];
+        assert_eq!(evict_old_images(&mut messages, 600), 1);
+        let Message::User(u) = &messages[0] else {
+            panic!("expected a user message");
+        };
+        let text = u
+            .content
+            .iter()
+            .find_map(|b| b.as_text())
+            .expect("no text block replaced the image");
+        assert!(text.contains("image dropped from context"), "{text}");
+        assert!(text.contains("image/png"), "{text}");
+    }
+
+    #[test]
+    fn images_within_the_budget_are_untouched() {
+        let mut messages = vec![user_with_image(100), user_with_image(100)];
+        let before = image_payload_bytes(&messages);
+        assert_eq!(evict_old_images(&mut messages, 1000), 0);
+        assert_eq!(image_payload_bytes(&messages), before);
+    }
+
+    /// Running twice must not keep rewriting history: once the payloads
+    /// are gone there is nothing left to evict.
+    #[test]
+    fn eviction_is_idempotent() {
+        let mut messages = vec![user_with_image(600), user_with_image(600)];
+        assert_eq!(evict_old_images(&mut messages, 1000), 1);
+        assert_eq!(evict_old_images(&mut messages, 1000), 0);
+    }
+
+    /// A single image larger than the whole budget is still dropped —
+    /// keeping it would blow the bound it exists to enforce.
+    #[test]
+    fn an_image_larger_than_the_budget_is_evicted() {
+        let mut messages = vec![user_with_image(2000)];
+        assert_eq!(evict_old_images(&mut messages, 1000), 1);
+        assert_eq!(image_payload_bytes(&messages), 0);
     }
 
     fn assistant_tool_use(ids: &[&str]) -> Message {

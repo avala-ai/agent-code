@@ -764,6 +764,19 @@ impl QueryEngine {
             crate::llm::message::user_message_with_attachments(user_input, attachments)
         };
         self.state.push_message(user_msg);
+        // Images are the one block a token threshold cannot see: each is
+        // charged a flat vision estimate, so compaction never fires on the
+        // megabytes they actually add to every later request. Bound what
+        // history retains here instead, once the new turn's own images are
+        // in and counted as the most recent.
+        let dropped =
+            compact::evict_old_images(&mut self.state.messages, compact::MAX_RETAINED_IMAGE_BYTES);
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "evicted image payloads beyond the retention budget"
+            );
+        }
 
         // UserPromptSubmit fires once per user turn, as soon as the
         // prompt is in history and before any PreTurn / LLM work. Hooks
