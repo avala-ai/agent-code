@@ -465,7 +465,7 @@ fn resolve_env_long(name: &str) -> Option<EnvLong> {
 /// wrapper), with the wrapper's options and their operands consumed.
 /// [`Unwrap::None`] when no command executes behind the arguments —
 /// including options this parser does not know, which env rejects.
-/// [`Unwrap::Dynamic`] when a command runs but only expansion decides
+/// [`Unresolved::Expansion`] when a command runs but only expansion decides
 /// which; mislocating it would hand restrictive rules text that
 /// silently fails to match.
 fn strip_wrapper(tokens: &[String]) -> Unwrap {
@@ -582,20 +582,35 @@ fn split_string_tokens(wrapper: &str, operand: &str, remainder: &[String]) -> Un
 pub enum Unwrap {
     /// The wrapped command's tokens.
     Tokens(Vec<String>),
-    /// A command runs but its identity cannot be known at gate time:
-    /// `env -S` expands `${VAR}` itself, so `CMD=rm env -S '${CMD} -rf
-    /// x'` executes `rm`. Gates must treat this as unknown, not as
-    /// "nothing wrapped" — a silent drop lets a broad allow through.
-    Dynamic,
+    /// A command runs but this parser cannot say which. Gates must
+    /// treat it as unknown, not as "nothing wrapped" — a silent drop
+    /// lets a broad allow through and hides the command from the
+    /// destructive-command scan.
+    Unresolved(Unresolved),
     /// Nothing was unwrapped: the head is not a wrapper, or the
     /// arguments are ones env itself rejects, so no command executes
     /// behind them.
     None,
 }
 
+/// Why a wrapper chain resolved to no identifiable command even though
+/// one runs. Every variant is a *resolution failure*, never an
+/// all-clear: the only correct response is to fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unresolved {
+    /// Run-time expansion decides the command: `env -S` expands
+    /// `${VAR}` itself, so `CMD=rm env -S '${CMD} -rf x'` executes
+    /// `rm`.
+    Expansion,
+    /// The wrapper chain outruns [`MAX_UNWRAP_HOPS`]. A command still
+    /// executes behind the wrappers; this parser just never reached
+    /// it.
+    Depth,
+}
+
 /// Split an `env -S` string the way GNU env does: whitespace-separated
 /// words, single and double quotes, backslash escapes, `#` comments
-/// and the `\c` terminator. [`Unwrap::Dynamic`] when `$` expansion
+/// and the `\c` terminator. [`Unresolved::Expansion`] when `$` expansion
 /// decides the command; [`Unwrap::None`] for sequences env rejects at
 /// runtime, behind which nothing executes anyway.
 fn split_env_s(s: &str) -> Unwrap {
@@ -621,7 +636,7 @@ fn split_env_s(s: &str) -> Unwrap {
         match c {
             c if c.is_whitespace() => end_word(&mut cur, &mut in_word, &mut words),
             '#' if !in_word => break,
-            '$' => return Unwrap::Dynamic,
+            '$' => return Unwrap::Unresolved(Unresolved::Expansion),
             '\'' => {
                 in_word = true;
                 loop {
@@ -640,7 +655,7 @@ fn split_env_s(s: &str) -> Unwrap {
                 loop {
                     match next_or_reject!(chars) {
                         '"' => break,
-                        '$' => return Unwrap::Dynamic,
+                        '$' => return Unwrap::Unresolved(Unresolved::Expansion),
                         '\\' => {
                             let esc = next_or_reject!(chars);
                             if esc == '_' {
@@ -698,11 +713,21 @@ fn env_s_escape(c: char) -> Option<char> {
     })
 }
 
+/// How many wrappers may be stripped before the chain is declared
+/// unresolvable. A bound is kept rather than removed so a wrapper that
+/// re-expands into itself cannot spin here; running out of it is a
+/// failure to resolve, not an all-clear.
+const MAX_UNWRAP_HOPS: usize = 8;
+
 /// The invocation's tokens with any leading wrapper chain stripped.
+/// Resolution is retried after every strip, so a chain exactly as long
+/// as the budget still names its command; only a chain that is *still*
+/// wrapped once the budget is spent is [`Unresolved::Depth`].
 fn unwrapped_tokens(argv: &[String]) -> Unwrap {
     let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
     let mut unwrapped = false;
-    for _ in 0..8 {
+    let mut hops = 0;
+    loop {
         let Some(first) = tokens.first() else {
             return Unwrap::None;
         };
@@ -713,13 +738,16 @@ fn unwrapped_tokens(argv: &[String]) -> Unwrap {
                 Unwrap::None
             };
         }
+        if hops == MAX_UNWRAP_HOPS {
+            return Unwrap::Unresolved(Unresolved::Depth);
+        }
         match strip_wrapper(&tokens) {
             Unwrap::Tokens(next) => tokens = next,
             other => return other,
         }
         unwrapped = true;
+        hops += 1;
     }
-    Unwrap::None
 }
 
 /// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
@@ -767,9 +795,9 @@ pub fn env_split_string(operand: &str) -> Option<Vec<String>> {
 /// The tokens a wrapper chain runs, for gates that need the argv
 /// rather than the joined text of [`unwrapped_invocation_texts`].
 /// `None` when the head is not a wrapper, or no wrapped command can be
-/// identified — including the dynamic case, which
-/// [`has_dynamic_wrapper`] reports separately so callers can fail
-/// closed instead of treating it as "nothing wrapped".
+/// identified — including the unresolved cases, which
+/// [`unresolved_wrapper`] reports separately so callers can fail
+/// closed instead of treating them as "nothing wrapped".
 pub fn unwrapped_argv(argv: &[String]) -> Option<Vec<String>> {
     match unwrapped_tokens(argv) {
         Unwrap::Tokens(tokens) => Some(tokens),
@@ -777,15 +805,20 @@ pub fn unwrapped_argv(argv: &[String]) -> Option<Vec<String>> {
     }
 }
 
-/// True when some invocation runs a command whose identity only
-/// run-time expansion decides (`env -S '${CMD} -rf x'`). The command
-/// text a gate would match is unknowable, so widening rules must fail
-/// closed rather than treat the invocation as "nothing wrapped".
-pub fn has_dynamic_wrapper(parsed: &ParsedCommand) -> bool {
+/// The reason some invocation runs a command this parser cannot name —
+/// run-time expansion (`env -S '${CMD} -rf x'`) or a wrapper chain
+/// past [`MAX_UNWRAP_HOPS`] (`env env … env rm x`). Either way the
+/// command text a gate would match is unknowable, so widening rules
+/// must fail closed rather than treat the invocation as "nothing
+/// wrapped".
+pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
     parsed
         .invocations
         .iter()
-        .any(|argv| unwrapped_tokens(argv) == Unwrap::Dynamic)
+        .find_map(|argv| match unwrapped_tokens(argv) {
+            Unwrap::Unresolved(reason) => Some(reason),
+            _ => None,
+        })
 }
 
 /// Check a parsed command against security rules.
@@ -812,12 +845,17 @@ pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {
         }
     }
 
-    if has_dynamic_wrapper(parsed) {
-        violations.push(
+    match unresolved_wrapper(parsed) {
+        Some(Unresolved::Expansion) => violations.push(
             "Wrapped command is chosen by run-time expansion (env -S with $), so what executes \
              cannot be determined"
                 .to_string(),
-        );
+        ),
+        Some(Unresolved::Depth) => violations.push(format!(
+            "Wrapper chain runs deeper than {MAX_UNWRAP_HOPS} levels, so what executes behind it \
+             cannot be determined"
+        )),
+        None => {}
     }
 
     for base in &heads {
@@ -1285,7 +1323,7 @@ mod tests {
     #[test]
     fn test_dynamic_split_string_is_reported_not_dropped() {
         let parsed = parse_bash("env -S '${CMD} -rf /tmp/x'").unwrap();
-        assert!(has_dynamic_wrapper(&parsed));
+        assert_eq!(unresolved_wrapper(&parsed), Some(Unresolved::Expansion));
         assert!(unwrapped_invocation_texts(&parsed).is_empty());
         assert!(
             check_parsed_security(&parsed)
@@ -1295,7 +1333,79 @@ mod tests {
         );
         // An option env itself rejects is not dynamic: nothing runs.
         let rejected = parse_bash("env --frobnicate git status").unwrap();
-        assert!(!has_dynamic_wrapper(&rejected));
+        assert_eq!(unresolved_wrapper(&rejected), None);
+    }
+
+    /// A chain as long as the budget allows still resolves: the head is
+    /// re-examined after the final strip, so the command is named and
+    /// judged on its name.
+    #[test]
+    fn test_wrapper_chain_within_the_budget_names_its_command() {
+        for depth in 1..=MAX_UNWRAP_HOPS {
+            let cmd = format!("{}$'rm' /tmp/victim", "env ".repeat(depth));
+            let parsed = parse_bash(&cmd).unwrap();
+            assert_eq!(
+                unwrapped_head(&parsed.invocations[0]).as_deref(),
+                Some("rm"),
+                "chain of {depth} wrappers lost its command"
+            );
+            assert_eq!(unresolved_wrapper(&parsed), None);
+            assert!(
+                check_parsed_security(&parsed)
+                    .iter()
+                    .any(|v| v.contains("'rm'")),
+                "expected 'rm' to be detected in: {cmd}"
+            );
+        }
+    }
+
+    /// Running out of unwrap budget means the command behind the chain
+    /// was never reached — not that there is none. Falling through to
+    /// [`Unwrap::None`] here let `env` x8 `$'rm' victim` past the
+    /// destructive-command gate entirely.
+    #[test]
+    fn test_wrapper_chain_past_the_budget_is_unresolved_not_absent() {
+        for extra in 1..=3 {
+            let depth = MAX_UNWRAP_HOPS + extra;
+            let cmd = format!("{}$'rm' /tmp/victim", "env ".repeat(depth));
+            let parsed = parse_bash(&cmd).unwrap();
+            assert_eq!(
+                unresolved_wrapper(&parsed),
+                Some(Unresolved::Depth),
+                "chain of {depth} wrappers must be unresolved, not empty"
+            );
+            assert!(
+                unwrapped_argv(&parsed.invocations[0]).is_none(),
+                "an unresolved chain must not hand out tokens"
+            );
+            assert!(
+                check_parsed_security(&parsed)
+                    .iter()
+                    .any(|v| v.contains("cannot be determined")),
+                "a chain past the budget must reach the gate as unknown: {cmd}"
+            );
+        }
+    }
+
+    /// The fail-closed path must stay narrow: ordinary wrapped commands
+    /// keep resolving and keep passing.
+    #[test]
+    fn test_wrapped_innocent_commands_are_not_over_blocked() {
+        for cmd in [
+            "git status",
+            "env git status",
+            "env -u PATH git status",
+            "nohup setsid env command ls -la",
+            "env env env env env env env env git status",
+            "env -S 'git status'",
+        ] {
+            let parsed = parse_bash(cmd).unwrap();
+            assert_eq!(unresolved_wrapper(&parsed), None, "over-blocked: {cmd}");
+            assert!(
+                check_parsed_security(&parsed).is_empty(),
+                "innocent command was flagged: {cmd}"
+            );
+        }
     }
 
     #[test]
