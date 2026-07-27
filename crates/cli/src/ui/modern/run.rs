@@ -635,6 +635,18 @@ pub(super) async fn event_loop(
                                  ({e}) — staying in {previous_cwd}",
                                     data.cwd
                                 )));
+                            // The session being kept has already been
+                            // told it stopped. Start it again so the
+                            // lifecycle stays paired: without this its
+                            // watchers and cleanup hooks stay torn down
+                            // for a session that goes on being used, and
+                            // the eventual exit emits a second stop with
+                            // no start between them.
+                            {
+                                let engine_arc = session.engine();
+                                let eng = engine_arc.lock().await;
+                                let _ = eng.fire_session_start_hooks().await;
+                            }
                             app.cancel_deferred_resume_work();
                             app.pending_resume = None;
                             app.dirty = true;
