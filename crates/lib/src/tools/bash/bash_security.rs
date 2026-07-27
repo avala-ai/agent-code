@@ -1319,6 +1319,20 @@ const MAX_HEREDOC_EXPANSIONS: usize = 64;
 /// unread rather than partly read, since the reading that was skipped
 /// is exactly the one that hides a command.
 fn heredoc_expansions(body: &[char]) -> (Vec<String>, bool) {
+    heredoc_expansions_within(body, 0)
+}
+
+/// How deep arithmetic may nest before the walk stops following it.
+/// Arithmetic contributes no expansion of its own, so nesting alone
+/// would never spend [`MAX_HEREDOC_EXPANSIONS`]; without a second
+/// budget a body of nothing but `$((` would recurse until the stack
+/// ran out, having rescanned each level on the way down.
+const MAX_HEREDOC_EXPANSION_DEPTH: usize = 32;
+
+fn heredoc_expansions_within(body: &[char], depth: usize) -> (Vec<String>, bool) {
+    if depth >= MAX_HEREDOC_EXPANSION_DEPTH {
+        return (Vec::new(), true);
+    }
     let mut found = Vec::new();
     let mut i = 0;
     while i < body.len() {
@@ -1336,7 +1350,8 @@ fn heredoc_expansions(body: &[char]) -> (Vec<String>, bool) {
             // looked for where they still have their context.
             '$' if body.get(i + 1) == Some(&'(') && body.get(i + 2) == Some(&'(') => {
                 let (inner, next) = read_expansion(body, i + 2, '(', ')');
-                let (mut nested, spent) = heredoc_expansions(&inner.chars().collect::<Vec<_>>());
+                let (mut nested, spent) =
+                    heredoc_expansions_within(&inner.chars().collect::<Vec<_>>(), depth + 1);
                 if spent || found.len() + nested.len() > MAX_HEREDOC_EXPANSIONS * 2 {
                     return (found, true);
                 }
@@ -3284,6 +3299,26 @@ mod tests {
         assert_eq!(classify_str("ls -la"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("git status"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("cargo test"), DestructivenessLevel::Safe);
+    }
+
+    #[test]
+    fn nested_arithmetic_spends_the_expansion_budget() {
+        // Arithmetic contributes no expansion of its own, so nesting
+        // alone never spends the count. Without the depth budget this
+        // recurses once per level, rescanning each on the way down.
+        let deep: Vec<char> = format!(
+            "{}1{}",
+            "$((".repeat(MAX_HEREDOC_EXPANSION_DEPTH * 4),
+            "))".repeat(MAX_HEREDOC_EXPANSION_DEPTH * 4)
+        )
+        .chars()
+        .collect();
+        let (found, spent) = heredoc_expansions(&deep);
+        assert!(spent, "a body this deep was not followed to the end");
+        assert!(found.is_empty());
+        // A depth the walk does follow reports nothing spent.
+        let shallow: Vec<char> = "$(($((1))))".chars().collect();
+        assert!(!heredoc_expansions(&shallow).1);
     }
 
     #[test]
