@@ -667,6 +667,35 @@ fn resolve_slash_name(cmd: &str) -> String {
         .unwrap_or(head)
 }
 
+/// True when a slash built-in replaces or rewrites the engine's message
+/// history, rather than only adding to it.
+///
+/// The TUI caches per-conversation state (the model's checklist), so it
+/// must rebuild that state after these run — nothing else tells it the
+/// messages underneath changed. **Add new history-rewriting commands
+/// here**, or the pane will keep describing a plan the history no longer
+/// contains.
+///
+/// `/compact` is deliberately absent. It rewrites history too, but as a
+/// lossy compression that preserves intent: the model is still working
+/// the same plan afterwards, so dropping the checklist because the
+/// originating call was summarized away would lose live information
+/// rather than stale information.
+pub fn slash_rewrites_conversation(cmd: &str) -> bool {
+    matches!(
+        resolve_slash_name(cmd).as_str(),
+        // Whole-conversation swaps.
+        "resume" | "session" | "pick-session"
+        // Truncation and deletion (`/undo` resolves to `rewind`).
+        | "rewind" | "snip"
+        // `App::submit` intercepts a bare `/clear`, but only on an exact
+        // match: `/clear anything` falls through to this bridge, where
+        // the `clear` arm empties the messages just the same. Listed
+        // here so that form is not a hole.
+        | "clear"
+    )
+}
+
 /// True when a slash built-in needs the real terminal (picker, pager,
 /// `$EDITOR`, or a y/N stdin prompt) rather than captured stdout under the
 /// alt-screen TUI.
@@ -847,6 +876,43 @@ mod slash_lookup_tests {
         assert!(!is_interactive_slash("/add-dir"));
         assert!(!is_interactive_slash("/color"));
         assert!(!is_interactive_slash("/resume"));
+        // Conversation-replacing commands, which the TUI must notice so
+        // its cached checklist does not outlive the session it describes.
+        for cmd in [
+            "/resume abc123",
+            "/session",
+            "/pick-session",
+            // Truncation and deletion rewrite history just as wholly.
+            "/rewind",
+            "/rewind 3",
+            "/undo",
+            "/snip 3-7",
+            // `App::submit` only intercepts an exact `/clear`; the
+            // argument form reaches the bridge and empties history there.
+            "/clear",
+            "/clear anything",
+        ] {
+            assert!(
+                slash_rewrites_conversation(cmd),
+                "{cmd} rewrites history and must refresh the checklist"
+            );
+        }
+        // Commands that add to the current conversation, or leave it
+        // alone entirely. `/compact` rewrites history but preserves
+        // intent -- see `slash_rewrites_conversation`.
+        for cmd in [
+            "/sessions",
+            "/compact",
+            "/model",
+            "/cd /tmp",
+            "/fork",
+            "/help",
+        ] {
+            assert!(
+                !slash_rewrites_conversation(cmd),
+                "{cmd} should not count as rewriting the conversation"
+            );
+        }
         assert!(!is_interactive_slash("/help"));
         assert!(!is_interactive_slash("/cost"));
     }

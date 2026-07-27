@@ -106,6 +106,19 @@ pub struct ManagerRow {
 /// Pane lines the grouped list needs: a heading per source group, a
 /// blank line between groups, and two lines per task. The layout uses
 /// this to size the below-transcript strip on narrow terminals.
+pub fn pane_rows_with_todos(tasks: &[TaskEntry], todos: &[TodoItem]) -> usize {
+    let mut rows = pane_rows(tasks);
+    if !todos.is_empty() {
+        // heading + one row per item, plus a blank separator when tasks
+        // follow it.
+        rows += 1 + todos.len();
+        if !tasks.is_empty() {
+            rows += 1;
+        }
+    }
+    rows
+}
+
 pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
     let mut rows = 0;
     let mut last: Option<TaskSource> = None;
@@ -286,5 +299,350 @@ mod tests {
             states,
             vec![TaskState::NeedsInput, TaskState::Working, TaskState::Done]
         );
+    }
+}
+
+/// A checklist entry from the model's latest `TodoWrite` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl TodoItem {
+    pub fn from_fields((id, content, status): super::sink::TodoFields) -> Self {
+        TodoItem {
+            id,
+            content,
+            status: TodoStatus::parse(&status),
+        }
+    }
+}
+
+/// The entries of a `TodoWrite` input, or `None` when any entry is
+/// missing one of the three fields the tool declares required.
+///
+/// Shared by the live sink and the session-restore path so a checklist
+/// is held to the same shape however it reaches the pane. One bad entry
+/// rejects the batch: a partial checklist misdescribes the plan as badly
+/// as an empty one.
+pub fn parse_todo_input(input: &serde_json::Value) -> Option<Vec<super::sink::TodoFields>> {
+    input
+        .get("todos")?
+        .as_array()?
+        .iter()
+        .map(|t| {
+            let field = |k: &str| t.get(k)?.as_str().map(str::to_string);
+            Some((field("id")?, field("content")?, field("status")?))
+        })
+        .collect()
+}
+
+/// The checklist a stored conversation ended with: the input of its last
+/// `TodoWrite` that came back without an error.
+///
+/// A command can swap or rewrite the conversation out from under the UI
+/// (`/resume`, the session picker, `/rewind`, `/snip`). The pane is
+/// cached state rather than a view of the messages, so without this it
+/// would go on describing a plan the history no longer contains.
+///
+/// A call counts only with a matching result that is *not* an error —
+/// success must be positively evidenced, not inferred from the absence
+/// of a failure. A `TodoWrite` with no result at all never ran (a turn
+/// cut short by max-token recovery records the assistant message before
+/// tool execution, and that history can be saved and resumed), and the
+/// live sink withholds exactly those. Treating them as successful here
+/// would let a restored pane show a checklist the streamed pane refused.
+pub fn todos_from_messages(messages: &[agent_code_lib::llm::message::Message]) -> Vec<TodoItem> {
+    use agent_code_lib::llm::message::{ContentBlock, Message};
+
+    fn blocks(m: &Message) -> &[ContentBlock] {
+        match m {
+            Message::User(u) => &u.content,
+            Message::Assistant(a) => &a.content,
+            Message::System(_) => &[],
+        }
+    }
+    let succeeded: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(blocks)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error: false,
+                ..
+            } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| blocks(m).iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolUse { id, name, input }
+                if name == "TodoWrite" && succeeded.contains(id.as_str()) =>
+            {
+                parse_todo_input(input)
+            }
+            _ => None,
+        })
+        .map(|fields| fields.into_iter().map(TodoItem::from_fields).collect())
+        .unwrap_or_default()
+}
+
+impl TodoStatus {
+    /// Map the tool's status string. Unknown values read as pending,
+    /// which is the honest default: an item nobody claimed is not done.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "done" | "completed" | "complete" => TodoStatus::Done,
+            "in_progress" | "in progress" | "active" => TodoStatus::InProgress,
+            _ => TodoStatus::Pending,
+        }
+    }
+
+    /// Checklist glyph, matching the markers `TodoWrite` already prints.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            TodoStatus::Done => "✔",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Pending => "□",
+        }
+    }
+}
+
+/// The slice of checklist items the pane can draw in `budget` rows, as
+/// `(start, len)`.
+///
+/// A checklist is model-authored and unbounded — nothing stops a plan
+/// with two hundred entries — so the pane windows it instead of letting
+/// it claim every row. The window is anchored on the item in flight
+/// (falling back to the first unfinished one), because that is the row
+/// the user is actually tracking, with a little lead-in above it for
+/// context.
+pub fn todo_window(todos: &[TodoItem], budget: usize) -> (usize, usize) {
+    if todos.len() <= budget {
+        return (0, todos.len());
+    }
+    if budget == 0 {
+        return (0, 0);
+    }
+    let anchor = todos
+        .iter()
+        .position(|t| t.status == TodoStatus::InProgress)
+        .or_else(|| todos.iter().position(|t| t.status != TodoStatus::Done))
+        .unwrap_or(0);
+    let lead = budget / 3;
+    let start = anchor.saturating_sub(lead).min(todos.len() - budget);
+    (start, budget)
+}
+
+/// `2/5` — how far through the checklist the model is.
+pub fn todo_progress(todos: &[TodoItem]) -> (usize, usize) {
+    let done = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Done)
+        .count();
+    (done, todos.len())
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+
+    #[test]
+    fn status_parsing_defaults_to_pending() {
+        assert_eq!(TodoStatus::parse("done"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("completed"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("in_progress"), TodoStatus::InProgress);
+        assert_eq!(TodoStatus::parse("pending"), TodoStatus::Pending);
+        // An unrecognised status must not read as finished.
+        assert_eq!(TodoStatus::parse("garbage"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
+    }
+
+    fn todo(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: content.into(),
+            content: content.into(),
+            status,
+        }
+    }
+
+    /// A long checklist must not claim more rows than it is given, and
+    /// the window has to keep the item being worked on — the only one
+    /// the user is really tracking — inside it.
+    #[test]
+    fn the_checklist_window_keeps_the_item_in_flight_visible() {
+        let mut todos: Vec<TodoItem> = (0..40)
+            .map(|i| todo(&format!("item {i}"), TodoStatus::Done))
+            .collect();
+        todos[30].status = TodoStatus::InProgress;
+        for t in todos.iter_mut().skip(31) {
+            t.status = TodoStatus::Pending;
+        }
+
+        let (start, len) = todo_window(&todos, 6);
+        assert_eq!(len, 6, "window exceeded its budget");
+        assert!(
+            (start..start + len).contains(&30),
+            "in-progress item {} fell outside window {start}..{}",
+            30,
+            start + len
+        );
+
+        // With no in-progress item, the first unfinished one anchors it.
+        let mut all_but_last_done: Vec<TodoItem> = (0..40)
+            .map(|i| todo(&format!("item {i}"), TodoStatus::Done))
+            .collect();
+        all_but_last_done[39].status = TodoStatus::Pending;
+        let (start, len) = todo_window(&all_but_last_done, 5);
+        assert!(
+            (start..start + len).contains(&39),
+            "the only unfinished item was windowed out"
+        );
+
+        // Short lists are shown whole; a zero budget shows nothing rather
+        // than panicking on the slice.
+        assert_eq!(todo_window(&todos[..3], 6), (0, 3));
+        assert_eq!(todo_window(&todos, 0), (0, 0));
+        assert_eq!(todo_window(&[], 4), (0, 0));
+    }
+
+    /// `/resume` swaps the conversation under a cached pane. Rebuilding
+    /// from the messages must find the last checklist that actually ran
+    /// — the same rule the live path applies — so the restored pane
+    /// agrees with what the session ended on.
+    #[test]
+    fn a_restored_conversation_yields_its_last_successful_checklist() {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message};
+
+        let todo_call = |id: &str, content: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            name: "TodoWrite".into(),
+            input: serde_json::json!({
+                "todos": [{ "id": "1", "content": content, "status": "in_progress" }]
+            }),
+        };
+        let assistant = |blocks: Vec<ContentBlock>| {
+            Message::Assistant(AssistantMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: blocks,
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            })
+        };
+        let result = |id: &str, is_error: bool| ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            is_error,
+            extra_content: Vec::new(),
+        };
+
+        // Latest successful call wins over an earlier one.
+        let msgs = vec![
+            assistant(vec![todo_call("t1", "the older plan")]),
+            assistant(vec![result("t1", false)]),
+            assistant(vec![todo_call("t2", "the newer plan")]),
+            assistant(vec![result("t2", false)]),
+        ];
+        let todos = todos_from_messages(&msgs);
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "the newer plan");
+        assert_eq!(todos[0].status, TodoStatus::InProgress);
+
+        // A denied or failed call is skipped in favour of the last one
+        // that ran — a rejected plan never described the session.
+        let msgs = vec![
+            assistant(vec![todo_call("t1", "the plan that ran")]),
+            assistant(vec![result("t1", false)]),
+            assistant(vec![todo_call("t2", "the denied plan")]),
+            assistant(vec![result("t2", true)]),
+        ];
+        let todos = todos_from_messages(&msgs);
+        assert_eq!(todos.len(), 1, "the denied call was published");
+        assert_eq!(todos[0].content, "the plan that ran");
+
+        // A call with no result at all never ran — a turn cut short
+        // before tool execution records the assistant message anyway,
+        // and that history can be saved and resumed. The live sink
+        // withholds those, so restoration must too, or the two panes
+        // disagree. Success has to be evidenced, not assumed.
+        let msgs = vec![
+            assistant(vec![todo_call("t1", "the plan that ran")]),
+            assistant(vec![result("t1", false)]),
+            assistant(vec![todo_call("t2", "the plan that never executed")]),
+        ];
+        let todos = todos_from_messages(&msgs);
+        assert_eq!(todos.len(), 1, "an unresolved call was published");
+        assert_eq!(
+            todos[0].content, "the plan that ran",
+            "an unresolved TodoWrite was treated as successful"
+        );
+
+        // The only call being unresolved leaves the pane empty rather
+        // than showing a checklist that never took effect.
+        assert!(
+            todos_from_messages(&[assistant(vec![todo_call("t1", "never ran")])]).is_empty(),
+            "a lone unresolved call was published"
+        );
+
+        // A session that never wrote a checklist clears the pane rather
+        // than leaving the previous session's plan up.
+        assert!(todos_from_messages(&[]).is_empty());
+        assert!(
+            todos_from_messages(&[assistant(vec![ContentBlock::Text {
+                text: "no todos here".into()
+            }])])
+            .is_empty()
+        );
+
+        // Malformed entries are held to the same shape as the live path,
+        // even when the call itself succeeded.
+        let malformed = vec![
+            assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "TodoWrite".into(),
+                input: serde_json::json!({ "todos": [{ "id": "1" }] }),
+            }]),
+            assistant(vec![result("t1", false)]),
+        ];
+        assert!(todos_from_messages(&malformed).is_empty());
+    }
+
+    #[test]
+    fn progress_counts_only_completed_items() {
+        let todos = vec![
+            TodoItem {
+                id: "1".into(),
+                content: "a".into(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: "2".into(),
+                content: "b".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "3".into(),
+                content: "c".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        assert_eq!(todo_progress(&todos), (1, 3));
+        assert_eq!(todo_progress(&[]), (0, 0));
     }
 }

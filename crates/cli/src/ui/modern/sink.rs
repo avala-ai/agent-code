@@ -13,6 +13,14 @@ use agent_code_lib::tools::{
 };
 use tokio::sync::mpsc;
 
+/// One checklist entry as it crosses the sink: `(id, content, status)`,
+/// still the raw strings `TodoWrite` supplied. Interpreting `status` is
+/// the UI's job (`TodoStatus::parse`).
+pub type TodoFields = (String, String, String);
+
+/// Validated checklists waiting for their tool result, keyed by call id.
+type PendingTodos = Vec<(String, Vec<TodoFields>)>;
+
 /// A question relayed to the UI (flattened from the engine's `UserQuestion`).
 #[derive(Debug, Clone)]
 pub struct UiQuestion {
@@ -25,6 +33,17 @@ pub struct UiQuestion {
 pub enum EngineEvent {
     Text(String),
     Thinking(String),
+    /// The model's current checklist, parsed from a `TodoWrite` call.
+    ///
+    /// Carried as its own event because `ToolStart` forwards only a
+    /// display string; the checklist needs the structured items.
+    TodoUpdate {
+        /// Which conversation this checklist describes. Stamped when the
+        /// turn's sink is built; the UI drops updates that do not match
+        /// the conversation on screen. See [`ChannelSink::new`].
+        epoch: u64,
+        items: Vec<TodoFields>,
+    },
     ToolStart {
         /// Stable engine tool-call id, used to correlate the result card.
         /// Empty only if the engine emitted the legacy id-less callback.
@@ -176,14 +195,37 @@ impl QuestionAsker for ModernQuestionAsker {
     }
 }
 
+/// How many validated-but-unresolved checklists to hold. A cancelled
+/// turn can leave a tool start with no matching result, so the buffer is
+/// capped rather than trusted to drain.
+const MAX_PENDING_TODOS: usize = 8;
+
 /// Sink that forwards every stream callback onto `tx`.
 pub struct ChannelSink {
     tx: mpsc::UnboundedSender<EngineEvent>,
+    /// The conversation this turn belongs to, stamped onto checklist
+    /// updates. See [`ChannelSink::new`].
+    epoch: u64,
+    /// Validated `TodoWrite` checklists waiting for their tool result,
+    /// keyed by call id. See [`ChannelSink::on_tool_call_start`].
+    pending_todos: std::sync::Mutex<PendingTodos>,
 }
 
 impl ChannelSink {
-    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>) -> Arc<Self> {
-        Arc::new(Self { tx })
+    /// `epoch` identifies the conversation this turn runs against.
+    ///
+    /// A turn outlives the conversation that started it: `/clear`,
+    /// `/resume`, `/rewind` and `/snip` can all land while a turn is
+    /// still streaming, and its queued events are drained afterwards.
+    /// Stamping the epoch here — a sink is built per turn — lets the UI
+    /// drop a checklist belonging to a conversation that is gone,
+    /// instead of racing the drain order to decide which write wins.
+    pub fn new(tx: mpsc::UnboundedSender<EngineEvent>, epoch: u64) -> Arc<Self> {
+        Arc::new(Self {
+            tx,
+            epoch,
+            pending_todos: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     fn send(&self, ev: EngineEvent) {
@@ -216,6 +258,36 @@ impl StreamSink for ChannelSink {
     }
 
     fn on_tool_call_start(&self, call_id: &str, tool_name: &str, input: &serde_json::Value) {
+        // The checklist is the point of a TodoWrite call, so surface it
+        // as state rather than leaving it buried in a tool card. It is
+        // only parsed here — publishing it waits for the tool result,
+        // because this callback runs ahead of both input validation and
+        // the permission check, and a call the user denies must not get
+        // to redescribe the active plan.
+        //
+        // Entries must carry the three fields TodoWrite declares
+        // required, each a string. Filling missing ones with empty
+        // strings would let a malformed call blank the pane into pending
+        // rows describing work the model never wrote; one bad entry
+        // rejects the batch, since a partial checklist misdescribes the
+        // plan as badly as an empty one.
+        //
+        // The `status` *value* is deliberately not checked against the
+        // schema's enum: `TodoStatus::parse` already treats anything it
+        // does not recognise as pending, and dropping a whole update
+        // over one unexpected word would strand the pane on stale work.
+        if tool_name == "TodoWrite"
+            && let Some(items) = crate::ui::modern::tasks::parse_todo_input(input)
+        {
+            let mut pending = self
+                .pending_todos
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.retain(|(id, _)| id != call_id);
+            pending.push((call_id.to_string(), items));
+            let overflow = pending.len().saturating_sub(MAX_PENDING_TODOS);
+            pending.drain(..overflow);
+        }
         let detail = tool_detail(tool_name, input);
         self.send(EngineEvent::ToolStart {
             call_id: call_id.to_string(),
@@ -232,6 +304,32 @@ impl StreamSink for ChannelSink {
             content,
             is_error: result.is_error,
         });
+        // Now the checklist parsed at tool-start is safe to publish: only
+        // a call that actually ran describes the plan the model is
+        // working to. A permission denial or an input rejection arrives
+        // here as an error result, and leaves the previous list standing.
+        // Either way the entry is dropped, so it cannot be published by a
+        // later call.
+        if tool_name == "TodoWrite" {
+            let parsed = {
+                let mut pending = self
+                    .pending_todos
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending
+                    .iter()
+                    .position(|(id, _)| id == call_id)
+                    .map(|i| pending.remove(i).1)
+            };
+            if let Some(items) = parsed
+                && !result.is_error
+            {
+                self.send(EngineEvent::TodoUpdate {
+                    epoch: self.epoch,
+                    items,
+                });
+            }
+        }
     }
 
     fn on_turn_start(&self, turn: usize) {
@@ -337,12 +435,111 @@ mod tests {
     #[test]
     fn sink_forwards_text() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = ChannelSink::new(tx);
+        let sink = ChannelSink::new(tx, 0);
         sink.on_text("hello");
         match rx.try_recv().unwrap() {
             EngineEvent::Text(t) => assert_eq!(t, "hello"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// `on_tool_call_start` runs before the engine validates the call and
+    /// before the user approves it, so a malformed `TodoWrite` must not
+    /// be allowed to overwrite a good checklist. Filling the missing
+    /// fields with empty strings would blank the pane into pending rows
+    /// describing work the model never wrote.
+    #[test]
+    fn a_malformed_todo_write_leaves_the_checklist_alone() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx, 0);
+
+        let todos = |v: serde_json::Value| serde_json::json!({ "todos": v });
+        let rejected = [
+            // Missing each required field in turn.
+            serde_json::json!([{ "content": "a", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "content": "a" }]),
+            // Right keys, wrong types.
+            serde_json::json!([{ "id": 1, "content": "a", "status": "pending" }]),
+            serde_json::json!([{ "id": "1", "content": null, "status": "pending" }]),
+            // One bad entry poisons the batch: a partial checklist would
+            // misdescribe the plan just as badly as a blank one.
+            serde_json::json!([
+                { "id": "1", "content": "a", "status": "done" },
+                { "id": "2", "status": "pending" },
+            ]),
+            // Not objects at all.
+            serde_json::json!(["just a string"]),
+        ];
+        // Drives a whole call and reports whether the checklist moved.
+        let run = |rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+                   input: &serde_json::Value,
+                   is_error: bool| {
+            sink.on_tool_call_start("c1", "TodoWrite", input);
+            let mut result = ToolResult::success("Todo list (1 items):\n[ ] 1: a");
+            result.is_error = is_error;
+            sink.on_tool_call_result("c1", "TodoWrite", &result);
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|ev| matches!(ev, EngineEvent::TodoUpdate { .. }))
+        };
+
+        for input in rejected {
+            assert!(
+                !run(&mut rx, &todos(input.clone()), false),
+                "malformed input replaced the checklist: {input}"
+            );
+        }
+
+        // A well-formed call lands, and an empty list is a valid "no
+        // plan" signal rather than a malformed one.
+        let valid = todos(serde_json::json!([
+            { "id": "1", "content": "a", "status": "pending" }
+        ]));
+        assert!(run(&mut rx, &valid, false), "valid input was dropped");
+        assert!(
+            run(&mut rx, &todos(serde_json::json!([])), false),
+            "an empty checklist should be publishable"
+        );
+
+        // A denied or rejected call never ran, so it does not get to
+        // redescribe the plan — the previous checklist stands.
+        assert!(
+            !run(&mut rx, &valid, true),
+            "an errored TodoWrite still replaced the checklist"
+        );
+    }
+
+    /// Publication waits for the result, so a start with no result must
+    /// not leave the parsed list sitting where a later call could
+    /// publish it — nor accumulate without bound across a long session
+    /// of cancelled turns.
+    #[test]
+    fn an_unresolved_todo_write_is_never_published_and_is_bounded() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx, 0);
+        let input = serde_json::json!({
+            "todos": [{ "id": "1", "content": "a", "status": "pending" }]
+        });
+
+        // Starts that never resolve (a cancelled turn) publish nothing.
+        for i in 0..MAX_PENDING_TODOS * 3 {
+            sink.on_tool_call_start(&format!("c{i}"), "TodoWrite", &input);
+        }
+        let published = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|ev| matches!(ev, EngineEvent::TodoUpdate { .. }))
+            .count();
+        assert_eq!(published, 0, "an unresolved start published a checklist");
+        assert!(
+            sink.pending_todos.lock().unwrap().len() <= MAX_PENDING_TODOS,
+            "the pending buffer grew without bound"
+        );
+
+        // The evicted ids are gone for good: a late result cannot revive
+        // one and publish a checklist from an abandoned turn.
+        sink.on_tool_call_result("c0", "TodoWrite", &ToolResult::success("ok"));
+        let revived = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, EngineEvent::TodoUpdate { .. }));
+        assert!(!revived, "an evicted checklist was published late");
     }
 
     #[test]
