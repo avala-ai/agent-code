@@ -145,11 +145,16 @@ impl SessionViews {
 
 /// Roughly what a view costs on the heap.
 ///
-/// Only the string payloads are counted: they are what makes a
-/// transcript large, and the budget wants an order of magnitude, not an
-/// allocator-exact figure.
+/// An estimate, not an allocator-exact figure — the budget only needs
+/// the order of magnitude. String payloads dominate, but each item is
+/// also charged its own struct size so that a transcript which is huge
+/// by item count rather than by text still counts against the budget.
 fn view_bytes(view: &SessionView) -> usize {
-    view.transcript.iter().map(item_bytes).sum()
+    let per_item = std::mem::size_of::<TranscriptItem>();
+    view.transcript
+        .iter()
+        .map(|item| per_item + item_bytes(item))
+        .sum()
 }
 
 fn item_bytes(item: &TranscriptItem) -> usize {
@@ -190,7 +195,7 @@ mod tests {
         }
     }
 
-    /// A view whose transcript is `bytes` long.
+    /// A view whose transcript carries `bytes` of text.
     fn view_of_size(bytes: usize) -> SessionView {
         SessionView {
             transcript: vec![TranscriptItem::User("x".repeat(bytes))],
@@ -199,6 +204,10 @@ mod tests {
             selected_item: None,
         }
     }
+
+    /// Comfortably under half the budget, so two such views coexist and
+    /// a third cannot — with slack for the per-item overhead.
+    const HALF: usize = MAX_BYTES / 2 - 4096;
 
     #[test]
     fn a_saved_view_comes_back_intact() {
@@ -288,10 +297,10 @@ mod tests {
     #[test]
     fn large_transcripts_are_evicted_before_the_entry_cap() {
         let mut views = SessionViews::default();
-        let half = MAX_BYTES / 2;
-        views.save("a", view_of_size(half));
-        views.save("b", view_of_size(half));
-        views.save("c", view_of_size(half));
+        views.save("a", view_of_size(HALF));
+        views.save("b", view_of_size(HALF));
+        assert_eq!(views.len(), 2, "two views inside the budget did not fit");
+        views.save("c", view_of_size(HALF));
         assert!(views.len() < 3, "three oversized views all stayed resident");
         assert!(views.contains("c"), "the newest view was the one dropped");
         assert!(!views.contains("a"), "the oldest view was kept");
@@ -302,11 +311,10 @@ mod tests {
     #[test]
     fn resaving_a_session_replaces_its_entry() {
         let mut views = SessionViews::default();
-        let half = MAX_BYTES / 2;
         for _ in 0..6 {
-            views.save("a", view_of_size(half));
+            views.save("a", view_of_size(HALF));
         }
-        views.save("b", view_of_size(half));
+        views.save("b", view_of_size(HALF));
         assert!(
             views.contains("a") && views.contains("b"),
             "repeated saves of one session leaked budget"
@@ -324,6 +332,27 @@ mod tests {
         assert!(
             views.contains("small"),
             "an oversized view evicted the cache it could not join"
+        );
+    }
+
+    /// Text length is not the only way a transcript gets big: a very
+    /// long one costs per item too, so item count is charged as well.
+    #[test]
+    fn a_transcript_huge_by_item_count_is_bounded_too() {
+        let mut views = SessionViews::default();
+        let items = MAX_BYTES / std::mem::size_of::<TranscriptItem>() + 1;
+        views.save(
+            "many",
+            SessionView {
+                transcript: vec![TranscriptItem::User(String::new()); items],
+                scroll: ScrollState::Follow,
+                expanded: Default::default(),
+                selected_item: None,
+            },
+        );
+        assert!(
+            !views.contains("many"),
+            "a transcript over budget by item count was cached as free"
         );
     }
 }
