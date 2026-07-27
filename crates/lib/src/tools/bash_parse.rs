@@ -854,7 +854,15 @@ pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
         // '${CMD}'` prints it. Being wrong about this list can only
         // report an unknown that is not one, which is the safe way to
         // be wrong.
-        let head_is_data = argv.first().is_some_and(|t| {
+        // The head that decides is the one that ends up running, so a
+        // wrapped data command is still one: `env printf '%s\n' env -S
+        // '${CMD}'` prints its operands exactly as `printf` alone does.
+        let unwrapped = unwrapped_argv(argv);
+        let head = unwrapped
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .or_else(|| argv.first());
+        let head_is_data = head.is_some_and(|t| {
             DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
         });
         if head_is_data {
@@ -867,10 +875,20 @@ pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
         // `sudo env -S '${CMD}'` are each the same unknown as `env -S
         // '${CMD}'` alone. Starting only at the head made every name
         // nobody enumerated a way to hide one.
-        (0..argv.len()).find_map(|start| match unwrapped_tokens(&argv[start..]) {
-            Unwrap::Unresolved(reason) => Some(reason),
-            _ => None,
-        })
+        //
+        // Only a word that names a wrapper is resolved from. Resolving
+        // from every one copies the whole suffix each time, which is
+        // quadratic in the argument count for arguments that could
+        // never resolve to anything.
+        argv.iter()
+            .enumerate()
+            .filter(|(_, word)| {
+                COMMAND_WRAPPERS.contains(&base_name(&unquote_token(word)).as_str())
+            })
+            .find_map(|(start, _)| match unwrapped_tokens(&argv[start..]) {
+                Unwrap::Unresolved(reason) => Some(reason),
+                _ => None,
+            })
     })
 }
 
@@ -1486,9 +1504,13 @@ mod tests {
             "exec -a foo git status",
             "exec env git status",
             // A head whose operands are text runs nothing they name,
-            // so a wrapper word among them is the data it looks like.
+            // so a wrapper word among them is the data it looks like —
+            // and the head that decides is the one that ends up
+            // running, so a wrapped data command is still one.
             "printf '%s\\n' env -S '${CMD} -rf /tmp/x'",
             "echo env -S '${CMD}'",
+            "env printf '%s\\n' env -S '${CMD} -rf /tmp/x'",
+            "nohup env echo env -S '${CMD}'",
         ] {
             let parsed = parse_bash(cmd).unwrap();
             assert_eq!(unresolved_wrapper(&parsed), None, "over-blocked: {cmd}");

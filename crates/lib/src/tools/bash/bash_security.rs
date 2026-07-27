@@ -1738,9 +1738,9 @@ fn carries_git_config(statements: &[String]) -> bool {
         for word in &words {
             push_assignment(&mut assigned, word);
         }
-        assigned.iter().any(|(name, _)| {
-            GIT_CONFIG_SELECTORS.contains(&name.as_str()) || name.starts_with("GIT_CONFIG")
-        })
+        assigned
+            .iter()
+            .any(|(name, _)| selects_git_config(name.as_str()))
     })
 }
 
@@ -1894,7 +1894,10 @@ fn statement_mentions_unaccounted_git_config(
         invocation.iter().skip(1).any(|token| {
             split_alias_value(&unquote_token(token)).iter().any(|word| {
                 let name = word.split('=').next().unwrap_or(word);
-                name.starts_with("GIT_CONFIG") && !collected.iter().any(|(seen, _)| seen == name)
+                // Every selector, not just the `GIT_CONFIG…` ones: a
+                // `HOME=` the positional walk did not account for
+                // redirects git's config exactly as they do.
+                selects_git_config(name) && !collected.iter().any(|(seen, _)| seen == name)
             })
         })
     })
@@ -2074,21 +2077,33 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
     })
 }
 
-/// Names that select where git reads its config *and* arrive already
-/// exported, so assigning one bare keeps the attribute it came with and
-/// reaches git without the command ever spelling an export:
-/// `HOME=/tmp/h; git p` reads `/tmp/h/.gitconfig`.
+/// Names that select where git reads its config, and so what a command
+/// word can turn out to be. [`GIT_CONFIG_SELECTORS`] names the ones a
+/// shell can be handed; the prefix covers the numbered
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` family, which is open
+/// ended.
 ///
-/// Every shell has `HOME`. `XDG_CONFIG_HOME` is often unset, and then a
-/// bare assignment makes a shell variable no child sees, so it counts
-/// only where this process was actually given it — the same environment
-/// the command is about to run in.
+/// Every question about a selector asks this one, so a name cannot be
+/// recognised by one walk and missed by another.
+fn selects_git_config(name: &str) -> bool {
+    GIT_CONFIG_SELECTORS.contains(&name) || name.starts_with("GIT_CONFIG")
+}
+
+/// Whether a bare assignment to `name` still reaches git.
 ///
-/// The `GIT_CONFIG…` names are absent for that same reason: a shell
-/// does not come with them set, which is why `GIT_CONFIG_GLOBAL=/tmp/g;
-/// git status` runs an ordinary status.
+/// A bare assignment keeps whatever attribute the name arrived with, so
+/// this is not a question about the command text: it is whether the
+/// environment already exports the name. Reading that from the process
+/// this runs in is reading the environment the command is about to run
+/// in — no name is assumed either way. A shell handed an exported
+/// `GIT_CONFIG_GLOBAL` carries `GIT_CONFIG_GLOBAL=/tmp/evil; git p` to
+/// git, and one with no `HOME` at all carries nothing.
 fn inherits_export_for_git_config(name: &str) -> bool {
-    name == "HOME" || (name == "XDG_CONFIG_HOME" && std::env::var_os(name).is_some())
+    inherits_export_where(name, |n| std::env::var_os(n).is_some())
+}
+
+fn inherits_export_where(name: &str, exported: impl Fn(&str) -> bool) -> bool {
+    selects_git_config(name) && exported(name)
 }
 
 /// Config keys that can make git run something the command text does
@@ -2782,6 +2797,12 @@ mod tests {
             // A config file can define aliases the command never shows.
             "GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
             "env GIT_CONFIG_SYSTEM=/tmp/g git p origin main",
+            // `HOME` selects git's config as surely as the
+            // `GIT_CONFIG…` names do, so every spelling that hides one
+            // from the positional walk hides it too.
+            "timeout 5 env HOME=/tmp/h git p",
+            "env -S'HOME=/tmp/h' git p",
+            "env -S'XDG_CONFIG_HOME=/tmp/h' git p",
             // An option operand must not be mistaken for the command.
             "env -u X GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
             "env -C /tmp GIT_CONFIG_GLOBAL=/tmp/g git p origin main",
@@ -2852,13 +2873,12 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
-            // A shell inherits `HOME` already exported, so a bare
-            // assignment keeps that attribute and still reaches a git
-            // in a later statement — no `export` need be spelled.
-            // `XDG_CONFIG_HOME` is not pinned here: whether a bare
-            // assignment carries depends on the environment this runs
-            // in, and only the prefix spelling above always does.
-            "HOME=/tmp/h; git p",
+            // Only the prefix spellings are pinned here. Whether a
+            // *bare* assignment to a selector carries depends on
+            // whether the environment already exports the name, which
+            // is not a property of the command text — that reading is
+            // tested directly in `inherited_exports_come_from_the_
+            // environment`.
             // A `<<` in arithmetic shifts, so it opens no heredoc and
             // holds no following line back: reading one as a heredoc
             // would skip to the line naming its delimiter and hide the
@@ -3226,7 +3246,10 @@ mod tests {
             "set -- GIT_CONFIG_GLOBAL=/tmp/g; git status",
             // Printing an alias example is not defining one.
             "printf '%s\\n' git -c 'alias.p=reset --hard' p",
-            // An unexported shell variable never reaches git.
+            // An unexported shell variable never reaches git. A shell
+            // is not handed `GIT_CONFIG_GLOBAL`, so a bare assignment
+            // to it exports nothing; were the environment running these
+            // to export one, it would reach git and this would refuse.
             "GIT_CONFIG_GLOBAL=/tmp/g; git status",
             "GIT_CONFIG_GLOBAL+=/tmp/g\ngit status",
             // A declaration without `-x` is not exported.
@@ -3311,6 +3334,44 @@ mod tests {
         assert_eq!(classify_str("ls -la"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("git status"), DestructivenessLevel::Safe);
         assert_eq!(classify_str("cargo test"), DestructivenessLevel::Safe);
+    }
+
+    #[test]
+    fn inherited_exports_come_from_the_environment() {
+        // Whether a bare assignment carries is not a property of the
+        // command text: it is whether the name arrives exported. No
+        // name is assumed either way, so the same reading covers a
+        // shell handed `GIT_CONFIG_GLOBAL` and one with no `HOME`.
+        let present = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_0",
+        ] {
+            assert!(
+                inherits_export_where(
+                    name,
+                    present(&[
+                        "HOME",
+                        "XDG_CONFIG_HOME",
+                        "GIT_CONFIG_GLOBAL",
+                        "GIT_CONFIG_KEY_0"
+                    ])
+                ),
+                "{name} exported by the environment must carry"
+            );
+            assert!(
+                !inherits_export_where(name, present(&[])),
+                "{name} absent from the environment carries nothing"
+            );
+        }
+        // A name that selects no config is never carried this way,
+        // however the environment is set.
+        assert!(!inherits_export_where(
+            "PATH",
+            present(&["PATH", "HOME", "GIT_CONFIG_GLOBAL"])
+        ));
     }
 
     #[test]

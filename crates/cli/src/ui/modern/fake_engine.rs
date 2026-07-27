@@ -186,14 +186,52 @@ pub(super) struct ScriptedTerm {
     rx: mpsc::UnboundedReceiver<std::io::Result<Event>>,
 }
 
+/// How long a gated script waits for the effect it is about to assert
+/// on. Generous on purpose: it is only ever reached when something is
+/// wrong, while an instrumented run can be an order of magnitude slower
+/// than an ordinary one.
+pub(super) const GATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl ScriptedTerm {
     pub(super) fn play(script: Vec<(Duration, Event)>) -> Self {
+        Self::play_gated(script, || true)
+    }
+
+    /// Play the script, but hold the last event until `ready` reports
+    /// the effect under test has actually happened.
+    ///
+    /// A script names fixed offsets, which say when to *press* a key,
+    /// not when the work behind it is done. A test that asserts on that
+    /// work must wait for the work: under coverage instrumentation the
+    /// same run takes many times longer, and a fixed offset that fits
+    /// on one machine quits before the tool has written its file on
+    /// another. Waiting on the condition removes the race in both
+    /// directions — it also returns as soon as the effect lands, so the
+    /// ordinary run gets no slower.
+    pub(super) fn play_gated(
+        script: Vec<(Duration, Event)>,
+        ready: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let last = script.len().saturating_sub(1);
             let trace = std::env::var("FAKE_ENGINE_TRACE").is_ok();
             let start = tokio::time::Instant::now();
-            for (at, ev) in script {
+            for (index, (at, ev)) in script.into_iter().enumerate() {
                 tokio::time::sleep_until(start + at).await;
+                if index == last {
+                    let deadline = tokio::time::Instant::now() + GATE_TIMEOUT;
+                    while !ready() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if trace {
+                        eprintln!(
+                            "[fake_engine] gate ready={} at {:?}",
+                            ready(),
+                            start.elapsed()
+                        );
+                    }
+                }
                 if trace {
                     eprintln!("[fake_engine] term send at {:?}: {ev:?}", start.elapsed());
                 }
@@ -295,9 +333,15 @@ pub(super) fn harness(provider: ScriptedProvider, cwd: &std::path::Path) -> Harn
 /// Run the real `event_loop` against a scripted terminal, rendering frames
 /// to a `TestBackend`. Returns the final `App` for assertions plus the
 /// number of frames drawn.
-pub(super) async fn run_script(
+pub(super) async fn run_script(h: Harness, term_script: Vec<(Duration, Event)>) -> (App, usize) {
+    run_script_gated(h, term_script, || true).await
+}
+
+/// [`run_script`], holding the script's last event until `ready`.
+pub(super) async fn run_script_gated(
     mut h: Harness,
     term_script: Vec<(Duration, Event)>,
+    ready: impl Fn() -> bool + Send + 'static,
 ) -> (App, usize) {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
@@ -316,7 +360,7 @@ pub(super) async fn run_script(
         }
         Ok(())
     };
-    let mut term_events = ScriptedTerm::play(term_script);
+    let mut term_events = ScriptedTerm::play_gated(term_script, ready);
     super::run::event_loop(
         &h.session,
         &mut h.app,
@@ -436,7 +480,12 @@ mod tests {
         script.push((ms(800), key(KeyCode::Char('y'))));
         script.push((ms(3000), key(KeyCode::Char(' '))));
 
-        let (app, _frames) = run_script(h, script).await;
+        // Quit once the tool has actually written, not at a fixed
+        // offset: the assertion below is about the write having
+        // happened, and an instrumented run reaches it later than a
+        // plain one.
+        let written = target.clone();
+        let (app, _frames) = run_script_gated(h, script, move || written.exists()).await;
 
         assert!(
             target.exists(),
