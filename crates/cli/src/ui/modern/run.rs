@@ -417,9 +417,10 @@ pub(super) async fn event_loop(
         // onto the conversation being replaced. The choice is not lost —
         // the restore replays it on top of the restored session, since a
         // toggle made after picking is the user's newest instruction.
-        if app.mode != last_mode && app.pending_resume.is_none() {
+        if (app.mode != last_mode || app.mode_chosen) && app.pending_resume.is_none() {
             apply_mode_to_engine(session, app.mode, base_permission_mode);
             last_mode = app.mode;
+            app.mode_chosen = false;
             app.dirty = true;
         }
 
@@ -503,12 +504,38 @@ pub(super) async fn event_loop(
             // still loading: drop it, the load arm fetches the new one.
             if app.pending_resume.as_deref() == Some(id.as_str()) {
                 match session.engine().try_lock() {
-                    Ok(mut eng) => {
+                    Ok(probe) => {
+                        // The probe only answers "is the engine free right
+                        // now"; the `Err` arm re-queues the restore for a
+                        // later pass. Release it before any `await`: the
+                        // hooks below need the lock themselves, and a
+                        // guard held across an await is how this loop
+                        // deadlocked before.
+                        drop(probe);
+                        // SessionStop for the session being *left*, while
+                        // the engine still describes it — the hook context
+                        // is built from engine state, so firing after the
+                        // swap would report the restored id as having
+                        // stopped. Without this, consumers saw
+                        // SessionStart(old) followed by SessionStop(new)
+                        // and no lifecycle at all for the restored session.
+                        {
+                            let engine_arc = session.engine();
+                            let eng = engine_arc.lock().await;
+                            let _ = eng.fire_session_stop_hooks().await;
+                        }
+                        let engine_arc = session.engine();
+                        let mut eng = engine_arc.lock().await;
                         // A mode toggled after the session was picked but
                         // before it loaded is the user's newest explicit
                         // instruction, so it is replayed on top of the
                         // restored mode rather than silently reverted.
-                        let user_mode = (app.mode != last_mode).then_some(app.mode);
+                        // What the user actually chose, not what differs
+                        // from the mode we last applied: re-picking the
+                        // mode already showing is still an instruction,
+                        // and inferring it from inequality discarded it.
+                        let user_mode =
+                            (app.mode_chosen || app.mode != last_mode).then_some(app.mode);
                         let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
@@ -572,10 +599,13 @@ pub(super) async fn event_loop(
                         let mode = user_mode.unwrap_or(stored_mode);
                         app.mode = mode;
                         // Keep the loop's mode tracker in step, or the
-                        // `app.mode != last_mode` gate at the top would
-                        // re-apply (or, worse, silently skip) the mode we
-                        // are about to install.
+                        // gate at the top would re-apply (or, worse,
+                        // silently skip) the mode we are about to install.
                         last_mode = mode;
+                        // The choice has now been honoured, so it is no
+                        // longer pending; leaving it set would re-apply it
+                        // on the next pass and block the engine sync.
+                        app.mode_chosen = false;
                         let plan = mode == super::mode::SessionMode::Plan;
                         eng.state_mut().plan_mode = plan;
                         // Live handles, not just the config copy: the
@@ -586,6 +616,16 @@ pub(super) async fn event_loop(
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
                         app.pending_resume = None;
+                        drop(eng);
+                        // SessionStart for the session just restored, now
+                        // that the engine describes it. Paired with the
+                        // SessionStop above, a resume reads as one session
+                        // ending and another beginning — which is what
+                        // per-session setup (watchers, audit) keys off.
+                        {
+                            let eng = engine_arc.lock().await;
+                            let _ = eng.fire_session_start_hooks().await;
+                        }
                         // Restart the loop so the handlers *above* this one
                         // get their turn now that the resume gate is open.
                         // They have already been passed this iteration, and
@@ -937,7 +977,7 @@ pub(super) async fn event_loop(
                         // (EnterPlanMode/ExitPlanMode tools). Sync the badge
                         // — and the permission override — back from the
                         // engine, unless the user has a newer pending switch.
-                        if app.mode == last_mode {
+                        if app.mode == last_mode && !app.mode_chosen {
                             let engine_plan = eng.state().plan_mode;
                             let ui_plan = app.mode == super::mode::SessionMode::Plan;
                             if engine_plan != ui_plan {

@@ -484,6 +484,15 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pub deferred_prompts:
         std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
+    /// Set when the *user* picks a mode (`/plan`, Shift+Tab), cleared
+    /// once that choice has been applied to the engine.
+    ///
+    /// Not derived from `app.mode != last_mode`: choosing the mode you
+    /// are already in is still a choice, and inferring it from a value
+    /// change lost it. During a resume that mattered — picking Plan again
+    /// while a Normal session loaded left no trace, and the restore
+    /// silently dropped the user to Normal.
+    pub mode_chosen: bool,
     /// Whether `ui.edit_mode` asked for vi bindings.
     pub vi_mode: bool,
     /// Composer mode when `vi_mode` is on.
@@ -677,6 +686,7 @@ impl App {
             pending_attachments: Vec::new(),
             cancel_is_interject: false,
             deferred_prompts: std::collections::VecDeque::new(),
+            mode_chosen: false,
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
             vi_pending_d: false,
@@ -1461,6 +1471,7 @@ impl App {
         }
         if text == "/plan" {
             self.mode = SessionMode::Plan;
+            self.mode_chosen = true;
             self.status_message = "mode → PLAN".into();
             self.transcript.push(TranscriptItem::System(
                 "mode → PLAN (Shift+Tab to cycle)".into(),
@@ -2206,6 +2217,7 @@ impl App {
 
     pub fn cycle_mode_forward(&mut self) {
         self.mode = self.mode.cycle_next();
+        self.mode_chosen = true;
         self.status_message = format!("mode → {}", self.mode.label());
         if self.mode == SessionMode::Plan {
             // Live mode applies immediately (even mid-turn) via
@@ -5899,5 +5911,36 @@ mod tests {
             app.pending_attachments.is_empty(),
             "encoded image carried onto the replacement prompt"
         );
+    }
+
+    /// Re-picking the mode you are already in is still a choice. The
+    /// resume path used to infer "the user switched" from
+    /// `app.mode != last_mode`, so choosing Plan while already in Plan
+    /// left no trace and a restored Normal session silently dropped the
+    /// user out of read-only mode.
+    #[test]
+    fn choosing_the_mode_already_active_still_records_a_choice() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.mode = SessionMode::Plan;
+        app.mode_chosen = false;
+
+        app.input = "/plan".into();
+        app.cursor = app.input.len();
+        app.submit();
+
+        assert_eq!(app.mode, SessionMode::Plan, "mode unchanged, as expected");
+        assert!(
+            app.mode_chosen,
+            "an explicit choice must be recorded even when the value does not change"
+        );
+    }
+
+    /// Shift+Tab records a choice the same way.
+    #[test]
+    fn cycling_the_mode_records_a_choice() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.mode_chosen = false;
+        app.cycle_mode_forward();
+        assert!(app.mode_chosen, "cycling is an explicit choice");
     }
 }
