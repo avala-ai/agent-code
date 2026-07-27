@@ -425,5 +425,9 @@ mod tests {
         );
         assert_eq!(reg.all().len(), builtin, "built-in tools must be untouched");
         assert_eq!(reg.remove_mcp_tools(), 0, "second call is a no-op");
+        assert!(
+            reg.all().iter().all(|t| !t.name().starts_with("mcp__")),
+            "no proxy may survive by another spelling"
+        );
     }
 }

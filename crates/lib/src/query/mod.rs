@@ -532,6 +532,12 @@ impl QueryEngine {
         self.state.config.permissions.allowed_tools = cfg.permissions.allowed_tools;
         self.state.config.permissions.disallowed_tools = cfg.permissions.disallowed_tools;
         self.state.config.hooks = cfg.hooks;
+        // The prompt describes the servers from config, so dropping the
+        // proxies without this told the model to call tools that no
+        // longer exist. The destination's own list takes its place —
+        // empty unless it configures servers, and its proxies are not
+        // connected either, so it stays empty until a restart.
+        self.state.config.mcp_servers.clear();
         // MCP proxies belong to the project that configured them. A
         // visibility filter would only hide them; they would still be
         // callable, so a model in the destination could reach servers the
