@@ -54,6 +54,15 @@ impl SessionPicker {
     }
 }
 
+/// First eight *characters* of a session id, for compact display.
+///
+/// Character-safe, not byte-safe: ids come from session filenames, and
+/// an imported or hand-renamed file can carry non-ASCII, where slicing
+/// at byte 8 can land mid-character and panic the whole TUI.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 /// One display row: what the picker shows for a session.
 ///
 /// Sizes the session by turn count rather than message count: the picker
@@ -68,7 +77,7 @@ pub fn summary_line(s: &SessionSummary) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| s.cwd.clone())
     });
-    let short_id: String = s.id.chars().take(8).collect();
+    let short_id = short_id(&s.id);
     let turns = s.turn_count;
     let plural = if turns == 1 { "" } else { "s" };
     format!(
@@ -419,6 +428,21 @@ impl App {
         self.dirty = true;
     }
 
+    /// Pasted text goes to the picker's filter while it is open — it
+    /// owns typed input, so it owns pasted input too. Otherwise the
+    /// paste silently edits the composer hidden behind it and the draft
+    /// resurfaces after the picker closes.
+    pub fn session_picker_insert_str(&mut self, text: &str) {
+        let Some(p) = self.session_picker.as_mut() else {
+            return;
+        };
+        // A filter is one line; newlines and control characters in a
+        // pasted id or label are noise.
+        p.query.extend(text.chars().filter(|c| !c.is_control()));
+        p.selected = 0;
+        self.dirty = true;
+    }
+
     pub fn session_picker_insert_char(&mut self, c: char) {
         let Some(p) = self.session_picker.as_mut() else {
             return;
@@ -463,7 +487,7 @@ impl App {
             true,
         );
         self.pending_resume = Some(id.clone());
-        self.status_message = format!("resuming {}…", &id[..id.len().min(8)]);
+        self.status_message = format!("resuming {}…", short_id(&id));
         self.dirty = true;
     }
 
@@ -487,7 +511,7 @@ impl App {
         self.layout.invalidate();
         self.transcript.push(TranscriptItem::System(format!(
             "resumed session {} · {} turns",
-            &id[..id.len().min(8)],
+            short_id(id),
             turns
         )));
         // Re-emit anything reported before the swap: it was pushed onto
@@ -1324,6 +1348,58 @@ mod tests {
         assert_ne!(
             app.conversation_epoch, epoch_before,
             "in-flight work from the old conversation was not disowned"
+        );
+    }
+
+    /// Ids come from session filenames, so an imported or hand-renamed
+    /// file can carry non-ASCII. Slicing at byte 8 lands mid-character
+    /// and takes the whole TUI down.
+    #[test]
+    fn a_non_ascii_session_id_does_not_panic() {
+        let id = "日本語のセッション";
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_session_picker(vec![summary(id, None, "/a")]);
+
+        // Rendering the row, accepting it, and reporting the restore all
+        // truncate the id.
+        let _ = summary_line(&summary(id, None, "/a"));
+        app.session_picker_accept();
+        assert_eq!(app.pending_resume.as_deref(), Some(id));
+        app.restore_transcript(vec![], id, 1);
+
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("日本語のセ"))),
+            "the restore note did not name the session: {:?}",
+            app.transcript
+        );
+    }
+
+    /// The picker captures typed keys, so it must capture pasted text
+    /// too — otherwise the paste edits an invisible composer draft.
+    #[test]
+    fn pasting_filters_the_picker_instead_of_the_hidden_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_session_picker(vec![
+            summary("aaa11111", Some("auth work"), "/a"),
+            summary("bbb22222", None, "/b"),
+        ]);
+
+        app.session_picker_insert_str(
+            "auth
+work",
+        );
+
+        let p = app.session_picker.as_ref().unwrap();
+        assert_eq!(
+            p.query, "authwork",
+            "newlines leaked into a one-line filter"
+        );
+        assert!(
+            app.input.is_empty(),
+            "the paste edited the composer behind the picker: {:?}",
+            app.input
         );
     }
 

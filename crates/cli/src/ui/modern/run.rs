@@ -1904,6 +1904,13 @@ fn handle_paste_inner(app: &mut App, text: &str) {
         app.search_insert_str(text);
         return;
     }
+    // Same for the `/resume` picker: it captures keys in `handle_key`,
+    // so a paste that fell through to the composer would edit a draft
+    // the user cannot see.
+    if app.session_picker_open() {
+        app.session_picker_insert_str(text);
+        return;
+    }
     app.insert_str(text);
 }
 
