@@ -79,6 +79,18 @@ impl Tool for ApplyPatchTool {
             .and_then(|ops| ops.into_iter().next().map(|o| o.path))
     }
 
+    /// One patch can touch many files, and `get_path` reports only the
+    /// first. A durable grant must bind to every file the patch lands
+    /// on, or the rest ride along on an approval that never named them.
+    fn grant_destinations(&self, input: &serde_json::Value) -> Vec<PathBuf> {
+        let Some(patch) = input.get("patch").and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+        parse_patch(patch)
+            .map(|ops| ops.into_iter().map(|o| o.path).collect())
+            .unwrap_or_default()
+    }
+
     async fn check_permissions(
         &self,
         input: &serde_json::Value,
@@ -531,6 +543,51 @@ mod tests {
 
     fn ctx(cwd: PathBuf) -> ToolContext {
         ToolContext::minimal(cwd, CancellationToken::new())
+    }
+
+    /// `get_path` reports only the first file, which is enough for a
+    /// permission *prompt* but not for a durable grant: every file the
+    /// patch lands on has to be in the key, or the rest are covered by
+    /// an approval that never named them.
+    #[test]
+    fn grant_destinations_lists_every_patched_file() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src/a.rs
+@@
+ fn main() {
+-    println!(\"old\");
++    println!(\"new\");
+ }
+*** Add File: src/b.rs
++pub fn hi() {}
+*** Delete File: src/c.rs
+*** End Patch
+";
+        let tool = ApplyPatchTool;
+        let input = serde_json::json!({ "patch": patch });
+
+        assert_eq!(
+            tool.get_path(&input),
+            Some(PathBuf::from("src/a.rs")),
+            "the prompt path is still the first file"
+        );
+        assert_eq!(
+            tool.grant_destinations(&input),
+            vec![
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/b.rs"),
+                PathBuf::from("src/c.rs"),
+            ],
+            "a durable grant must name every patched file"
+        );
+
+        // An unparseable patch grants nothing rather than guessing.
+        assert!(
+            tool.grant_destinations(&serde_json::json!({ "patch": "junk" }))
+                .is_empty()
+        );
+        assert!(tool.grant_destinations(&serde_json::json!({})).is_empty());
     }
 
     #[test]

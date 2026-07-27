@@ -89,6 +89,23 @@ pub struct TaskEntry {
     /// runs. Drill-in reads output by this id; `None` means the row is
     /// purely event-driven and has no output file to open.
     pub task_id: Option<String>,
+    /// Captured results for a row with no `task_id` — inline subagents,
+    /// whose results never reach the `TaskManager` and so have no file to
+    /// read. Appended as each one finishes.
+    ///
+    /// A list rather than one body because `agent_id` is a display id
+    /// derived from the call's description: two calls whose descriptions
+    /// share a 32-character prefix land on the same row, and keying by it
+    /// would let the second result overwrite the first.
+    pub outputs: Vec<CapturedOutput>,
+}
+
+/// One inline subagent result, tagged with the tool call that produced
+/// it so results sharing a row stay distinguishable.
+#[derive(Debug, Clone)]
+pub struct CapturedOutput {
+    pub call_id: String,
+    pub body: String,
 }
 
 /// One record from the `TaskManager` poll, before reconciliation.
@@ -187,6 +204,44 @@ pub fn upsert(tasks: &mut Vec<TaskEntry>, agent_id: &str, state: &str, headline:
     upsert_with_source(tasks, agent_id, state, headline, TaskSource::Subagent);
 }
 
+/// How many inline results one row keeps. Rows collect a result per
+/// colliding call, so the list is capped to keep a long session from
+/// accumulating bodies without limit; the oldest is dropped first.
+const MAX_CAPTURED_PER_ROW: usize = 8;
+
+/// Record a finished inline subagent's output on its row, keyed by the
+/// tool call that produced it.
+///
+/// Inline subagents never reach the `TaskManager`, so they have no
+/// `task_id` and nothing on disk to open. Without this the pane shows a
+/// finished agent whose result cannot be read anywhere.
+///
+/// Keyed by `call_id`, not by the row's `agent_id`: that id comes from
+/// the call's description, so two calls sharing a description prefix
+/// share a row and keying by it would drop one of their results.
+/// Re-delivery of the same call replaces its entry in place.
+pub fn set_output(tasks: &mut [TaskEntry], agent_id: &str, call_id: &str, output: &str) -> bool {
+    let Some(row) = tasks
+        .iter_mut()
+        .find(|t| t.agent_id == agent_id && t.source == TaskSource::Subagent)
+    else {
+        return false;
+    };
+    match row.outputs.iter_mut().find(|o| o.call_id == call_id) {
+        Some(existing) => existing.body = output.to_string(),
+        None => {
+            row.outputs.push(CapturedOutput {
+                call_id: call_id.to_string(),
+                body: output.to_string(),
+            });
+            if row.outputs.len() > MAX_CAPTURED_PER_ROW {
+                row.outputs.remove(0);
+            }
+        }
+    }
+    true
+}
+
 /// Upsert a row from a specific source. Background rows are replaced
 /// wholesale on each poll, so their state always reflects the manager.
 pub fn upsert_with_source(
@@ -216,6 +271,7 @@ pub fn upsert_with_source(
             headline: headline.to_string(),
             source,
             task_id: None,
+            outputs: Vec::new(),
         });
     }
     // Group by source, then float needs-input rows to the top within it.
@@ -349,6 +405,123 @@ mod tests {
         assert!(!is_folded_heading(&tasks, &folded, agent_rows[1]));
         // An expanded group has no folded heading at all.
         assert!(!is_folded_heading(&tasks, &[], agent_rows[0]));
+    }
+
+    /// The drill-in dead end this closes: an inline subagent finishes,
+    /// has no `task_id` because it never reached the TaskManager, and so
+    /// there is nothing to open. Its result is captured on the row.
+    #[test]
+    fn a_finished_inline_subagent_keeps_its_output() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look around");
+        assert!(tasks[0].outputs.is_empty());
+        assert!(tasks[0].task_id.is_none(), "inline rows have no task id");
+
+        assert!(set_output(
+            &mut tasks,
+            "explorer",
+            "c1",
+            "found three things"
+        ));
+        assert_eq!(tasks[0].outputs.len(), 1);
+        assert_eq!(tasks[0].outputs[0].body, "found three things");
+    }
+
+    /// Background rows read their output from the TaskManager by id, so
+    /// captured output must not be attached to them — it would shadow
+    /// the live file.
+    #[test]
+    fn output_is_not_attached_to_background_rows() {
+        let mut tasks = Vec::new();
+        upsert_with_source(&mut tasks, "b1", "done", "build", TaskSource::Background);
+        assert!(
+            !set_output(&mut tasks, "b1", "c1", "stale"),
+            "captured output was attached to a manager-backed row"
+        );
+        assert!(tasks[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn output_for_an_unknown_agent_is_ignored() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look");
+        assert!(!set_output(&mut tasks, "someone-else", "c1", "hi"));
+        assert!(tasks[0].outputs.is_empty());
+    }
+
+    /// A later status update must not wipe the captured result — the
+    /// upsert path rewrites state and headline, and output has to
+    /// survive that.
+    #[test]
+    fn a_later_update_does_not_drop_captured_output() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "working", "look");
+        set_output(&mut tasks, "explorer", "c1", "the answer");
+        upsert(&mut tasks, "explorer", "done", "finished");
+        assert_eq!(
+            tasks[0].outputs[0].body, "the answer",
+            "a status update discarded the captured output"
+        );
+    }
+
+    /// The collision this guards: `agent_id` is derived from the call's
+    /// description, so two Agent calls whose descriptions share a
+    /// 32-character prefix land on one row. Keyed by that id, the second
+    /// result overwrote the first and one finished agent had nothing to
+    /// open. Keyed by the tool call, both survive.
+    #[test]
+    fn two_calls_sharing_a_row_each_keep_their_result() {
+        let mut tasks = Vec::new();
+        let shared = "audit the authentication module for"; // > 32 chars
+        upsert(&mut tasks, shared, "working", "audit A");
+        set_output(&mut tasks, shared, "call-a", "A found a bug");
+        set_output(&mut tasks, shared, "call-b", "B found nothing");
+
+        assert_eq!(tasks.len(), 1, "the rows collapse — that is the premise");
+        let bodies: Vec<&str> = tasks[0].outputs.iter().map(|o| o.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["A found a bug", "B found nothing"],
+            "one call's result overwrote the other"
+        );
+    }
+
+    /// Re-delivery of the same call replaces its entry rather than
+    /// stacking duplicates.
+    #[test]
+    fn the_same_call_reported_twice_replaces_its_entry() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "done", "look");
+        set_output(&mut tasks, "explorer", "c1", "first");
+        set_output(&mut tasks, "explorer", "c1", "corrected");
+        assert_eq!(tasks[0].outputs.len(), 1);
+        assert_eq!(tasks[0].outputs[0].body, "corrected");
+    }
+
+    /// Captured bodies are bounded per row, so a long session that keeps
+    /// hitting one row cannot grow it without limit.
+    #[test]
+    fn captured_outputs_are_capped_per_row() {
+        let mut tasks = Vec::new();
+        upsert(&mut tasks, "explorer", "done", "look");
+        for i in 0..MAX_CAPTURED_PER_ROW + 3 {
+            set_output(
+                &mut tasks,
+                "explorer",
+                &format!("c{i}"),
+                &format!("body {i}"),
+            );
+        }
+        assert_eq!(tasks[0].outputs.len(), MAX_CAPTURED_PER_ROW);
+        assert_eq!(
+            tasks[0].outputs.last().unwrap().body,
+            format!("body {}", MAX_CAPTURED_PER_ROW + 2),
+            "the newest result must be kept"
+        );
+        assert_eq!(
+            tasks[0].outputs[0].call_id, "c3",
+            "the oldest results are the ones dropped"
+        );
     }
 
     /// The pane was fed only by `EngineEvent::SubagentUpdate`, so a
