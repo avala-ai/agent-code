@@ -699,16 +699,29 @@ fn shell_statements(raw: &str) -> Vec<String> {
     // `GIT_CONFIG_GLOBAL=…` line of `cat <<EOF … EOF` is an argument
     // `cat` receives. This is the reading `shell_text_facts` already
     // applies, sharing its delimiter and body helpers.
-    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    let mut pending_heredocs: Vec<(String, bool, bool)> = Vec::new();
     let mut i = 0;
     while i < text.len() {
         let c = text[i];
         // The line has ended and a heredoc was declared on it: the
         // body is skipped whole, while the declaration line itself
         // still ends here.
+        //
+        // Unless the body expands. An unquoted delimiter leaves a
+        // substitution in it live, and what it runs is statements —
+        // `cat <<EOF\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF` selects
+        // a config and runs git during the expansion. Holding that
+        // back would keep it from every walk that reads statements,
+        // so a body that can run something is read as one.
         if c == '\n' && !pending_heredocs.is_empty() {
-            for (delimiter, strip_tabs) in std::mem::take(&mut pending_heredocs) {
-                i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+            let pending = std::mem::take(&mut pending_heredocs);
+            let executes = pending.iter().any(|(delimiter, strip_tabs, expands)| {
+                *expands && body_expands(&text, i, delimiter, *strip_tabs)
+            });
+            if !executes {
+                for (delimiter, strip_tabs, _) in pending {
+                    i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+                }
             }
             if stack.is_empty() {
                 statements.push(std::mem::take(&mut current));
@@ -789,7 +802,10 @@ fn shell_statements(raw: &str) -> Vec<String> {
                         read_heredoc_delimiter(&text, i + run);
                     let delimiter = unquote_token(&word);
                     if !delimiter.is_empty() {
-                        pending_heredocs.push((delimiter, strip_tabs));
+                        // Quoting any part of the delimiter closes the
+                        // body to expansion, leaving it data.
+                        let expands = !word.contains(['\'', '"', '\\']);
+                        pending_heredocs.push((delimiter, strip_tabs, expands));
                     }
                     // The redirect and its delimiter word belong to
                     // the statement that declares them.
@@ -1044,11 +1060,11 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             for (delimiter, strip_tabs, expands) in std::mem::take(&mut pending_heredocs) {
                 let end = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
                 if expands {
-                    let body: String = text[i..end.min(text.len())].iter().collect();
                     // Only a body that expands something can run
                     // anything; plain text stays the data it looks
                     // like, so `$\"` in it is still literal.
-                    if body.contains("$(") || body.contains('`') || body.contains("${") {
+                    if body_expands(&text, i, &delimiter, strip_tabs) {
+                        let body: String = text[i..end.min(text.len())].iter().collect();
                         let inner = shell_text_facts(&body);
                         facts.control_operator |= inner.control_operator;
                         facts.locale_quote |= inner.locale_quote;
@@ -1201,6 +1217,16 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
         i += 1;
     }
     facts
+}
+
+/// True when a heredoc body, already known to be open to expansion by
+/// its delimiter, actually expands something. Plain text runs nothing
+/// however unquoted it is, so only a body carrying a substitution or a
+/// parameter is code rather than the data it looks like.
+fn body_expands(text: &[char], newline: usize, delimiter: &str, strip_tabs: bool) -> bool {
+    let end = skip_heredoc_body(text, newline, delimiter, strip_tabs);
+    let body: String = text[newline..end.min(text.len())].iter().collect();
+    body.contains("$(") || body.contains('`') || body.contains("${")
 }
 
 /// Read a heredoc's delimiter word, given the index just past its
@@ -2541,6 +2567,10 @@ mod tests {
             // arrive from a file the command does not name.
             "HOME= git p",
             "XDG_CONFIG_HOME= git p",
+            // An unquoted delimiter leaves the body open to expansion,
+            // so the substitution runs during it: the selector and the
+            // git it configures are statements, not text.
+            "cat <<EOF\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF",
             // A later assignment cannot argue an opaque config back to
             // safety: a subshell keeps its own copy, and a `#` in the
             // middle of a word is not a comment.
@@ -2775,6 +2805,9 @@ mod tests {
             // A heredoc body is data the command receives, so a config
             // example inside one is not a statement that sets anything.
             "cat <<EOF\nGIT_CONFIG_GLOBAL=/tmp/g\nEOF\ngit status",
+            // Quoting the delimiter closes the body, so even a
+            // substitution in it is text `cat` prints.
+            "cat <<'EOF'\n$(GIT_CONFIG_GLOBAL=/tmp/g git p)\nEOF",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
