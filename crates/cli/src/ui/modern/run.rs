@@ -220,7 +220,14 @@ async fn finish_cwd_adoption(
     // rules, tool visibility, sandbox and bypass policy, hooks — from the
     // config the caller read before any of this began. Moving a subset
     // left part of the policy answering for the project we left.
-    eng.adopt_project(dir, cfg.clone());
+    let dropped_mcp = eng.adopt_project(dir, cfg.clone());
+    if dropped_mcp > 0 {
+        app.transcript
+            .push(super::app::TranscriptItem::System(format!(
+                "{dropped_mcp} MCP tool(s) from the previous project are no longer available — \
+             restart in this directory to connect its own MCP servers"
+            )));
+    }
     // The TUI keeps its own copy of one policy bit, consulted on every
     // submit: left at the value the process started with, a project that
     // forbids shell-executing skills inherits one that allows it.
@@ -402,7 +409,7 @@ pub(super) async fn event_loop(
     app: &mut App,
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
-    base_permission_mode: PermissionMode,
+    mut base_permission_mode: PermissionMode,
     notifier: &NotifierService,
     term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
@@ -824,6 +831,13 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
+                            // The destination's default decides unmatched
+                            // tools from here on. Left at the value captured
+                            // from the project the process started in, a
+                            // session resumed into a project configured to
+                            // ask (or deny) kept answering with the old
+                            // project's allow.
+                            base_permission_mode = cfg.permissions.default_mode;
                             finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
                         }
                         app.pending_resume = None;

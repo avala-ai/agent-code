@@ -75,6 +75,22 @@ impl ToolRegistry {
         self.visibility = filter;
     }
 
+    /// Drop every MCP proxy tool, returning how many went.
+    ///
+    /// Proxies are live connections to the *project's* configured
+    /// servers, made once at startup. Adopting another project must not
+    /// leave them registered: the destination may configure no MCP at
+    /// all, and hiding them behind a visibility filter is not enough
+    /// because the tools remain callable. Reconnecting the destination's
+    /// servers needs the async client setup that only startup performs,
+    /// so a resumed session has no MCP tools until the process restarts —
+    /// the safe direction, and the caller says so.
+    pub fn remove_mcp_tools(&mut self) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|t| !t.name().starts_with("mcp__"));
+        before - self.tools.len()
+    }
+
     /// Visibility filter currently installed (mostly for diagnostics).
     pub fn visibility(&self) -> &ToolVisibilityFilter {
         &self.visibility
@@ -362,5 +378,52 @@ mod tests {
         assert!(!deferred.contains(&"Sleep"));
         // Other deferred tools are still listed.
         assert!(deferred.contains(&"NotebookEdit"));
+    }
+
+    /// A stand-in for an MCP proxy: the registry identifies them by the
+    /// `mcp__{server}__{tool}` name `create_proxy_tools` builds.
+    struct FakeMcpTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "fake mcp proxy"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolResult, crate::tools::ToolError> {
+            unreachable!("never called in this test")
+        }
+    }
+
+    /// Adopting another project must *remove* the previous project's MCP
+    /// proxies, not merely hide them: a hidden tool is still callable, so
+    /// a model in the destination could reach servers configured by the
+    /// project the session left.
+    #[test]
+    fn adopting_a_project_removes_mcp_proxies_not_just_hides_them() {
+        let mut reg = ToolRegistry::default_tools();
+        let builtin = reg.all().len();
+        reg.register(std::sync::Arc::new(FakeMcpTool("mcp__old__read")));
+        reg.register(std::sync::Arc::new(FakeMcpTool("mcp__old__write")));
+        assert_eq!(reg.all().len(), builtin + 2);
+
+        let dropped = reg.remove_mcp_tools();
+
+        assert_eq!(dropped, 2, "both proxies should have gone");
+        assert!(
+            reg.get("mcp__old__read").is_none(),
+            "a hidden-but-registered proxy is still callable"
+        );
+        assert_eq!(reg.all().len(), builtin, "built-in tools must be untouched");
+        assert_eq!(reg.remove_mcp_tools(), 0, "second call is a no-op");
     }
 }
