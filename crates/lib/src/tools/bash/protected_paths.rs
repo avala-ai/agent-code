@@ -388,9 +388,25 @@ fn follow_created_links(
             });
         }
         let substituted = link.substituted(&remainder);
-        let sub_forms = normalized_forms(&substituted, &state.anchor).forms;
+        let Forms {
+            forms: sub_forms,
+            exhausted,
+        } = normalized_forms(&substituted, &state.anchor);
         for form in &sub_forms {
             ensure_form_not_protected(form, path, source)?;
+        }
+        // The substituted target is a path in its own right: if its
+        // symlink walk ran out of budget, where it lands is unknown and
+        // dropping the flag here would reopen the fail-open hole one
+        // level down.
+        if exhausted {
+            return Err(ProtectedPathViolation {
+                reason: format!(
+                    "{source} writes to {path} through a link created by this \
+                     command whose target has too many path components to \
+                     resolve; failing closed — use a shorter absolute path"
+                ),
+            });
         }
         follow_created_links(&sub_forms, path, source, state, depth + 1)?;
     }
@@ -1386,6 +1402,9 @@ mod tests {
     /// A path too deep to resolve is refused, not silently trusted:
     /// exhausting the walk means the destination is unknown, and a
     /// link below the budget could still redirect it.
+    /// Unix-only: a `/`-rooted path is not absolute on Windows, so the
+    /// ancestor walk never engages there (see `is_shell_absolute`).
+    #[cfg(unix)]
     #[test]
     fn a_path_deeper_than_the_walk_budget_is_refused() {
         let deep = "d/".repeat(MAX_ANCESTOR_HOPS + 16);
