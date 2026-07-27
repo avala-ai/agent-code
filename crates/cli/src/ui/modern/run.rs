@@ -1293,18 +1293,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         {
             app.tasks_select(1);
         }
-        // Retained prompts win the empty Enter: after an aborted turn the
         // Space folds/unfolds the selected group. Safe to claim here
         // because this branch only runs with an empty composer, so it is
-        // not a space the user is trying to type.
+        // not a space the user is trying to type. Gated on there being a
+        // group to fold: a pane showing only the model's checklist has
+        // none, and swallowing the key there would lose a keystroke the
+        // composer should have had.
         (m, KeyCode::Char(' '))
             if m.is_empty()
-                && app.tasks_visible()
+                && app.tasks_nav_active()
                 && !app.show_queue_pane
                 && app.input.is_empty() =>
         {
             app.toggle_selected_group();
         }
+        // Retained prompts win the empty Enter: after an aborted turn the
         // UI promises "press Enter to send", so drill-in only claims the
         // key when no queued prompt is waiting for dispatch.
         (m, KeyCode::Enter)
@@ -1843,6 +1846,42 @@ mod tests {
         // Plain Enter still drives the pane (subagent row → explanation).
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.status_message.contains("no separate output"));
+    }
+
+    /// Space is the fold key, but a checklist-only pane has no group to
+    /// fold. The guard has to stand aside there like the arrows do, or
+    /// the keystroke is silently dropped instead of reaching the
+    /// composer.
+    #[test]
+    fn a_checklist_only_pane_passes_space_to_the_composer() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            epoch: 0,
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        assert!(app.tasks_visible(), "the checklist should show the pane");
+        assert!(app.tasks.is_empty());
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.input, " ",
+            "the checklist-only pane swallowed the space"
+        );
+
+        // With a real task present Space is the pane's again.
+        app.input.clear();
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            app.input.is_empty(),
+            "a selectable pane should still claim Space"
+        );
+        assert!(
+            app.collapsed_groups
+                .contains(&crate::ui::modern::tasks::TaskSource::Subagent),
+            "Space did not fold the group"
+        );
     }
 
     /// A checklist makes the pane visible with nothing selectable in it.
