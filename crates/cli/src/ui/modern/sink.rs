@@ -261,25 +261,16 @@ impl StreamSink for ChannelSink {
         // does not recognise as pending, and dropping a whole update
         // over one unexpected word would strand the pane on stale work.
         if tool_name == "TodoWrite"
-            && let Some(todos) = input.get("todos").and_then(|v| v.as_array())
+            && let Some(items) = crate::ui::modern::tasks::parse_todo_input(input)
         {
-            let items: Option<Vec<TodoFields>> = todos
-                .iter()
-                .map(|t| {
-                    let field = |k: &str| t.get(k)?.as_str().map(str::to_string);
-                    Some((field("id")?, field("content")?, field("status")?))
-                })
-                .collect();
-            if let Some(items) = items {
-                let mut pending = self
-                    .pending_todos
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                pending.retain(|(id, _)| id != call_id);
-                pending.push((call_id.to_string(), items));
-                let overflow = pending.len().saturating_sub(MAX_PENDING_TODOS);
-                pending.drain(..overflow);
-            }
+            let mut pending = self
+                .pending_todos
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.retain(|(id, _)| id != call_id);
+            pending.push((call_id.to_string(), items));
+            let overflow = pending.len().saturating_sub(MAX_PENDING_TODOS);
+            pending.drain(..overflow);
         }
         let detail = tool_detail(tool_name, input);
         self.send(EngineEvent::ToolStart {

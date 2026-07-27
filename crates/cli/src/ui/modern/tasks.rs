@@ -317,6 +317,83 @@ pub enum TodoStatus {
     Done,
 }
 
+impl TodoItem {
+    pub fn from_fields((id, content, status): super::sink::TodoFields) -> Self {
+        TodoItem {
+            id,
+            content,
+            status: TodoStatus::parse(&status),
+        }
+    }
+}
+
+/// The entries of a `TodoWrite` input, or `None` when any entry is
+/// missing one of the three fields the tool declares required.
+///
+/// Shared by the live sink and the session-restore path so a checklist
+/// is held to the same shape however it reaches the pane. One bad entry
+/// rejects the batch: a partial checklist misdescribes the plan as badly
+/// as an empty one.
+pub fn parse_todo_input(input: &serde_json::Value) -> Option<Vec<super::sink::TodoFields>> {
+    input
+        .get("todos")?
+        .as_array()?
+        .iter()
+        .map(|t| {
+            let field = |k: &str| t.get(k)?.as_str().map(str::to_string);
+            Some((field("id")?, field("content")?, field("status")?))
+        })
+        .collect()
+}
+
+/// The checklist a stored conversation ended with: the input of its last
+/// `TodoWrite` that came back without an error.
+///
+/// A command can swap the conversation out from under the UI (`/resume`,
+/// the session picker). The pane is cached state rather than a view of
+/// the messages, so without this it would go on describing the previous
+/// session's plan. Skipping calls whose result was an error applies the
+/// same rule as the live path — publish only what actually ran — so a
+/// restored pane and a streamed one agree.
+pub fn todos_from_messages(messages: &[agent_code_lib::llm::message::Message]) -> Vec<TodoItem> {
+    use agent_code_lib::llm::message::{ContentBlock, Message};
+
+    fn blocks(m: &Message) -> &[ContentBlock] {
+        match m {
+            Message::User(u) => &u.content,
+            Message::Assistant(a) => &a.content,
+            Message::System(_) => &[],
+        }
+    }
+    let failed: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(blocks)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error: true,
+                ..
+            } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| blocks(m).iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolUse { id, name, input }
+                if name == "TodoWrite" && !failed.contains(id.as_str()) =>
+            {
+                parse_todo_input(input)
+            }
+            _ => None,
+        })
+        .map(|fields| fields.into_iter().map(TodoItem::from_fields).collect())
+        .unwrap_or_default()
+}
+
 impl TodoStatus {
     /// Map the tool's status string. Unknown values read as pending,
     /// which is the honest default: an item nobody claimed is not done.
@@ -434,6 +511,82 @@ mod todo_tests {
         assert_eq!(todo_window(&todos[..3], 6), (0, 3));
         assert_eq!(todo_window(&todos, 0), (0, 0));
         assert_eq!(todo_window(&[], 4), (0, 0));
+    }
+
+    /// `/resume` swaps the conversation under a cached pane. Rebuilding
+    /// from the messages must find the last checklist that actually ran
+    /// — the same rule the live path applies — so the restored pane
+    /// agrees with what the session ended on.
+    #[test]
+    fn a_restored_conversation_yields_its_last_successful_checklist() {
+        use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message};
+
+        let todo_call = |id: &str, content: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            name: "TodoWrite".into(),
+            input: serde_json::json!({
+                "todos": [{ "id": "1", "content": content, "status": "in_progress" }]
+            }),
+        };
+        let assistant = |blocks: Vec<ContentBlock>| {
+            Message::Assistant(AssistantMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: blocks,
+                model: None,
+                usage: None,
+                stop_reason: None,
+                request_id: None,
+            })
+        };
+        let result = |id: &str, is_error: bool| ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            is_error,
+            extra_content: Vec::new(),
+        };
+
+        // Latest successful call wins over an earlier one.
+        let msgs = vec![
+            assistant(vec![todo_call("t1", "the older plan")]),
+            assistant(vec![result("t1", false)]),
+            assistant(vec![todo_call("t2", "the newer plan")]),
+            assistant(vec![result("t2", false)]),
+        ];
+        let todos = todos_from_messages(&msgs);
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "the newer plan");
+        assert_eq!(todos[0].status, TodoStatus::InProgress);
+
+        // A denied or failed call is skipped in favour of the last one
+        // that ran — a rejected plan never described the session.
+        let msgs = vec![
+            assistant(vec![todo_call("t1", "the plan that ran")]),
+            assistant(vec![result("t1", false)]),
+            assistant(vec![todo_call("t2", "the denied plan")]),
+            assistant(vec![result("t2", true)]),
+        ];
+        let todos = todos_from_messages(&msgs);
+        assert_eq!(todos.len(), 1, "the denied call was published");
+        assert_eq!(todos[0].content, "the plan that ran");
+
+        // A session that never wrote a checklist clears the pane rather
+        // than leaving the previous session's plan up.
+        assert!(todos_from_messages(&[]).is_empty());
+        assert!(
+            todos_from_messages(&[assistant(vec![ContentBlock::Text {
+                text: "no todos here".into()
+            }])])
+            .is_empty()
+        );
+
+        // Malformed entries are held to the same shape as the live path.
+        let malformed = assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "TodoWrite".into(),
+            input: serde_json::json!({ "todos": [{ "id": "1" }] }),
+        }]);
+        assert!(todos_from_messages(&[malformed]).is_empty());
     }
 
     #[test]

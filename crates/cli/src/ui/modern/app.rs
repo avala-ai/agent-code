@@ -730,15 +730,18 @@ impl App {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
             EngineEvent::TodoUpdate { items } => {
-                self.todos = items
-                    .into_iter()
-                    .map(|(id, content, status)| super::tasks::TodoItem {
-                        id,
-                        content,
-                        status: super::tasks::TodoStatus::parse(&status),
-                    })
-                    .collect();
-                self.dirty = true;
+                // `/clear` during a turn cannot take the engine lock, so
+                // the turn keeps running and may still write a checklist.
+                // That work belongs to the conversation being discarded;
+                // accepting it would repopulate the pane behind the
+                // clear the user just asked for.
+                if !self.pending_clear {
+                    self.todos = items
+                        .into_iter()
+                        .map(super::tasks::TodoItem::from_fields)
+                        .collect();
+                    self.dirty = true;
+                }
             }
             EngineEvent::ToolStart {
                 call_id,
@@ -3242,6 +3245,49 @@ mod tests {
             !app.tasks_visible(),
             "the pane stayed open on a cleared conversation"
         );
+    }
+
+    /// `/clear` typed mid-turn cannot take the engine lock, so the turn
+    /// runs on and may still finish a `TodoWrite`. That checklist belongs
+    /// to the conversation being discarded and must not repopulate the
+    /// pane behind the clear the user asked for.
+    #[test]
+    fn a_checklist_written_after_clear_does_not_revive_the_pane() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            items: vec![("1".into(), "the old plan".into(), "in_progress".into())],
+        });
+        app.input = "/clear".into();
+        app.cursor = 6;
+        app.submit();
+        assert!(
+            app.pending_clear,
+            "the engine clear should still be pending"
+        );
+
+        // The in-flight turn writes a checklist before the run loop wins
+        // the lock.
+        app.apply_engine(EngineEvent::TodoUpdate {
+            items: vec![(
+                "9".into(),
+                "work from the discarded turn".into(),
+                "done".into(),
+            )],
+        });
+        assert!(
+            app.todos.is_empty(),
+            "a discarded turn's checklist repopulated the pane: {:?}",
+            app.todos
+        );
+        assert!(!app.tasks_visible());
+
+        // Once the clear has actually been applied, checklists land again.
+        app.pending_clear = false;
+        app.apply_engine(EngineEvent::TodoUpdate {
+            items: vec![("1".into(), "the new plan".into(), "in_progress".into())],
+        });
+        assert_eq!(app.todos.len(), 1, "the pane stayed deaf after the clear");
+        assert_eq!(app.todos[0].content, "the new plan");
     }
 
     #[test]

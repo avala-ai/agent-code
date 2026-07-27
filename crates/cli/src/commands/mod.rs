@@ -667,6 +667,19 @@ fn resolve_slash_name(cmd: &str) -> String {
         .unwrap_or(head)
 }
 
+/// True when a slash built-in swaps the engine conversation for a
+/// different one, rather than adding to the current one.
+///
+/// The TUI caches per-conversation state (the model's checklist), so it
+/// has to rebuild that state after these run — nothing else tells it the
+/// messages underneath were replaced wholesale.
+pub fn slash_replaces_conversation(cmd: &str) -> bool {
+    matches!(
+        resolve_slash_name(cmd).as_str(),
+        "resume" | "session" | "pick-session"
+    )
+}
+
 /// True when a slash built-in needs the real terminal (picker, pager,
 /// `$EDITOR`, or a y/N stdin prompt) rather than captured stdout under the
 /// alt-screen TUI.
@@ -847,6 +860,18 @@ mod slash_lookup_tests {
         assert!(!is_interactive_slash("/add-dir"));
         assert!(!is_interactive_slash("/color"));
         assert!(!is_interactive_slash("/resume"));
+        // Conversation-replacing commands, which the TUI must notice so
+        // its cached checklist does not outlive the session it describes.
+        assert!(slash_replaces_conversation("/resume abc123"));
+        assert!(slash_replaces_conversation("/session"));
+        assert!(slash_replaces_conversation("/pick-session"));
+        // Commands that add to the current conversation, not replace it.
+        for cmd in ["/sessions", "/clear", "/compact", "/model", "/cd /tmp"] {
+            assert!(
+                !slash_replaces_conversation(cmd),
+                "{cmd} should not count as replacing the conversation"
+            );
+        }
         assert!(!is_interactive_slash("/help"));
         assert!(!is_interactive_slash("/cost"));
     }
