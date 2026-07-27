@@ -296,73 +296,56 @@ pub fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
 /// from the file extension.
 pub fn image_block_from_file(path: &std::path::Path) -> Result<ContentBlock, String> {
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image: {e}"))?;
-
-    let media_type = image_media_type(path).unwrap_or("application/octet-stream");
-
-    use std::io::Write;
-    let mut encoded = String::new();
-    {
-        let mut encoder = base64_encode_writer(&mut encoded);
-        encoder
-            .write_all(&data)
-            .map_err(|e| format!("base64 error: {e}"))?;
-    }
-
-    Ok(ContentBlock::Image {
-        media_type: media_type.to_string(),
-        data: encoded,
-    })
+    Ok(image_block_from_bytes(path, &data))
 }
 
-/// Simple base64 encoder (no external dependency).
-fn base64_encode_writer(output: &mut String) -> Base64Writer<'_> {
-    Base64Writer {
-        output,
-        buffer: Vec::new(),
+/// Build an image block from bytes already in hand.
+///
+/// Lets a caller that must bound the read do it itself and still get the
+/// same media-type inference; `path` is used only for its extension.
+pub fn image_block_from_bytes(path: &std::path::Path, data: &[u8]) -> ContentBlock {
+    ContentBlock::Image {
+        media_type: image_media_type(path)
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        data: base64_encode(data),
     }
 }
 
-struct Base64Writer<'a> {
-    output: &'a mut String,
-    buffer: Vec<u8>,
-}
-
-impl<'a> std::io::Write for Base64Writer<'a> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
+/// Base64 (RFC 4648, padded) without an external dependency.
+///
+/// A whole-input function rather than an `io::Write` adaptor: the writer
+/// this replaced only encoded from `flush()`, and every caller dropped it
+/// after `write_all`, so every image block shipped with an empty payload.
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for c in &mut chunks {
+        let (b0, b1, b2) = (c[0] as usize, c[1] as usize, c[2] as usize);
+        out.push(CHARS[b0 >> 2] as char);
+        out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
+        out.push(CHARS[b2 & 0x3f] as char);
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i + 2 < self.buffer.len() {
-            let b0 = self.buffer[i] as usize;
-            let b1 = self.buffer[i + 1] as usize;
-            let b2 = self.buffer[i + 2] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-            self.output
-                .push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
-            self.output.push(CHARS[b2 & 0x3f] as char);
-            i += 3;
+    match *chunks.remainder() {
+        [b0] => {
+            let b0 = b0 as usize;
+            out.push(CHARS[b0 >> 2] as char);
+            out.push(CHARS[(b0 & 3) << 4] as char);
+            out.push('=');
+            out.push('=');
         }
-        let remaining = self.buffer.len() - i;
-        if remaining == 1 {
-            let b0 = self.buffer[i] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[(b0 & 3) << 4] as char);
-            self.output.push('=');
-            self.output.push('=');
-        } else if remaining == 2 {
-            let b0 = self.buffer[i] as usize;
-            let b1 = self.buffer[i + 1] as usize;
-            self.output.push(CHARS[b0 >> 2] as char);
-            self.output.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-            self.output.push(CHARS[(b1 & 0xf) << 2] as char);
-            self.output.push('=');
+        [b0, b1] => {
+            let (b0, b1) = (b0 as usize, b1 as usize);
+            out.push(CHARS[b0 >> 2] as char);
+            out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+            out.push(CHARS[(b1 & 0xf) << 2] as char);
+            out.push('=');
         }
-        Ok(())
+        _ => {}
     }
+    out
 }
 
 /// Helper to create a user message with an image.
@@ -587,10 +570,39 @@ mod tests {
         let path = dir.path().join("SHOT.PNG");
         std::fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
         let block = image_block_from_file(&path).expect("encoded");
-        let ContentBlock::Image { media_type, .. } = block else {
+        let ContentBlock::Image { media_type, data } = block else {
             panic!("expected an image block");
         };
         assert_eq!(media_type, "image/png");
+        // The encoder this replaced only produced output from `flush()`,
+        // which no caller invoked: every image shipped with empty data.
+        assert_eq!(data, "iVBORw==", "image payload was not encoded");
+    }
+
+    /// RFC 4648 §10 test vectors — the padded remainders are exactly where
+    /// the previous encoder silently produced nothing.
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encodes_every_byte_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let encoded = base64_encode(&all);
+        assert_eq!(encoded.len(), 344, "256 bytes encode to 344 base64 chars");
+        assert!(encoded.starts_with("AAECAwQF"));
+        assert!(encoded.ends_with("+/w=="));
     }
 
     #[test]

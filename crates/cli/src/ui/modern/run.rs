@@ -576,23 +576,10 @@ pub(super) async fn event_loop(
             // starts, and lets a read failure be reported as a note
             // instead of blocking the prompt.
             let images = std::mem::take(&mut app.pending_images);
-            let mut blocks = Vec::new();
-            for path in &images {
-                // Size re-checked here, not just at mention time: the file
-                // can grow in between, and this is the read that would
-                // actually allocate it.
-                let loaded = super::mentions::image_size_within_cap(path)
-                    .and_then(|_| agent_code_lib::llm::message::image_block_from_file(path));
-                match loaded {
-                    Ok(block) => blocks.push(block),
-                    Err(e) => {
-                        app.transcript
-                            .push(super::app::TranscriptItem::System(format!(
-                                "could not attach {}: {e}",
-                                path.display()
-                            )));
-                    }
-                }
+            let (blocks, refused) = super::mentions::load_image_blocks(&images);
+            for note in refused {
+                app.transcript
+                    .push(super::app::TranscriptItem::System(note));
             }
             // Set unconditionally, awaiting the lock rather than skipping on
             // contention: an empty set clears anything a previous attempt

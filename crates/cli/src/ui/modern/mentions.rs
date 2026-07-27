@@ -357,6 +357,25 @@ fn is_image(path: &Path) -> bool {
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 
+/// Read at most `cap` bytes, refusing a file that has more.
+///
+/// `take(cap + 1)` so exceeding the cap is *observed* rather than silently
+/// truncated — a half-read image would be sent as a corrupt attachment.
+fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("image unreadable ({e})"))?;
+    let mut data = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("image unreadable ({e})"))?;
+    if data.len() > cap {
+        return Err(format!(
+            "image too large (over {} MiB)",
+            cap / (1024 * 1024)
+        ));
+    }
+    Ok(data)
+}
+
 /// Byte length of an image that is small enough to attach, or the reason it
 /// must be refused.
 ///
@@ -377,6 +396,58 @@ pub fn image_size_within_cap(path: &Path) -> Result<usize, String> {
         ));
     }
     Ok(len)
+}
+
+/// Read and encode staged image attachments, re-applying the full budget.
+///
+/// Returns the blocks to attach plus a note for every path refused. The
+/// budget is enforced again here, not only at mention time: a staged file
+/// can grow (or be replaced) between the mention and the turn actually
+/// starting, and this is the point where the bytes are really read and
+/// base64-encoded. Every limit is re-checked — per-image size, the
+/// per-prompt total, and the count — so no combination of edits between
+/// the two points can exceed what was advertised.
+pub fn load_image_blocks(
+    paths: &[PathBuf],
+) -> (Vec<agent_code_lib::llm::message::ContentBlock>, Vec<String>) {
+    let mut blocks = Vec::new();
+    let mut notes = Vec::new();
+    let mut total = 0usize;
+    for path in paths {
+        let name = path.display();
+        if blocks.len() >= MAX_IMAGES {
+            notes.push(format!(
+                "could not attach {name}: at most {MAX_IMAGES} images"
+            ));
+            continue;
+        }
+        if let Err(reason) = image_size_within_cap(path) {
+            notes.push(format!("could not attach {name}: {reason}"));
+            continue;
+        }
+        // Read through a cap rather than trusting the size just measured:
+        // the file can still grow between the stat and the read, and an
+        // unbounded read is exactly what the budget exists to prevent.
+        let data = match read_capped(path, MAX_IMAGE_BYTES) {
+            Ok(data) => data,
+            Err(reason) => {
+                notes.push(format!("could not attach {name}: {reason}"));
+                continue;
+            }
+        };
+        if total + data.len() > MAX_TOTAL_IMAGE_BYTES {
+            notes.push(format!(
+                "could not attach {name}: {} MiB total image limit reached",
+                MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+            ));
+            continue;
+        }
+        total += data.len();
+        blocks.push(agent_code_lib::llm::message::image_block_from_bytes(
+            path, &data,
+        ));
+    }
+    (blocks, notes)
 }
 
 /// True when `path` resolves inside `cwd`. Both sides are canonicalized.
@@ -844,6 +915,71 @@ mod tests {
             out.notes
         );
         assert!(out.notes.iter().any(|n| n.contains("image(s) skipped")));
+    }
+
+    /// The budget is re-applied when the bytes are actually read: a staged
+    /// file can grow between the mention and the turn starting, so checking
+    /// only the per-image cap there let the per-prompt total be exceeded.
+    #[test]
+    fn loading_reapplies_the_total_image_budget() {
+        let dir = fixture();
+        let each = MAX_TOTAL_IMAGE_BYTES / 3 + 1024;
+        let mut paths = Vec::new();
+        for name in ["a.png", "b.png", "c.png"] {
+            let p = dir.path().join(name);
+            fs::write(&p, vec![0u8; each]).unwrap();
+            paths.push(p);
+        }
+        let (blocks, notes) = load_image_blocks(&paths);
+        assert_eq!(blocks.len(), 2, "total budget not enforced at load time");
+        assert!(
+            notes.iter().any(|n| n.contains("total image limit")),
+            "no note about the refused image: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn loading_refuses_a_file_that_grew_past_the_per_image_cap() {
+        let dir = fixture();
+        let path = dir.path().join("grew.png");
+        fs::write(&path, vec![0u8; MAX_IMAGE_BYTES + 1]).unwrap();
+        let (blocks, notes) = load_image_blocks(&[path]);
+        assert!(blocks.is_empty(), "oversized image was attached at load");
+        assert!(
+            notes.iter().any(|n| n.contains("too large")),
+            "no note about the refusal: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn loading_caps_the_attachment_count() {
+        let dir = fixture();
+        let mut paths = Vec::new();
+        for i in 0..(MAX_IMAGES + 2) {
+            let p = dir.path().join(format!("s{i}.png"));
+            fs::write(&p, [0x89, b'P', b'N', b'G']).unwrap();
+            paths.push(p);
+        }
+        let (blocks, notes) = load_image_blocks(&paths);
+        assert_eq!(blocks.len(), MAX_IMAGES);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+    }
+
+    /// The encoder used to emit nothing unless flushed, so an attachment
+    /// reached the provider as an empty payload.
+    #[test]
+    fn loading_produces_a_non_empty_encoded_payload() {
+        use agent_code_lib::llm::message::ContentBlock;
+        let dir = fixture();
+        let path = dir.path().join("shot.png");
+        fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        let (blocks, notes) = load_image_blocks(&[path]);
+        assert_eq!(blocks.len(), 1, "{notes:?}");
+        let ContentBlock::Image { media_type, data } = &blocks[0] else {
+            panic!("expected an image block");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(data, "iVBORw==");
     }
 
     /// Fail-closed: an image whose size cannot be read is refused, not
