@@ -665,14 +665,26 @@ fn bash_grant_context(
 }
 
 /// The context a prefix grant for this call would be bound to, or `None`
-/// when the tool is not a shell (prefix grants are shell-only).
+/// when the tool is not the Bash tool.
+///
+/// Bash only, deliberately. Both halves of the feature — deriving a
+/// prefix and matching one — run the Bash grammar, and the permission
+/// rules already treat PowerShell as unanalysable for exactly that
+/// reason (`auto_decision` in `permissions/mod.rs`). Judging PowerShell
+/// syntax with the wrong grammar is the same mistake, made where the
+/// answer is durable.
+///
+/// The tool name is part of the context as well, so a grant can never be
+/// honoured for a different tool that happens to produce the same
+/// context — a second shell tool added later starts with its own
+/// namespace rather than inheriting Bash's approvals.
 pub fn bash_prefix_context(
     tool: &str,
     input: &serde_json::Value,
     sandbox_state: &str,
     cwd: &std::path::Path,
 ) -> Option<String> {
-    if tool != "Bash" && tool != "PowerShell" {
+    if tool != "Bash" {
         return None;
     }
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -686,12 +698,12 @@ pub fn bash_prefix_context(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let timeout = crate::tools::bash::effective_timeout_ms(input);
-    Some(bash_grant_context(
-        unsandboxed,
-        background,
-        timeout,
-        sandbox_state,
-        &cwd_digest,
+    // Namespaced by tool, and kept out of `bash_grant_context` itself so
+    // the exact-grant key that shares it stays byte-identical to what
+    // already-released versions wrote.
+    Some(format!(
+        "tool:{tool}\0{}",
+        bash_grant_context(unsandboxed, background, timeout, sandbox_state, &cwd_digest)
     ))
 }
 
@@ -903,6 +915,43 @@ mod session_allow_tests {
             None,
             &[],
         )
+    }
+
+    /// Prefix grants are Bash-only. Both deriving a prefix and matching
+    /// one run the Bash grammar, and the permission rules already refuse
+    /// to analyse PowerShell for that reason; offering a durable grant
+    /// there would judge PowerShell syntax with the wrong parser — and,
+    /// since the context carries no tool name of its own, would let a
+    /// Bash grant answer for a PowerShell call with the same text.
+    #[test]
+    fn only_the_bash_tool_gets_a_prefix_context() {
+        let input = serde_json::json!({"command": "git status"});
+        let cwd = std::path::Path::new(".");
+        assert!(
+            bash_prefix_context("Bash", &input, "none", cwd).is_some(),
+            "Bash must still offer prefix grants"
+        );
+        for tool in ["PowerShell", "powershell", "Zsh", "Read"] {
+            assert_eq!(
+                bash_prefix_context(tool, &input, "none", cwd),
+                None,
+                "{tool} was offered a prefix grant"
+            );
+        }
+    }
+
+    /// Even within Bash the context names its tool, so a future second
+    /// shell tool starts with its own namespace rather than inheriting
+    /// approvals made for Bash.
+    #[test]
+    fn a_prefix_context_names_its_tool() {
+        let input = serde_json::json!({"command": "git status"});
+        let cx = bash_prefix_context("Bash", &input, "none", std::path::Path::new("."))
+            .expect("a context");
+        assert!(
+            cx.starts_with("tool:Bash\0"),
+            "context not namespaced: {cx}"
+        );
     }
 
     /// The grant scope is the repository root while the session can

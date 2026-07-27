@@ -448,13 +448,74 @@ mod tests {
             derive_prefix("cargo build --release").as_deref(),
             Some("cargo build")
         );
-        // No subcommand: the binary alone.
-        assert_eq!(derive_prefix("ls -la").as_deref(), Some("ls"));
-        // Path-qualified binaries reduce to their name.
+        // A path-qualified binary keeps its spelling. Reducing it to
+        // `git status` would persist a grant that never matches the
+        // command it came from, because matching sees the raw text.
         assert_eq!(
             derive_prefix("/usr/bin/git status").as_deref(),
-            Some("git status")
+            Some("/usr/bin/git status")
         );
+    }
+
+    /// The bare binary is never offered, with or without flags. The
+    /// matcher goes on to test `{prefix} *`, so a `git` grant would cover
+    /// `git push --force` — one approval turning into "never ask about
+    /// git again".
+    #[test]
+    fn derive_prefix_never_offers_a_bare_binary() {
+        for cmd in ["git --version", "ls -la", "ls", "npm", "df -h"] {
+            assert_eq!(
+                derive_prefix(cmd),
+                None,
+                "offered a bare-binary prefix for {cmd}"
+            );
+        }
+
+        // What that would have cost, had it been offered.
+        let mut store = GrantStore::ephemeral();
+        store.insert_prefix("git", "ctx", "").unwrap();
+        assert!(
+            store.allows_prefix("git push --force", "ctx"),
+            "precondition: a bare-binary grant really does cover everything"
+        );
+    }
+
+    /// A stored prefix is a *pattern* to the matcher, not a literal. A
+    /// glob character in the executable name would widen the grant past
+    /// the command it was derived from, and a prefix of only `*` is
+    /// short-circuited as universal — one approval suppressing every
+    /// later prompt in the same context.
+    #[test]
+    fn derive_prefix_refuses_glob_metacharacters() {
+        for cmd in [
+            r"./\* --version",
+            r"./\* status",
+            r"'*' status",
+            r"\? status",
+            "./ru?ner build",
+            "./run*er build",
+        ] {
+            assert_eq!(
+                derive_prefix(cmd),
+                None,
+                "a glob metacharacter reached the offered prefix for {cmd}"
+            );
+        }
+    }
+
+    /// The universal-pattern short-circuit is what makes the rule above
+    /// load-bearing: had `*` been derivable, it would have authorized
+    /// every command in the context.
+    #[test]
+    fn a_glob_prefix_would_have_been_universal() {
+        let mut store = GrantStore::ephemeral();
+        store.insert_prefix("*", "ctx", "").unwrap();
+        assert!(
+            store.allows_prefix("rm -rf /tmp/x", "ctx"),
+            "precondition: `*` is treated as universal by the matcher"
+        );
+        // …which is why nothing can derive it.
+        assert_eq!(derive_prefix(r"./\* --version"), None);
     }
 
     /// Never propose a prefix for something the gate cannot reason
@@ -505,7 +566,7 @@ mod tests {
     /// `curl <url>` as `curl <url>` may never be resolved by offering the
     /// bare binary, which would approve every future use of that tool.
     #[test]
-    fn derive_prefix_does_not_widen_to_the_bare_binary() {
+    fn derive_prefix_does_not_widen_to_the_bare_binary_for_data_arguments() {
         assert_eq!(derive_prefix("curl https://example.com/a"), None);
         // The same binary with a real subcommand still works, and a
         // later credential-bearing call is not covered by it.
@@ -538,7 +599,14 @@ mod tests {
     /// silently does nothing.
     #[test]
     fn an_offered_prefix_covers_the_command_it_came_from() {
-        for cmd in ["git status --porcelain", "cargo build --release", "ls -la"] {
+        for cmd in [
+            "git status --porcelain",
+            "cargo build --release",
+            "/usr/bin/git status",
+            "./deploy.sh staging",
+            "npm run build",
+            "docker compose up",
+        ] {
             let prefix = derive_prefix(cmd).unwrap_or_else(|| panic!("no prefix for {cmd}"));
             let mut store = GrantStore::ephemeral();
             store.insert_prefix(&prefix, "ctx", "").unwrap();
@@ -547,6 +615,29 @@ mod tests {
                 "prefix `{prefix}` did not cover its own command {cmd}"
             );
         }
+    }
+
+    /// The spelling that gets persisted has to be the spelling the
+    /// matcher will see. A path-qualified binary reduced to its base name
+    /// produced a grant that never fired — the user answered "always" and
+    /// was asked again on the identical next call.
+    #[test]
+    fn a_path_qualified_binary_keeps_its_grant() {
+        let cmd = "/usr/bin/git status";
+        let prefix = derive_prefix(cmd).expect("a prefix");
+        let mut store = GrantStore::ephemeral();
+        store.insert_prefix(&prefix, "ctx", "").unwrap();
+        assert!(
+            store.allows_prefix(cmd, "ctx"),
+            "the identical command prompted again after `always`"
+        );
+        assert!(
+            store.allows_prefix("/usr/bin/git status --porcelain", "ctx"),
+            "the grant did not extend to the same command with flags"
+        );
+        // Still bound to that spelling — it does not leak to another
+        // binary that merely shares the base name.
+        assert!(!store.allows_prefix("/opt/evil/git status", "ctx"));
     }
 
     /// A project holding only prefix grants is still a project with
@@ -1162,15 +1253,27 @@ fn is_subcommand_token(tok: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// True when `tok` is safe to persist and to render as an executable
-/// name. Binaries legitimately carry `.`, `/` and `~` (`./deploy.sh`), so
-/// they cannot be held to [`is_subcommand_token`]; what they must not
-/// carry is anything that makes the stored bytes differ from the painted
-/// ones — control characters, bidi overrides, zero-width joiners.
-fn is_displayable_binary(tok: &str) -> bool {
+/// True when `tok` may be persisted and rendered as an executable name.
+///
+/// Binaries legitimately carry `.`, `/` and `~` (`./deploy.sh`), so they
+/// cannot be held to [`is_subcommand_token`]. Three things disqualify
+/// them:
+///
+/// * **Glob metacharacters.** A stored prefix is a *pattern* to
+///   [`crate::permissions::matches_shell_command`], not a literal. `*`
+///   and `?` would therefore widen the grant past the command it was
+///   derived from, and a prefix of only `*` is short-circuited by that
+///   matcher as universal — approving `./\* --version` would suppress
+///   the prompt for every later command in the same context.
+/// * **Quoting and expansion characters.** They mean the stored spelling
+///   is not the spelling the matcher will see in the command text.
+/// * **Invisible characters.** Control, bidi and zero-width characters
+///   make the persisted bytes differ from the painted ones.
+fn is_literal_binary_token(tok: &str) -> bool {
     !tok.is_empty()
         && !tok.chars().any(|c| {
-            c.is_control()
+            matches!(c, '*' | '?' | '\'' | '"' | '\\' | '$' | '`')
+                || c.is_control()
                 || c.is_whitespace()
                 || matches!(c,
                     '\u{200B}'..='\u{200F}'
@@ -1181,23 +1284,49 @@ fn is_displayable_binary(tok: &str) -> bool {
         })
 }
 
+/// True when `prefix` authorizes `command`, ignoring context.
+///
+/// Shared by [`derive_prefix`] and [`GrantStore::allows_prefix`] so that
+/// what is offered and what is later honoured can never drift apart —
+/// an offered prefix that does not match its own command is a grant that
+/// silently does nothing.
+///
+/// Two patterns, not one `{prefix}*`: a trailing glob would make
+/// `git status` cover `git statusx`, which is a different binary
+/// invocation entirely. The prefix has to end on a token boundary —
+/// either the whole invocation, or the invocation up to a space.
+fn prefix_covers(prefix: &str, command: &str) -> bool {
+    crate::permissions::matches_shell_command(prefix, command, /*widening*/ true)
+        || crate::permissions::matches_shell_command(
+            &format!("{prefix} *"),
+            command,
+            /*widening*/ true,
+        )
+}
+
 /// Propose the prefix to offer for `command`: the binary plus its first
-/// non-flag argument.
+/// non-flag argument, and nothing else.
 ///
-/// `git status --porcelain` proposes `git status`, not `git`. Offering
-/// the bare binary would turn "don't ask about `git status` again" into
-/// "never ask about git again", including `git push --force`. Offering
-/// the whole line would never match twice.
+/// `git status --porcelain` proposes `git status`. Both halves must be
+/// there. The bare binary is **never** offered — not for `git`, not for
+/// the flag-only `git --version` — because `allows_prefix` goes on to
+/// test `{prefix} *`, so a `git` grant would cover `git push --force`.
+/// Offering the whole line instead would never match twice.
 ///
-/// Returns `None` when the command is anything the gate cannot reason
-/// about — multiple invocations, substitutions, redirection — because a
-/// prefix over an unanalysable command is not a prefix over anything.
+/// Returns `None`, offering nothing, in every case it cannot vouch for.
+/// The user still has `[y]`/`[a]`/`[A]`; only the durable widening is
+/// withheld.
 ///
-/// Also returns `None` when that first non-flag argument is data rather
-/// than a subcommand ([`is_subcommand_token`]). `curl https://token@host`
-/// must not put a credential in the config directory, and widening to the
-/// bare binary instead — "never ask about `curl` again" — would be worse
-/// than asking. Nothing is offered; `[y]`/`[a]`/`[A]` still are.
+/// * Commands the gate cannot reason about — multiple invocations,
+///   substitutions, subshells, redirection, assignment.
+/// * A first non-flag argument that is data rather than a subcommand
+///   ([`is_subcommand_token`]): `curl https://token@host` must not put a
+///   credential in the config directory.
+/// * A binary that is not a literal ([`is_literal_binary_token`]).
+/// * A prefix that does not, in the end, cover the very command it was
+///   derived from ([`prefix_covers`]) — which is what stops a
+///   path-qualified or quoted spelling from being offered as a grant
+///   that would never match.
 pub fn derive_prefix(command: &str) -> Option<String> {
     let parsed = crate::tools::bash_parse::parse_bash(command)?;
     if parsed.has_parse_error
@@ -1218,24 +1347,27 @@ pub fn derive_prefix(command: &str) -> Option<String> {
     let mut tokens = invocation
         .iter()
         .map(|t| crate::tools::bash_parse::unquote_token(t));
-    // Only the binary is reduced to its base name: `/usr/bin/git` and
-    // `git` are the same tool. Arguments keep their full text, because
-    // base-naming them would both mangle the prefix past matching
-    // (`ls /usr/bin` → `ls bin`, which matches neither) and hide the
-    // separators that mark an argument as data.
-    let binary = crate::tools::bash_parse::base_name(&tokens.next()?);
-    if !is_displayable_binary(&binary) {
+    // Tokens keep their full text — the binary is *not* reduced to its
+    // base name. Matching compares the stored prefix against the raw
+    // command text, so `/usr/bin/git status` reduced to `git status`
+    // would be persisted as a grant that never matches the call it came
+    // from. The same reasoning rules out base-naming arguments, which
+    // additionally hid the separators that mark an argument as data.
+    let binary = tokens.next()?;
+    if !is_literal_binary_token(&binary) {
         return None;
     }
-    match tokens.find(|t| !t.starts_with('-')) {
-        Some(sub) if is_subcommand_token(&sub) => Some(format!("{binary} {sub}")),
-        // A positional argument that is not a subcommand is data. Fail
-        // closed rather than persist it or widen to the bare binary.
-        Some(_) => None,
-        // No positional argument at all: the binary is the whole command,
-        // so a prefix over it grants no more than the call being approved.
-        None => Some(binary),
+    // Both halves are required: see the bare-binary note above.
+    let sub = tokens.find(|t| !t.starts_with('-'))?;
+    if !is_subcommand_token(&sub) {
+        return None;
     }
+    let prefix = format!("{binary} {sub}");
+    // Last gate: what is offered has to be what will later be honoured.
+    // Any spelling the matcher would not recognise — quoting the parser
+    // stripped, odd spacing — is caught here rather than persisted as a
+    // grant that silently does nothing.
+    prefix_covers(&prefix, command).then_some(prefix)
 }
 
 impl GrantStore {
@@ -1258,20 +1390,7 @@ impl GrantStore {
             if e.context != context {
                 return false;
             }
-            // Two patterns, not one `{prefix}*`: a trailing glob would
-            // make `git status` cover `git statusx`, which is a
-            // different binary invocation entirely. The prefix has to
-            // end on a token boundary — either the whole invocation, or
-            // the invocation up to a space.
-            let exact = crate::permissions::matches_shell_command(
-                &e.prefix, command, /*widening*/ true,
-            );
-            let with_args = crate::permissions::matches_shell_command(
-                &format!("{} *", e.prefix),
-                command,
-                /*widening*/ true,
-            );
-            exact || with_args
+            prefix_covers(&e.prefix, command)
         })
     }
 

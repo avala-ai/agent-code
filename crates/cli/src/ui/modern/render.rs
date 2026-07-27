@@ -913,6 +913,24 @@ fn draw_permission_modal(
     scroll: usize,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // The durable grant leads the body, not the footer. The footer is a
+    // single fixed row that cannot wrap, so a narrow terminal truncated
+    // the tail of the prefix while `[P]` stayed live — a durable grant
+    // whose full scope the user could not read. Here it wraps, and being
+    // the first row it survives however short the modal gets. Escaped
+    // like every other untrusted string in this modal: the prefix is
+    // derived from a model-supplied command, and a bidi or zero-width
+    // control in it would make the grant read as something other than
+    // the bytes to be persisted.
+    if let Some(ref prefix) = pending.suggested_prefix {
+        lines.push(Line::from(Span::styled(
+            format!("[P] always allow: {}", escape_deceptive(prefix)),
+            Style::default()
+                .fg(palette().warning)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
     if pending_behind > 0 {
         lines.push(Line::from(Span::styled(
             format!("⚠ {pending_behind} more pending"),
@@ -988,20 +1006,12 @@ fn draw_permission_modal(
         // Keep ≤ 40 cols so min-width modals still show every binding —
         // the deny action must never be the one that gets clipped.
         // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
-        Some(key_hint_line(&match pending.suggested_prefix.as_deref() {
-            // Name the prefix in the hint. "[P] prefix" would make the
-            // user guess what they are about to approve. Escaped like
-            // every other untrusted string in this modal: the prefix is
-            // derived from the model-supplied command, and a bidi or
-            // zero-width control in it would make the durable grant read
-            // as something other than the bytes to be persisted.
-            Some(prefix) => {
-                format!(
-                    "[y] once [a] session [A] always [P] always `{}` [n] deny",
-                    escape_deceptive(prefix)
-                )
-            }
-            None => "[y] once [a] session [A] always [n] deny".to_string(),
+        // The prefix itself is NOT named here: it is variable-length, and
+        // this row cannot wrap. The body row above carries the scope.
+        Some(key_hint_line(if pending.suggested_prefix.is_some() {
+            "[y] once [a] session [A] always [P] prefix [n] deny"
+        } else {
+            "[y] once [a] session [A] always [n] deny"
         })),
     );
 }
@@ -1634,6 +1644,52 @@ mod tests {
             s.contains("git<U+202E>sutats"),
             "override in the offered prefix not surfaced:\n{s}"
         );
+    }
+
+    /// `[P]` creates a *durable* grant, so its full scope has to be
+    /// readable before the key is live. The hint used to live in the
+    /// one-row footer, which cannot wrap: at 60 columns the prefix tail
+    /// was truncated while `[P]` still worked.
+    #[test]
+    fn permission_modal_shows_the_whole_prefix_on_a_narrow_terminal() {
+        // Long enough that no single row of a narrow modal could hold it.
+        let prefix = "/usr/local/bin/kubectl rollout-status-with-a-long-name";
+        for cols in [46u16, 60, 80, 120] {
+            let backend = TestBackend::new(cols, 24);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: Some(prefix.into()),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            // The body wraps, so the prefix may be split across rows;
+            // dropping the box borders and collapsing whitespace
+            // reassembles it.
+            let flat = s
+                .replace(['│', '┌', '┐', '└', '┘', '─'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                flat.contains(prefix),
+                "the prefix was not fully visible at {cols} columns:\n{s}"
+            );
+            assert!(
+                s.contains("[P]"),
+                "the prefix binding vanished at {cols} columns:\n{s}"
+            );
+        }
     }
 
     /// The modal title names the tool being approved. A plugin manifest or
