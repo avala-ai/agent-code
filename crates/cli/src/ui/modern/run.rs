@@ -489,31 +489,7 @@ pub(super) async fn event_loop(
                             })
                         }
                     });
-                    match result {
-                        crate::commands::CommandResult::Exit => {
-                            app.should_quit = true;
-                        }
-                        crate::commands::CommandResult::Prompt(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Passthrough(p) => {
-                            app.enqueue_turn_from_command(p);
-                        }
-                        crate::commands::CommandResult::Handled => {
-                            let text = captured.trim();
-                            if !text.is_empty() {
-                                for line in text.lines() {
-                                    // Strip ANSI for the transcript view.
-                                    let plain = strip_ansi_simple(line);
-                                    if !plain.is_empty() {
-                                        app.transcript
-                                            .push(super::app::TranscriptItem::System(plain));
-                                    }
-                                }
-                            }
-                            app.status_message = format!("ran {slash}");
-                        }
-                    }
+                    apply_command_result(app, result, &captured, &slash);
                     // Keep TUI header/path and `!` shell in sync with engine
                     // after `/cd` (and any other cwd-changing command).
                     app.cwd = eng.state().cwd.clone();
@@ -1027,6 +1003,51 @@ async fn manager_rows(
             .then_with(|| a.id.cmp(&b.id))
     });
     rows
+}
+
+/// Apply a slash command's outcome to the app.
+///
+/// The captured stdout is emitted for *every* outcome, not just
+/// `Handled`. A command that returns a prompt still prints for the user
+/// — `/review` announces which target it resolved — and that line is
+/// the only feedback they get in the modern TUI. It goes in before the
+/// turn is enqueued so the note precedes the turn it explains.
+fn apply_command_result(
+    app: &mut App,
+    result: crate::commands::CommandResult,
+    captured: &str,
+    slash: &str,
+) {
+    push_captured_output(app, captured);
+    match result {
+        crate::commands::CommandResult::Exit => {
+            app.should_quit = true;
+        }
+        crate::commands::CommandResult::Prompt(p)
+        | crate::commands::CommandResult::Passthrough(p) => {
+            app.enqueue_turn_from_command(p);
+        }
+        crate::commands::CommandResult::Handled => {
+            app.status_message = format!("ran {slash}");
+        }
+    }
+}
+
+/// Push stdout captured from a slash command into the transcript, one
+/// `System` line per non-empty line.
+fn push_captured_output(app: &mut App, captured: &str) {
+    let text = captured.trim();
+    if text.is_empty() {
+        return;
+    }
+    for line in text.lines() {
+        // Strip ANSI for the transcript view.
+        let plain = strip_ansi_simple(line);
+        if !plain.is_empty() {
+            app.transcript
+                .push(super::app::TranscriptItem::System(plain));
+        }
+    }
 }
 
 /// Strip common CSI/OSC ANSI sequences for transcript display.
@@ -3483,5 +3504,62 @@ mod tests {
             "Esc on permission denies without cancelling the turn"
         );
         assert!(app.front_permission().is_none());
+    }
+
+    /// A slash command that returns a prompt still prints for the user:
+    /// `/review` announces which target it resolved. That line has to
+    /// reach the transcript and land *before* the turn it explains —
+    /// the Prompt arm used to discard captured stdout, leaving the
+    /// modern TUI with no indication of what was under review.
+    #[test]
+    fn a_prompt_returning_command_still_surfaces_what_it_printed() {
+        use crate::ui::modern::app::TranscriptItem;
+
+        let mut app = App::new("m", "/tmp", "s");
+        let resolved = agent_code_lib::review::resolve(
+            agent_code_lib::review::ReviewTarget::BaseBranch {
+                base: "main".into(),
+            },
+            std::path::Path::new("/tmp"),
+        )
+        .expect("a plain branch name is a valid target");
+        // What the `/review` arm prints, colour codes and all.
+        let captured = format!("\u{1b}[2mReviewing {}…\u{1b}[0m\n", resolved.hint);
+
+        apply_command_result(
+            &mut app,
+            crate::commands::CommandResult::Prompt(resolved.prompt),
+            &captured,
+            "/review base main",
+        );
+
+        let note = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::System(t) if t.contains("changes vs main")));
+        let turn = app
+            .transcript
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::User(_)));
+        let note = note.unwrap_or_else(|| {
+            panic!(
+                "review target hint never reached the transcript: {:?}",
+                app.transcript
+            )
+        });
+        let turn = turn.expect("the prompt was not enqueued as a turn");
+        assert!(
+            note < turn,
+            "the hint must precede the turn it explains: {:?}",
+            app.transcript
+        );
+        // ANSI is stripped for the transcript view, as on the Handled path.
+        let TranscriptItem::System(text) = &app.transcript[note] else {
+            unreachable!()
+        };
+        assert!(
+            !text.contains('\u{1b}'),
+            "escape sequences reached the transcript: {text:?}"
+        );
     }
 }
