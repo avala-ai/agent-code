@@ -281,6 +281,12 @@ pub fn upsert_with_source(
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
     fn two_groups() -> Vec<TaskEntry> {
         let mut t = Vec::new();
         upsert(&mut t, "a1", "working", "explore");
@@ -803,6 +809,8 @@ pub fn todo_progress(todos: &[TodoItem]) -> (usize, usize) {
 
 #[cfg(test)]
 mod todo_tests {
+    #![deny(dead_code)]
+
     use super::*;
 
     #[test]

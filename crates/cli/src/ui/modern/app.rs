@@ -2774,6 +2774,12 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface,
+    // which also silences a test that loses its `#[test]`. Opt back in:
+    // an unannotated test is unreachable, so the compiler should be the
+    // thing that notices.
+    #![deny(dead_code)]
+
     use super::*;
     use agent_code_lib::tools::PermissionResponse;
 
@@ -4658,6 +4664,7 @@ mod tests {
         ));
     }
 
+    #[test]
     fn copy_reports_no_assistant_when_empty() {
         let mut app = App::new("m", "/tmp", "s");
         app.copy_last_assistant();

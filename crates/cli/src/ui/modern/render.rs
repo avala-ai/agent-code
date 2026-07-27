@@ -1597,6 +1597,13 @@ pub fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface, which
+    // also silences a test that loses its `#[test]` — exactly what a
+    // merge did to `normal_mode_is_visible_in_the_prompt` here. Opt this
+    // module back in: an unannotated test is unreachable, so the
+    // compiler is the thing that should notice.
+    #![deny(dead_code)]
+
     use super::*;
     use crate::ui::modern::app::TranscriptItem;
     use ratatui::Terminal;
@@ -2266,6 +2273,7 @@ mod tests {
         assert!(folded.contains("cargo build"), "buffer:\n{folded}");
     }
 
+    #[test]
     fn normal_mode_is_visible_in_the_prompt() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
