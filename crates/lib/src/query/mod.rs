@@ -333,7 +333,15 @@ impl QueryEngine {
         // directories this engine no longer has in scope.
         if dropped_dirs {
             let cwd = self.state.cwd.clone();
-            self.fire_cwd_changed_hooks(&cwd, "session-swap").await;
+            // A scope of its own, never the turn's. A swap happens
+            // between turns, and after an aborted one `self.cancel` stays
+            // cancelled until the next `begin_turn` — passing it would
+            // have `run_hooks` reject every hook before it started, so
+            // watchers would silently never hear about the dropped
+            // directories.
+            let swap_cancel = CancellationToken::new();
+            self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
+                .await;
         }
     }
 
@@ -428,6 +436,18 @@ impl QueryEngine {
         previous_cwd: &str,
         cause: &str,
     ) -> Vec<crate::hooks::HookResult> {
+        self.run_cwd_changed_hooks(previous_cwd, cause, Some(&self.cancel))
+            .await
+    }
+
+    /// [`Self::fire_cwd_changed_hooks`] with an explicit cancellation
+    /// scope, for dispatches that do not belong to a turn.
+    async fn run_cwd_changed_hooks(
+        &self,
+        previous_cwd: &str,
+        cause: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<crate::hooks::HookResult> {
         let ctx = serde_json::json!({
             "previous_cwd": previous_cwd,
             "new_cwd": self.state.cwd,
@@ -435,7 +455,7 @@ impl QueryEngine {
             "cause": cause,
         });
         self.hooks
-            .run_hooks(&HookEvent::CwdChanged, None, &ctx, Some(&self.cancel))
+            .run_hooks(&HookEvent::CwdChanged, None, &ctx, cancel)
             .await
     }
 
@@ -3589,6 +3609,37 @@ mod tests {
             engine.extraction_state.lock().await.last_processed_index(),
             0,
             "a late write from the previous conversation reached the reset state"
+        );
+    }
+
+    /// A swap happens between turns, and after an aborted turn
+    /// `self.cancel` stays cancelled until the next `begin_turn` — so
+    /// dispatching the cwd-change event on the turn's token had
+    /// `run_hooks` reject it before it started, and watchers were never
+    /// told the tracked directories had gone.
+    #[tokio::test]
+    async fn a_session_swap_notifies_cwd_hooks_after_an_aborted_turn() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        std::fs::write(&path, "").unwrap();
+
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        engine.hooks.register(crate::hooks::HookDefinition {
+            event: HookEvent::CwdChanged,
+            tool_name: None,
+            action: crate::hooks::HookAction::Shell {
+                command: format!("echo fired >> {path:?}"),
+            },
+        });
+        engine.state.additional_dirs.push("/srv/scratch".into());
+        // The previous turn was cancelled and no new one has begun.
+        engine.cancel.cancel();
+
+        engine.reset_for_session_swap().await;
+
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("fired"),
+            "the cwd hook never ran, so watchers still track the dropped directories"
         );
     }
 
