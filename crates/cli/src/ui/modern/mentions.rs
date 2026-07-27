@@ -507,6 +507,16 @@ fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
 /// junction needs no special privilege, so every ancestor between the
 /// workspace root and the file is rejected outright if it has become a
 /// reparse point.
+///
+/// Unlike the Unix path this is not atomic: the ancestor checks and the
+/// open are separate lookups, and Win32 has no handle-relative open to
+/// close that gap — only `NtCreateFile` with a root directory handle can,
+/// which is undocumented-adjacent FFI this crate does not otherwise carry.
+/// What remains is a local attacker who can already write inside the
+/// workspace and must win a race, and who could instead simply put the
+/// bytes they want in an image file there and have it attached with no
+/// race at all. The bound worth having — that a mention cannot *quietly*
+/// reach outside the workspace — is what the checks above provide.
 #[cfg(not(unix))]
 fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -540,11 +550,14 @@ fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     let file = options
         .open(path)
         .map_err(|e| format!("unreadable ({})", e.kind()))?;
-    if !file
+    let meta = file
         .metadata()
-        .map_err(|e| format!("unreadable ({})", e.kind()))?
-        .is_file()
-    {
+        .map_err(|e| format!("unreadable ({})", e.kind()))?;
+    // The descriptor decides, and a reparse point is judged by its
+    // attribute: `is_file` only excludes the tags `is_symlink` recognizes,
+    // so a placeholder or any other non-name-surrogate tag would otherwise
+    // be accepted here as an ordinary file.
+    if is_reparse_point(&meta) || !meta.is_file() {
         return Err("not a regular file".into());
     }
     Ok(file)
