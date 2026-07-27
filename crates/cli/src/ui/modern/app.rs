@@ -726,8 +726,12 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
-            EngineEvent::SubagentOutput { agent_id, output } => {
-                if super::tasks::set_output(&mut self.tasks, &agent_id, &output) {
+            EngineEvent::SubagentOutput {
+                agent_id,
+                call_id,
+                output,
+            } => {
+                if super::tasks::set_output(&mut self.tasks, &agent_id, &call_id, &output) {
                     self.dirty = true;
                 }
             }
@@ -2122,7 +2126,7 @@ impl App {
                         headline: row.headline,
                         source: TaskSource::Subagent,
                         task_id: Some(row.id),
-                        output: None,
+                        outputs: Vec::new(),
                     });
                     claimed.push(true);
                 }
@@ -2135,7 +2139,7 @@ impl App {
                 headline: row.headline,
                 source: TaskSource::Background,
                 task_id: Some(row.id),
-                output: None,
+                outputs: Vec::new(),
             });
         }
         // A manager-backed agent row whose record vanished (e.g.
@@ -2229,6 +2233,24 @@ impl App {
         self.dirty = true;
     }
 
+    /// Render a row's captured inline results as one body.
+    ///
+    /// Usually one. A row holds several only when distinct Agent calls
+    /// collapsed onto it (their descriptions share a prefix), and then
+    /// each is labelled by its tool call — showing only the last would
+    /// hide a finished agent's result and could attribute the wrong
+    /// output to the row.
+    fn captured_body(outputs: &[super::tasks::CapturedOutput]) -> String {
+        match outputs {
+            [only] => only.body.clone(),
+            many => many
+                .iter()
+                .map(|o| format!("── call {} ──\n{}", o.call_id, o.body))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
+
     /// Ask the run loop for the selected task's output (D4-27 drill-in).
     ///
     /// Only rows backed by a `TaskManager` id have output to show —
@@ -2239,20 +2261,20 @@ impl App {
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
-        match (&row.task_id, &row.output) {
+        match &row.task_id {
             // Backed by a TaskManager task: read the file on the run loop.
-            (Some(id), _) => {
+            Some(id) => {
                 self.pending_task_output = Some(id.clone());
                 self.status_message = format!("loading output for {id}…");
             }
             // Inline subagent: its result was captured when it finished,
             // because it has no output file to read.
-            (None, Some(output)) => {
-                let (id, body) = (row.agent_id.clone(), output.clone());
-                self.show_task_output(&id, Ok(body));
-            }
-            (None, None) => {
+            None if row.outputs.is_empty() => {
                 self.status_message = "this agent has not produced output yet".to_string();
+            }
+            None => {
+                let (id, body) = (row.agent_id.clone(), Self::captured_body(&row.outputs));
+                self.show_task_output(&id, Ok(body));
             }
         }
         self.dirty = true;
@@ -3522,6 +3544,7 @@ mod tests {
         });
         app.apply_engine(EngineEvent::SubagentOutput {
             agent_id: "explorer".into(),
+            call_id: "toolu_01".into(),
             output: "found the bug in auth.rs".into(),
         });
 
@@ -3542,6 +3565,45 @@ mod tests {
             app.pending_task_output.is_none(),
             "an inline subagent has no task file to read"
         );
+    }
+
+    /// Two Agent calls whose descriptions share a prefix collapse onto
+    /// one row. Drill-in must show both results, each labelled by its
+    /// call — before this the second overwrote the first and one
+    /// finished agent's work was unreachable.
+    #[test]
+    fn a_shared_row_opens_every_captured_result() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "done".into(),
+            headline: "audit".into(),
+        });
+        for (call, body) in [("call-a", "A found a bug"), ("call-b", "B found nothing")] {
+            app.apply_engine(EngineEvent::SubagentOutput {
+                agent_id: shared.into(),
+                call_id: call.into(),
+                output: body.into(),
+            });
+        }
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => {
+                let body = result.as_deref().unwrap();
+                assert!(body.contains("A found a bug"), "first result lost: {body}");
+                assert!(
+                    body.contains("B found nothing"),
+                    "second result lost: {body}"
+                );
+                assert!(body.contains("call-a") && body.contains("call-b"));
+            }
+            other => panic!("expected a tool card, got {other:?}"),
+        }
     }
 
     /// A subagent still running has nothing to show yet, and must say so

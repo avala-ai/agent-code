@@ -94,6 +94,15 @@ pub fn requested_background(input: &serde_json::Value) -> bool {
 /// background launches does not match.
 pub fn is_background_launch_ack(content: &str) -> bool {
     let content = content.trim_end();
+    // The acknowledgement is a single line the tool wrote by itself. A
+    // foreground result opens with its own `Agent (…) completed.` header
+    // and puts the child's answer on later lines, so an acknowledgement
+    // quoted anywhere in that answer is rejected here — before any
+    // segment is inspected — rather than being found by a scan past the
+    // header.
+    if content.contains(['\n', '\r']) {
+        return false;
+    }
     let Some(rest) = content.strip_prefix(ACK_HEAD) else {
         return false;
     };
@@ -1113,6 +1122,31 @@ mod background_ack_tests {
         ));
         assert!(!is_background_launch_ack("found three call sites"));
         assert!(!is_background_launch_ack(""));
+    }
+
+    /// The foreground result carries the tool's *own* `Agent (…)` header
+    /// too, so an anchored prefix alone is not enough: a child that
+    /// quotes a real acknowledgement at the end of its answer would
+    /// otherwise strand its finished row at `working`.
+    #[test]
+    fn a_foreground_result_quoting_an_acknowledgement_is_not_one() {
+        let quoted = format!(
+            "Agent (sweep the repo, type=general-purpose, subagent_id=sweep) completed.\n\n\
+             I launched a helper and it replied:\n{REAL_ACK}"
+        );
+        assert!(
+            !is_background_launch_ack(&quoted),
+            "a quoted acknowledgement inside a foreground result was taken as a dispatch"
+        );
+    }
+
+    /// The degenerate foreground result — the child wrote nothing — is
+    /// still just a completion header.
+    #[test]
+    fn an_empty_foreground_result_is_not_an_acknowledgement() {
+        assert!(!is_background_launch_ack(
+            "Agent (sweep, type=general-purpose, subagent_id=sweep) completed.\n\n"
+        ));
     }
 
     #[test]

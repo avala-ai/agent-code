@@ -147,7 +147,13 @@ pub trait StreamSink: Send + Sync {
     /// one-line headline: a UI that lets the user open a subagent needs
     /// the body, and the completion path already has it in hand.
     /// Defaulted so existing sinks are unaffected.
-    fn on_subagent_output(&self, _agent_id: &str, _output: &str) {}
+    ///
+    /// `call_id` is the Agent tool-call id and is the identity to key
+    /// captured output by. `agent_id` is a *display* id derived from the
+    /// call's description, so two calls whose descriptions share a
+    /// prefix collapse onto one — distinct results must not be keyed by
+    /// it or one would overwrite the other.
+    fn on_subagent_output(&self, _agent_id: &str, _call_id: &str, _output: &str) {}
 
     /// Terminal turn outcome: `done` | `cancelled` | `error` | `max_turns`.
     /// `turn` is session-cumulative, matching [`Self::on_turn_start`].
@@ -2008,7 +2014,7 @@ fn emit_agent_result_update(
     // over intact so a UI can open the subagent's own output instead of
     // showing a row that leads nowhere.
     if state != "working" && !result.content.trim().is_empty() {
-        sink.on_subagent_output(&agent_id, &result.content);
+        sink.on_subagent_output(&agent_id, tool_use_id, &result.content);
     }
 }
 
@@ -2447,11 +2453,11 @@ mod tests {
                 .unwrap()
                 .push((agent_id.to_string(), state.to_string()));
         }
-        fn on_subagent_output(&self, agent_id: &str, output: &str) {
+        fn on_subagent_output(&self, agent_id: &str, call_id: &str, output: &str) {
             self.outputs
                 .lock()
                 .unwrap()
-                .push((agent_id.to_string(), output.to_string()));
+                .push((format!("{agent_id}/{call_id}"), output.to_string()));
         }
     }
 
@@ -2540,6 +2546,52 @@ mod tests {
         );
         assert_eq!(sink.updates.lock().unwrap().first().unwrap().1, "done");
         assert_eq!(sink.outputs.lock().unwrap().len(), 1);
+    }
+
+    /// Two calls whose descriptions share a 32-character prefix resolve
+    /// to the same display `agent_id`. The captured output must still be
+    /// attributable, so the tool-call id rides along with it.
+    #[test]
+    fn captured_output_carries_the_calls_own_id() {
+        let shared = "audit the authentication module for";
+        let calls = vec![
+            crate::tools::executor::PendingToolCall {
+                id: "call-a".into(),
+                name: "Agent".into(),
+                input: serde_json::json!({"description": format!("{shared} tokens")}),
+            },
+            crate::tools::executor::PendingToolCall {
+                id: "call-b".into(),
+                name: "Agent".into(),
+                input: serde_json::json!({"description": format!("{shared} sessions")}),
+            },
+        ];
+        let sink = SubagentSink::default();
+        emit_agent_result_update(
+            &sink,
+            &crate::tools::ToolResult::success("A found a bug"),
+            &calls,
+            "call-a",
+        );
+        emit_agent_result_update(
+            &sink,
+            &crate::tools::ToolResult::success("B found nothing"),
+            &calls,
+            "call-b",
+        );
+
+        let outputs = sink.outputs.lock().unwrap();
+        let keys: Vec<&str> = outputs.iter().map(|(k, _)| k.as_str()).collect();
+        let display_id = |k: &str| k.rsplit_once('/').unwrap().0.to_string();
+        assert_eq!(
+            display_id(keys[0]),
+            display_id(keys[1]),
+            "the premise: both calls resolve to one display id"
+        );
+        assert!(
+            keys[0].ends_with("/call-a") && keys[1].ends_with("/call-b"),
+            "the per-call identity was not carried: {keys:?}"
+        );
     }
 
     #[test]

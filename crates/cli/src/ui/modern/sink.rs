@@ -27,8 +27,13 @@ pub enum EngineEvent {
     Text(String),
     Thinking(String),
     /// A finished subagent's full output, for pane drill-in.
+    ///
+    /// `call_id` is the Agent tool-call id. Two calls can share an
+    /// `agent_id` (it is derived from the description), so the call id is
+    /// what keeps their results apart.
     SubagentOutput {
         agent_id: String,
+        call_id: String,
         output: String,
     },
     ToolStart {
@@ -292,9 +297,10 @@ impl StreamSink for ChannelSink {
         self.send(EngineEvent::ContextUsage { used, max });
     }
 
-    fn on_subagent_output(&self, agent_id: &str, output: &str) {
+    fn on_subagent_output(&self, agent_id: &str, call_id: &str, output: &str) {
         self.send(EngineEvent::SubagentOutput {
             agent_id: agent_id.to_string(),
+            call_id: call_id.to_string(),
             output: bound_subagent_output(output, SUBAGENT_OUTPUT_MAX_CHARS),
         });
     }
@@ -464,11 +470,17 @@ mod tests {
         let notice = format!("{TRUNCATION_NOTICE_PREFIX}: 999999 bytes total)");
         sink.on_subagent_output(
             "explorer",
+            "toolu_01",
             &format!("{}{notice}", "d".repeat(SUBAGENT_OUTPUT_MAX_CHARS)),
         );
         match rx.try_recv().unwrap() {
-            EngineEvent::SubagentOutput { agent_id, output } => {
+            EngineEvent::SubagentOutput {
+                agent_id,
+                call_id,
+                output,
+            } => {
                 assert_eq!(agent_id, "explorer");
+                assert_eq!(call_id, "toolu_01", "the per-call identity was dropped");
                 assert!(output.ends_with(&notice));
             }
             other => panic!("unexpected {other:?}"),
