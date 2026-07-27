@@ -338,6 +338,32 @@ impl TodoStatus {
     }
 }
 
+/// The slice of checklist items the pane can draw in `budget` rows, as
+/// `(start, len)`.
+///
+/// A checklist is model-authored and unbounded — nothing stops a plan
+/// with two hundred entries — so the pane windows it instead of letting
+/// it claim every row. The window is anchored on the item in flight
+/// (falling back to the first unfinished one), because that is the row
+/// the user is actually tracking, with a little lead-in above it for
+/// context.
+pub fn todo_window(todos: &[TodoItem], budget: usize) -> (usize, usize) {
+    if todos.len() <= budget {
+        return (0, todos.len());
+    }
+    if budget == 0 {
+        return (0, 0);
+    }
+    let anchor = todos
+        .iter()
+        .position(|t| t.status == TodoStatus::InProgress)
+        .or_else(|| todos.iter().position(|t| t.status != TodoStatus::Done))
+        .unwrap_or(0);
+    let lead = budget / 3;
+    let start = anchor.saturating_sub(lead).min(todos.len() - budget);
+    (start, budget)
+}
+
 /// `2/5` — how far through the checklist the model is.
 pub fn todo_progress(todos: &[TodoItem]) -> (usize, usize) {
     let done = todos
@@ -360,6 +386,54 @@ mod todo_tests {
         // An unrecognised status must not read as finished.
         assert_eq!(TodoStatus::parse("garbage"), TodoStatus::Pending);
         assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
+    }
+
+    fn todo(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: content.into(),
+            content: content.into(),
+            status,
+        }
+    }
+
+    /// A long checklist must not claim more rows than it is given, and
+    /// the window has to keep the item being worked on — the only one
+    /// the user is really tracking — inside it.
+    #[test]
+    fn the_checklist_window_keeps_the_item_in_flight_visible() {
+        let mut todos: Vec<TodoItem> = (0..40)
+            .map(|i| todo(&format!("item {i}"), TodoStatus::Done))
+            .collect();
+        todos[30].status = TodoStatus::InProgress;
+        for t in todos.iter_mut().skip(31) {
+            t.status = TodoStatus::Pending;
+        }
+
+        let (start, len) = todo_window(&todos, 6);
+        assert_eq!(len, 6, "window exceeded its budget");
+        assert!(
+            (start..start + len).contains(&30),
+            "in-progress item {} fell outside window {start}..{}",
+            30,
+            start + len
+        );
+
+        // With no in-progress item, the first unfinished one anchors it.
+        let mut all_but_last_done: Vec<TodoItem> = (0..40)
+            .map(|i| todo(&format!("item {i}"), TodoStatus::Done))
+            .collect();
+        all_but_last_done[39].status = TodoStatus::Pending;
+        let (start, len) = todo_window(&all_but_last_done, 5);
+        assert!(
+            (start..start + len).contains(&39),
+            "the only unfinished item was windowed out"
+        );
+
+        // Short lists are shown whole; a zero budget shows nothing rather
+        // than panicking on the slice.
+        assert_eq!(todo_window(&todos[..3], 6), (0, 3));
+        assert_eq!(todo_window(&todos, 0), (0, 0));
+        assert_eq!(todo_window(&[], 4), (0, 0));
     }
 
     #[test]

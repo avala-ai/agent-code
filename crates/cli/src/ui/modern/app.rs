@@ -1256,6 +1256,10 @@ impl App {
             // context. The run loop applies this under try_lock.
             self.pending_clear = true;
             self.ctx_meter = None;
+            // The checklist belongs to the conversation being discarded;
+            // keeping it would hold the pane open on work that no longer
+            // exists.
+            self.todos.clear();
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
@@ -2307,6 +2311,14 @@ impl App {
         self.show_tasks && (!self.tasks.is_empty() || !self.todos.is_empty())
     }
 
+    /// Whether the pane's arrow/Enter bindings may claim the key. Visible
+    /// is not enough: a checklist-only pane has nothing to select, and
+    /// swallowing the keys there would make prompt history unreachable
+    /// until the user hid the pane.
+    pub fn tasks_nav_active(&self) -> bool {
+        self.tasks_visible() && !self.tasks.is_empty()
+    }
+
     /// Force a full repaint (Ctrl+L). Drops the layout cache so every block
     /// is re-wrapped from scratch and asks the draw path to clear the
     /// terminal first — the escape hatch for a screen corrupted by another
@@ -3208,6 +3220,28 @@ mod tests {
         app.submit();
         assert!(app.pending_clear, "engine clear deferred to run loop");
         assert!(app.transcript.is_empty());
+    }
+
+    /// `/clear` discards the conversation; the checklist describes that
+    /// conversation's work, so leaving it behind would hold the pane open
+    /// on a plan for a session that no longer exists.
+    #[test]
+    fn clear_drops_the_checklist() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::TodoUpdate {
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        assert!(app.tasks_visible());
+
+        app.input = "/clear".into();
+        app.cursor = 6;
+        app.submit();
+
+        assert!(app.todos.is_empty(), "stale checklist survived /clear");
+        assert!(
+            !app.tasks_visible(),
+            "the pane stayed open on a cleared conversation"
+        );
     }
 
     #[test]

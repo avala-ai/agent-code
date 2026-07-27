@@ -1251,14 +1251,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_queue_pane();
         }
-        // When the tasks pane is open (and the queue pane is not, which
-        // owns the same keys), plain arrows move the selection and plain
-        // Enter opens the selected task's output. Modified presses fall
-        // through so global bindings (Ctrl+Enter interject, Alt+Enter
-        // newline) stay reachable while the pane is open.
+        // When the tasks pane has selectable rows (and the queue pane is
+        // not open, which owns the same keys), plain arrows move the
+        // selection and plain Enter opens the selected task's output.
+        // Modified presses fall through so global bindings (Ctrl+Enter
+        // interject, Alt+Enter newline) stay reachable while the pane is
+        // open. A checklist-only pane is not selectable, so these arms
+        // stand aside and the keys reach prompt history.
         (m, KeyCode::Up)
             if m.is_empty()
-                && app.tasks_visible()
+                && app.tasks_nav_active()
                 && !app.show_queue_pane
                 && app.input.is_empty() =>
         {
@@ -1266,7 +1268,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         (m, KeyCode::Down)
             if m.is_empty()
-                && app.tasks_visible()
+                && app.tasks_nav_active()
                 && !app.show_queue_pane
                 && app.input.is_empty() =>
         {
@@ -1277,7 +1279,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // key when no queued prompt is waiting for dispatch.
         (m, KeyCode::Enter)
             if m.is_empty()
-                && app.tasks_visible()
+                && app.tasks_nav_active()
                 && !app.show_queue_pane
                 && app.queue.is_empty()
                 && app.input.is_empty() =>
@@ -1811,6 +1813,46 @@ mod tests {
         // Plain Enter still drives the pane (subagent row → explanation).
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.status_message.contains("no separate output"));
+    }
+
+    /// A checklist makes the pane visible with nothing selectable in it.
+    /// The arrow arms must stand aside there, or ↑ on an empty composer
+    /// would be swallowed by a no-op `tasks_select` and prompt history
+    /// would be unreachable until the user hid the pane.
+    #[test]
+    fn a_checklist_only_pane_leaves_prompt_history_reachable() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_tasks = true;
+        app.apply_engine(crate::ui::modern::sink::EngineEvent::TodoUpdate {
+            items: vec![("1".into(), "add the guard".into(), "in_progress".into())],
+        });
+        app.prompt_history.push("the earlier prompt".into());
+        assert!(app.tasks_visible(), "the checklist should show the pane");
+        assert!(app.tasks.is_empty());
+
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.input, "the earlier prompt",
+            "the checklist-only pane swallowed prompt history"
+        );
+
+        // Enter is likewise not the pane's to claim with nothing selected.
+        app.input.clear();
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.pending_task_output.is_none(),
+            "drill-in ran with no selectable row"
+        );
+
+        // With a real task present the pane takes the keys back.
+        app.input.clear();
+        app.history_browse = None;
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        handle_key(&mut app, key(KeyCode::Up));
+        assert!(
+            app.input.is_empty(),
+            "a selectable pane should still claim ↑"
+        );
     }
 
     /// After an aborted turn the UI says "queued prompts kept — press
