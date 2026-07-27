@@ -508,6 +508,13 @@ pub(super) async fn event_loop(
                         // resumed session inherits approvals the user
                         // never gave it and the executor skips the ask.
                         eng.clear_session_allows().await;
+                        // The system prompt is cached by a hash over model
+                        // and cwd, neither of which need change here — but
+                        // `build_system_prompt` selects memories from the
+                        // recent messages, so a stale entry would hand the
+                        // first resumed turn a prompt built for the
+                        // conversation just discarded.
+                        eng.reset_system_prompt_cache();
                         app.restore_transcript(items, &id, turns);
                         let stored_mode = app.adopt_restored_session(&restored);
                         let mode = user_mode.unwrap_or(stored_mode);
@@ -527,6 +534,13 @@ pub(super) async fn event_loop(
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
                         app.pending_resume = None;
+                        // Restart the loop so the handlers *above* this one
+                        // get their turn now that the resume gate is open.
+                        // They have already been passed this iteration, and
+                        // `select!` below has no readiness condition for a
+                        // pending `/model`, so it would sit unapplied until
+                        // some unrelated key or engine event arrived.
+                        continue;
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.

@@ -234,7 +234,10 @@ impl App {
         // unreachable. These are mutually exclusive overlays.
         self.cancel_search();
         self.model_picker = None;
-        self.theme_picker = None;
+        // Cancel, not drop: the theme picker previews live, so discarding
+        // it would strand the global palette on a theme the user never
+        // accepted while the config still names the original.
+        self.theme_picker_cancel();
         self.command_palette = None;
         self.show_shortcuts = false;
         self.session_picker = Some(SessionPicker {
@@ -885,6 +888,37 @@ mod tests {
         assert!(app.model_picker.is_none());
         assert!(app.theme_picker.is_none());
         assert!(app.command_palette.is_none());
+    }
+
+    /// The theme picker previews live, so dropping it would strand the
+    /// global palette on a theme the user never accepted. Mutates the
+    /// process-global theme, hence the shared test lock.
+    #[test]
+    fn opening_the_picker_reverts_a_theme_preview_rather_than_dropping_it() {
+        let _g = crate::ui::theme::test_lock();
+        let mut app = App::new("m", "/tmp", "s");
+        app.set_theme("one-dark");
+        app.pending_theme = None;
+
+        app.open_theme_picker();
+        // Browsing previews the candidate globally without committing.
+        app.theme_picker_move(1);
+        app.theme_picker_move(1);
+
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+
+        assert!(app.session_picker_open());
+        assert!(app.theme_picker.is_none());
+        assert_eq!(app.theme_name, "one-dark");
+        assert!(
+            app.pending_theme.is_none(),
+            "an unaccepted preview was queued for persistence"
+        );
+        assert_eq!(
+            crate::ui::theme::current().accent,
+            crate::ui::theme::Theme::from_name("one-dark").accent,
+            "an unaccepted preview survived opening the resume picker"
+        );
     }
 
     /// Rows that arrive late must clear search too — the user has had a
