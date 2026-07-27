@@ -192,13 +192,19 @@ async fn finish_cwd_adoption(
     let cwd = dir.display().to_string();
     eng.state_mut().cwd = cwd.clone();
     eng.reset_system_prompt_cache();
-    // Grants *and* the live checker: both are per-project and both are
-    // consulted when a tool runs. The checker was left pinned to the root
-    // the process started in, so a write into the restored project's
-    // `.agent/team-memory` through a symlink matched neither the old root
-    // nor the raw path — a protected directory stopped being protected
-    // the moment a resume crossed projects.
-    eng.rescope_project(dir);
+    // Everything project-scoped moves together: grants, the checker's
+    // root, its *rules*, and the hook registry. Moving a subset left the
+    // destination's deny rules unapplied and the source project's hooks
+    // still firing — including the lifecycle hooks fired just below.
+    // Reported rather than fatal: the session has already been restored
+    // by this point, and refusing here would strand it.
+    if let Err(e) = eng.adopt_project(dir) {
+        app.transcript
+            .push(super::app::TranscriptItem::System(format!(
+                "resumed, but this project's configuration could not be read ({e}) — \
+             permission rules and hooks are still the previous project's"
+            )));
+    }
     app.cwd = cwd;
     let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
@@ -614,6 +620,16 @@ pub(super) async fn event_loop(
                             // flight here, so renewing is safe.
                             eng.renew_cancel_scope();
                             let _ = eng.fire_session_stop_hooks().await;
+                            // Also here, and for the same reason: this
+                            // tears down the departing session — grants,
+                            // `/add-dir` paths, the prompt cache, the
+                            // extraction cursor, the denial tracker — and
+                            // notifies watchers about the directories it
+                            // is dropping. Those hooks inherit the process
+                            // cwd, so running it after the move fired
+                            // project A's teardown inside project B while
+                            // its context still named project A.
+                            eng.reset_for_session_swap().await;
                         }
                         // Only now move. Shell hooks inherit the process
                         // directory, so entering the destination before
@@ -695,12 +711,6 @@ pub(super) async fn event_loop(
                         // reused across the swap, so without this the
                         // resumed session inherits approvals the user
                         // never gave it and the executor skips the ask.
-                        // Permission grants, `/add-dir` paths, the prompt
-                        // cache, the memory-extraction cursor, the denial
-                        // tracker and the rest of the conversation-scoped
-                        // state the session file does not carry. One call,
-                        // so a swap cannot forget a field.
-                        eng.reset_for_session_swap().await;
                         // Built after the reset so `effort` is the value
                         // the engine actually ends up with, not the one
                         // the discarded conversation had chosen.

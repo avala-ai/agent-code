@@ -41,6 +41,15 @@ impl HookRegistry {
         Self { hooks: Vec::new() }
     }
 
+    /// Replace every registered hook.
+    ///
+    /// Hooks are project-scoped: adopting another project's session must
+    /// drop the hooks configured for the one being left, or its teardown
+    /// and tooling keep firing inside a tree they were never written for.
+    pub fn replace(&mut self, hooks: Vec<HookDefinition>) {
+        self.hooks = hooks;
+    }
+
     pub fn register(&mut self, hook: HookDefinition) {
         self.hooks.push(hook);
     }

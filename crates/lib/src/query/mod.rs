@@ -449,25 +449,41 @@ impl QueryEngine {
         self.persistent_grants.clone()
     }
 
+    /// Adopt `project_root` as this engine's project: grant store,
+    /// permission root, permission *rules*, and hooks.
+    ///
+    /// Every one of these is per-project and every one is consulted when
+    /// a tool runs, so moving a subset leaves part of the policy
+    /// answering for the project the process just left — the
+    /// destination's deny rules never apply, or the source's hooks keep
+    /// firing in a tree they were not written for. Resuming a session
+    /// from another project is the case that needs this.
+    ///
+    /// Rules and hooks come from the config layers of the *process
+    /// working directory*, so the caller must have moved there first.
+    /// Only policy is taken from that config: the model, modes and the
+    /// rest of the runtime state belong to the session being restored,
+    /// not to the directory it lives in.
+    pub fn adopt_project(
+        &mut self,
+        project_root: &std::path::Path,
+    ) -> Result<(), crate::error::ConfigError> {
+        self.rescope_persistent_grants(project_root);
+        self.permissions
+            .set_project_root(project_root.to_path_buf());
+        let cfg = crate::config::Config::load()?;
+        self.permissions.set_rules(cfg.permissions.rules.clone());
+        self.hooks.replace(cfg.hooks.clone());
+        self.state.config.permissions.rules = cfg.permissions.rules;
+        self.state.config.hooks = cfg.hooks;
+        Ok(())
+    }
+
     /// Re-scope persistent grants to a new project root. Must be called
     /// whenever the session cwd changes (`/cd`): grants are per-project,
     /// so an approval saved in the old project must not keep suppressing
     /// prompts in the new one, and new grants must be written to the new
     /// project's file. No-op when the feature was never enabled.
-    /// Point everything project-scoped at `project_root`: the persistent
-    /// grant store *and* the live permission checker.
-    ///
-    /// Both are per-project and both are consulted when a tool runs, so
-    /// moving one without the other leaves either approvals or the
-    /// canonical protected-path checks answering for the project the
-    /// process just left. Resuming a session from another project is the
-    /// case that needs this.
-    pub fn rescope_project(&mut self, project_root: &std::path::Path) {
-        self.rescope_persistent_grants(project_root);
-        self.permissions
-            .set_project_root(project_root.to_path_buf());
-    }
-
     pub fn rescope_persistent_grants(&mut self, project_root: &std::path::Path) {
         let Some(store) = self.persistent_grants.clone() else {
             return;

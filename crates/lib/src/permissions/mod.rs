@@ -35,7 +35,12 @@ pub struct PermissionChecker {
     /// AcceptEdits / Plan / Ask mid-turn without rebuilding the checker
     /// or waiting on the query-engine mutex (M0 mid-turn mode).
     default_mode: std::sync::RwLock<PermissionMode>,
-    rules: Vec<PermissionRule>,
+    /// Behind a lock for the same reason as `default_mode` and
+    /// `project_root`: rules come from the project's config, so adopting
+    /// a session from another project has to move them on the live
+    /// checker rather than leave the old project's allow/deny list
+    /// deciding.
+    rules: std::sync::RwLock<Vec<PermissionRule>>,
     /// Project root used for runtime checks (e.g. team-memory).
     /// `None` means "no project root known" — runtime checks that
     /// require it become best-effort.
@@ -59,7 +64,7 @@ impl PermissionChecker {
     pub fn from_config(config: &PermissionsConfig) -> Self {
         Self {
             default_mode: std::sync::RwLock::new(config.default_mode),
-            rules: config.rules.clone(),
+            rules: std::sync::RwLock::new(config.rules.clone()),
             project_root: std::sync::RwLock::new(None),
             read_scope: None,
         }
@@ -69,7 +74,7 @@ impl PermissionChecker {
     pub fn allow_all() -> Self {
         Self {
             default_mode: std::sync::RwLock::new(PermissionMode::Allow),
-            rules: Vec::new(),
+            rules: std::sync::RwLock::new(Vec::new()),
             project_root: std::sync::RwLock::new(None),
             read_scope: None,
         }
@@ -87,6 +92,14 @@ impl PermissionChecker {
     pub fn set_default_mode(&self, mode: PermissionMode) {
         if let Ok(mut g) = self.default_mode.write() {
             *g = mode;
+        }
+    }
+
+    /// Replace the rule list on a checker already shared behind an
+    /// `Arc`. A poisoned lock leaves the previous rules in place.
+    pub fn set_rules(&self, rules: Vec<PermissionRule>) {
+        if let Ok(mut guard) = self.rules.write() {
+            *guard = rules;
         }
     }
 
@@ -242,7 +255,13 @@ impl PermissionChecker {
         // because a tacked-on `&& rm` broke its every-segment match,
         // exposing a broader Allow behind it).
         let mut winner: Option<PermissionDecision> = None;
-        for rule in &self.rules {
+        let rules = self
+            .rules
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for rule in &rules {
             if !matches_tool(&rule.tool, tool_name) {
                 continue;
             }
@@ -280,7 +299,13 @@ impl PermissionChecker {
     /// Check for read-only operations (always allowed).
     pub fn check_read(&self, tool_name: &str, input: &serde_json::Value) -> PermissionDecision {
         // Read operations use a relaxed check — only explicit deny rules block.
-        for rule in &self.rules {
+        let rules = self
+            .rules
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for rule in &rules {
             // Only `deny` can block a read, so anything else is skipped
             // before matching — that also keeps the pattern match on the
             // restricting side of the allow/deny asymmetry.
@@ -1590,6 +1615,47 @@ mod tests {
             }
             other => panic!("expected Deny for {tool} {file_path} (team-memory), got {other:?}"),
         }
+    }
+
+    /// Rules are project config too. While they stayed as built at
+    /// startup, a resume into another project ran under the *old*
+    /// project's allow/deny list: its denials still applied here, and
+    /// this project's never did.
+    #[test]
+    fn moving_the_rules_moves_which_project_decides() {
+        let checker = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Ask,
+            rules: vec![PermissionRule {
+                tool: "Bash".into(),
+                pattern: Some("git *".into()),
+                action: PermissionMode::Allow,
+            }],
+            ..Default::default()
+        });
+        let git = serde_json::json!({"command": "git status"});
+        assert!(
+            matches!(checker.check("Bash", &git), PermissionDecision::Allow),
+            "precondition: the starting project allows git"
+        );
+
+        // The destination project does not.
+        checker.set_rules(vec![PermissionRule {
+            tool: "Bash".into(),
+            pattern: Some("cargo *".into()),
+            action: PermissionMode::Allow,
+        }]);
+
+        assert!(
+            !matches!(checker.check("Bash", &git), PermissionDecision::Allow),
+            "the project we left was still deciding"
+        );
+        assert!(
+            matches!(
+                checker.check("Bash", &serde_json::json!({"command": "cargo test"})),
+                PermissionDecision::Allow
+            ),
+            "this project's own rules never applied"
+        );
     }
 
     /// Resuming a session from another project moves the checker's root.
