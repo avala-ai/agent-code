@@ -475,15 +475,6 @@ pub(super) async fn event_loop(
                         // instruction, so it is replayed on top of the
                         // restored mode rather than silently reverted.
                         let user_mode = (app.mode != last_mode).then_some(app.mode);
-                        let restored = super::session_picker::RestoredState {
-                            id: id.clone(),
-                            model: data.model.clone(),
-                            turn_count: data.turn_count,
-                            tokens_in: data.total_input_tokens,
-                            tokens_out: data.total_output_tokens,
-                            cost_usd: data.total_cost_usd,
-                            plan_mode: data.plan_mode,
-                        };
                         let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
@@ -521,6 +512,19 @@ pub(super) async fn event_loop(
                         // state the session file does not carry. One call,
                         // so a swap cannot forget a field.
                         eng.reset_for_session_swap().await;
+                        // Built after the reset so `effort` is the value
+                        // the engine actually ends up with, not the one
+                        // the discarded conversation had chosen.
+                        let restored = super::session_picker::RestoredState {
+                            id: id.clone(),
+                            model: data.model.clone(),
+                            turn_count: data.turn_count,
+                            tokens_in: data.total_input_tokens,
+                            tokens_out: data.total_output_tokens,
+                            cost_usd: data.total_cost_usd,
+                            plan_mode: data.plan_mode,
+                            effort: eng.state().config.api.effort.clone(),
+                        };
                         app.restore_transcript(items, &id, turns);
                         let stored_mode = app.adopt_restored_session(&restored);
                         let mode = user_mode.unwrap_or(stored_mode);

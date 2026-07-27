@@ -88,6 +88,9 @@ pub struct RestoredState {
     pub tokens_out: u64,
     pub cost_usd: f64,
     pub plan_mode: bool,
+    /// Reasoning effort *after* the engine reset — the configured
+    /// startup value, not the discarded conversation's choice.
+    pub effort: Option<String>,
 }
 
 /// Rebuild transcript items from a restored conversation.
@@ -293,7 +296,12 @@ impl App {
     /// user was trying to leave — a prompt or `!cmd` would take real tool
     /// and filesystem side effects there — so it is cancelled and shown.
     pub fn cancel_deferred_resume_work(&mut self) {
-        self.cancel_pending_session_work("cancelled — held for the session that failed to load:");
+        // Terminal path: no restore follows, so nothing needs to survive
+        // a transcript swap that will not happen.
+        self.cancel_pending_session_work(
+            "cancelled — held for the session that failed to load:",
+            false,
+        );
     }
 
     /// Session-scoped work staged against a conversation that is being
@@ -303,7 +311,10 @@ impl App {
     /// away) and must not run anywhere else, so it is cancelled — but
     /// reproduced verbatim, never reduced to a count. The submitted
     /// prompt goes back to the composer when the composer is free.
-    fn cancel_pending_session_work(&mut self, why: &str) {
+    /// `carry` keeps a copy for [`App::restore_transcript`] to re-emit:
+    /// a successful resume replaces the whole transcript, which would
+    /// otherwise wipe the report before the user ever read it.
+    fn cancel_pending_session_work(&mut self, why: &str, carry: bool) {
         let mut cancelled: Vec<String> = Vec::new();
         if self.pending_clear {
             self.pending_clear = false;
@@ -321,8 +332,11 @@ impl App {
         self.reclaim_staged_prompts("not sent:", &mut cancelled);
         if !cancelled.is_empty() {
             let body = cancelled.join("\n");
-            self.transcript
-                .push(TranscriptItem::System(format!("{why}\n{body}")));
+            let note = format!("{why}\n{body}");
+            if carry {
+                self.resume_notices.push(note.clone());
+            }
+            self.transcript.push(TranscriptItem::System(note));
             self.scroll_to_bottom();
             self.dirty = true;
         }
@@ -425,7 +439,10 @@ impl App {
         // resume gates would merely *hold* it, and it would then land on
         // the restored session — a `/clear` issued against the old
         // conversation would clear the new one.
-        self.cancel_pending_session_work("cancelled — issued before you resumed another session:");
+        self.cancel_pending_session_work(
+            "cancelled — issued before you resumed another session:",
+            true,
+        );
         self.pending_resume = Some(id.clone());
         self.status_message = format!("resuming {}…", &id[..id.len().min(8)]);
         self.dirty = true;
@@ -442,6 +459,12 @@ impl App {
             &id[..id.len().min(8)],
             turns
         )));
+        // Re-emit anything reported before the swap: it was pushed onto
+        // the transcript we just replaced, so without this the promised
+        // verbatim report of cancelled work never reaches the user.
+        for note in std::mem::take(&mut self.resume_notices) {
+            self.transcript.push(TranscriptItem::System(note));
+        }
         self.scroll_to_bottom();
         self.status_message.clear();
         self.dirty = true;
@@ -466,6 +489,7 @@ impl App {
         self.tokens_in = s.tokens_in;
         self.tokens_out = s.tokens_out;
         self.cost_usd = s.cost_usd;
+        self.effort = s.effort.clone();
         // Belongs to the conversation that was just replaced; the next
         // turn re-reports it for the restored one.
         self.ctx_meter = None;
@@ -1009,6 +1033,7 @@ mod tests {
             tokens_out: 567,
             cost_usd: 4.25,
             plan_mode: true,
+            effort: None,
         }
     }
 
@@ -1131,6 +1156,54 @@ mod tests {
                 "{expected} was cancelled silently: {said}"
             );
         }
+    }
+
+    /// The cancellation report is pushed onto the transcript that the
+    /// restore then replaces wholesale, so it has to be re-emitted or
+    /// the user never sees what was cancelled on their behalf.
+    #[test]
+    fn the_cancellation_report_survives_the_transcript_swap() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_shell = Some("make clean".into());
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        app.session_picker_accept();
+
+        // The restore replaces everything that was on screen.
+        app.restore_transcript(vec![TranscriptItem::User("restored".into())], "aaa11111", 2);
+
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("!make clean"),
+            "the cancellation report was wiped by the resume: {said}"
+        );
+        assert!(
+            app.resume_notices.is_empty(),
+            "notices must not be re-emitted a second time"
+        );
+    }
+
+    /// Reasoning effort is chosen per conversation and not saved, so the
+    /// resumed session must show what the engine actually reset to.
+    #[test]
+    fn the_effort_mirror_follows_the_restored_session() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.effort = Some("high".into());
+        app.adopt_restored_session(&RestoredState {
+            effort: None,
+            ..restored()
+        });
+        assert!(
+            app.effort.is_none(),
+            "the badge still claims an effort the restored session never chose"
+        );
     }
 
     /// A prompt submitted while the session was still loading never ran

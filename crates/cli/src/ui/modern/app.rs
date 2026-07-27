@@ -435,6 +435,9 @@ pub struct App {
     /// will not draw over a modal, so they wait here instead of being
     /// dropped on the floor.
     pub deferred_sessions: Option<Vec<agent_code_lib::services::session::SessionSummary>>,
+    /// Notes reported before a resume replaces the transcript, re-emitted
+    /// afterwards so the swap does not erase them.
+    pub resume_notices: Vec<String>,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -613,6 +616,7 @@ impl App {
             pending_resume: None,
             pending_session_list: false,
             deferred_sessions: None,
+            resume_notices: Vec::new(),
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),

@@ -84,6 +84,12 @@ pub struct QueryEngine {
     /// discarded conversation does not also discard the user's
     /// configured default for the rest of the process.
     initial_disk_output_style: Option<crate::output_styles::OutputStyle>,
+    /// `config.api.effort` as configured at startup. Reasoning effort is
+    /// chosen per conversation (`/effort`, the model picker) and is not
+    /// saved in a session, so a swap returns to this rather than
+    /// inheriting a level the restored session never selected — which
+    /// its model may not even support.
+    initial_effort: Option<String>,
     /// Publishes the current turn's [`TurnStatus`] to observers.
     turn_status: tokio::sync::watch::Sender<TurnStatus>,
     /// Sender side of the steering channel. Cloned out via
@@ -203,9 +209,10 @@ impl QueryEngine {
         let cancel = CancellationToken::new();
         let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Snapshot before `state` is moved: this is the configured
-        // default a session swap restores to.
+        // Snapshot before `state` is moved: these are the configured
+        // defaults a session swap restores to.
         let initial_disk_output_style = state.disk_output_style.clone();
+        let initial_effort = state.config.api.effort.clone();
         let live_plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(state.plan_mode));
         Self {
             llm,
@@ -229,6 +236,7 @@ impl QueryEngine {
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             initial_disk_output_style: initial_disk_output_style.clone(),
+            initial_effort: initial_effort.clone(),
             permission_prompter: None,
             question_asker: None,
             cached_system_prompt: None,
@@ -287,6 +295,7 @@ impl QueryEngine {
         while self.steer_rx.try_recv().is_ok() {}
 
         let initial_style = self.initial_disk_output_style.clone();
+        let initial_effort = self.initial_effort.clone();
         let state = &mut self.state;
         // `/add-dir` tells the model it may read and edit these paths
         // without re-asking. That permission was given to the previous
@@ -296,6 +305,10 @@ impl QueryEngine {
         state.response_style = crate::state::ResponseStyle::default();
         // Back to the configured default, not to nothing.
         state.disk_output_style = initial_style;
+        // Likewise for reasoning effort: chosen per conversation, absent
+        // from the session file, and not necessarily supported by the
+        // model the restored session uses.
+        state.config.api.effort = initial_effort;
         // `/fast` restores this on its next toggle, but the restore takes
         // the model from the session, so there is nothing to go back to.
         state.pre_fast_model = None;
@@ -3572,6 +3585,23 @@ mod tests {
         assert!(
             engine.state.disk_output_style.is_none(),
             "an in-conversation output style survived the swap"
+        );
+    }
+
+    /// Reasoning effort is chosen per conversation (`/effort`, the model
+    /// picker), is not saved in a session, and may not even be supported
+    /// by the restored session's model.
+    #[tokio::test]
+    async fn a_session_swap_returns_to_the_configured_effort() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        let configured = engine.state.config.api.effort.clone();
+        engine.state.config.api.effort = Some("high".into());
+
+        engine.reset_for_session_swap().await;
+
+        assert_eq!(
+            engine.state.config.api.effort, configured,
+            "the resumed session inherited an effort it never selected"
         );
     }
 
