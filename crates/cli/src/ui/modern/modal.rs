@@ -127,7 +127,7 @@ impl App {
             // the modal must not assert storage it cannot observe.
             // `/permissions` lists what actually persisted.
             PermissionResponse::AllowAlwaysPrefix { ref prefix } => {
-                format!("always allowing commands starting with `{prefix}` (saved)")
+                format!("always allowing commands starting with `{prefix}`")
             }
             PermissionResponse::AllowAlways => {
                 format!("always allowing this exact {} call", p.name)

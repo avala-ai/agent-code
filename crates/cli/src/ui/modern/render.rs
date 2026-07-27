@@ -990,9 +990,16 @@ fn draw_permission_modal(
         // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
         Some(key_hint_line(&match pending.suggested_prefix.as_deref() {
             // Name the prefix in the hint. "[P] prefix" would make the
-            // user guess what they are about to approve.
+            // user guess what they are about to approve. Escaped like
+            // every other untrusted string in this modal: the prefix is
+            // derived from the model-supplied command, and a bidi or
+            // zero-width control in it would make the durable grant read
+            // as something other than the bytes to be persisted.
             Some(prefix) => {
-                format!("[y] once [a] session [A] always [P] always `{prefix}` [n] deny")
+                format!(
+                    "[y] once [a] session [A] always [P] always `{}` [n] deny",
+                    escape_deceptive(prefix)
+                )
             }
             None => "[y] once [a] session [A] always [n] deny".to_string(),
         })),
@@ -1592,6 +1599,41 @@ mod tests {
             "a bidi override reached the screen:\n{s}"
         );
         assert!(s.contains("<U+202E>"), "override not surfaced:\n{s}");
+    }
+
+    /// `[P]` approves a *durable* grant, so the prefix beside it has to
+    /// read as the bytes that will be persisted and later authorized. The
+    /// prefix is derived from the model-supplied command, so a bidi
+    /// override in it would make the footer advertise a different grant
+    /// from the one being made.
+    #[test]
+    fn permission_modal_reveals_a_bidi_override_in_the_offered_prefix() {
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: "Bash: run a command".into(),
+                    origin: None,
+                    input_preview: None,
+                    suggested_prefix: Some("git\u{202e}sutats".into()),
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            !s.contains('\u{202e}'),
+            "a bidi override in the offered prefix reached the screen:\n{s}"
+        );
+        assert!(
+            s.contains("git<U+202E>sutats"),
+            "override in the offered prefix not surfaced:\n{s}"
+        );
     }
 
     /// The modal title names the tool being approved. A plugin manifest or
