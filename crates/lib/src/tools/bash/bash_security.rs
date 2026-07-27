@@ -2018,8 +2018,6 @@ fn env_option_is_modelled(option: &str) -> bool {
 /// of it. `false` means an option changed the grammar in a way this
 /// does not model, so what the command runs with is unknown.
 fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
-    let mut unreadable = false;
-    let mut pairs: Vec<(String, String)> = Vec::new();
     let name_of = |t: &String| base_name(&unquote_token(t)).to_lowercase();
     // A head whose operands are text names nothing it runs: `echo env
     // FOO=bar git p` prints those words, it does not set anything.
@@ -2027,23 +2025,41 @@ fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
         .first()
         .is_some_and(|t| DATA_COMMANDS.contains(&name_of(t).as_str()))
     {
-        return (pairs, true);
+        return (Vec::new(), true);
     }
-    // The wrapper is not always argv[0]. `timeout 5 env -S'GIT_CONFIG_GLOBAL=… git p'`
-    // puts it behind a runner whose own grammar this does not model, and
-    // reading only position zero missed the environment entirely. Start
-    // from wherever the modelled wrapper actually is; the outer runner's
-    // own operands set nothing, so skipping them loses nothing.
-    let Some(wrapper_at) = invocation
-        .iter()
-        .position(|t| COMMAND_RUNNER_WRAPPERS.contains(&name_of(t).as_str()))
-    else {
-        return (pairs, true);
-    };
-    // Which wrapper's grammar is being walked right now. `env` is the
-    // only one whose options this models; the others are recognised so
-    // the walk can continue through them, not parsed.
-    let mut wrapper = name_of(&invocation[wrapper_at]);
+    // The wrapper is not always argv[0], and there can be more than one
+    // of them: `timeout 5 env -S'…'` hides it behind an unmodelled
+    // runner, and `find … -exec echo env x \; -exec env -S'…' \;` runs
+    // two commands from one invocation. Taking only the first
+    // wrapper-shaped token let an inert `env` earlier in the argv mask a
+    // real one later, so every occurrence is walked and what they set is
+    // pooled. An occurrence that reads to a command word simply
+    // contributes nothing.
+    let mut unreadable = false;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (at, token) in invocation.iter().enumerate() {
+        if !COMMAND_RUNNER_WRAPPERS.contains(&name_of(token).as_str()) {
+            continue;
+        }
+        let (found, read_fully) = walk_runner_from(invocation, at, name_of(token));
+        pairs.extend(found);
+        unreadable = unreadable || !read_fully;
+    }
+    (pairs, !unreadable)
+}
+
+/// Read one wrapper occurrence: the environment it sets, and whether the
+/// walk reached the end of it. `wrapper` is which wrapper's grammar is
+/// being walked — `env` is the only one whose options this models; the
+/// others are recognised so the walk can continue through them, not
+/// parsed.
+fn walk_runner_from(
+    invocation: &[String],
+    wrapper_at: usize,
+    mut wrapper: String,
+) -> (Vec<(String, String)>, bool) {
+    let mut unreadable = false;
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut idx = wrapper_at + 1;
     while let Some(token) = invocation.get(idx) {
         let unquoted = unquote_token(token);
@@ -3672,6 +3688,25 @@ mod tests {
                 classify_str(cmd),
                 DestructivenessLevel::Safe,
                 "env behind a runner was skipped: {cmd}"
+            );
+        }
+    }
+
+    /// One invocation can execute more than one command, so the first
+    /// wrapper-shaped token is not the only one. An inert `env` in an
+    /// earlier action masked the real one: the walk selected it, stopped
+    /// at its operand, and never examined the `env -S` that points git
+    /// at an external config.
+    #[test]
+    fn an_earlier_inert_env_does_not_mask_a_later_real_one() {
+        for cmd in [
+            "find /tmp -maxdepth 0 -exec echo env x \\; -exec env -S'GIT_CONFIG_GLOBAL=/tmp/evil git p' \\;",
+            "sh -c true; echo env x; env GIT_CONFIG_GLOBAL=/tmp/evil git p",
+        ] {
+            assert_ne!(
+                classify_str(cmd),
+                DestructivenessLevel::Safe,
+                "an earlier wrapper-shaped token hid the real one: {cmd}"
             );
         }
     }
