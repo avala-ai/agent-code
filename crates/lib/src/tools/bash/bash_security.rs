@@ -1329,6 +1329,21 @@ fn heredoc_expansions(body: &[char]) -> (Vec<String>, bool) {
                 i += 2;
                 continue;
             }
+            // `$((` is arithmetic. It runs nothing itself, and its
+            // text stops being arithmetic once taken out — a `<<` in
+            // it would read as a heredoc and hold back the lines after
+            // it. Only the expansions nested inside it run, so they are
+            // looked for where they still have their context.
+            '$' if body.get(i + 1) == Some(&'(') && body.get(i + 2) == Some(&'(') => {
+                let (inner, next) = read_expansion(body, i + 2, '(', ')');
+                let (mut nested, spent) = heredoc_expansions(&inner.chars().collect::<Vec<_>>());
+                if spent || found.len() + nested.len() > MAX_HEREDOC_EXPANSIONS * 2 {
+                    return (found, true);
+                }
+                found.append(&mut nested);
+                i = next;
+                continue;
+            }
             '$' if body.get(i + 1) == Some(&'(') => {
                 let (inner, next) = read_expansion(body, i + 2, '(', ')');
                 Some((inner, i + 2, next))
@@ -2827,6 +2842,11 @@ mod tests {
             // statements in between.
             "((1 << 2))\nGIT_CONFIG_GLOBAL=/tmp/g git p\n2",
             "echo $((1 << 2))\nGIT_CONFIG_GLOBAL=/tmp/g git p\n2",
+            // Arithmetic in a body runs only what is nested in it, and
+            // its text stops being arithmetic once taken out — so the
+            // substitution is looked for where it still has its
+            // context, rather than the `<< 2` being read as a heredoc.
+            "cat <<EOF\n$((1 << 2\n + $(GIT_CONFIG_GLOBAL=/tmp/g git p; echo 0)\n))\nEOF",
             // Emptying them disables no file: git resolves the global
             // config of `HOME=` to `/.gitconfig`, so an alias can still
             // arrive from a file the command does not name.
@@ -3100,6 +3120,9 @@ mod tests {
             // subshell is still two subshells.
             "echo $((1 + 2))",
             "( (echo a) )",
+            // Arithmetic in a body runs nothing on its own.
+            "cat <<EOF\n$((1 << 2))\nEOF\ngit status",
+            "cat <<'EOF'\n$((1 << 2\n + $(GIT_CONFIG_GLOBAL=/tmp/g git p; echo 0)\n))\nEOF",
             // The payload's own words say this git only reports its
             // version, so no alias of any origin dispatches.
             "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git --version'",
