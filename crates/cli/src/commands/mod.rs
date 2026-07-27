@@ -673,24 +673,30 @@ fn resolve_slash_name(cmd: &str) -> String {
 ///
 /// List-only commands (`/sessions`, `/mcp`, `/plugin list`, …) stay on the
 /// captured path so their output lands in the modern transcript.
+/// Commands that take over the terminal (pickers, pagers, `$EDITOR`).
+///
+/// Exposed so tests can assert every one of them is actually registered
+/// in `COMMANDS` — a restated copy of this list would drift the moment a
+/// name is added here, which is the drift the test exists to catch.
+pub const INTERACTIVE_SLASH_NAMES: &[&str] = &[
+    // Session picker (not `/sessions`, which only prints a list).
+    "session",
+    // Scrollback pager.
+    "scroll",
+    // `$EDITOR` owners — must keep a real TTY on stdout (no pipe tee).
+    "editor",
+    "open",
+    // Theme / model / tutorial pickers.
+    "theme",
+    "model",
+    "powerup",
+    // Full interactive uninstall flow.
+    "uninstall",
+];
+
 pub fn is_interactive_slash(cmd: &str) -> bool {
     let name = resolve_slash_name(cmd);
-    matches!(
-        name.as_str(),
-        // Session picker (not `/sessions`, which only prints a list).
-        "session"
-            // Scrollback pager.
-            | "scroll"
-            // `$EDITOR` owners — must keep a real TTY on stdout (no pipe tee).
-            | "editor"
-            | "open"
-            // Theme / model / tutorial pickers.
-            | "theme"
-            | "model"
-            | "powerup"
-            // Full interactive uninstall flow.
-            | "uninstall"
-    ) || slash_needs_stdin_prompt(cmd)
+    INTERACTIVE_SLASH_NAMES.contains(&name.as_str()) || slash_needs_stdin_prompt(cmd)
 }
 
 /// True when the interactive slash must keep a real TTY on stdout (no pipe
@@ -6314,15 +6320,15 @@ mod tests {
             "documented but not registered in COMMANDS: {missing:?}"
         );
 
-        // The interactive list names commands too; every one of those must
-        // be registered as well, or `execute` will never reach it.
-        for name in ["theme", "model", "scroll", "editor", "open"] {
-            if is_interactive_slash(&format!("/{name}")) {
-                assert!(
-                    is_builtin_command(name),
-                    "/{name} is classified interactive but is not registered in COMMANDS"
-                );
-            }
+        // Every interactive-classified name must be registered too, or
+        // `execute` never reaches it. Read the classifier's own list
+        // rather than restating a subset: a copy here would silently
+        // stop covering names added there.
+        for name in INTERACTIVE_SLASH_NAMES {
+            assert!(
+                is_builtin_command(name),
+                "/{name} is classified interactive but is not registered in COMMANDS"
+            );
         }
     }
 

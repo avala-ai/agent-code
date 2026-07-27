@@ -630,56 +630,46 @@ impl Theme {
     /// standard palette ids, then any user palette ids. Drives the
     /// onboarding picker and the `/color` slash command.
     pub fn all_names() -> Vec<String> {
-        // `dark` / `light` are aliases `from_name` already resolves, and
-        // the docs advertise them. Without them here `/color dark` was
-        // rejected as unknown even though the theme it names works.
-        let mut names = vec!["auto".to_string(), "dark".to_string(), "light".to_string()];
-        names.extend(standard_palettes().into_iter().map(|p| p.id.into_owned()));
-        names.extend(user_palettes().into_iter().map(|p| p.id.into_owned()));
-        // A user palette literally named `dark`/`light` is resolved by
-        // `from_name` ahead of the alias, so listing both would offer the
-        // same identifier twice — the alias row is the one that never wins.
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|n| seen.insert(n.clone()));
-        names
+        Self::all_options().into_iter().map(|(id, _)| id).collect()
     }
 
-    /// `(id, label)` pairs in display order, for pickers that show a
-    /// human-facing name. Mirrors [`Self::all_names`].
+    /// `(id, label)` pairs in display order — the single catalog both
+    /// [`Self::all_names`] and the pickers read, so the two can never
+    /// disagree about which ids exist or where they sit.
+    ///
+    /// `auto` / `dark` / `light` are aliases [`Self::from_name`]
+    /// resolves, and the docs advertise them, so they lead the list.
+    /// A user palette file named after an alias is resolved *first* by
+    /// `from_name`, so in that case the alias row is dropped and the
+    /// user palette keeps the id — listing both would offer the same
+    /// identifier twice with only one of them reachable.
     pub fn all_options() -> Vec<(String, String)> {
-        let mut opts = vec![
-            ("auto".to_string(), "Auto (match terminal)".to_string()),
-            (
-                "dark".to_string(),
-                "Dark (default dark palette)".to_string(),
-            ),
-            (
-                "light".to_string(),
-                "Light (default light palette)".to_string(),
-            ),
-        ];
+        let user: Vec<(String, String)> = user_palettes()
+            .into_iter()
+            .map(|p| (p.id.into_owned(), p.label.into_owned()))
+            .collect();
+        let shadowed: std::collections::HashSet<&str> =
+            user.iter().map(|(id, _)| id.as_str()).collect();
+
+        let mut opts: Vec<(String, String)> = [
+            ("auto", "Auto (match terminal)"),
+            ("dark", "Dark (default dark palette)"),
+            ("light", "Light (default light palette)"),
+        ]
+        .into_iter()
+        .filter(|(id, _)| !shadowed.contains(id))
+        .map(|(id, label)| (id.to_string(), label.to_string()))
+        .collect();
+
         for p in standard_palettes() {
             opts.push((p.id.into_owned(), p.label.into_owned()));
         }
-        for p in user_palettes() {
-            opts.push((p.id.into_owned(), p.label.into_owned()));
-        }
-        // Drop the alias row when a user palette owns the same id (see
-        // `all_names`): keep the entry that `from_name` actually resolves.
-        let shadowed: std::collections::HashSet<String> = user_palettes()
-            .into_iter()
-            .map(|p| p.id.into_owned())
-            .collect();
+        opts.extend(user);
+
+        // A user palette sharing an id with a standard one shadows it the
+        // same way; keep the first occurrence so ordering stays stable.
         let mut seen = std::collections::HashSet::new();
-        opts.retain(|(id, label)| {
-            let is_alias = (id == "dark" || id == "light")
-                && (label.contains("default dark palette")
-                    || label.contains("default light palette"));
-            if is_alias && shadowed.contains(id) {
-                return false;
-            }
-            seen.insert(id.clone())
-        });
+        opts.retain(|(id, _)| seen.insert(id.clone()));
         opts
     }
 
