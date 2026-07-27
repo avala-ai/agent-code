@@ -346,16 +346,18 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                 &mut exported,
             );
         }
-        let carried: Vec<(String, String)> = exported
-            .iter()
-            .filter_map(|name| {
-                shell_vars
-                    .iter()
-                    .rev()
-                    .find(|(known, _)| known == name)
-                    .cloned()
-            })
-            .collect();
+        // A name the shell inherited already exported keeps that
+        // attribute through a bare assignment, so it reaches git
+        // without the command spelling an export of its own.
+        let mut carried: Vec<(String, String)> = Vec::new();
+        for (name, value) in shell_vars.iter().rev() {
+            if carried.iter().any(|(seen, _)| seen == name) {
+                continue;
+            }
+            if exported.contains(name) || inherits_export_for_git_config(name) {
+                carried.push((name.clone(), value.clone()));
+            }
+        }
         config_ever_opaque = config_ever_opaque || env_defines_opaque_git_alias(&carried);
         if !statement_runs_git(&parsed) {
             continue;
@@ -2072,6 +2074,19 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
     })
 }
 
+/// Names that select where git reads its config *and* that a shell
+/// ordinarily inherits already exported. Assigning one bare keeps the
+/// attribute it came with, so it reaches git without the command ever
+/// spelling an export: `HOME=/tmp/h; git p` reads `/tmp/h/.gitconfig`.
+///
+/// The `GIT_CONFIG…` names are deliberately absent. A shell does not
+/// come with them set, so a bare assignment to one makes a shell
+/// variable that no child sees — which is why `GIT_CONFIG_GLOBAL=/tmp/g;
+/// git status` runs an ordinary status.
+fn inherits_export_for_git_config(name: &str) -> bool {
+    matches!(name, "HOME" | "XDG_CONFIG_HOME")
+}
+
 /// Config keys that can make git run something the command text does
 /// not show: an alias *is* a command, and an include names a file that
 /// can define one. Every carrier — `-c`, `--config-env`,
@@ -2851,6 +2866,11 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
+            // A shell inherits these already exported, so a bare
+            // assignment keeps that attribute and still reaches a git
+            // in a later statement — no `export` need be spelled.
+            "HOME=/tmp/h; git p",
+            "XDG_CONFIG_HOME=/tmp/h; git p",
             // A `<<` in arithmetic shifts, so it opens no heredoc and
             // holds no following line back: reading one as a heredoc
             // would skip to the line naming its delimiter and hide the
@@ -3182,6 +3202,10 @@ mod tests {
             "GIT_CONFIG_SYSTEM= git log -p",
             // A home git cannot read a config out of defines nothing.
             "HOME=/dev/null git status",
+            "HOME=/dev/null; git status",
+            // Inheriting the export matters only where a git can read
+            // it; nothing here does.
+            "HOME=/tmp/h; echo x",
             // A prefix assignment belongs to the statement it
             // introduces, not to a later one.
             "GIT_CONFIG_GLOBAL=/tmp/g /bin/true; git status",
