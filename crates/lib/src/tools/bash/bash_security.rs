@@ -1229,29 +1229,51 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
 /// as shell syntax; reading it as syntax would let a literal quote
 /// swallow the substitution it surrounds. What each expansion contains
 /// *is* code, and is returned for the caller to read as such.
+/// Each expansion contributes two readings. The first is what the
+/// reader below says it contains. The second is the whole rest of the
+/// body from that opener, which is what makes the reader safe to be
+/// wrong: deciding an expansion ends too early would drop the code
+/// after it, and the shell has more ways to spell a `)` that does not
+/// close one — a `case` pattern, a comment — than a reader is likely to
+/// enumerate. Reading too far only offers body text to scans that then
+/// refuse more than they must, which is the safe direction; reading too
+/// little hides a command. Only the openers this covers are read that
+/// way, so the work stays linear in the body.
+const HEREDOC_EXPANSION_TAILS: usize = 8;
+
 fn heredoc_expansions(body: &[char]) -> Vec<String> {
     let mut found = Vec::new();
+    let mut tails = 0;
     let mut i = 0;
     while i < body.len() {
-        match body[i] {
+        let opener = match body[i] {
             // In a body a backslash still escapes what would otherwise
             // start an expansion, so the next character starts none.
-            '\\' => i += 1,
+            '\\' => {
+                i += 2;
+                continue;
+            }
             '$' if body.get(i + 1) == Some(&'(') => {
                 let (inner, next) = read_expansion(body, i + 2, '(', ')');
                 found.push(inner);
-                i = next;
-                continue;
+                Some((i + 2, next))
             }
             '`' => {
                 let (inner, next) = read_backquote(body, i + 1);
                 found.push(inner);
-                i = next;
-                continue;
+                Some((i + 1, next))
             }
-            _ => {}
+            _ => None,
+        };
+        let Some((from, next)) = opener else {
+            i += 1;
+            continue;
+        };
+        if tails < HEREDOC_EXPANSION_TAILS {
+            found.push(body[from..].iter().collect());
+            tails += 1;
         }
-        i += 1;
+        i = next;
     }
     found
 }
@@ -1270,6 +1292,10 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
     let mut case_stack: Vec<usize> = Vec::new();
     // The bare word being read, to recognise `case` and `esac`.
     let mut word = String::new();
+    // Whether a word starting here would be the first of a command.
+    // Only there are `case` and `esac` reserved words: the `esac` in
+    // `case y in x) echo esac;; y) …` is an argument `echo` prints.
+    let mut command_position = true;
     let mut i = start;
     while i < text.len() {
         let c = text[i];
@@ -1278,12 +1304,23 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
         if c == '\\' && quote != Some('\'') {
             inner.push(c);
             word.clear();
+            command_position = false;
             if let Some(&escaped) = text.get(i + 1) {
                 inner.push(escaped);
                 i += 2;
                 continue;
             }
             i += 1;
+            continue;
+        }
+        // A `#` where a word could start comments out the rest of the
+        // line, so a `)` in it closes nothing.
+        if quote.is_none() && c == '#' && word.is_empty() {
+            while i < text.len() && text[i] != '\n' {
+                inner.push(text[i]);
+                i += 1;
+            }
+            command_position = true;
             continue;
         }
         match quote {
@@ -1296,18 +1333,25 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
             None => {
                 // The word that just ended decides whether a `case` is
                 // open, and it has to be read before this character is.
-                match word.as_str() {
-                    "case" => case_stack.push(depth),
-                    "esac" => {
-                        case_stack.pop();
+                if !word.is_empty() {
+                    if command_position {
+                        match word.as_str() {
+                            "case" => case_stack.push(depth),
+                            "esac" => {
+                                case_stack.pop();
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
+                    command_position = false;
+                    word.clear();
                 }
-                word.clear();
                 if c == '\'' || c == '"' {
                     quote = Some(c);
+                    command_position = false;
                 } else if c == open {
                     depth += 1;
+                    command_position = true;
                 } else if c == close {
                     // A `case` pattern closes with `)` having opened
                     // nothing, so a `)` at the depth its `case` was
@@ -1321,6 +1365,12 @@ fn read_expansion(text: &[char], start: usize, open: char, close: char) -> (Stri
                             return (inner, i + 1);
                         }
                     }
+                    // Either way a command can start after it: the
+                    // clause of a pattern, or whatever follows what
+                    // just closed.
+                    command_position = true;
+                } else if matches!(c, ';' | '&' | '|' | '\n') {
+                    command_position = true;
                 }
             }
         }
@@ -2774,6 +2824,13 @@ mod tests {
             // deeper level, and the subshell's own `)` still closes the
             // subshell, so what follows both is inside the expansion.
             "cat <<EOF\n$( (case x in x) :;; esac); $\"safe\")\nEOF",
+            // A `)` inside a comment closes nothing, so the command on
+            // the line after it is still inside the expansion.
+            "cat <<EOF\n$(echo hi # )\n$\"safe\")\nEOF",
+            // `esac` as an argument is data: only a reserved word in
+            // command position closes the `case`, so the pattern after
+            // it is a pattern rather than the end of the expansion.
+            "cat <<EOF\n$(case y in x) echo esac;; y) $\"safe\";; esac)\nEOF",
             // The delimiter is unquoted the way the shell unquotes it.
             "cat <<$'EOF'\nbody\nEOF\n$\"safe\"",
             // An escaped space belongs to the delimiter.
@@ -2958,6 +3015,7 @@ mod tests {
             "cat <<'EOF'\n`GIT_CONFIG_GLOBAL=/tmp/g git p`\nEOF",
             "cat <<'EOF'\n$(case x in x) $\"safe\";; esac)\nEOF",
             "cat <<'EOF'\n$( (case x in x) :;; esac); $\"safe\")\nEOF",
+            "cat <<'EOF'\n$(echo hi # )\n$\"safe\")\nEOF",
             // Only the expansion is code: the body text around it is
             // still what the command reads, and what follows the
             // terminator is still split.
