@@ -288,8 +288,17 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
     // resolve — the state after it is unknown, and a git command
     // downstream of an unknown environment is refused rather than
     // read against a state that may be wrong in either direction.
+    //
+    // Nothing about that state matters unless something can read it,
+    // so a git invocation has to be in reach: `GIT_CONFIG_GLOBAL=/tmp/g;
+    // echo x && echo y` sets the variable where the walk cannot follow
+    // it, but no command consumes it. A statement this cannot parse
+    // counts as reach, so unreadable text keeps failing closed.
     let statements = shell_statements(&cmd.raw);
-    if state_is_unresolvable(&cmd.raw, &statements) && carries_git_config(&statements) {
+    if state_is_unresolvable(&cmd.raw, &statements)
+        && carries_git_config(&statements)
+        && any_statement_runs_git(&statements)
+    {
         findings.push(DestructiveFinding {
             level: DestructivenessLevel::Destructive,
             reason: "git configuration is set where the shell state cannot be followed; what it \
@@ -335,47 +344,7 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
             })
             .collect();
         config_ever_opaque = config_ever_opaque || env_defines_opaque_git_alias(&carried);
-        // A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=…
-        // bash -c 'git p'` configures the git inside the payload. The
-        // payload is one token here, so tokens are searched word by
-        // word rather than whole.
-        let runs_git = parsed.invocations.iter().any(|invocation| {
-            // `env printf …` prints as `printf …` does, so the wrapper
-            // comes off before the head decides.
-            let unwrapped = unwrapped_argv(invocation);
-            let invocation = unwrapped.as_ref().unwrap_or(invocation);
-            // A head whose operands are text runs nothing they name:
-            // `GIT_CONFIG_GLOBAL=… printf '%s\n' git` prints the word.
-            let head_is_data = invocation.first().is_some_and(|t| {
-                DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
-            });
-            if head_is_data {
-                return false;
-            }
-            [
-                Some(invocation.as_slice()),
-                unwrapped_argv(invocation).as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|tokens| {
-                tokens.iter().enumerate().any(|(index, token)| {
-                    split_alias_value(&unquote_token(token))
-                        .iter()
-                        .any(|word| base_name(word).to_lowercase() == "git")
-                        // `git --version` prints and exits without
-                        // dispatching anything, so no alias of any
-                        // origin can run.
-                        && !dispatches_no_subcommand(
-                            &tokens[index + 1..]
-                                .iter()
-                                .map(|t| unquote_token(t))
-                                .collect::<Vec<_>>(),
-                        )
-                })
-            })
-        });
-        if !runs_git {
+        if !statement_runs_git(&parsed) {
             continue;
         }
         let mut pairs: Vec<(String, String)> = carried.clone();
@@ -719,12 +688,35 @@ fn shell_statements(raw: &str) -> Vec<String> {
         Brace,
         Backtick,
     }
+    let text: Vec<char> = raw.chars().collect();
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut stack: Vec<Context> = Vec::new();
     let mut at_word_start = true;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
+    // Heredocs declared on the current line, in the order their bodies
+    // follow it. A body is data the command reads, not statements, so
+    // splitting it on newlines would promote text into commands: the
+    // `GIT_CONFIG_GLOBAL=…` line of `cat <<EOF … EOF` is an argument
+    // `cat` receives. This is the reading `shell_text_facts` already
+    // applies, sharing its delimiter and body helpers.
+    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i];
+        // The line has ended and a heredoc was declared on it: the
+        // body is skipped whole, while the declaration line itself
+        // still ends here.
+        if c == '\n' && !pending_heredocs.is_empty() {
+            for (delimiter, strip_tabs) in std::mem::take(&mut pending_heredocs) {
+                i = skip_heredoc_body(&text, i, &delimiter, strip_tabs);
+            }
+            if stack.is_empty() {
+                statements.push(std::mem::take(&mut current));
+            }
+            at_word_start = true;
+            i += 1;
+            continue;
+        }
         let word_start = at_word_start;
         at_word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(');
         // A separator inside a comment separates nothing: bash reads
@@ -733,9 +725,10 @@ fn shell_statements(raw: &str) -> Vec<String> {
             && c == '#'
             && !matches!(stack.last(), Some(Context::Single | Context::Double))
         {
-            while chars.peek().is_some_and(|next| *next != '\n') {
-                chars.next();
+            while text.get(i + 1).is_some_and(|next| *next != '\n') {
+                i += 1;
             }
+            i += 1;
             continue;
         }
         if matches!(stack.last(), Some(Context::Single)) {
@@ -743,14 +736,17 @@ fn shell_statements(raw: &str) -> Vec<String> {
             if c == '\'' {
                 stack.pop();
             }
+            i += 1;
             continue;
         }
         let in_double = matches!(stack.last(), Some(Context::Double));
+        let peek = text.get(i + 1).copied();
         match c {
             '\\' => {
                 current.push(c);
-                if let Some(escaped) = chars.next() {
+                if let Some(escaped) = peek {
                     current.push(escaped);
+                    i += 1;
                 }
             }
             '\'' if !in_double => {
@@ -765,8 +761,8 @@ fn shell_statements(raw: &str) -> Vec<String> {
                 }
                 current.push(c);
             }
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
+            '$' if peek == Some('(') => {
+                i += 1;
                 stack.push(Context::Substitution);
                 current.push('$');
                 current.push('(');
@@ -779,8 +775,35 @@ fn shell_statements(raw: &str) -> Vec<String> {
                 }
                 current.push(c);
             }
-            '<' | '>' if !in_double && chars.peek() == Some(&'(') => {
-                chars.next();
+            // `<<` declares a heredoc; `<<<` is a here-string with no
+            // body at all. The declaration line keeps being split —
+            // commands can follow the redirect — and only the body is
+            // held back, when the line ends.
+            '<' if !in_double && peek == Some('<') => {
+                let mut run = 0;
+                while text.get(i + run) == Some(&'<') {
+                    run += 1;
+                }
+                if run == 2 {
+                    let (word, strip_tabs, _translated, next) =
+                        read_heredoc_delimiter(&text, i + run);
+                    let delimiter = unquote_token(&word);
+                    if !delimiter.is_empty() {
+                        pending_heredocs.push((delimiter, strip_tabs));
+                    }
+                    // The redirect and its delimiter word belong to
+                    // the statement that declares them.
+                    current.extend(text[i..next].iter());
+                    i = next.saturating_sub(1);
+                } else {
+                    for _ in 0..run {
+                        current.push('<');
+                    }
+                    i += run - 1;
+                }
+            }
+            '<' | '>' if !in_double && peek == Some('(') => {
+                i += 1;
                 stack.push(Context::Substitution);
                 current.push(c);
                 current.push('(');
@@ -812,13 +835,14 @@ fn shell_statements(raw: &str) -> Vec<String> {
             }
             ';' | '\n' | '|' | '&' if stack.is_empty() => {
                 // Consume the second character of `&&` and `||`.
-                if (c == '|' || c == '&') && chars.peek() == Some(&c) {
-                    chars.next();
+                if (c == '|' || c == '&') && peek == Some(c) {
+                    i += 1;
                 }
                 statements.push(std::mem::take(&mut current));
             }
             _ => current.push(c),
         }
+        i += 1;
     }
     statements.push(current);
     statements
@@ -1286,6 +1310,60 @@ fn state_is_unresolvable(raw: &str, statements: &[String]) -> bool {
         }
         false
     })
+}
+
+/// True when a statement could run git, so configuration reaching it
+/// from the environment decides what it does.
+///
+/// A launcher inherits the environment, so `GIT_CONFIG_GLOBAL=… bash -c
+/// 'git p'` configures the git inside the payload. The payload is one
+/// token here, so tokens are searched word by word rather than whole.
+fn statement_runs_git(parsed: &ParsedCommand) -> bool {
+    parsed.invocations.iter().any(|invocation| {
+        // `env printf …` prints as `printf …` does, so the wrapper
+        // comes off before the head decides.
+        let unwrapped = unwrapped_argv(invocation);
+        let invocation = unwrapped.as_ref().unwrap_or(invocation);
+        // A head whose operands are text runs nothing they name:
+        // `GIT_CONFIG_GLOBAL=… printf '%s\n' git` prints the word.
+        let head_is_data = invocation.first().is_some_and(|t| {
+            DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        if head_is_data {
+            return false;
+        }
+        [
+            Some(invocation.as_slice()),
+            unwrapped_argv(invocation).as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|tokens| {
+            tokens.iter().enumerate().any(|(index, token)| {
+                split_alias_value(&unquote_token(token))
+                    .iter()
+                    .any(|word| base_name(word).to_lowercase() == "git")
+                    // `git --version` prints and exits without
+                    // dispatching anything, so no alias of any
+                    // origin can run.
+                    && !dispatches_no_subcommand(
+                        &tokens[index + 1..]
+                            .iter()
+                            .map(|t| unquote_token(t))
+                            .collect::<Vec<_>>(),
+                    )
+            })
+        })
+    })
+}
+
+/// True when some statement could run git. A statement that does not
+/// parse is not readable, so it counts: an unreadable statement must
+/// not be the reason git is ruled out.
+fn any_statement_runs_git(statements: &[String]) -> bool {
+    statements
+        .iter()
+        .any(|statement| parse_bash(statement).is_none_or(|parsed| statement_runs_git(&parsed)))
 }
 
 /// True when some statement assigns a variable that selects git's
@@ -2401,6 +2479,12 @@ mod tests {
              false && GIT_CONFIG_GLOBAL=/dev/null; git p",
             // A heredoc body is data, not statements.
             "export GIT_CONFIG_GLOBAL=/tmp/g; cat <<EOF\nGIT_CONFIG_GLOBAL=/dev/null\nEOF\ngit p",
+            // Holding the body back does not stop the split: what
+            // follows the terminator is read as statements again.
+            "cat <<EOF\nhello\nEOF\nexport GIT_CONFIG_GLOBAL=/tmp/g; git p",
+            // A git invocation in reach of state the walk cannot
+            // follow is still refused.
+            "GIT_CONFIG_GLOBAL=/tmp/g; git status && echo y",
             // `HOME` and `XDG_CONFIG_HOME` choose where git reads its
             // config, aliases and all.
             "HOME=/tmp/h git p",
@@ -2622,6 +2706,13 @@ mod tests {
             // both words are pathspecs.
             "git status -- -c 'alias.status=push --force'",
             "git log -c 'alias.log=push --force'",
+            // Unreadable shell state matters only where a git
+            // invocation can read it; nothing here consumes the
+            // variable.
+            "GIT_CONFIG_GLOBAL=/tmp/g; echo x && echo y",
+            // A heredoc body is data the command receives, so a config
+            // example inside one is not a statement that sets anything.
+            "cat <<EOF\nGIT_CONFIG_GLOBAL=/tmp/g\nEOF\ngit status",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
