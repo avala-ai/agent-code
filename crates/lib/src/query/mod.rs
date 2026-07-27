@@ -274,12 +274,6 @@ impl QueryEngine {
         sink.on_context_usage(used, DEFAULT_CONTEXT_WINDOW);
     }
 
-    /// Install the interactive permission prompter.
-    ///
-    /// Without this, an `Ask` permission decision falls through to auto-allow
-    /// (see `tools::executor`), so the interactive TUI would silently execute
-    /// mutating tools under `ask` mode. The CLI installs a prompter on the
-    /// interactive path only; one-shot/non-interactive runs leave it unset.
     /// Attach content blocks to the next user turn.
     ///
     /// Replaces rather than appends, so a cancelled composer cannot
@@ -288,6 +282,12 @@ impl QueryEngine {
         self.pending_attachments = blocks;
     }
 
+    /// Install the interactive permission prompter.
+    ///
+    /// Without this, an `Ask` permission decision falls through to auto-allow
+    /// (see `tools::executor`), so the interactive TUI would silently execute
+    /// mutating tools under `ask` mode. The CLI installs a prompter on the
+    /// interactive path only; one-shot/non-interactive runs leave it unset.
     pub fn set_permission_prompter(&mut self, prompter: Arc<dyn crate::tools::PermissionPrompter>) {
         self.permission_prompter = Some(prompter);
     }

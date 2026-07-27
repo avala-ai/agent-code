@@ -576,23 +576,30 @@ pub(super) async fn event_loop(
             // starts, and lets a read failure be reported as a note
             // instead of blocking the prompt.
             let images = std::mem::take(&mut app.pending_images);
-            if !images.is_empty() {
-                let mut blocks = Vec::new();
-                for path in images {
-                    match agent_code_lib::llm::message::image_block_from_file(&path) {
-                        Ok(block) => blocks.push(block),
-                        Err(e) => {
-                            app.transcript
-                                .push(super::app::TranscriptItem::System(format!(
-                                    "could not attach {}: {e}",
-                                    path.display()
-                                )));
-                        }
+            let mut blocks = Vec::new();
+            for path in &images {
+                // Size re-checked here, not just at mention time: the file
+                // can grow in between, and this is the read that would
+                // actually allocate it.
+                let loaded = super::mentions::image_size_within_cap(path)
+                    .and_then(|_| agent_code_lib::llm::message::image_block_from_file(path));
+                match loaded {
+                    Ok(block) => blocks.push(block),
+                    Err(e) => {
+                        app.transcript
+                            .push(super::app::TranscriptItem::System(format!(
+                                "could not attach {}: {e}",
+                                path.display()
+                            )));
                     }
                 }
-                if let Ok(mut eng) = session.engine().try_lock() {
-                    eng.set_pending_attachments(blocks);
-                }
+            }
+            // Set unconditionally, awaiting the lock rather than skipping on
+            // contention: an empty set clears anything a previous attempt
+            // staged, so no turn can inherit another turn's attachment.
+            {
+                let engine = session.engine();
+                engine.lock().await.set_pending_attachments(blocks);
             }
             let sink = ChannelSink::new(eng_tx.clone());
             match session.spawn_turn(prompt.clone(), sink).await {
@@ -602,8 +609,10 @@ pub(super) async fn event_loop(
                 }
                 Err(e) => {
                     // Should be rare: TUI serializes turns. Put the prompt
-                    // back so the next idle loop can retry.
+                    // and its attachments back so the next idle loop retries
+                    // them together.
                     app.pending_submit = Some(prompt);
+                    app.pending_images = images;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
                 }

@@ -273,6 +273,23 @@ pub fn user_message(text: impl Into<String>) -> Message {
     })
 }
 
+/// Media type for an image path, inferred from its extension.
+///
+/// Case-insensitive: callers that decide *whether* a path is an image
+/// normalize the extension, so `shot.PNG` must not fall through to a
+/// generic media type the provider then rejects.
+pub fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
+}
+
 /// Helper to create an image content block from a file path.
 ///
 /// Reads the file, base64-encodes it, and infers the media type
@@ -280,14 +297,7 @@ pub fn user_message(text: impl Into<String>) -> Message {
 pub fn image_block_from_file(path: &std::path::Path) -> Result<ContentBlock, String> {
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image: {e}"))?;
 
-    let media_type = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
-    };
+    let media_type = image_media_type(path).unwrap_or("application/octet-stream");
 
     use std::io::Write;
     let mut encoded = String::new();
@@ -544,6 +554,43 @@ mod tests {
         assert!(matches!(u.content[0], ContentBlock::Image { .. }));
         assert!(matches!(&u.content[1], ContentBlock::Text { text } if text == "what is this?"));
         assert!(!u.is_meta, "an attachment turn is still real user input");
+    }
+
+    /// Mention detection accepts `shot.PNG` by lowercasing the extension;
+    /// inferring the media type case-sensitively handed the provider an
+    /// `application/octet-stream` block it rejects.
+    #[test]
+    fn the_media_type_is_inferred_case_insensitively() {
+        use std::path::Path;
+        for (name, expected) in [
+            ("shot.PNG", "image/png"),
+            ("shot.png", "image/png"),
+            ("photo.Jpeg", "image/jpeg"),
+            ("photo.JPG", "image/jpeg"),
+            ("anim.GIF", "image/gif"),
+            ("pic.WebP", "image/webp"),
+            ("art.SVG", "image/svg+xml"),
+        ] {
+            assert_eq!(
+                image_media_type(Path::new(name)),
+                Some(expected),
+                "wrong media type for {name}"
+            );
+        }
+        assert_eq!(image_media_type(Path::new("blob.bin")), None);
+        assert_eq!(image_media_type(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn an_uppercase_image_file_still_gets_a_real_media_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("SHOT.PNG");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
+        let block = image_block_from_file(&path).expect("encoded");
+        let ContentBlock::Image { media_type, .. } = block else {
+            panic!("expected an image block");
+        };
+        assert_eq!(media_type, "image/png");
     }
 
     #[test]

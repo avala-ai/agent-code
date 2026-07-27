@@ -26,6 +26,21 @@ pub const MAX_FILE_BYTES: usize = 64 * 1024;
 /// the worst case at four full-size files; the rest are skipped with a note.
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024;
 
+/// Per-image cap. An attachment is read whole and base64-encoded on the UI
+/// thread, and base64 inflates by 4/3, so 3 MiB is the largest file that
+/// still fits the 5 MB per-image payload the providers accept.
+pub const MAX_IMAGE_BYTES: usize = 3 * 1024 * 1024;
+
+/// Cap across every image in one prompt. Images do not consume the text
+/// budget — they never enter the prompt string — so they need a budget of
+/// their own; without one `@*.png` over a screenshot directory can freeze
+/// or OOM the CLI before the request is ever built.
+pub const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Upper bound on attachments per prompt, independent of their size: each
+/// one costs a full re-encode and a large block of context.
+pub const MAX_IMAGES: usize = 4;
+
 /// Upper bound on directory entries examined for one completion, so a
 /// pathological directory cannot stall the UI thread.
 pub const MAX_SCAN_ENTRIES: usize = 4_000;
@@ -189,7 +204,9 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     let mut notes: Vec<String> = Vec::new();
     let mut images: Vec<PathBuf> = Vec::new();
     let mut used = 0usize;
+    let mut image_bytes = 0usize;
     let mut over_budget = 0usize;
+    let mut over_image_budget = 0usize;
 
     for raw in mentions {
         if !seen.insert(raw.clone()) {
@@ -202,6 +219,27 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
                 continue;
             }
         };
+        // Attached rather than inlined; the model receives it as an image
+        // block on the turn. Budgeted before the path is accepted — the
+        // loader would otherwise encode an unbounded blob on the UI thread.
+        if let Resolved::File(ref path) = resolved
+            && is_image(path)
+        {
+            if images.len() >= MAX_IMAGES {
+                over_image_budget += 1;
+                continue;
+            }
+            match image_size_within_cap(path) {
+                Ok(len) if image_bytes + len <= MAX_TOTAL_IMAGE_BYTES => {
+                    image_bytes += len;
+                    notes.push(format!("@{raw} — attached as an image"));
+                    images.push(path.clone());
+                }
+                Ok(_) => over_image_budget += 1,
+                Err(reason) => notes.push(format!("@{raw} — {reason}")),
+            }
+            continue;
+        }
         let remaining = MAX_TOTAL_BYTES.saturating_sub(used);
         if remaining == 0 {
             over_budget += 1;
@@ -212,15 +250,6 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
             Resolved::Dir(path) => {
                 let label = display_path(cwd, &path, &raw);
                 (label, "directory", list_dir(&path))
-            }
-            Resolved::File(path) if is_image(&path) => {
-                // Attached rather than inlined; the model receives it as
-                // an image block on the turn.
-                let label = display_path(cwd, &path, &raw);
-                notes.push(format!("@{raw} — attached as an image"));
-                images.push(path);
-                let _ = label;
-                continue;
             }
             Resolved::File(path) => match read_text_capped(&path, cap) {
                 Ok(content) => (display_path(cwd, &path, &raw), "file", content),
@@ -247,6 +276,12 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
         notes.push(format!(
             "{over_budget} mention(s) skipped — {} KiB total limit reached",
             MAX_TOTAL_BYTES / 1024
+        ));
+    }
+    if over_image_budget > 0 {
+        notes.push(format!(
+            "{over_image_budget} image(s) skipped — at most {MAX_IMAGES} images / {} MiB per prompt",
+            MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
         ));
     }
 
@@ -320,6 +355,28 @@ fn is_image(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Byte length of an image that is small enough to attach, or the reason it
+/// must be refused.
+///
+/// Fail-closed: a file whose size cannot be determined is refused rather
+/// than attached, because the loader would otherwise read and base64-encode
+/// an unbounded blob on the UI thread. Re-checked at load time as well as at
+/// mention time — the file can grow in between.
+pub fn image_size_within_cap(path: &Path) -> Result<usize, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("image unreadable ({e})"))?
+        .len();
+    let len = usize::try_from(len).map_err(|_| "image too large".to_string())?;
+    if len > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image too large ({:.1} MiB, max {} MiB)",
+            len as f64 / (1024.0 * 1024.0),
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(len)
 }
 
 /// True when `path` resolves inside `cwd`. Both sides are canonicalized.
@@ -730,6 +787,72 @@ mod tests {
         }
         let out = expand_mentions("@a.PNG @b.Jpeg @c.webp", dir.path()).expect("expanded");
         assert_eq!(out.images.len(), 3, "{:?}", out.notes);
+    }
+
+    /// A single oversized image is refused before it is ever read: the
+    /// loader base64-encodes on the UI thread, so an unbounded file froze
+    /// or OOM'd the CLI before the request was built.
+    #[test]
+    fn an_oversized_image_is_refused_with_a_note() {
+        let dir = fixture();
+        fs::write(
+            dir.path().join("huge.png"),
+            vec![0u8; MAX_IMAGE_BYTES + 1024],
+        )
+        .unwrap();
+        let out = expand_mentions("look at @huge.png", dir.path()).expect("expanded");
+        assert!(out.images.is_empty(), "oversized image was attached");
+        assert!(
+            out.notes.iter().any(|n| n.contains("image too large")),
+            "no note explaining the refusal: {:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn image_attachments_are_capped_by_count() {
+        let dir = fixture();
+        for i in 0..(MAX_IMAGES + 3) {
+            fs::write(dir.path().join(format!("s{i}.png")), [0x89, 0, 1]).unwrap();
+        }
+        let text: String = (0..(MAX_IMAGES + 3))
+            .map(|i| format!("@s{i}.png "))
+            .collect();
+        let out = expand_mentions(&text, dir.path()).expect("expanded");
+        assert_eq!(out.images.len(), MAX_IMAGES, "{:?}", out.notes);
+        assert!(
+            out.notes.iter().any(|n| n.contains("image(s) skipped")),
+            "no note about the skipped images: {:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn image_attachments_are_capped_by_total_bytes() {
+        let dir = fixture();
+        // Each is under the per-image cap; together they exceed the total.
+        let each = MAX_TOTAL_IMAGE_BYTES / 3 + 1024;
+        assert!(each <= MAX_IMAGE_BYTES, "fixture must stay under the cap");
+        for name in ["a.png", "b.png", "c.png"] {
+            fs::write(dir.path().join(name), vec![0u8; each]).unwrap();
+        }
+        let out = expand_mentions("@a.png @b.png @c.png", dir.path()).expect("expanded");
+        assert_eq!(
+            out.images.len(),
+            2,
+            "total image budget not enforced: {:?}",
+            out.notes
+        );
+        assert!(out.notes.iter().any(|n| n.contains("image(s) skipped")));
+    }
+
+    /// Fail-closed: an image whose size cannot be read is refused, not
+    /// attached and hoped for.
+    #[test]
+    fn an_unmeasurable_image_is_refused() {
+        let dir = fixture();
+        let missing = dir.path().join("gone.png");
+        assert!(image_size_within_cap(&missing).is_err());
     }
 
     /// A non-image binary still reports why it was skipped, rather than

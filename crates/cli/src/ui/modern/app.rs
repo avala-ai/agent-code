@@ -1669,6 +1669,12 @@ impl App {
     /// Resolve user text into a turn: expand `/skill` invocations the same
     /// way slash dispatch does via `commands::execute` skill lookup.
     fn enqueue_turn(&mut self, text: String) {
+        // Attachments belong to exactly one prompt. A staged prompt can be
+        // replaced before it starts (two interjections while a turn is
+        // cancelling), and only the mention branch assigns `pending_images`
+        // — so clear here, or the replacement turn would carry the previous
+        // prompt's image and disclose a file the user did not mean to send.
+        self.pending_images.clear();
         let mut mention_notes: Vec<String> = Vec::new();
         let (display, prompt) =
             match try_expand_skill_slash_full(&text, &self.cwd, self.disable_skill_shell) {
@@ -4500,5 +4506,60 @@ mod tests {
         type_input(&mut app, "hello there");
         app.submit();
         assert_eq!(app.pending_submit.as_deref(), Some("hello there"));
+    }
+
+    fn write_png(app: &App, name: &str) {
+        std::fs::write(
+            std::path::Path::new(&app.cwd).join(name),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn submitting_an_image_mention_stages_it_for_the_turn() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "image was not staged");
+    }
+
+    /// Replacing a staged prompt must drop its attachments: the second
+    /// prompt would otherwise ship the first one's image and disclose a
+    /// file the user never meant to send with it.
+    #[test]
+    fn replacing_a_staged_prompt_drops_its_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        // Interject again with a prompt that mentions nothing.
+        type_input(&mut app, "actually never mind");
+        app.interject();
+        assert_eq!(app.pending_submit.as_deref(), Some("actually never mind"));
+        assert!(
+            app.pending_images.is_empty(),
+            "stale image carried onto the replacement prompt"
+        );
+    }
+
+    /// The skill branch never touches `pending_images` either, so a skill
+    /// prompt must not inherit the previous prompt's attachment.
+    #[test]
+    fn a_replacement_slash_command_drops_staged_images() {
+        let (_dir, mut app) = app_in_workspace();
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.enqueue_turn_from_command("summarize the repo".into());
+        assert!(
+            app.pending_images.is_empty(),
+            "stale image carried onto a command-produced turn"
+        );
     }
 }
