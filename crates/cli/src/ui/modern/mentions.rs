@@ -175,17 +175,24 @@ pub fn mention_text(candidate: &str) -> String {
 }
 
 /// Result of inlining `@path` mentions into a prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MentionExpansion {
     /// What the engine should receive: the user's text plus file blocks.
     pub prompt: String,
     /// Short human-readable notes about anything skipped or truncated.
     pub notes: Vec<String>,
-    /// Image files to attach to the turn as content blocks. An image
-    /// cannot be inlined as text, so `@shot.png` used to report
-    /// "binary, skipped" — which is never what the user meant by
-    /// mentioning one.
-    pub images: Vec<PathBuf>,
+    /// Images to attach to the turn as content blocks. An image cannot be
+    /// inlined as text, so `@shot.png` used to report "binary, skipped" —
+    /// which is never what the user meant by mentioning one.
+    ///
+    /// Encoded here, not at turn start. Carrying paths meant re-opening
+    /// them after an unbounded delay, and nothing about a path survives
+    /// that wait: swapping the file (or any ancestor directory) for a
+    /// symlink pointed the later `open` at a file outside the workspace
+    /// that had never been validated. Reading the bytes while the path is
+    /// still the one `resolve_mention` just checked is the same discipline
+    /// the text mentions above follow, and it leaves nothing to re-check.
+    pub images: Vec<agent_code_lib::llm::message::ContentBlock>,
 }
 
 /// Inline the contents of every `@path` mention in `text`.
@@ -202,7 +209,7 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut body = String::new();
     let mut notes: Vec<String> = Vec::new();
-    let mut images: Vec<PathBuf> = Vec::new();
+    let mut images: Vec<agent_code_lib::llm::message::ContentBlock> = Vec::new();
     let mut used = 0usize;
     let mut image_bytes = 0usize;
     let mut over_budget = 0usize;
@@ -220,8 +227,9 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
             }
         };
         // Attached rather than inlined; the model receives it as an image
-        // block on the turn. Budgeted before the path is accepted — the
-        // loader would otherwise encode an unbounded blob on the UI thread.
+        // block on the turn. Budgeted before a byte is read — an image is
+        // held whole and base64-encoded, so an unbounded one would freeze
+        // or OOM the UI thread.
         if let Resolved::File(ref path) = resolved
             && is_image(path)
         {
@@ -229,11 +237,20 @@ pub fn expand_mentions(text: &str, cwd: &Path) -> Option<MentionExpansion> {
                 over_image_budget += 1;
                 continue;
             }
-            match image_size_within_cap(path) {
-                Ok(len) if image_bytes + len <= MAX_TOTAL_IMAGE_BYTES => {
-                    image_bytes += len;
+            if image_bytes >= MAX_TOTAL_IMAGE_BYTES {
+                over_image_budget += 1;
+                continue;
+            }
+            match read_image_capped(path, MAX_IMAGE_BYTES) {
+                // Checked after the read, so the note distinguishes "this
+                // one is too big" from "the prompt is full"; the read is
+                // capped either way, so the peak stays bounded.
+                Ok(data) if image_bytes + data.len() <= MAX_TOTAL_IMAGE_BYTES => {
+                    image_bytes += data.len();
                     notes.push(format!("@{raw} — attached as an image"));
-                    images.push(path.clone());
+                    images.push(agent_code_lib::llm::message::image_block_from_bytes(
+                        path, &data,
+                    ));
                 }
                 Ok(_) => over_image_budget += 1,
                 Err(reason) => notes.push(format!("@{raw} — {reason}")),
@@ -357,45 +374,13 @@ fn is_image(path: &Path) -> bool {
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 
-/// Re-check a staged attachment against the rules its mention passed.
+/// Open a path that `resolve_mention` just validated, without trusting the
+/// name to still mean the same file.
 ///
-/// A path is accepted at mention time but opened later, when the turn
-/// starts. Anything can happen in between: replacing `shot.png` with a
-/// symlink out of the workspace would otherwise leak that file's bytes to
-/// the provider, and replacing it with a FIFO would hang the UI on `open`.
-/// So containment, `.git/`, the extension and regular-file status are all
-/// re-established here, on the *canonical* target.
-fn revalidate_image(cwd: &Path, path: &Path) -> Result<PathBuf, String> {
-    let canon = path
-        .canonicalize()
-        .map_err(|e| format!("image unreadable ({e})"))?;
-    if !contained_in(cwd, &canon) {
-        return Err("image left the workspace".into());
-    }
-    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    if let Ok(rel) = canon.strip_prefix(&cwd_canon)
-        && rel.components().any(|c| c.as_os_str() == ".git")
-    {
-        return Err("image is inside .git/".into());
-    }
-    if !is_image(&canon) {
-        return Err("not an image".into());
-    }
-    if !std::fs::symlink_metadata(&canon)
-        .map_err(|e| format!("image unreadable ({e})"))?
-        .is_file()
-    {
-        return Err("not a regular file".into());
-    }
-    Ok(canon)
-}
-
-/// Open a validated path without trusting it to still be a regular file.
-///
-/// `O_NOFOLLOW` refuses a symlink swapped in after canonicalization, and
-/// `O_NONBLOCK` keeps `open` from hanging on a FIFO; the `fstat` on the
-/// descriptor is what finally decides, since it describes the file that
-/// was actually opened rather than whatever the name points at now.
+/// `O_NOFOLLOW` refuses a symlink swapped in since the check, `O_NONBLOCK`
+/// keeps `open` from hanging on a FIFO, and the `fstat` on the descriptor
+/// is what finally decides — it describes the file that was actually
+/// opened rather than whatever the name points at now.
 fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -406,10 +391,10 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
     }
     let file = options
         .open(path)
-        .map_err(|e| format!("image unreadable ({e})"))?;
+        .map_err(|e| format!("unreadable ({})", e.kind()))?;
     if !file
         .metadata()
-        .map_err(|e| format!("image unreadable ({e})"))?
+        .map_err(|e| format!("unreadable ({})", e.kind()))?
         .is_file()
     {
         return Err("not a regular file".into());
@@ -417,16 +402,17 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Read at most `cap` bytes, refusing a file that has more.
+/// Read an image, refusing one larger than `cap` rather than truncating it.
 ///
-/// `take(cap + 1)` so exceeding the cap is *observed* rather than silently
-/// truncated — a half-read image would be sent as a corrupt attachment.
-fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+/// `take(cap + 1)` so exceeding the cap is *observed*: a half-read image
+/// would otherwise be attached as a corrupt payload. The cap is what keeps
+/// an oversized file from being held and base64-encoded on the UI thread.
+fn read_image_capped(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
     let file = open_regular_file(path)?;
     let mut data = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut data)
-        .map_err(|e| format!("image unreadable ({e})"))?;
+        .map_err(|e| format!("unreadable ({})", e.kind()))?;
     if data.len() > cap {
         return Err(format!(
             "image too large (over {} MiB)",
@@ -434,90 +420,6 @@ fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(data)
-}
-
-/// Byte length of an image that is small enough to attach, or the reason it
-/// must be refused.
-///
-/// Fail-closed: a file whose size cannot be determined is refused rather
-/// than attached, because the loader would otherwise read and base64-encode
-/// an unbounded blob on the UI thread. Re-checked at load time as well as at
-/// mention time — the file can grow in between.
-pub fn image_size_within_cap(path: &Path) -> Result<usize, String> {
-    let len = std::fs::metadata(path)
-        .map_err(|e| format!("image unreadable ({e})"))?
-        .len();
-    let len = usize::try_from(len).map_err(|_| "image too large".to_string())?;
-    if len > MAX_IMAGE_BYTES {
-        return Err(format!(
-            "image too large ({:.1} MiB, max {} MiB)",
-            len as f64 / (1024.0 * 1024.0),
-            MAX_IMAGE_BYTES / (1024 * 1024)
-        ));
-    }
-    Ok(len)
-}
-
-/// Read and encode staged image attachments, re-applying the full budget.
-///
-/// Returns the blocks to attach plus a note for every path refused. The
-/// budget is enforced again here, not only at mention time: a staged file
-/// can grow (or be replaced) between the mention and the turn actually
-/// starting, and this is the point where the bytes are really read and
-/// base64-encoded. Every limit is re-checked — per-image size, the
-/// per-prompt total, and the count — so no combination of edits between
-/// the two points can exceed what was advertised. The path itself is
-/// re-validated too: acceptance at mention time says nothing about what
-/// the name points at once the turn finally starts.
-pub fn load_image_blocks(
-    cwd: &Path,
-    paths: &[PathBuf],
-) -> (Vec<agent_code_lib::llm::message::ContentBlock>, Vec<String>) {
-    let mut blocks = Vec::new();
-    let mut notes = Vec::new();
-    let mut total = 0usize;
-    for path in paths {
-        let name = path.display();
-        if blocks.len() >= MAX_IMAGES {
-            notes.push(format!(
-                "could not attach {name}: at most {MAX_IMAGES} images"
-            ));
-            continue;
-        }
-        let path = match revalidate_image(cwd, path) {
-            Ok(p) => p,
-            Err(reason) => {
-                notes.push(format!("could not attach {name}: {reason}"));
-                continue;
-            }
-        };
-        if let Err(reason) = image_size_within_cap(&path) {
-            notes.push(format!("could not attach {name}: {reason}"));
-            continue;
-        }
-        // Read through a cap rather than trusting the size just measured:
-        // the file can still grow between the stat and the read, and an
-        // unbounded read is exactly what the budget exists to prevent.
-        let data = match read_capped(&path, MAX_IMAGE_BYTES) {
-            Ok(data) => data,
-            Err(reason) => {
-                notes.push(format!("could not attach {name}: {reason}"));
-                continue;
-            }
-        };
-        if total + data.len() > MAX_TOTAL_IMAGE_BYTES {
-            notes.push(format!(
-                "could not attach {name}: {} MiB total image limit reached",
-                MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
-            ));
-            continue;
-        }
-        total += data.len();
-        blocks.push(agent_code_lib::llm::message::image_block_from_bytes(
-            &path, &data,
-        ));
-    }
-    (blocks, notes)
 }
 
 /// True when `path` resolves inside `cwd`. Both sides are canonicalized.
@@ -639,6 +541,7 @@ fn truncate_utf8(s: String, cap: usize) -> (String, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_code_lib::llm::message::ContentBlock;
     use std::fs;
 
     fn fixture() -> tempfile::TempDir {
@@ -908,7 +811,11 @@ mod tests {
             "image was not attached: {:?}",
             out.notes
         );
-        assert!(out.images[0].ends_with("shot.png"));
+        let ContentBlock::Image { media_type, data } = &out.images[0] else {
+            panic!("expected an image block");
+        };
+        assert_eq!(media_type, "image/png");
+        assert!(!data.is_empty(), "image was attached with an empty payload");
         assert!(
             out.notes.iter().any(|n| n.contains("attached as an image")),
             "no note explaining the attachment: {:?}",
@@ -987,130 +894,106 @@ mod tests {
         assert!(out.notes.iter().any(|n| n.contains("image(s) skipped")));
     }
 
-    /// The budget is re-applied when the bytes are actually read: a staged
-    /// file can grow between the mention and the turn starting, so checking
-    /// only the per-image cap there let the per-prompt total be exceeded.
+    /// The bytes are read while the mention is being validated, so the
+    /// block the turn ships is the file that passed the check — not
+    /// whatever the name pointed at some seconds later.
     #[test]
-    fn loading_reapplies_the_total_image_budget() {
+    fn an_attached_image_carries_its_encoded_bytes() {
         let dir = fixture();
-        let each = MAX_TOTAL_IMAGE_BYTES / 3 + 1024;
-        let mut paths = Vec::new();
-        for name in ["a.png", "b.png", "c.png"] {
-            let p = dir.path().join(name);
-            fs::write(&p, vec![0u8; each]).unwrap();
-            paths.push(p);
-        }
-        let (blocks, notes) = load_image_blocks(dir.path(), &paths);
-        assert_eq!(blocks.len(), 2, "total budget not enforced at load time");
-        assert!(
-            notes.iter().any(|n| n.contains("total image limit")),
-            "no note about the refused image: {notes:?}"
-        );
-    }
-
-    #[test]
-    fn loading_refuses_a_file_that_grew_past_the_per_image_cap() {
-        let dir = fixture();
-        let path = dir.path().join("grew.png");
-        fs::write(&path, vec![0u8; MAX_IMAGE_BYTES + 1]).unwrap();
-        let (blocks, notes) = load_image_blocks(dir.path(), &[path]);
-        assert!(blocks.is_empty(), "oversized image was attached at load");
-        assert!(
-            notes.iter().any(|n| n.contains("too large")),
-            "no note about the refusal: {notes:?}"
-        );
-    }
-
-    #[test]
-    fn loading_caps_the_attachment_count() {
-        let dir = fixture();
-        let mut paths = Vec::new();
-        for i in 0..(MAX_IMAGES + 2) {
-            let p = dir.path().join(format!("s{i}.png"));
-            fs::write(&p, [0x89, b'P', b'N', b'G']).unwrap();
-            paths.push(p);
-        }
-        let (blocks, notes) = load_image_blocks(dir.path(), &paths);
-        assert_eq!(blocks.len(), MAX_IMAGES);
-        assert_eq!(notes.len(), 2, "{notes:?}");
-    }
-
-    /// The encoder used to emit nothing unless flushed, so an attachment
-    /// reached the provider as an empty payload.
-    #[test]
-    fn loading_produces_a_non_empty_encoded_payload() {
-        use agent_code_lib::llm::message::ContentBlock;
-        let dir = fixture();
-        let path = dir.path().join("shot.png");
-        fs::write(&path, [0x89, b'P', b'N', b'G']).unwrap();
-        let (blocks, notes) = load_image_blocks(dir.path(), &[path]);
-        assert_eq!(blocks.len(), 1, "{notes:?}");
-        let ContentBlock::Image { media_type, data } = &blocks[0] else {
+        fs::write(dir.path().join("shot.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let out = expand_mentions("@shot.png", dir.path()).expect("expanded");
+        assert_eq!(out.images.len(), 1, "{:?}", out.notes);
+        let ContentBlock::Image { media_type, data } = &out.images[0] else {
             panic!("expected an image block");
         };
         assert_eq!(media_type, "image/png");
         assert_eq!(data, "iVBORw==");
     }
 
-    /// A staged path is opened long after it was accepted. Swapping it for
-    /// a symlink out of the workspace must not leak the target's bytes to
-    /// the provider.
+    /// A symlink pointing out of the workspace is refused, so an image
+    /// mention cannot exfiltrate a file the workspace never contained.
     #[cfg(unix)]
     #[test]
-    fn loading_refuses_a_path_swapped_for_an_escaping_symlink() {
+    fn an_image_symlinked_outside_the_workspace_is_refused() {
         let outside = tempfile::tempdir().expect("tempdir");
         let secret = outside.path().join("secret.png");
         fs::write(&secret, b"exfiltrate me").unwrap();
 
         let dir = fixture();
-        let staged = dir.path().join("shot.png");
-        fs::write(&staged, [0x89, b'P', b'N', b'G']).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("shot.png")).unwrap();
+
         let out = expand_mentions("look at @shot.png", dir.path()).expect("expanded");
-        assert_eq!(out.images.len(), 1, "precondition");
-
-        // The turn has not started yet; the file is replaced underneath it.
-        fs::remove_file(&staged).unwrap();
-        std::os::unix::fs::symlink(&secret, &staged).unwrap();
-
-        let (blocks, notes) = load_image_blocks(dir.path(), &out.images);
-        assert!(blocks.is_empty(), "read a file outside the workspace");
+        assert!(out.images.is_empty(), "read a file outside the workspace");
         assert!(
-            notes.iter().any(|n| n.contains("left the workspace")),
-            "no note about the escape: {notes:?}"
+            out.notes
+                .iter()
+                .any(|n| n.contains("outside the workspace")),
+            "no note about the escape: {:?}",
+            out.notes
         );
     }
 
-    /// Replacing the staged file with a FIFO used to hang the UI thread on
-    /// `open`; it must be refused instead.
+    /// A FIFO named like an image must not be attached — and must not hang
+    /// the UI thread inside `open` while it waits for a writer.
     #[cfg(unix)]
     #[test]
-    fn loading_refuses_a_path_swapped_for_a_fifo() {
+    fn a_fifo_named_like_an_image_is_refused() {
         let dir = fixture();
-        let staged = dir.path().join("shot.png");
-        fs::write(&staged, [0x89, b'P', b'N', b'G']).unwrap();
-        let out = expand_mentions("look at @shot.png", dir.path()).expect("expanded");
-        assert_eq!(out.images.len(), 1, "precondition");
-
-        fs::remove_file(&staged).unwrap();
-        let c = std::ffi::CString::new(staged.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: `c` is a valid NUL-terminated path for the duration.
+        let path = dir.path().join("shot.png");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the call.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
 
-        let (blocks, notes) = load_image_blocks(dir.path(), &out.images);
-        assert!(blocks.is_empty(), "attached a FIFO");
+        let out = expand_mentions("look at @shot.png", dir.path()).expect("expanded");
+        assert!(out.images.is_empty(), "attached a FIFO");
         assert!(
-            notes.iter().any(|n| n.contains("not a regular file")),
-            "no note about the FIFO: {notes:?}"
+            out.notes.iter().any(|n| n.contains("not a regular file")),
+            "no note about the FIFO: {:?}",
+            out.notes
         );
     }
 
-    /// Fail-closed: an image whose size cannot be read is refused, not
-    /// attached and hoped for.
+    /// `open_regular_file` is the last line of defence if a path stops
+    /// being a regular file between the check and the open.
+    #[cfg(unix)]
     #[test]
-    fn an_unmeasurable_image_is_refused() {
+    fn opening_a_non_regular_file_is_refused() {
+        let dir = fixture();
+        let path = dir.path().join("pipe.png");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        assert_eq!(
+            open_regular_file(&path).unwrap_err(),
+            "not a regular file",
+            "a FIFO must never be opened for attachment"
+        );
+    }
+
+    /// A symlink swapped in after the check must not be followed by the
+    /// open that reads the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn opening_refuses_to_follow_a_symlink() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("secret.png");
+        fs::write(&target, b"exfiltrate me").unwrap();
+        let dir = fixture();
+        let link = dir.path().join("link.png");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            open_regular_file(&link).is_err(),
+            "open followed a symlink out of the workspace"
+        );
+    }
+
+    /// Fail-closed: an image that cannot be read is refused, not attached
+    /// and hoped for.
+    #[test]
+    fn an_unreadable_image_is_refused() {
         let dir = fixture();
         let missing = dir.path().join("gone.png");
-        assert!(image_size_within_cap(&missing).is_err());
+        assert!(read_image_capped(&missing, MAX_IMAGE_BYTES).is_err());
     }
 
     /// A non-image binary still reports why it was skipped, rather than

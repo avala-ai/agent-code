@@ -570,24 +570,17 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
-            // Load any mentioned images and hand them to the engine for
-            // this turn. Decoding here rather than at mention time keeps
-            // a big screenshot out of memory until the turn actually
-            // starts, and lets a read failure be reported as a note
-            // instead of blocking the prompt.
+            // Hand this turn's images to the engine. They were read and
+            // encoded during mention expansion, while the path was still
+            // the one that had just been validated — nothing is opened
+            // here, so there is no second chance to point them elsewhere.
             let images = std::mem::take(&mut app.pending_images);
-            let (blocks, refused) =
-                super::mentions::load_image_blocks(std::path::Path::new(&app.cwd), &images);
-            for note in refused {
-                app.transcript
-                    .push(super::app::TranscriptItem::System(note));
-            }
             // Set unconditionally, awaiting the lock rather than skipping on
             // contention: an empty set clears anything a previous attempt
             // staged, so no turn can inherit another turn's attachment.
             {
                 let engine = session.engine();
-                engine.lock().await.set_pending_attachments(blocks);
+                engine.lock().await.set_pending_attachments(images.clone());
             }
             let sink = ChannelSink::new(eng_tx.clone());
             match session.spawn_turn(prompt.clone(), sink).await {
