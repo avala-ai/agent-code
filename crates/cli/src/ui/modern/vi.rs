@@ -36,7 +36,8 @@ impl App {
             return;
         }
         self.composer_mode = ComposerMode::Normal;
-        self.cursor = prev_boundary(&self.input, self.cursor);
+        let (start, _) = line_bounds(&self.input, self.cursor);
+        self.cursor = prev_boundary(&self.input, self.cursor).max(start);
         self.dirty = true;
     }
 
@@ -51,46 +52,54 @@ impl App {
         if self.vi_pending_d {
             self.vi_pending_d = false;
             if c == 'd' {
-                self.input.clear();
-                self.cursor = 0;
-                self.dirty = true;
+                self.delete_current_line();
             }
             return ViOutcome::Consumed;
         }
 
+        let (start, end) = line_bounds(&self.input, self.cursor);
         match c {
-            'h' => self.cursor = prev_boundary(&self.input, self.cursor),
-            'l' => self.cursor = next_boundary(&self.input, self.cursor),
-            '0' => self.cursor = 0,
-            '$' => self.cursor = prev_boundary(&self.input, self.input.len()),
+            'h' => self.cursor = prev_boundary(&self.input, self.cursor).max(start),
+            'l' => {
+                self.cursor =
+                    next_boundary(&self.input, self.cursor).min(line_last(&self.input, start, end))
+            }
+            '0' => self.cursor = start,
+            '$' => self.cursor = line_last(&self.input, start, end),
             'w' => self.cursor = word_forward(&self.input, self.cursor),
             'b' => self.cursor = word_back(&self.input, self.cursor),
             'i' => self.vi_enter_insert(),
             'a' => {
-                self.cursor = next_boundary(&self.input, self.cursor);
+                self.cursor = next_boundary(&self.input, self.cursor).min(end);
                 self.vi_enter_insert();
             }
             'I' => {
-                self.cursor = 0;
+                self.cursor = start;
                 self.vi_enter_insert();
             }
             'A' => {
-                self.cursor = self.input.len();
+                self.cursor = end;
                 self.vi_enter_insert();
             }
             'x' => {
-                if self.cursor < self.input.len() {
+                if self.cursor < end {
                     self.input.remove(self.cursor);
-                    // Deleting the last character leaves the cursor on
-                    // the new last one, as vi does.
-                    if self.cursor >= self.input.len() {
-                        self.cursor = prev_boundary(&self.input, self.input.len());
+                    // Deleting the last character on the line leaves the
+                    // cursor on the new last one, as vi does.
+                    let (_, new_end) = line_bounds(&self.input, self.cursor);
+                    if self.cursor >= new_end {
+                        self.cursor = prev_boundary(&self.input, self.cursor).max(start);
                     }
                 }
             }
-            'D' => self.input.truncate(self.cursor),
+            'D' => {
+                self.input.replace_range(self.cursor..end, "");
+                if self.cursor > start {
+                    self.cursor = prev_boundary(&self.input, self.cursor).max(start);
+                }
+            }
             'C' => {
-                self.input.truncate(self.cursor);
+                self.input.replace_range(self.cursor..end, "");
                 self.vi_enter_insert();
             }
             'd' => self.vi_pending_d = true,
@@ -100,6 +109,48 @@ impl App {
         }
         self.dirty = true;
         ViOutcome::Consumed
+    }
+
+    /// `dd`: drop the line under the cursor, not the whole draft.
+    fn delete_current_line(&mut self) {
+        let (start, end) = line_bounds(&self.input, self.cursor);
+        if end < self.input.len() {
+            // A following line exists: take this line and its newline,
+            // leaving the cursor at the start of what moved up.
+            self.input.replace_range(start..end + 1, "");
+            self.cursor = start;
+        } else if start > 0 {
+            // Last line of several: take the newline that precedes it so
+            // the draft does not keep a trailing blank line.
+            self.input.truncate(start - 1);
+            self.cursor = line_bounds(&self.input, self.input.len()).0;
+        } else {
+            self.input.clear();
+            self.cursor = 0;
+        }
+        self.dirty = true;
+    }
+}
+
+/// Byte range of the line holding `at`, excluding the trailing newline.
+/// The composer holds a whole multi-line draft, so every line command
+/// scopes itself to this range instead of to the buffer.
+fn line_bounds(s: &str, at: usize) -> (usize, usize) {
+    let mut at = at.min(s.len());
+    while at > 0 && !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    let start = s[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = s[at..].find('\n').map(|i| at + i).unwrap_or(s.len());
+    (start, end)
+}
+
+/// Offset of the last character on a line, or the line start when empty.
+fn line_last(s: &str, start: usize, end: usize) -> usize {
+    if end > start {
+        prev_boundary(s, end).max(start)
+    } else {
+        start
     }
 }
 
@@ -248,6 +299,95 @@ mod tests {
         a.vi_normal_key('d');
         a.vi_normal_key('z');
         assert_eq!(a.input, "hello");
+    }
+
+    /// The composer holds multi-line drafts. Every line command must act
+    /// on the line under the cursor; the first cut cleared the whole
+    /// `String`, discarding lines the user never touched.
+    #[test]
+    fn line_commands_stay_inside_the_current_line() {
+        // `dd` on a middle line drops only that line.
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5; // on "two"
+        a.vi_normal_key('d');
+        a.vi_normal_key('d');
+        assert_eq!(a.input, "one\nthree", "dd ate lines outside the cursor's");
+        assert_eq!(
+            a.cursor, 4,
+            "dd leaves the cursor on the line that moved up"
+        );
+
+        // `dd` on the last line takes the newline before it.
+        let mut a = vi_app("one\ntwo");
+        a.cursor = 5;
+        a.vi_normal_key('d');
+        a.vi_normal_key('d');
+        assert_eq!(a.input, "one");
+        assert_eq!(a.cursor, 0);
+
+        // `dd` on the only line still clears the draft.
+        let mut a = vi_app("solo");
+        a.vi_normal_key('d');
+        a.vi_normal_key('d');
+        assert_eq!(a.input, "");
+
+        // `0` and `$` bound to the current line.
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5;
+        a.vi_normal_key('0');
+        assert_eq!(a.cursor, 4, "0 jumped past the start of the line");
+        a.vi_normal_key('$');
+        assert_eq!(a.cursor, 6, "$ jumped past the end of the line");
+
+        // `D` and `C` truncate the line, not the draft.
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5;
+        a.vi_normal_key('D');
+        assert_eq!(a.input, "one\nt\nthree");
+
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5;
+        a.vi_normal_key('C');
+        assert_eq!(a.input, "one\nt\nthree");
+        assert_eq!(a.composer_mode, ComposerMode::Insert);
+
+        // `I` and `A` land on this line's edges.
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5;
+        a.vi_normal_key('I');
+        assert_eq!(a.cursor, 4);
+
+        let mut a = vi_app("one\ntwo\nthree");
+        a.cursor = 5;
+        a.vi_normal_key('A');
+        assert_eq!(a.cursor, 7, "A appended past the end of the line");
+    }
+
+    /// `h`, `l`, `a` and `x` must not step over a newline either — vi
+    /// keeps character motions within the line.
+    #[test]
+    fn character_motions_do_not_cross_newlines() {
+        let mut a = vi_app("ab\ncd");
+        a.cursor = 3; // on 'c'
+        a.vi_normal_key('h');
+        assert_eq!(a.cursor, 3, "h crossed onto the previous line");
+
+        let mut a = vi_app("ab\ncd");
+        a.cursor = 1; // on 'b', the last char of line one
+        a.vi_normal_key('l');
+        assert_eq!(a.cursor, 1, "l crossed onto the next line");
+
+        let mut a = vi_app("ab\ncd");
+        a.cursor = 1;
+        a.vi_normal_key('a');
+        assert_eq!(a.cursor, 2, "a should append at the end of its own line");
+
+        // `x` on an empty line has nothing to delete and must not eat the
+        // newline, which would join two lines of the draft.
+        let mut a = vi_app("ab\n\ncd");
+        a.cursor = 3;
+        a.vi_normal_key('x');
+        assert_eq!(a.input, "ab\n\ncd", "x swallowed a newline");
     }
 
     /// An unhandled normal-mode key must be swallowed, not passed on —

@@ -871,6 +871,15 @@ mod slash_lookup_tests {
     }
 }
 
+pub(crate) const VI_EDIT_MODE_MSG: &str = "Editing mode set to vi (Esc for normal mode).";
+
+/// `/emacs` only turns the vi bindings off — the composer has no Emacs
+/// chords of its own (Ctrl+E and Ctrl+U are transcript controls, and
+/// Ctrl+A/K/W are unbound), so the message must not promise any. If
+/// composer chords are ever added, say so here and in
+/// `docs/tui/KEYBINDINGS.md`.
+pub(crate) const EMACS_EDIT_MODE_MSG: &str = "Editing mode set to emacs (vi bindings off).";
+
 pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
     let input = input.trim_start_matches('/');
     let (cmd, args) = input
@@ -2005,14 +2014,12 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
         }
         Some("vim") => {
             engine.state_mut().config.ui.edit_mode = "vi".to_string();
-            println!("Editing mode set to vi (Esc for normal mode).");
+            println!("{VI_EDIT_MODE_MSG}");
             CommandResult::Handled
         }
         Some("emacs") => {
-            // Emacs bindings are the composer's default: Ctrl+A/E/K/U/W
-            // already work, so this only turns vi bindings back off.
             engine.state_mut().config.ui.edit_mode = "emacs".to_string();
-            println!("Editing mode set to emacs (the default bindings).");
+            println!("{EMACS_EDIT_MODE_MSG}");
             CommandResult::Handled
         }
         Some("version") => {

@@ -2159,6 +2159,56 @@ mod tests {
         );
     }
 
+    /// `/emacs` must not advertise composer bindings that do not exist.
+    /// This pins what those chords actually do: Ctrl+A/K/W are unbound in
+    /// the composer, Ctrl+E expands thinking blocks and Ctrl+U scrolls the
+    /// transcript. If any of them ever becomes a composer edit, update
+    /// `EMACS_EDIT_MODE_MSG` and `docs/tui/KEYBINDINGS.md` with it.
+    #[test]
+    fn emacs_mode_message_matches_the_real_bindings() {
+        let msg = crate::commands::EMACS_EDIT_MODE_MSG;
+        assert!(
+            !msg.contains("Ctrl+"),
+            "/emacs advertises composer chords: {msg}"
+        );
+
+        for c in ['a', 'k', 'w'] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.input = "hello world".into();
+            app.cursor = 6;
+            handle_key(&mut app, ctrl(c));
+            assert_eq!(
+                (app.input.as_str(), app.cursor),
+                ("hello world", 6),
+                "Ctrl+{c} now edits the composer but is still undocumented"
+            );
+        }
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello world".into();
+        app.cursor = 6;
+        handle_key(&mut app, ctrl('e'));
+        assert_eq!(
+            (app.input.as_str(), app.cursor),
+            ("hello world", 6),
+            "Ctrl+E edited the composer"
+        );
+        assert_eq!(
+            app.status_message, "no thinking blocks",
+            "Ctrl+E no longer reaches the thinking toggle"
+        );
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello world".into();
+        app.cursor = 6;
+        handle_key(&mut app, ctrl('u'));
+        assert_eq!(
+            (app.input.as_str(), app.cursor),
+            ("hello world", 6),
+            "Ctrl+U killed the line"
+        );
+    }
+
     /// With vi off, every key must behave exactly as before.
     #[test]
     fn without_vi_mode_esc_still_arms_quit() {

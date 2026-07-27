@@ -185,5 +185,7 @@ the line · `Enter` submits. Unrecognised keys do nothing rather than firing
 a global shortcut.
 
 `Esc` in normal mode falls through to the usual behaviour, so the
-double-press quit is still reachable. `/emacs` returns to the default
-bindings (`Ctrl+A`/`E`/`K`/`U`/`W`), which are always active.
+double-press quit is still reachable. `/emacs` turns the vi bindings back
+off; the composer then behaves as it does everywhere else in this
+document. It does not add Emacs chords — the composer has none of its
+own, and `Ctrl+E` / `Ctrl+U` are the transcript controls listed above.
