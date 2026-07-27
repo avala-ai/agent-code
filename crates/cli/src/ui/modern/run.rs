@@ -148,15 +148,16 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
     result
 }
 
-/// Enter a restored session's directory, or report why not.
+/// Whether a restored session's directory can be entered, without
+/// entering it.
 ///
-/// This runs *before* any session state is replaced, because it is a
+/// Runs *before* any session state is replaced, because it is a
 /// precondition of the restore rather than a step in it: if the saved
 /// directory is gone, adopting the conversation anyway would leave a
 /// project-A session running against project-B's cwd — the wrong-tree
 /// hazard the whole cwd restore exists to prevent. `Ok(None)` means
-/// there was nothing to move to.
-fn enter_session_cwd(
+/// there is nothing to move to.
+fn check_session_cwd(
     restored_cwd: &str,
     previous_cwd: &str,
 ) -> Result<Option<std::path::PathBuf>, std::io::Error> {
@@ -164,7 +165,17 @@ fn enter_session_cwd(
         return Ok(None);
     }
     let dir = std::path::PathBuf::from(restored_cwd);
-    std::env::set_current_dir(&dir)?;
+    // Deliberately does not move: the departing session's stop hooks
+    // still have to run in its own directory, and shell hooks inherit
+    // the process cwd. This only answers "could we", so the resume can
+    // be refused before any state changes.
+    let meta = std::fs::metadata(&dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "not a directory",
+        ));
+    }
     Ok(Some(dir))
 }
 
@@ -181,7 +192,13 @@ async fn finish_cwd_adoption(
     let cwd = dir.display().to_string();
     eng.state_mut().cwd = cwd.clone();
     eng.reset_system_prompt_cache();
-    eng.rescope_persistent_grants(dir);
+    // Grants *and* the live checker: both are per-project and both are
+    // consulted when a tool runs. The checker was left pinned to the root
+    // the process started in, so a write into the restored project's
+    // `.agent/team-memory` through a symlink matched neither the old root
+    // nor the raw path — a protected directory stopped being protected
+    // the moment a resume crossed projects.
+    eng.rescope_project(dir);
     app.cwd = cwd;
     let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
@@ -558,7 +575,7 @@ pub(super) async fn event_loop(
                         // cwd — the wrong-tree hazard this restore exists
                         // to prevent. Refuse the whole resume instead.
                         let previous_cwd = session.engine().lock().await.state().cwd.clone();
-                        let entered = match enter_session_cwd(&data.cwd, &previous_cwd) {
+                        let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
                             Ok(dir) => dir,
                             Err(e) => {
                                 app.status_message.clear();
@@ -597,6 +614,31 @@ pub(super) async fn event_loop(
                             // flight here, so renewing is safe.
                             eng.renew_cancel_scope();
                             let _ = eng.fire_session_stop_hooks().await;
+                        }
+                        // Only now move. Shell hooks inherit the process
+                        // directory, so entering the destination before
+                        // the stop hooks ran executed project A's
+                        // teardown — a formatter, a cleanup, an
+                        // auto-commit — inside project B.
+                        //
+                        // The check above already refused a directory
+                        // that cannot be entered, so this fails only if
+                        // it disappeared in between; refuse the resume
+                        // then too rather than continuing half-moved.
+                        if let Some(dir) = entered.as_deref()
+                            && let Err(e) = std::env::set_current_dir(dir)
+                        {
+                            app.status_message.clear();
+                            app.transcript
+                                .push(super::app::TranscriptItem::Error(format!(
+                                    "could not resume {id}: its directory {} became unavailable \
+                                 ({e}) — staying in {previous_cwd}",
+                                    data.cwd
+                                )));
+                            app.cancel_deferred_resume_work();
+                            app.pending_resume = None;
+                            app.dirty = true;
+                            continue;
                         }
                         let engine_arc = session.engine();
                         let mut eng = engine_arc.lock().await;
@@ -4189,17 +4231,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("no-such-project");
 
-        let err = enter_session_cwd(&gone.display().to_string(), "/tmp/original")
+        let err = check_session_cwd(&gone.display().to_string(), "/tmp/original")
             .expect_err("a directory that does not exist must not be entered");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
         // Nothing to move to is not a failure — it just means stay put.
         assert!(
-            enter_session_cwd("", "/tmp/original").unwrap().is_none(),
+            check_session_cwd("", "/tmp/original").unwrap().is_none(),
             "an empty saved cwd should be a no-op, not an error"
         );
         assert!(
-            enter_session_cwd("/tmp/original", "/tmp/original")
+            check_session_cwd("/tmp/original", "/tmp/original")
                 .unwrap()
                 .is_none(),
             "already being there should be a no-op, not a move"

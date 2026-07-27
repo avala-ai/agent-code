@@ -454,6 +454,20 @@ impl QueryEngine {
     /// so an approval saved in the old project must not keep suppressing
     /// prompts in the new one, and new grants must be written to the new
     /// project's file. No-op when the feature was never enabled.
+    /// Point everything project-scoped at `project_root`: the persistent
+    /// grant store *and* the live permission checker.
+    ///
+    /// Both are per-project and both are consulted when a tool runs, so
+    /// moving one without the other leaves either approvals or the
+    /// canonical protected-path checks answering for the project the
+    /// process just left. Resuming a session from another project is the
+    /// case that needs this.
+    pub fn rescope_project(&mut self, project_root: &std::path::Path) {
+        self.rescope_persistent_grants(project_root);
+        self.permissions
+            .set_project_root(project_root.to_path_buf());
+    }
+
     pub fn rescope_persistent_grants(&mut self, project_root: &std::path::Path) {
         let Some(store) = self.persistent_grants.clone() else {
             return;
