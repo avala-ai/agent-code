@@ -256,7 +256,13 @@ async fn execute_single_tool(
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
             let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
-            let grant_key = persistent_grant_key(&call.name, &call.input, &sandbox_state, &ctx.cwd);
+            let grant_key = persistent_grant_key(
+                &call.name,
+                &call.input,
+                &sandbox_state,
+                &ctx.cwd,
+                tool.grant_binding().as_deref(),
+            );
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
                 None => false,
@@ -488,6 +494,13 @@ pub fn sandbox_grant_state(sandbox: Option<&crate::sandbox::SandboxExecutor>) ->
 ///   serde_json maps serialize with sorted keys (`preserve_order` is off),
 ///   so the string is canonical.
 ///
+/// `binding` pins the key to the external implementation behind the
+/// tool name when the name alone does not
+/// ([`crate::tools::Tool::grant_binding`]). MCP proxies supply a digest
+/// of their server's transport configuration: `mcp__foo__bar` is only
+/// ever whatever `[mcp_servers.foo]` currently resolves to, and that is
+/// mutable project settings.
+///
 /// Shell and file keys are additionally bound to a digest of the
 /// canonicalized `cwd`: the grant scope is the repository root and the
 /// session can `/cd` inside it, so `./build.sh` approved in one
@@ -508,6 +521,7 @@ pub fn persistent_grant_key(
     input: &serde_json::Value,
     sandbox_state: &str,
     cwd: &std::path::Path,
+    binding: Option<&str>,
 ) -> String {
     let cwd_digest = {
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -561,7 +575,15 @@ pub fn persistent_grant_key(
             )
         }
     };
-    format!("{tool}\0{shape}")
+    // A tool name is not always the implementation: `mcp__foo__bar` is
+    // whatever `[mcp_servers.foo]` currently points at, and that mapping
+    // changes with a branch switch or an updated project settings file.
+    // Binding the key to the server's transport digest keeps an approval
+    // from following the *name* onto a replacement external process.
+    match binding {
+        Some(b) => format!("{tool}\0{shape}\0binding:{b}"),
+        None => format!("{tool}\0{shape}"),
+    }
 }
 
 /// Label safe to persist next to a grant key. The description shown in
@@ -640,7 +662,7 @@ mod session_allow_tests {
     /// `persistent_grant_key` with no active isolation and a fixed cwd —
     /// the common fixture for properties that concern neither.
     fn pkey(tool: &str, input: &serde_json::Value) -> String {
-        persistent_grant_key(tool, input, "none", std::path::Path::new("/test-cwd"))
+        persistent_grant_key(tool, input, "none", std::path::Path::new("/test-cwd"), None)
     }
 
     /// The grant scope is the repository root while the session can
@@ -651,25 +673,49 @@ mod session_allow_tests {
     #[test]
     fn a_grant_key_is_bound_to_the_effective_cwd() {
         let cmd = serde_json::json!({"command": "./build.sh"});
-        let a = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"));
-        let b = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/b"));
+        let a = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"), None);
+        let b = persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/b"), None);
         assert_ne!(a, b, "a relative command crossed directories");
         assert_eq!(
             a,
-            persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"))
+            persistent_grant_key("Bash", &cmd, "none", std::path::Path::new("/repo/a"), None)
         );
 
         let write = serde_json::json!({"file_path": "notes.md", "content": "x"});
         assert_ne!(
-            persistent_grant_key("FileWrite", &write, "none", std::path::Path::new("/repo/a")),
-            persistent_grant_key("FileWrite", &write, "none", std::path::Path::new("/repo/b")),
+            persistent_grant_key(
+                "FileWrite",
+                &write,
+                "none",
+                std::path::Path::new("/repo/a"),
+                None
+            ),
+            persistent_grant_key(
+                "FileWrite",
+                &write,
+                "none",
+                std::path::Path::new("/repo/b"),
+                None
+            ),
             "a relative write crossed directories"
         );
 
         let fetch = serde_json::json!({"url": "https://example.com/x"});
         assert_eq!(
-            persistent_grant_key("WebFetch", &fetch, "none", std::path::Path::new("/repo/a")),
-            persistent_grant_key("WebFetch", &fetch, "none", std::path::Path::new("/repo/b")),
+            persistent_grant_key(
+                "WebFetch",
+                &fetch,
+                "none",
+                std::path::Path::new("/repo/a"),
+                None
+            ),
+            persistent_grant_key(
+                "WebFetch",
+                &fetch,
+                "none",
+                std::path::Path::new("/repo/b"),
+                None
+            ),
         );
     }
 
@@ -794,10 +840,17 @@ mod session_allow_tests {
             &input,
             "fp-strict-policy",
             std::path::Path::new("/test-cwd"),
+            None,
         );
         assert_ne!(
             isolated,
-            persistent_grant_key("Bash", &input, "none", std::path::Path::new("/test-cwd")),
+            persistent_grant_key(
+                "Bash",
+                &input,
+                "none",
+                std::path::Path::new("/test-cwd"),
+                None
+            ),
             "a grant crossed between isolated and unisolated sessions"
         );
         assert_ne!(
@@ -806,7 +859,8 @@ mod session_allow_tests {
                 "Bash",
                 &input,
                 "fp-weaker-policy",
-                std::path::Path::new("/test-cwd")
+                std::path::Path::new("/test-cwd"),
+                None
             ),
             "a grant survived an isolation-policy change"
         );
@@ -994,6 +1048,102 @@ mod session_allow_tests {
         );
     }
 
+    /// `mcp__foo__bar` names a *binding*, not an implementation: it is
+    /// whatever `[mcp_servers.foo]` currently resolves to, and a branch
+    /// switch or an updated project settings file can repoint it at a
+    /// different command or URL. A grant approved for one server must
+    /// not silently dispatch the same input to a replacement process.
+    #[test]
+    fn an_mcp_grant_is_bound_to_the_configured_server() {
+        use crate::services::mcp::{McpServerConfig, McpTransport};
+
+        let input = serde_json::json!({"query": "select 1"});
+        let cwd = std::path::Path::new("/test-cwd");
+        let server = |transport| McpServerConfig {
+            transport,
+            name: "foo".to_string(),
+            env: std::collections::HashMap::new(),
+        };
+
+        let original = server(McpTransport::Stdio {
+            command: "/usr/bin/foo-mcp".to_string(),
+            args: vec!["--safe".to_string()],
+        });
+        // Same server name, repointed at another program.
+        let swapped = server(McpTransport::Stdio {
+            command: "/tmp/evil-mcp".to_string(),
+            args: vec!["--safe".to_string()],
+        });
+        // Same program, different arguments.
+        let rearmed = server(McpTransport::Stdio {
+            command: "/usr/bin/foo-mcp".to_string(),
+            args: vec!["--unsafe".to_string()],
+        });
+        // Same name, now a remote endpoint entirely.
+        let remote = server(McpTransport::Sse {
+            url: "https://mcp.example.com/sse".to_string(),
+        });
+
+        let key = |c: &McpServerConfig| {
+            persistent_grant_key(
+                "mcp__foo__query",
+                &input,
+                "none",
+                cwd,
+                Some(&c.binding_fingerprint()),
+            )
+        };
+
+        assert_eq!(key(&original), key(&original), "the key must be stable");
+        for (other, what) in [
+            (&swapped, "a different command"),
+            (&rearmed, "different arguments"),
+            (&remote, "a different transport"),
+        ] {
+            assert_ne!(
+                key(&original),
+                key(other),
+                "an MCP grant survived {what} behind the same server name"
+            );
+        }
+
+        // Env is part of the binding: it decides what the server process
+        // can reach. Sorted before hashing, so the digest is stable.
+        let mut env_a = server(McpTransport::Stdio {
+            command: "/usr/bin/foo-mcp".to_string(),
+            args: vec![],
+        });
+        env_a.env.insert("TOKEN".into(), "one".into());
+        env_a.env.insert("MODE".into(), "prod".into());
+        let mut env_b = server(McpTransport::Stdio {
+            command: "/usr/bin/foo-mcp".to_string(),
+            args: vec![],
+        });
+        env_b.env.insert("TOKEN".into(), "two".into());
+        env_b.env.insert("MODE".into(), "prod".into());
+        assert_ne!(key(&env_a), key(&env_b), "env changes must re-prompt");
+        assert_eq!(
+            env_a.binding_fingerprint(),
+            env_a.binding_fingerprint(),
+            "the fingerprint must not depend on HashMap iteration order"
+        );
+
+        // The binding is a digest: a token in the command line or the
+        // SSE url must not reach the persisted key.
+        let secret = "hunter2-super-secret";
+        let leaky = server(McpTransport::Sse {
+            url: format!("https://mcp.example.com/sse?token={secret}"),
+        });
+        let leaky_key = key(&leaky);
+        assert!(
+            !leaky_key.contains(secret),
+            "MCP binding leaked a credential into the grant key: {leaky_key}"
+        );
+
+        // A built-in tool has no binding and keeps its shorter key.
+        assert!(!pkey("FileWrite", &input).contains("\0binding:"));
+    }
+
     /// `is_active()` is false for a degraded sandbox whether it fails
     /// closed or open, so both states would key as `"none"`. A grant
     /// recorded while the backend was missing and the call was being
@@ -1041,8 +1191,8 @@ mod session_allow_tests {
         let input = serde_json::json!({"command": "make"});
         let cwd = std::path::Path::new("/test-cwd");
         assert_ne!(
-            persistent_grant_key("Bash", &input, &blocked_state, cwd),
-            persistent_grant_key("Bash", &input, &permitted_state, cwd),
+            persistent_grant_key("Bash", &input, &blocked_state, cwd, None),
+            persistent_grant_key("Bash", &input, &permitted_state, cwd, None),
             "a grant stored while degraded-and-refusing carried into a \
              degraded-but-permitted session"
         );

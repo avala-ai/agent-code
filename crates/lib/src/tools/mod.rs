@@ -117,6 +117,18 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Digest of the external binding this tool dispatches to, when the
+    /// tool name alone does not pin that down.
+    ///
+    /// Durable permission grants include it, so an approval stops
+    /// matching once the same tool name resolves somewhere else. `None`
+    /// for built-in tools, whose name *is* the implementation; MCP
+    /// proxies return a fingerprint of their server's transport
+    /// configuration, which is mutable between sessions.
+    fn grant_binding(&self) -> Option<String> {
+        None
+    }
+
     /// Maximum result size in characters before truncation.
     fn max_result_size_chars(&self) -> usize {
         100_000

@@ -22,10 +22,19 @@ pub struct McpProxyTool {
     client: Arc<Mutex<McpClient>>,
     /// Original server name for display.
     server_name: String,
+    /// Digest of the server's transport configuration, captured at
+    /// registration. Durable grants key on it so an approval does not
+    /// follow the server *name* onto a different command or endpoint.
+    binding: String,
 }
 
 impl McpProxyTool {
-    pub fn new(definition: McpTool, server_name: &str, client: Arc<Mutex<McpClient>>) -> Self {
+    pub fn new(
+        definition: McpTool,
+        server_name: &str,
+        client: Arc<Mutex<McpClient>>,
+        binding: &str,
+    ) -> Self {
         let qualified_name = format!(
             "mcp__{}__{}",
             normalize_name(server_name),
@@ -36,6 +45,7 @@ impl McpProxyTool {
             qualified_name,
             client,
             server_name: server_name.to_string(),
+            binding: binding.to_string(),
         }
     }
 }
@@ -67,6 +77,10 @@ impl Tool for McpProxyTool {
 
     fn is_concurrency_safe(&self) -> bool {
         false // MCP servers may have internal state.
+    }
+
+    fn grant_binding(&self) -> Option<String> {
+        Some(self.binding.clone())
     }
 
     async fn call(
@@ -117,15 +131,69 @@ fn normalize_name(s: &str) -> String {
 }
 
 /// Create proxy tools from all tools discovered on an MCP server.
+///
+/// `binding` is [`crate::services::mcp::McpServerConfig::binding_fingerprint`]
+/// for the server these tools came from; it enters the durable grant key
+/// so a saved approval cannot carry over to a server that has since been
+/// repointed at a different command or URL.
 pub fn create_proxy_tools(
     server_name: &str,
     mcp_tools: &[McpTool],
     client: Arc<Mutex<McpClient>>,
+    binding: &str,
 ) -> Vec<Arc<dyn Tool>> {
     mcp_tools
         .iter()
         .map(|t| {
-            Arc::new(McpProxyTool::new(t.clone(), server_name, client.clone())) as Arc<dyn Tool>
+            Arc::new(McpProxyTool::new(
+                t.clone(),
+                server_name,
+                client.clone(),
+                binding,
+            )) as Arc<dyn Tool>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::mcp::{McpServerConfig, McpTransport};
+
+    fn server(command: &str) -> McpServerConfig {
+        McpServerConfig {
+            transport: McpTransport::Stdio {
+                command: command.to_string(),
+                args: vec![],
+            },
+            name: "foo".to_string(),
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    fn proxy(binding: &str) -> McpProxyTool {
+        let definition = McpTool {
+            name: "query".to_string(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        };
+        let client = Arc::new(Mutex::new(McpClient::new(server("/usr/bin/foo-mcp"))));
+        McpProxyTool::new(definition, "foo", client, binding)
+    }
+
+    /// The permission system only ever sees the flattened
+    /// `mcp__foo__query`, which is mutable configuration. The proxy must
+    /// surface the server it was registered against, or a durable grant
+    /// cannot tell one binding from another.
+    #[test]
+    fn a_proxy_reports_the_binding_it_was_registered_with() {
+        let original = server("/usr/bin/foo-mcp").binding_fingerprint();
+        let swapped = server("/tmp/evil-mcp").binding_fingerprint();
+        assert_ne!(original, swapped, "precondition: the bindings differ");
+
+        let tool = proxy(&original);
+        assert_eq!(tool.name(), "mcp__foo__query");
+        assert_eq!(tool.grant_binding().as_deref(), Some(original.as_str()));
+        assert_ne!(proxy(&swapped).grant_binding(), tool.grant_binding());
+    }
 }

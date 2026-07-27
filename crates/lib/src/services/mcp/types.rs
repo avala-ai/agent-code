@@ -14,6 +14,57 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
 }
 
+impl McpServerConfig {
+    /// Stable digest of everything that decides *what process or endpoint*
+    /// this server name resolves to: the transport and its command, args,
+    /// url and environment.
+    ///
+    /// Durable permission grants for `mcp__{server}__{tool}` embed this.
+    /// The server name is mutable configuration — a branch switch or an
+    /// updated project settings file can repoint `[mcp_servers.foo]` at a
+    /// different command or URL — and without the binding in the key an
+    /// approval given for one server would silently suppress the prompt
+    /// while the input was dispatched to a replacement external process.
+    ///
+    /// A digest, not the values: commands, URLs and env values carry
+    /// credentials (tokens in an SSE url, API keys in `env`), and the
+    /// grant file lives in the config directory, where secrets must never
+    /// be written.
+    pub fn binding_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut part = |bytes: &[u8]| {
+            // Length-prefix every field so adjacent values cannot blur
+            // into each other ("ab"+"c" vs "a"+"bc").
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        };
+        match &self.transport {
+            McpTransport::Stdio { command, args } => {
+                part(b"stdio");
+                part(command.as_bytes());
+                for a in args {
+                    part(a.as_bytes());
+                }
+            }
+            McpTransport::Sse { url } => {
+                part(b"sse");
+                part(url.as_bytes());
+            }
+        }
+        // Sorted: `HashMap` iteration order is not stable, and a
+        // fingerprint that changed between runs would re-prompt forever.
+        part(b"|env|");
+        let mut env: Vec<(&String, &String)> = self.env.iter().collect();
+        env.sort();
+        for (k, v) in env {
+            part(k.as_bytes());
+            part(v.as_bytes());
+        }
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 /// Transport configuration for connecting to an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]

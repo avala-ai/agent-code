@@ -894,6 +894,12 @@ async fn async_main() -> anyhow::Result<()> {
             env: entry.env.clone(),
         };
 
+        // Captured before the config moves into the client: durable
+        // grants key on it, so an approval for `mcp__{name}__*` stops
+        // matching once this server name is repointed at a different
+        // command, url or environment.
+        let binding = mcp_config.binding_fingerprint();
+
         let mut client = agent_code_lib::services::mcp::McpClient::new(mcp_config);
         match client.connect().await {
             Ok(()) => {
@@ -903,6 +909,7 @@ async fn async_main() -> anyhow::Result<()> {
                     name,
                     &discovered,
                     client_arc,
+                    &binding,
                 );
                 let count = proxies.len();
                 for proxy in proxies {
