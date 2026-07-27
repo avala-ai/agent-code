@@ -79,39 +79,12 @@ fn trim_end(s: &mut String) {
     }
 }
 
-/// Replace this crate's version with a fixed placeholder so a release
-/// bump does not invalidate every golden.
-///
-/// The header renders `agent-code <version>`, so without this the
-/// version bump in a release PR turns all frame snapshots red on main
-/// — which is exactly what happened at 0.28.0. The padding is
-/// preserved (same byte length) so column alignment, and therefore the
-/// style rows, stay comparable across versions of differing width.
-fn mask_version(frame: &str) -> String {
-    const PLACEHOLDER: &str = "x.y.z";
-    let version = env!("CARGO_PKG_VERSION");
-    if !frame.contains(version) {
-        return frame.to_string();
-    }
-    let mut replacement = String::from(PLACEHOLDER);
-    match version.len().cmp(&PLACEHOLDER.len()) {
-        // Keep the byte length identical so nothing shifts columns.
-        std::cmp::Ordering::Greater => {
-            replacement.push_str(&" ".repeat(version.len() - PLACEHOLDER.len()))
-        }
-        std::cmp::Ordering::Less => replacement.truncate(version.len()),
-        std::cmp::Ordering::Equal => {}
-    }
-    frame.replace(version, &replacement)
-}
-
 /// Compare `actual` against the golden file for `name`, or rewrite it
 /// when `UPDATE_SNAPSHOTS` is set.
 ///
 /// Panics with the full expected/actual text on mismatch: a snapshot
 /// failure is only useful if the reader can see what moved.
 pub fn assert_snapshot(name: &str, actual: &str) {
-    let actual = &mask_version(actual);
     let path = snapshot_path(name);
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         if let Some(dir) = path.parent() {
@@ -128,7 +101,7 @@ pub fn assert_snapshot(name: &str, actual: &str) {
             path.display()
         );
     };
-    if expected != *actual {
+    if expected != actual {
         panic!(
             "snapshot {} does not match.\n\
              If the change is intended, re-run with UPDATE_SNAPSHOTS=1 and read the diff.\n\

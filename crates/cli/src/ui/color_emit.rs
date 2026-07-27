@@ -250,6 +250,55 @@ pub fn quantize_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * r6 + 6 * g6 + b6
 }
 
+/// Inverse of [`quantize_to_ansi256`]: the RGB an ANSI-256 index
+/// stands for.
+///
+/// Exact for the colour cube and the greyscale ramp, and canonical
+/// xterm values for the 16 system slots (which a terminal may
+/// nonetheless redefine). Needed because the 256-colour downgrade turns
+/// every palette slot into an index, and code that has to reason about
+/// a colour — how legible text will be on top of it — otherwise sees
+/// nothing it can measure.
+pub fn ansi256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    /// The six cube levels, per channel.
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match idx {
+        0..=15 => SYSTEM_RGB[idx as usize],
+        16..=231 => {
+            let n = idx - 16;
+            (
+                LEVELS[(n / 36) as usize],
+                LEVELS[((n % 36) / 6) as usize],
+                LEVELS[(n % 6) as usize],
+            )
+        }
+        232..=255 => {
+            let v = 8 + 10 * (idx - 232);
+            (v, v, v)
+        }
+    }
+}
+
+/// Canonical xterm RGB for the 16 system colours, in index order.
+const SYSTEM_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
 /// Map a 0..=255 channel value to a 0..=5 cube step. The cube levels
 /// are 0, 95, 135, 175, 215, 255 — non-linear, so we pick the closest
 /// level by midpoint thresholds.

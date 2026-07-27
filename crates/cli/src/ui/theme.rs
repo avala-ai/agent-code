@@ -225,6 +225,74 @@ fn brighten(c: Color, amt: u8) -> Color {
     }
 }
 
+/// WCAG AA contrast floor for normal-size text.
+pub(crate) const MIN_TEXT_CONTRAST: f32 = 4.5;
+
+/// WCAG relative luminance of an sRGB triple.
+pub(crate) fn relative_luminance(r: u8, g: u8, b: u8) -> f32 {
+    let ch = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+}
+
+/// WCAG contrast ratio between two relative luminances.
+pub(crate) fn contrast_ratio(a: f32, b: f32) -> f32 {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn luminance_of(c: Color) -> Option<f32> {
+    match c {
+        Color::Rgb { r, g, b } => Some(relative_luminance(r, g, b)),
+        _ => None,
+    }
+}
+
+/// Darken or lighten `fg` until it clears `min` contrast against `bg`.
+///
+/// Used for derived slots that pair a palette hue with a palette
+/// background: on `solarized-light` the yellow that reads as "code" sits
+/// at about 2.7:1 on the cream code background, which is a hue chosen
+/// for a role without checking it against the surface it lands on.
+/// Blending toward the contrasting pole keeps the hue recognisable
+/// where a straight swap to the text colour would not.
+///
+/// Named (non-RGB) colours are returned untouched. The ANSI-16 themes
+/// exist precisely to defer to whatever palette the terminal defines,
+/// so second-guessing them with computed RGB would defeat the point.
+fn ensure_contrast(fg: Color, bg: Color, min: f32) -> Color {
+    let (Some(fg_l), Some(bg_l)) = (luminance_of(fg), luminance_of(bg)) else {
+        return fg;
+    };
+    if contrast_ratio(fg_l, bg_l) >= min {
+        return fg;
+    }
+    let pole = if contrast_ratio(bg_l, 0.0) >= contrast_ratio(bg_l, 1.0) {
+        Color::Rgb { r: 0, g: 0, b: 0 }
+    } else {
+        Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    };
+    for step in 1..=10 {
+        let candidate = mix(fg, pole, step as f32 / 10.0);
+        if let Some(l) = luminance_of(candidate)
+            && contrast_ratio(l, bg_l) >= min
+        {
+            return candidate;
+        }
+    }
+    pole
+}
+
 /// Parse a `"#rrggbb"` (or `"rrggbb"`) hex string into a [`Color::Rgb`].
 /// Returns `None` for anything that isn't exactly six hex digits.
 fn parse_hex(s: &str) -> Option<Color> {
@@ -249,6 +317,11 @@ fn rgb(hex: &str) -> Color {
 /// [`Theme`] field is filled here — semantic roles map onto the base
 /// colours, and derived tints/shades come from [`mix`]/[`brighten`].
 fn theme_from_palette(p: &Palette) -> Theme {
+    // `mix` passes its *first* argument through unchanged for named
+    // (non-RGB) colours, so the background is written first: on the
+    // ANSI-16 themes this degrades to the plain theme background rather
+    // than silently becoming the foreground colour.
+    let code_bg = mix(p.bg, p.fg, 0.08);
     Theme {
         accent: p.accent,
         error: p.red,
@@ -260,12 +333,10 @@ fn theme_from_palette(p: &Palette) -> Theme {
         plan: p.purple,
         text: p.fg,
         bg: p.bg,
-        code_fg: p.yellow,
-        // `mix` passes its *first* argument through unchanged for named
-        // (non-RGB) colours, so the background is written first: on the
-        // ANSI-16 themes this degrades to the plain theme background
-        // rather than silently becoming the foreground colour.
-        code_bg: mix(p.bg, p.fg, 0.08),
+        // Code keeps the palette's yellow as its hue, darkened or
+        // lightened only as far as the code background requires.
+        code_fg: ensure_contrast(p.yellow, code_bg, MIN_TEXT_CONTRAST),
+        code_bg,
         diff_add: p.green,
         diff_remove: p.red,
         agent_colors: [
@@ -813,10 +884,24 @@ mod tests {
             assert!(!matches!(t.bg, Color::Reset), "{id}: bg unset");
             assert!(!matches!(t.code_fg, Color::Reset), "{id}: code_fg unset");
             assert!(!matches!(t.code_bg, Color::Reset), "{id}: code_bg unset");
-            assert_ne!(
-                t.code_fg, t.code_bg,
-                "{id}: code text invisible on its own background"
-            );
+            // "Different colours" is far too weak a bar for text: on
+            // solarized-light the palette yellow differs from the cream
+            // code background and is still only 2.7:1. Measure it.
+            if let (Some(fg), Some(bg)) = (luminance_of(t.code_fg), luminance_of(t.code_bg)) {
+                let ratio = contrast_ratio(fg, bg);
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{id}: inline code reaches only {ratio:.2}:1 \
+                     ({:?} on {:?})",
+                    t.code_fg,
+                    t.code_bg
+                );
+            } else {
+                assert_ne!(
+                    t.code_fg, t.code_bg,
+                    "{id}: code text invisible on its own background"
+                );
+            }
             // `mix` returns its first argument unchanged for named
             // colours. Writing the background first means the ANSI-16
             // palettes fall back to the plain background here; getting

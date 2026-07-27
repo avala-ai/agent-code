@@ -84,16 +84,12 @@ pub fn palette() -> Palette {
 /// the theme background — on `solarized-light` that is cream on
 /// `#b58900`, about 3:1.
 ///
-/// Colours whose luminance cannot be determined (`Reset`, and the
-/// indexed values the 256-colour downgrade produces) fall back to the
-/// background. Under `NO_COLOR` that is the case that applies: every
-/// candidate is already `Reset`, so the fill and its text collapse
-/// together and the row stays readable.
+/// Named and indexed fills are decoded to RGB first, so the ANSI-16
+/// themes and the 256-colour downgrade get a real decision rather than a
+/// default. `Reset` is the only colour left with no luminance, and it is
+/// what `NO_COLOR` produces: every candidate is `Reset` too, so the fill
+/// and its text collapse together and the row stays readable.
 pub fn on_fill(fill: Color) -> Color {
-    /// WCAG AA for normal text. Badge text is short and usually bold,
-    /// but these bars carry the words the user must act on.
-    const MIN_CONTRAST: f32 = 4.5;
-
     let p = palette();
     let Some(fill_l) = luminance(fill) else {
         return p.bg;
@@ -106,7 +102,7 @@ pub fn on_fill(fill: Color) -> Color {
         .filter_map(|c| luminance(c).map(|l| (contrast(fill_l, l), c)))
         .max_by(|a, b| a.0.total_cmp(&b.0));
     if let Some((ratio, c)) = best
-        && ratio >= MIN_CONTRAST
+        && ratio >= theme::MIN_TEXT_CONTRAST
     {
         return c;
     }
@@ -125,32 +121,30 @@ pub fn on_fill(fill: Color) -> Color {
 
 /// WCAG contrast ratio between two relative luminances.
 pub(super) fn contrast(a: f32, b: f32) -> f32 {
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    (hi + 0.05) / (lo + 0.05)
+    theme::contrast_ratio(a, b)
 }
 
 /// WCAG relative luminance, or `None` when the colour carries no
 /// inspectable RGB value.
 pub(super) fn luminance(c: Color) -> Option<f32> {
     let (r, g, b) = rgb_of(c)?;
-    let ch = |v: u8| {
-        let v = f32::from(v) / 255.0;
-        if v <= 0.039_28 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    Some(0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b))
+    Some(theme::relative_luminance(r, g, b))
 }
 
 /// Approximate RGB for a ratatui colour. The named ANSI slots use the
 /// canonical xterm values, so the ANSI-16 accessibility themes — whose
 /// palettes are named rather than RGB — still get a real contrast
 /// decision instead of the fallback.
+///
+/// Indexed values matter just as much: on Apple Terminal, `screen` and
+/// `tmux` the 256-colour downgrade turns *every* slot into an index, so
+/// treating those as unknowable would silently disable the contrast
+/// pick on exactly the terminals that cannot show the intended colour
+/// in the first place.
 fn rgb_of(c: Color) -> Option<(u8, u8, u8)> {
     Some(match c {
         Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => crate::ui::color_emit::ansi256_to_rgb(i),
         Color::Black => (0, 0, 0),
         Color::Red => (205, 0, 0),
         Color::Green => (0, 205, 0),
@@ -258,6 +252,39 @@ mod tests {
         crate::ui::theme::init("one-dark");
         let p = palette();
         assert_eq!(on_fill(p.warning), p.bg);
+    }
+
+    /// The 256-colour downgrade — Apple Terminal, `screen`, `tmux`, or
+    /// an explicit `AGENT_CODE_COLOR_MODE=ansi256` — replaces every slot
+    /// with an index. If those read as unmeasurable the badge silently
+    /// falls back to the theme background, which is the low-contrast
+    /// pairing this whole helper exists to avoid, on the terminals least
+    /// able to render around it.
+    #[test]
+    fn badges_stay_readable_after_the_256_colour_downgrade() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        let _g = crate::ui::theme::test_lock();
+        let _mode = pin_mode(EmitMode::Ansi256);
+        for name in ["solarized-light", "one-dark", "light-colorblind"] {
+            crate::ui::theme::init(name);
+            let p = palette();
+            for (slot, fill) in [("accent", p.accent), ("warning", p.warning)] {
+                assert!(
+                    matches!(fill, Color::Indexed(_)),
+                    "{name}: {slot} should be indexed in ansi256 mode, got {fill:?}"
+                );
+                let fg = on_fill(fill);
+                let ratio = contrast(
+                    luminance(fg).expect("decoded fg"),
+                    luminance(fill).expect("decoded fill"),
+                );
+                assert!(
+                    ratio >= theme::MIN_TEXT_CONTRAST,
+                    "{name}: {slot} badge only reaches {ratio:.2}:1 after downgrade"
+                );
+            }
+        }
+        crate::ui::theme::init("one-dark");
     }
 
     /// Under `NO_COLOR` there is nothing to contrast against; the fill

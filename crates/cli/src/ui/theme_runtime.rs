@@ -169,6 +169,11 @@ impl From<legacy::Theme> for Theme {
     }
 }
 
+/// Shared contrast utilities. Live on the palette side because that is
+/// where derived slots are computed; re-exported so the ratatui-side
+/// chrome measures legibility the same way.
+pub(crate) use legacy::{MIN_TEXT_CONTRAST, contrast_ratio, relative_luminance};
+
 pub fn styled(text: &str, color: Color) -> StyledContent<String> {
     legacy::styled(text, color)
 }
