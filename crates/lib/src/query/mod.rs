@@ -309,6 +309,7 @@ impl QueryEngine {
         // `/add-dir` tells the model it may read and edit these paths
         // without re-asking. That permission was given to the previous
         // conversation.
+        let dropped_dirs = !state.additional_dirs.is_empty();
         state.additional_dirs.clear();
         state.brief_mode = false;
         state.response_style = crate::state::ResponseStyle::default();
@@ -325,6 +326,15 @@ impl QueryEngine {
         // Per-model breakdown behind `/cost`; the totals are restored
         // from the session file, so a stale breakdown would not add up.
         state.model_usage.clear();
+
+        // Narrowing the working set is a cwd change like `/add-dir
+        // --clear` is, and external watchers and indexers subscribe to
+        // it. Silently dropping the paths would leave them tracking
+        // directories this engine no longer has in scope.
+        if dropped_dirs {
+            let cwd = self.state.cwd.clone();
+            self.fire_cwd_changed_hooks(&cwd, "session-swap").await;
+        }
     }
 
     /// Set plan mode for the next permission / executor check without
@@ -406,8 +416,10 @@ impl QueryEngine {
 
     /// Run any configured `CwdChanged` hooks when the session's
     /// working-directory state mutates. `cause` is `"cd"` when the
-    /// primary cwd was replaced (e.g. via `/cd`) and `"add-dir"` when
-    /// the additional-dirs set changed (via `/add-dir`). Context
+    /// primary cwd was replaced (e.g. via `/cd`), `"add-dir"` when
+    /// the additional-dirs set changed (via `/add-dir`), and
+    /// `"session-swap"` when a resume dropped the previous
+    /// conversation's tracked directories. Context
     /// carries the previous and new cwd plus the current
     /// additional-dirs list so repo-watchers / file-indexers can
     /// retune their scope without re-polling state.

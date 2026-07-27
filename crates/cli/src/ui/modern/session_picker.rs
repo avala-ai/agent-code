@@ -371,12 +371,15 @@ impl App {
         // Submitting during the resume window moved the phase to
         // Streaming, but the gate stopped any turn from spawning, so
         // nothing will ever reap it back to Idle — and a stuck Streaming
-        // phase makes every later Enter queue instead of send. No turn
-        // can be live here (spawning is blocked for the whole window).
-        // A HITL modal keeps the phase it owns.
-        if self.modals.is_empty() && self.phase != Phase::Idle {
+        // phase makes every later Enter queue instead of send.
+        //
+        // Only when no turn is actually live. Accepting the picker
+        // mid-stream reaches here with a real `TurnHandle` still owned by
+        // the event loop: forcing Idle there would send Ctrl+C down the
+        // quit path instead of cancelling the turn. A HITL modal likewise
+        // keeps the phase it owns.
+        if !self.turn_live && self.modals.is_empty() && self.phase != Phase::Idle {
             self.phase = Phase::Idle;
-            self.turn_live = false;
             self.dirty = true;
         }
     }
@@ -1358,6 +1361,26 @@ mod tests {
             app.phase,
             Phase::Idle,
             "the app is stuck mid-turn with no turn to end it"
+        );
+    }
+
+    /// Accepting the picker mid-stream reaches the reclaim path with a
+    /// real turn still owned by the event loop. Forcing Idle there would
+    /// send Ctrl+C down the quit path instead of cancelling the turn.
+    #[test]
+    fn reclaiming_does_not_unstick_a_genuinely_live_turn() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.mark_turn_started();
+        assert!(app.turn_live, "fixture did not start a turn");
+        app.pending_submit = Some("staged".into());
+
+        app.adopt_restored_session(&restored());
+
+        assert!(app.turn_live, "a live turn was marked dead");
+        assert_ne!(
+            app.phase,
+            Phase::Idle,
+            "Ctrl+C would now quit instead of cancelling the running turn"
         );
     }
 
