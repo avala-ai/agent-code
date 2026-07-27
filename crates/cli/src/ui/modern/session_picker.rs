@@ -422,6 +422,16 @@ impl App {
     fn reclaim_staged_prompts(&mut self, header: &str, spill: &mut Vec<String>) {
         let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
+        // A prompt whose images are still being encoded is inside the
+        // blocking task, not in `pending_submit`, so nothing else here
+        // can reach it — and the restore bumps the epoch, which makes
+        // the eventual result be discarded. Without this it disappeared
+        // silently, which is the one thing this function exists to
+        // prevent.
+        if let Some(text) = self.encoding_display.take() {
+            self.remove_staged_row(&text);
+            carried.push(text);
+        }
         if let Some(payload) = self.pending_submit.take() {
             // Its images go back with it. The descriptors and any bytes
             // already read from them belong to *this* prompt, and the
@@ -1796,6 +1806,29 @@ work",
         assert!(
             app.pending_attachments.is_empty(),
             "encoded bytes stayed staged and would attach to the next prompt"
+        );
+    }
+
+    /// A prompt whose images are still encoding lives inside the
+    /// blocking task, not in `pending_submit`. The restore bumps the
+    /// conversation epoch, so the encode result is discarded when it
+    /// lands — without reclaiming the text here the user's typed words
+    /// vanish with it, which is exactly what this path exists to stop.
+    #[test]
+    fn a_prompt_still_encoding_is_reported_not_lost() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.encoding_display = Some("look at @shot.png please".into());
+
+        let mut spill = Vec::new();
+        app.reclaim_staged_prompts("not sent:", &mut spill);
+
+        assert!(
+            spill.iter().any(|s| s.contains("look at @shot.png please")),
+            "the in-flight prompt was not reported back: {spill:?}"
+        );
+        assert!(
+            app.encoding_display.is_none(),
+            "the stash must be consumed, or it would be reported twice"
         );
     }
 }

@@ -521,7 +521,15 @@ pub(super) async fn event_loop(
                         // and no lifecycle at all for the restored session.
                         {
                             let engine_arc = session.engine();
-                            let eng = engine_arc.lock().await;
+                            let mut eng = engine_arc.lock().await;
+                            // A cancelled turn leaves `cancel` cancelled
+                            // until the next `begin_turn`, and `run_hooks`
+                            // refuses a cancelled scope — so resuming
+                            // after a cancel would have dropped both
+                            // lifecycle events, which is precisely when a
+                            // teardown hook matters most. No turn is in
+                            // flight here, so renewing is safe.
+                            eng.renew_cancel_scope();
                             let _ = eng.fire_session_stop_hooks().await;
                         }
                         let engine_arc = session.engine();
@@ -865,6 +873,13 @@ pub(super) async fn event_loop(
             && let Some(prompt) = app.pending_submit.take()
         {
             let images = std::mem::take(&mut app.pending_images);
+            // Keep the user's own words where the UI can still reach
+            // them: `prompt` is about to move into the blocking task,
+            // and a resume accepted before it lands drops the result.
+            app.encoding_display = app
+                .pending_submit_display
+                .take()
+                .or_else(|| Some(prompt.clone()));
             let tx = img_tx.clone();
             encode_seq += 1;
             let id = encode_seq;
@@ -1260,9 +1275,14 @@ pub(super) async fn event_loop(
                     // resumed or rewound. Starting it now would attach the
                     // file to a thread the user never attached it to.
                     active_encode = None;
+                    // Its text was handed back when the conversation was
+                    // replaced, so it is not lost with the bytes.
+                    app.encoding_display = None;
                     app.abandon_staged_attachments();
                 } else {
                     active_encode = None;
+                    // It arrived, so nothing needs reclaiming on its behalf.
+                    app.encoding_display = None;
                     for note in notes {
                         app.transcript.push(super::app::TranscriptItem::System(note));
                     }

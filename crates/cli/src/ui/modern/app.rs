@@ -484,6 +484,14 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pub deferred_prompts:
         std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
+    /// The display text of a prompt whose images are being encoded off
+    /// this thread.
+    ///
+    /// The prompt itself has already been moved into the blocking task,
+    /// so nothing else can hand it back. A resume accepted mid-encode
+    /// discards the result (the conversation it belonged to is gone),
+    /// and without this copy the user's typed words vanished with it.
+    pub encoding_display: Option<String>,
     /// Set when the *user* picks a mode (`/plan`, Shift+Tab), cleared
     /// once that choice has been applied to the engine.
     ///
@@ -686,6 +694,7 @@ impl App {
             pending_attachments: Vec::new(),
             cancel_is_interject: false,
             deferred_prompts: std::collections::VecDeque::new(),
+            encoding_display: None,
             mode_chosen: false,
             vi_mode: false,
             composer_mode: ComposerMode::Insert,

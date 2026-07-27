@@ -294,6 +294,19 @@ impl QueryEngine {
     /// This is deliberately one call rather than a checklist at the call
     /// site — a swap that forgets a field is exactly the bug this
     /// prevents, and new session-local state should be added here.
+    /// Start a fresh cancellation scope.
+    ///
+    /// `cancel` stays cancelled after an aborted turn until the next
+    /// `begin_turn`, and everything that consults it — `run_hooks` above
+    /// all — refuses to start while it is. A session swap is a new scope
+    /// in its own right, so it renews the token rather than inheriting
+    /// the cancellation of the turn the user abandoned. Safe only with
+    /// no turn in flight, which is what the caller waits for.
+    pub fn renew_cancel_scope(&mut self) {
+        self.cancel = CancellationToken::new();
+        *self.cancel_shared.lock().unwrap() = self.cancel.clone();
+    }
+
     pub async fn reset_for_session_swap(&mut self) {
         // The executor consults this store *before* prompting, so a
         // carried-over entry silently skips the ask.
