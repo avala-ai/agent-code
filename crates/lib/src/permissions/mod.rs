@@ -483,9 +483,10 @@ pub(crate) fn matches_shell_command(pattern: &str, command: &str, widening: bool
     let Some(parsed) = parsed else {
         return false;
     };
-    // `env -S '${CMD} -rf x'` runs whatever CMD expands to; there is
-    // no text to vouch for.
-    if crate::tools::bash_parse::has_dynamic_wrapper(&parsed) {
+    // `env -S '${CMD} -rf x'` runs whatever CMD expands to, and a
+    // wrapper chain past the unwrap budget hides whatever sits at its
+    // end; either way there is no text to vouch for.
+    if crate::tools::bash_parse::unresolved_wrapper(&parsed).is_some() {
         return false;
     }
     if parsed.has_parse_error
@@ -1396,6 +1397,39 @@ mod tests {
                 PermissionDecision::Allow
             ),
             "an unknowable wrapped command must not be auto-allowed"
+        );
+    }
+
+    /// Nor can a chain long enough to outrun the unwrap budget: the
+    /// command at its end was never reached, so `Allow("env *")` has
+    /// nothing to vouch for. A chain the budget does cover still
+    /// resolves, and an `rm` behind it keeps costing permissions.
+    #[test]
+    fn wrapper_chain_past_the_budget_fails_closed_against_widening_rule() {
+        let c = checker(vec![rule("Bash", "env *", PermissionMode::Allow)]);
+        for depth in [9usize, 12] {
+            let cmd = format!("{}$'rm' -rf /tmp/x", "env ".repeat(depth));
+            assert!(
+                !matches!(
+                    c.check("Bash", &bash_input(&cmd)),
+                    PermissionDecision::Allow
+                ),
+                "a chain past the unwrap budget must not be auto-allowed: {cmd}"
+            );
+        }
+        let c = checker(vec![
+            rule("Bash", "rm *", PermissionMode::Ask),
+            rule("Bash", "*", PermissionMode::Allow),
+        ]);
+        assert!(
+            matches!(
+                c.check(
+                    "Bash",
+                    &bash_input("env env env env env env env env $'rm' /tmp/victim")
+                ),
+                PermissionDecision::Ask(_)
+            ),
+            "a chain at the budget must still un-hide its command from a restrictive rule"
         );
     }
 

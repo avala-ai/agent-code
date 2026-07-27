@@ -186,7 +186,10 @@ fn command_argv(node: Node, source: &[u8]) -> Vec<String> {
 /// `-dele\te`.
 ///
 /// Follows shell rules closely enough for matching: inside single
-/// quotes a backslash is literal; elsewhere `\x` yields `x`.
+/// quotes a backslash is literal; elsewhere `\x` yields `x`. ANSI-C
+/// quoting is decoded too — bash hands `$'git'` to the kernel as
+/// `git`, so leaving the `$` in place would let that spelling walk
+/// past every scan that matches on the unquoted token.
 pub fn unquote_token(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -219,9 +222,48 @@ pub fn unquote_token(raw: &str) -> String {
                 },
                 _ => out.push(c),
             },
-            Some(_) => unreachable!("only ' and \" open a quote"),
+            // ANSI-C string body: `$'…'`, tracked as `Some('$')`.
+            Some('$') => match c {
+                '\'' => quote = None,
+                '\\' => {
+                    // An escape that evaluates to NUL truncates: bash
+                    // drops the NUL and the rest of the quoted segment,
+                    // so `$'git\x00junk'` is `git`. Skip to the closing
+                    // quote (escapes still pair, so `\'` cannot end the
+                    // segment early) or the head stays hidden.
+                    if push_ansi_c_escape(&mut chars, &mut out) {
+                        while let Some(rest) = chars.next() {
+                            match rest {
+                                '\'' => break,
+                                '\\' => {
+                                    chars.next();
+                                }
+                                _ => {}
+                            }
+                        }
+                        quote = None;
+                    }
+                }
+                _ => out.push(c),
+            },
+            Some(_) => unreachable!("only ', \" and $' open a quote"),
             None => match c {
                 '\'' | '"' => quote = Some(c),
+                '$' => match chars.peek() {
+                    // ANSI-C quoting: bash decodes the escapes and the
+                    // command sees only the result, so `$'git' push
+                    // --force` executes `git push --force`.
+                    Some('\'') => {
+                        chars.next();
+                        quote = Some('$');
+                    }
+                    // Locale translation `$"…"` behaves like `"…"`.
+                    Some('"') => {
+                        chars.next();
+                        quote = Some('"');
+                    }
+                    _ => out.push('$'),
+                },
                 '\\' => match chars.next() {
                     Some('\n') | None => {}
                     Some(next) => out.push(next),
@@ -233,14 +275,141 @@ pub fn unquote_token(raw: &str) -> String {
     out
 }
 
+/// Decode one backslash escape inside an ANSI-C `$'…'` string,
+/// pushing what bash would hand to the command. `$'r\x6d'` is `rm`,
+/// so numeric escapes must decode to their character or the pattern
+/// scans compare against the wrong text. Escapes bash leaves alone
+/// are kept literally.
+///
+/// Returns `true` when the escape evaluates to NUL (`\0`, `\x00`,
+/// `\u0000`, `\c@`, …): bash discards the NUL and everything after it
+/// in the quoted segment, and the caller must truncate the same way.
+fn push_ansi_c_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) -> bool {
+    fn radix_value(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max_digits: u32,
+        seed: u32,
+    ) -> u32 {
+        let mut value = seed;
+        let mut taken = 0;
+        while taken < max_digits {
+            match chars.peek().and_then(|c| c.to_digit(radix)) {
+                Some(d) => {
+                    chars.next();
+                    value = value * radix + d;
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+        value
+    }
+    fn push_nul_or(decoded: char, out: &mut String) -> bool {
+        if decoded == '\0' {
+            true
+        } else {
+            out.push(decoded);
+            false
+        }
+    }
+    let Some(esc) = chars.next() else {
+        out.push('\\');
+        return false;
+    };
+    match esc {
+        'a' => out.push('\x07'),
+        'b' => out.push('\x08'),
+        'e' | 'E' => out.push('\x1b'),
+        'f' => out.push('\x0c'),
+        'n' => out.push('\n'),
+        'r' => out.push('\r'),
+        't' => out.push('\t'),
+        'v' => out.push('\x0b'),
+        '\\' | '\'' | '"' | '?' => out.push(esc),
+        'x' => match chars.peek().and_then(|c| c.to_digit(16)) {
+            Some(_) => {
+                return push_nul_or(char::from(radix_value(chars, 16, 2, 0) as u8), out);
+            }
+            None => out.push_str("\\x"),
+        },
+        'u' | 'U' => {
+            let max = if esc == 'u' { 4 } else { 8 };
+            match chars.peek().and_then(|c| c.to_digit(16)) {
+                // Bash omits an out-of-range code point rather than
+                // substituting anything, so `$'\Uffffffffgit'` is
+                // `git`; inventing a character here would hide it.
+                Some(_) => {
+                    let value = radix_value(chars, 16, max, 0);
+                    return match char::from_u32(value) {
+                        Some(decoded) => push_nul_or(decoded, out),
+                        None => false,
+                    };
+                }
+                None => {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+        }
+        d @ '0'..='7' => {
+            // Octal, up to three digits counting this one; bash keeps
+            // the low eight bits.
+            let value = radix_value(chars, 8, 2, d.to_digit(8).unwrap_or(0));
+            return push_nul_or(char::from((value & 0xff) as u8), out);
+        }
+        'c' => match chars.next() {
+            // `\cX` is Ctrl-X, masked the way bash masks it: `x & 0x1f`
+            // (with `\c?` as DEL). An XOR would map non-letters onto
+            // printable text — `\c3` must become byte 0x13, not `s`,
+            // or `printf %s $'\c3hutdown'` reads as `shutdown`.
+            Some('?') => out.push('\x7f'),
+            Some(ctl) if ctl.is_ascii() => {
+                return push_nul_or(char::from((ctl as u8) & 0x1f), out);
+            }
+            Some(other) => out.push(other),
+            None => out.push_str("\\c"),
+        },
+        other => {
+            out.push('\\');
+            out.push(other);
+        }
+    }
+    false
+}
+
 /// Strip a leading path from an already-unquoted command name.
 pub fn base_name(name: &str) -> String {
     name.rsplit('/').next().unwrap_or(name).to_string()
 }
 
+/// Commands whose operands are text to print, match or transform —
+/// never a program to run. A shell name among *their* arguments is
+/// data: `printf '%s\n' bash -c "'git' push --force"` prints four
+/// words.
+///
+/// Only this direction is listed. An unrecognised head keeps counting
+/// as a possible runner, so `firejail bash -c '…'` and every other
+/// runner nobody enumerated still recurse.
+/// Interpreters that can run a command are deliberately absent, even
+/// though their operands look like text: `awk 'BEGIN{system(ARGV[1] …
+/// )}' git push -uf` executes what follows, and `sed`'s `e` and the
+/// pagers' shell escapes do the same. Their arguments are not data.
+pub(crate) const DATA_COMMANDS: &[&str] = &[
+    "echo", "printf", "cat", "tee", "grep", "egrep", "fgrep", "rg", "ag", "tr", "cut", "paste",
+    "sort", "uniq", "head", "tail", "wc", "fold", "column", "diff", "comm", "jq", "yq", "strings",
+    "logger",
+];
+
 /// Commands whose job is to run the command that follows them, so the
 /// wrapper name says nothing about what actually executes.
-const COMMAND_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid"];
+/// `exec` is here because it replaces the shell with what follows, so
+/// `exec env -S '…'` runs whatever that `env` resolves to; leaving it
+/// out stopped the walk at `exec` and reported nothing wrapped.
+const COMMAND_WRAPPERS: &[&str] = &["env", "command", "nohup", "setsid", "exec"];
 
 /// True when `tok` is a `NAME=value` environment assignment.
 pub fn is_env_assignment(tok: &str) -> bool {
@@ -317,7 +486,7 @@ fn resolve_env_long(name: &str) -> Option<EnvLong> {
 /// wrapper), with the wrapper's options and their operands consumed.
 /// [`Unwrap::None`] when no command executes behind the arguments —
 /// including options this parser does not know, which env rejects.
-/// [`Unwrap::Dynamic`] when a command runs but only expansion decides
+/// [`Unresolved::Expansion`] when a command runs but only expansion decides
 /// which; mislocating it would hand restrictive rules text that
 /// silently fails to match.
 fn strip_wrapper(tokens: &[String]) -> Unwrap {
@@ -329,7 +498,11 @@ fn strip_wrapper(tokens: &[String]) -> Unwrap {
             }
         };
     }
-    let is_env = base_name(reject_unless!(tokens.first())) == "env";
+    let head = base_name(reject_unless!(tokens.first()));
+    let is_env = head == "env";
+    // `exec -a NAME cmd` renames argv[0]: the name is the option's
+    // operand, not the command being run.
+    let is_exec = head == "exec";
     let rest = &tokens[1..];
     let mut i = 0;
     while i < rest.len() {
@@ -371,6 +544,17 @@ fn strip_wrapper(tokens: &[String]) -> Unwrap {
             continue;
         }
         if let Some(cluster) = tok.strip_prefix('-') {
+            if is_exec && !cluster.is_empty() {
+                match cluster.find('a') {
+                    // `-a NAME` and `-aNAME`, clustered or not.
+                    Some(pos) if cluster[pos + 1..].is_empty() => {
+                        reject_unless!(rest.get(i + 1));
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+                continue;
+            }
             if !is_env || cluster.is_empty() {
                 // Bare `-` is env's shorthand for `-i`; non-env
                 // wrappers have no operand-taking options to consume.
@@ -434,20 +618,35 @@ fn split_string_tokens(wrapper: &str, operand: &str, remainder: &[String]) -> Un
 pub enum Unwrap {
     /// The wrapped command's tokens.
     Tokens(Vec<String>),
-    /// A command runs but its identity cannot be known at gate time:
-    /// `env -S` expands `${VAR}` itself, so `CMD=rm env -S '${CMD} -rf
-    /// x'` executes `rm`. Gates must treat this as unknown, not as
-    /// "nothing wrapped" — a silent drop lets a broad allow through.
-    Dynamic,
+    /// A command runs but this parser cannot say which. Gates must
+    /// treat it as unknown, not as "nothing wrapped" — a silent drop
+    /// lets a broad allow through and hides the command from the
+    /// destructive-command scan.
+    Unresolved(Unresolved),
     /// Nothing was unwrapped: the head is not a wrapper, or the
     /// arguments are ones env itself rejects, so no command executes
     /// behind them.
     None,
 }
 
+/// Why a wrapper chain resolved to no identifiable command even though
+/// one runs. Every variant is a *resolution failure*, never an
+/// all-clear: the only correct response is to fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unresolved {
+    /// Run-time expansion decides the command: `env -S` expands
+    /// `${VAR}` itself, so `CMD=rm env -S '${CMD} -rf x'` executes
+    /// `rm`.
+    Expansion,
+    /// The wrapper chain outruns [`MAX_UNWRAP_HOPS`]. A command still
+    /// executes behind the wrappers; this parser just never reached
+    /// it.
+    Depth,
+}
+
 /// Split an `env -S` string the way GNU env does: whitespace-separated
 /// words, single and double quotes, backslash escapes, `#` comments
-/// and the `\c` terminator. [`Unwrap::Dynamic`] when `$` expansion
+/// and the `\c` terminator. [`Unresolved::Expansion`] when `$` expansion
 /// decides the command; [`Unwrap::None`] for sequences env rejects at
 /// runtime, behind which nothing executes anyway.
 fn split_env_s(s: &str) -> Unwrap {
@@ -473,7 +672,7 @@ fn split_env_s(s: &str) -> Unwrap {
         match c {
             c if c.is_whitespace() => end_word(&mut cur, &mut in_word, &mut words),
             '#' if !in_word => break,
-            '$' => return Unwrap::Dynamic,
+            '$' => return Unwrap::Unresolved(Unresolved::Expansion),
             '\'' => {
                 in_word = true;
                 loop {
@@ -492,7 +691,7 @@ fn split_env_s(s: &str) -> Unwrap {
                 loop {
                     match next_or_reject!(chars) {
                         '"' => break,
-                        '$' => return Unwrap::Dynamic,
+                        '$' => return Unwrap::Unresolved(Unresolved::Expansion),
                         '\\' => {
                             let esc = next_or_reject!(chars);
                             if esc == '_' {
@@ -550,11 +749,21 @@ fn env_s_escape(c: char) -> Option<char> {
     })
 }
 
+/// How many wrappers may be stripped before the chain is declared
+/// unresolvable. A bound is kept rather than removed so a wrapper that
+/// re-expands into itself cannot spin here; running out of it is a
+/// failure to resolve, not an all-clear.
+const MAX_UNWRAP_HOPS: usize = 8;
+
 /// The invocation's tokens with any leading wrapper chain stripped.
+/// Resolution is retried after every strip, so a chain exactly as long
+/// as the budget still names its command; only a chain that is *still*
+/// wrapped once the budget is spent is [`Unresolved::Depth`].
 fn unwrapped_tokens(argv: &[String]) -> Unwrap {
     let mut tokens: Vec<String> = argv.iter().map(|a| unquote_token(a)).collect();
     let mut unwrapped = false;
-    for _ in 0..8 {
+    let mut hops = 0;
+    loop {
         let Some(first) = tokens.first() else {
             return Unwrap::None;
         };
@@ -565,13 +774,16 @@ fn unwrapped_tokens(argv: &[String]) -> Unwrap {
                 Unwrap::None
             };
         }
+        if hops == MAX_UNWRAP_HOPS {
+            return Unwrap::Unresolved(Unresolved::Depth);
+        }
         match strip_wrapper(&tokens) {
             Unwrap::Tokens(next) => tokens = next,
             other => return other,
         }
         unwrapped = true;
+        hops += 1;
     }
-    Unwrap::None
 }
 
 /// For a wrapper invocation (`env`, `command`, `nohup`, `setsid`),
@@ -602,15 +814,137 @@ pub fn unwrapped_invocation_texts(parsed: &ParsedCommand) -> Vec<String> {
         .collect()
 }
 
-/// True when some invocation runs a command whose identity only
-/// run-time expansion decides (`env -S '${CMD} -rf x'`). The command
-/// text a gate would match is unknowable, so widening rules must fail
-/// closed rather than treat the invocation as "nothing wrapped".
+/// The words GNU `env -S` splits an operand into. `None` when the
+/// split cannot be known statically (`$` expansion decides it) or when
+/// env would reject the string, so nothing runs behind it.
+///
+/// Exposed so gates that need to see what `-S` unpacks — environment
+/// assignments, for one — read the same semantics the wrapper
+/// resolution uses instead of approximating them.
+pub fn env_split_string(operand: &str) -> Option<Vec<String>> {
+    match split_env_s(operand) {
+        Unwrap::Tokens(words) => Some(words),
+        _ => None,
+    }
+}
+
+/// The tokens a wrapper chain runs, for gates that need the argv
+/// rather than the joined text of [`unwrapped_invocation_texts`].
+/// `None` when the head is not a wrapper, or no wrapped command can be
+/// identified — including the unresolved cases, which
+/// [`unresolved_wrapper`] reports separately so callers can fail
+/// closed instead of treating them as "nothing wrapped".
+pub fn unwrapped_argv(argv: &[String]) -> Option<Vec<String>> {
+    match unwrapped_tokens(argv) {
+        Unwrap::Tokens(tokens) => Some(tokens),
+        _ => None,
+    }
+}
+
+/// The reason some invocation runs a command this parser cannot name —
+/// run-time expansion (`env -S '${CMD} -rf x'`) or a wrapper chain
+/// past [`MAX_UNWRAP_HOPS`] (`env env … env rm x`). Either way the
+/// command text a gate would match is unknowable, so widening rules
+/// must fail closed rather than treat the invocation as "nothing
+/// wrapped".
+pub fn unresolved_wrapper(parsed: &ParsedCommand) -> Option<Unresolved> {
+    parsed.invocations.iter().find_map(|argv| {
+        // A head whose operands are text runs nothing they name, so a
+        // wrapper word among them is data: `printf '%s\n' env -S
+        // '${CMD}'` prints it. Being wrong about this list can only
+        // report an unknown that is not one, which is the safe way to
+        // be wrong.
+        // The head that decides is the one that ends up running, so a
+        // wrapped data command is still one: `env printf '%s\n' env -S
+        // '${CMD}'` prints its operands exactly as `printf` alone does.
+        let unwrapped = unwrapped_argv(argv);
+        let head = unwrapped
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .or_else(|| argv.first());
+        let head_is_data = head.is_some_and(|t| {
+            DATA_COMMANDS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+        });
+        if head_is_data {
+            return None;
+        }
+        // Resolve from every word, not only the first. What precedes a
+        // wrapper decides nothing about whether that wrapper resolves,
+        // and the name in front need not be one this list knows —
+        // `exec env -S '${CMD}'`, `stdbuf -o0 env -S '${CMD}'` and
+        // `sudo env -S '${CMD}'` are each the same unknown as `env -S
+        // '${CMD}'` alone. Starting only at the head made every name
+        // nobody enumerated a way to hide one.
+        //
+        // Only a word that names a wrapper is resolved from. Resolving
+        // from every one copies the whole suffix each time, which is
+        // quadratic in the argument count for arguments that could
+        // never resolve to anything.
+        // Only tokens that can be in command position: `git log -- env
+        // -S '${CMD}'` names a pathspec, and resolving it reported an
+        // unresolved expansion that rejected a read-only command.
+        let argv = executable_tokens(argv);
+        argv.iter()
+            .enumerate()
+            .filter(|(_, word)| {
+                COMMAND_WRAPPERS.contains(&base_name(&unquote_token(word)).as_str())
+            })
+            .find_map(|(start, _)| match unwrapped_tokens(&argv[start..]) {
+                Unwrap::Unresolved(reason) => Some(reason),
+                _ => None,
+            })
+    })
+}
+
+/// Heads whose `--` ends the options and introduces *operands* rather
+/// than a command. `git` documents its tail as `[[--] <path>...]`, so a
+/// subcommand name after the separator is a path.
+///
+/// Deliberately a short allowlist rather than "any head that is not a
+/// wrapper". `xargs --help` documents `xargs [OPTION]... COMMAND
+/// [INITIAL-ARGS]...`, so `xargs -- git push -uf` really does run the
+/// push; treating every unlisted head as operand-terminating skipped
+/// exactly that from every scan. Unlisted heads therefore keep all their
+/// tokens, which can only ever over-block.
+const OPERAND_TERMINATOR_HEADS: &[&str] = &["git"];
+
+/// The prefix of `invocation` whose tokens can name something
+/// executable — everything, unless the head is one that turns `--` into
+/// operands.
+///
+/// One rule with one home: the destructive-pattern scan, the environment
+/// walk, the unaccounted-mention check, the git subcommand scan, the
+/// wrapper-suffix scan and the nested-payload scan all need it, and each
+/// that grew its own copy got it subtly wrong.
+pub(crate) fn executable_tokens(invocation: &[String]) -> &[String] {
+    let terminates = invocation.first().is_some_and(|t| {
+        OPERAND_TERMINATOR_HEADS.contains(&base_name(&unquote_token(t)).to_lowercase().as_str())
+    });
+    if !terminates {
+        return invocation;
+    }
+    match invocation.iter().position(|t| unquote_token(t) == "--") {
+        Some(end) => &invocation[..end],
+        None => invocation,
+    }
+}
+
+/// True when some invocation runs a command whose identity this parser
+/// cannot pin down: run-time expansion decides it (`env -S '${CMD} -rf
+/// x'`), or the wrapper chain ran past [`MAX_UNWRAP_HOPS`] before the
+/// command was reached. The command text a gate would match is
+/// unknowable either way, so widening rules must fail closed rather than
+/// treat the invocation as "nothing wrapped".
+///
+/// Restored on this branch's richer [`Unwrap`] representation: `main`
+/// expressed this state as a single `Unwrap::Dynamic`, which became
+/// [`Unresolved`] here. Every `Unresolved` reason is dynamic in the sense
+/// the callers care about, so both map to `true`.
 pub fn has_dynamic_wrapper(parsed: &ParsedCommand) -> bool {
     parsed
         .invocations
         .iter()
-        .any(|argv| unwrapped_tokens(argv) == Unwrap::Dynamic)
+        .any(|argv| matches!(unwrapped_tokens(argv), Unwrap::Unresolved(_)))
 }
 
 /// Check a parsed command against security rules.
@@ -637,12 +971,17 @@ pub fn check_parsed_security(parsed: &ParsedCommand) -> Vec<String> {
         }
     }
 
-    if has_dynamic_wrapper(parsed) {
-        violations.push(
+    match unresolved_wrapper(parsed) {
+        Some(Unresolved::Expansion) => violations.push(
             "Wrapped command is chosen by run-time expansion (env -S with $), so what executes \
              cannot be determined"
                 .to_string(),
-        );
+        ),
+        Some(Unresolved::Depth) => violations.push(format!(
+            "Wrapper chain runs deeper than {MAX_UNWRAP_HOPS} levels, so what executes behind it \
+             cannot be determined"
+        )),
+        None => {}
     }
 
     for base in &heads {
@@ -778,6 +1117,25 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_ansi_c_quoted_dangerous_command() {
+        // `$'rm'` executes `rm`; the ANSI-C decode in `unquote_token`
+        // must reach the AST head check as well.
+        for cmd in [
+            "$'rm' -rf /",
+            "$'r\\x6d' -rf /",
+            "env $'rm' -rf /",
+            "$'rm\\x00junk' -rf /",
+        ] {
+            let parsed = parse_bash(cmd).unwrap();
+            let violations = check_parsed_security(&parsed);
+            assert!(
+                violations.iter().any(|v| v.contains("rm")),
+                "ANSI-C quoting hid the command head: {cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn test_invocations_capture_arguments() {
         let parsed = parse_bash("git push origin main").unwrap();
         assert_eq!(
@@ -837,6 +1195,48 @@ mod tests {
         assert_eq!(unquote_token("plain"), "plain");
         // A backslash inside single quotes stays literal, as in a shell.
         assert_eq!(unquote_token("'-dele\\te'"), "-dele\\te");
+    }
+
+    /// ANSI-C (`$'…'`) and locale (`$"…"`) quoting decode to what bash
+    /// hands the command — `$'git' push --force` runs `git push
+    /// --force`, so the unquoted token must read `git`, not `$git`.
+    #[test]
+    fn test_unquote_token_ansi_c() {
+        assert_eq!(unquote_token("$'git'"), "git");
+        assert_eq!(unquote_token("$'rm'"), "rm");
+        assert_eq!(unquote_token("$'ch'mod"), "chmod");
+        assert_eq!(unquote_token("$\"git\""), "git");
+        // Numeric escapes decode to their character.
+        assert_eq!(unquote_token("$'\\x67it'"), "git");
+        assert_eq!(unquote_token("$'r\\x6d'"), "rm");
+        assert_eq!(unquote_token("$'\\147it'"), "git");
+        assert_eq!(unquote_token("$'\\u0067it'"), "git");
+        assert_eq!(unquote_token("$'a\\tb'"), "a\tb");
+        // Escapes bash leaves alone stay literal.
+        assert_eq!(unquote_token("$'\\q'"), "\\q");
+        // A `$` that does not open a quoted string is untouched.
+        assert_eq!(unquote_token("$HOME"), "$HOME");
+        assert_eq!(unquote_token("a$b"), "a$b");
+        assert_eq!(unquote_token("$"), "$");
+        // `$'` is not special inside double or single quotes.
+        assert_eq!(unquote_token("\"$'x'\""), "$'x'");
+        assert_eq!(unquote_token("'$'"), "$");
+        // A NUL escape truncates the quoted segment, exactly as bash
+        // does: `$'git\x00junk'` executes `git`.
+        assert_eq!(unquote_token("$'git\\x00junk'"), "git");
+        assert_eq!(unquote_token("$'git\\0junk'"), "git");
+        assert_eq!(unquote_token("$'git\\c@junk'"), "git");
+        assert_eq!(unquote_token("$'git\\u0000junk'"), "git");
+        // An escaped quote inside the discarded remainder does not end
+        // the segment early.
+        assert_eq!(unquote_token("$'a\\0b\\'c'"), "a");
+        // Text concatenated after the closing quote still appends.
+        assert_eq!(unquote_token("$'gi\\0zz't"), "git");
+        // Bash's control mask is `& 0x1f` (`\c?` is DEL): `\c3` is byte
+        // 0x13, not the printable `s` an XOR would produce.
+        assert_eq!(unquote_token("$'\\c3'"), "\u{13}");
+        assert_eq!(unquote_token("$'\\c?'"), "\u{7f}");
+        assert_eq!(unquote_token("$'\\ca'"), "\u{1}");
     }
 
     #[test]
@@ -1049,7 +1449,7 @@ mod tests {
     #[test]
     fn test_dynamic_split_string_is_reported_not_dropped() {
         let parsed = parse_bash("env -S '${CMD} -rf /tmp/x'").unwrap();
-        assert!(has_dynamic_wrapper(&parsed));
+        assert_eq!(unresolved_wrapper(&parsed), Some(Unresolved::Expansion));
         assert!(unwrapped_invocation_texts(&parsed).is_empty());
         assert!(
             check_parsed_security(&parsed)
@@ -1059,7 +1459,121 @@ mod tests {
         );
         // An option env itself rejects is not dynamic: nothing runs.
         let rejected = parse_bash("env --frobnicate git status").unwrap();
-        assert!(!has_dynamic_wrapper(&rejected));
+        assert_eq!(unresolved_wrapper(&rejected), None);
+        // What stands in front of the `env` decides nothing about
+        // whether it resolves, so none of these names has to be known
+        // for the unknown behind it to be reported. `firejail` is here
+        // deliberately: it is in no list, and that is the point.
+        for cmd in [
+            "exec env -S '${CMD} -rf /tmp/x'",
+            "exec -a foo env -S '${CMD} -rf /tmp/x'",
+            "exec -la foo env -S '${CMD} -rf /tmp/x'",
+            "stdbuf -o0 env -S '${CMD} -rf /tmp/x'",
+            "sudo env -S '${CMD} -rf /tmp/x'",
+            "time env -S '${CMD} -rf /tmp/x'",
+            "xargs env -S '${CMD} -rf /tmp/x'",
+            "firejail env -S '${CMD} -rf /tmp/x'",
+        ] {
+            let parsed = parse_bash(cmd).unwrap();
+            assert_eq!(
+                unresolved_wrapper(&parsed),
+                Some(Unresolved::Expansion),
+                "exec hid a dynamic wrapper: {cmd}"
+            );
+        }
+        // And a command `exec` names is the one that runs.
+        let execed = parse_bash("exec env rm -rf /tmp/x").unwrap();
+        assert_eq!(
+            unwrapped_argv(&execed.invocations[0]),
+            Some(vec![
+                "rm".to_string(),
+                "-rf".to_string(),
+                "/tmp/x".to_string()
+            ])
+        );
+    }
+
+    /// A chain as long as the budget allows still resolves: the head is
+    /// re-examined after the final strip, so the command is named and
+    /// judged on its name.
+    #[test]
+    fn test_wrapper_chain_within_the_budget_names_its_command() {
+        for depth in 1..=MAX_UNWRAP_HOPS {
+            let cmd = format!("{}$'rm' /tmp/victim", "env ".repeat(depth));
+            let parsed = parse_bash(&cmd).unwrap();
+            assert_eq!(
+                unwrapped_head(&parsed.invocations[0]).as_deref(),
+                Some("rm"),
+                "chain of {depth} wrappers lost its command"
+            );
+            assert_eq!(unresolved_wrapper(&parsed), None);
+            assert!(
+                check_parsed_security(&parsed)
+                    .iter()
+                    .any(|v| v.contains("'rm'")),
+                "expected 'rm' to be detected in: {cmd}"
+            );
+        }
+    }
+
+    /// Running out of unwrap budget means the command behind the chain
+    /// was never reached — not that there is none. Falling through to
+    /// [`Unwrap::None`] here let `env` x8 `$'rm' victim` past the
+    /// destructive-command gate entirely.
+    #[test]
+    fn test_wrapper_chain_past_the_budget_is_unresolved_not_absent() {
+        for extra in 1..=3 {
+            let depth = MAX_UNWRAP_HOPS + extra;
+            let cmd = format!("{}$'rm' /tmp/victim", "env ".repeat(depth));
+            let parsed = parse_bash(&cmd).unwrap();
+            assert_eq!(
+                unresolved_wrapper(&parsed),
+                Some(Unresolved::Depth),
+                "chain of {depth} wrappers must be unresolved, not empty"
+            );
+            assert!(
+                unwrapped_argv(&parsed.invocations[0]).is_none(),
+                "an unresolved chain must not hand out tokens"
+            );
+            assert!(
+                check_parsed_security(&parsed)
+                    .iter()
+                    .any(|v| v.contains("cannot be determined")),
+                "a chain past the budget must reach the gate as unknown: {cmd}"
+            );
+        }
+    }
+
+    /// The fail-closed path must stay narrow: ordinary wrapped commands
+    /// keep resolving and keep passing.
+    #[test]
+    fn test_wrapped_innocent_commands_are_not_over_blocked() {
+        for cmd in [
+            "git status",
+            "env git status",
+            "env -u PATH git status",
+            "nohup setsid env command ls -la",
+            "env env env env env env env env git status",
+            "env -S 'git status'",
+            "exec ls -la",
+            "exec -a foo git status",
+            "exec env git status",
+            // A head whose operands are text runs nothing they name,
+            // so a wrapper word among them is the data it looks like —
+            // and the head that decides is the one that ends up
+            // running, so a wrapped data command is still one.
+            "printf '%s\\n' env -S '${CMD} -rf /tmp/x'",
+            "echo env -S '${CMD}'",
+            "env printf '%s\\n' env -S '${CMD} -rf /tmp/x'",
+            "nohup env echo env -S '${CMD}'",
+        ] {
+            let parsed = parse_bash(cmd).unwrap();
+            assert_eq!(unresolved_wrapper(&parsed), None, "over-blocked: {cmd}");
+            assert!(
+                check_parsed_security(&parsed).is_empty(),
+                "innocent command was flagged: {cmd}"
+            );
+        }
     }
 
     #[test]
