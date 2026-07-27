@@ -226,6 +226,15 @@ impl App {
         if self.front_modal().is_some() {
             return;
         }
+        // Every other overlay that owns the keyboard has to go first.
+        // `handle_key` routes to search *before* the picker, so rows that
+        // arrive after the user opened Ctrl+F would draw a picker that
+        // silently ignored every keystroke; the model and theme pickers
+        // are routed after, so they would instead be left open and
+        // unreachable. These are mutually exclusive overlays.
+        self.cancel_search();
+        self.model_picker = None;
+        self.theme_picker = None;
         self.command_palette = None;
         self.show_shortcuts = false;
         self.session_picker = Some(SessionPicker {
@@ -858,6 +867,36 @@ mod tests {
                 "{expected} was cancelled silently: {said}"
             );
         }
+    }
+
+    /// `handle_key` routes to search before the picker, so a picker
+    /// opened while search is up would ignore every keystroke.
+    #[test]
+    fn opening_the_picker_closes_the_overlays_that_would_eat_its_keys() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_search();
+        assert!(app.search_open());
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        assert!(app.session_picker_open());
+        assert!(
+            !app.search_open(),
+            "search still owns the keyboard under a visible picker"
+        );
+        assert!(app.model_picker.is_none());
+        assert!(app.theme_picker.is_none());
+        assert!(app.command_palette.is_none());
+    }
+
+    /// Rows that arrive late must clear search too — the user has had a
+    /// whole scan's worth of time to press Ctrl+F.
+    #[test]
+    fn late_rows_also_close_search() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_session_list = true;
+        app.open_search();
+        app.show_session_picker(vec![summary("aaa11111", None, "/a")]);
+        assert!(app.session_picker_open());
+        assert!(!app.search_open());
     }
 
     /// Put a permission modal in front. The receiver is returned so the

@@ -379,7 +379,11 @@ pub(super) async fn event_loop(
         // The mode→permission policy lives entirely in `SessionMode`
         // (`permission_hint`); the loop just applies it — no per-mode
         // special-cases here.
-        if app.mode != last_mode {
+        // Not while a resume is outstanding: this would push the new mode
+        // onto the conversation being replaced. The choice is not lost —
+        // the restore replays it on top of the restored session, since a
+        // toggle made after picking is the user's newest instruction.
+        if app.mode != last_mode && app.pending_resume.is_none() {
             apply_mode_to_engine(session, app.mode, base_permission_mode);
             last_mode = app.mode;
             app.dirty = true;
@@ -466,6 +470,11 @@ pub(super) async fn event_loop(
             if app.pending_resume.as_deref() == Some(id.as_str()) {
                 match session.engine().try_lock() {
                     Ok(mut eng) => {
+                        // A mode toggled after the session was picked but
+                        // before it loaded is the user's newest explicit
+                        // instruction, so it is replayed on top of the
+                        // restored mode rather than silently reverted.
+                        let user_mode = (app.mode != last_mode).then_some(app.mode);
                         let restored = super::session_picker::RestoredState {
                             id: id.clone(),
                             model: data.model.clone(),
@@ -475,7 +484,6 @@ pub(super) async fn event_loop(
                             cost_usd: data.total_cost_usd,
                             plan_mode: data.plan_mode,
                         };
-                        let plan = data.plan_mode;
                         let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
@@ -490,18 +498,27 @@ pub(super) async fn event_loop(
                             st.total_cost_usd = data.total_cost_usd;
                             st.total_usage.input_tokens = data.total_input_tokens;
                             st.total_usage.output_tokens = data.total_output_tokens;
-                            st.plan_mode = plan;
                             if !data.model.is_empty() {
                                 st.config.api.model = data.model.clone();
                             }
                         }
+                        // "Allow for this session" grants belong to the
+                        // conversation they were given in. The engine is
+                        // reused across the swap, so without this the
+                        // resumed session inherits approvals the user
+                        // never gave it and the executor skips the ask.
+                        eng.clear_session_allows().await;
                         app.restore_transcript(items, &id, turns);
-                        let mode = app.adopt_restored_session(&restored);
+                        let stored_mode = app.adopt_restored_session(&restored);
+                        let mode = user_mode.unwrap_or(stored_mode);
+                        app.mode = mode;
                         // Keep the loop's mode tracker in step, or the
                         // `app.mode != last_mode` gate at the top would
                         // re-apply (or, worse, silently skip) the mode we
                         // are about to install.
                         last_mode = mode;
+                        let plan = mode == super::mode::SessionMode::Plan;
+                        eng.state_mut().plan_mode = plan;
                         // Live handles, not just the config copy: the
                         // permission-checker default has to move with the
                         // restored plan flag, or a resumed plan session

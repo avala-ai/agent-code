@@ -239,6 +239,18 @@ impl QueryEngine {
         self.live_plan_mode.clone()
     }
 
+    /// Drop every "allow for this session" grant.
+    ///
+    /// These approvals are scoped to the conversation they were given in.
+    /// When a UI swaps a different saved session into an existing engine
+    /// (`/resume`), the grants must not travel with it: the executor
+    /// consults this store *before* prompting, so a carried-over entry
+    /// silently skips the permission ask for a conversation the user
+    /// never approved it in.
+    pub async fn clear_session_allows(&self) {
+        self.session_allows.lock().await.clear();
+    }
+
     /// Set plan mode for the next permission / executor check without
     /// needing exclusive access to conversation state.
     pub fn set_live_plan_mode(&self, enabled: bool) {
@@ -3395,6 +3407,29 @@ mod tests {
             "cancel latency {:?} exceeded {:?}",
             t0.elapsed(),
             budget
+        );
+    }
+
+    /// "Allow for this session" is scoped to the conversation it was
+    /// granted in. A UI that swaps a saved session into a live engine
+    /// (`/resume`) must be able to drop those grants, or the resumed
+    /// conversation inherits approvals the user never gave it — the
+    /// executor consults this store *before* prompting.
+    #[tokio::test]
+    async fn clearing_session_allows_drops_grants_from_the_previous_session() {
+        let engine = build_engine(Arc::new(CompletingProvider));
+        engine
+            .session_allows
+            .lock()
+            .await
+            .insert("Bash:rm -rf build".to_string());
+        assert!(!engine.session_allows.lock().await.is_empty());
+
+        engine.clear_session_allows().await;
+
+        assert!(
+            engine.session_allows.lock().await.is_empty(),
+            "a session-scoped grant survived the session swap"
         );
     }
 
