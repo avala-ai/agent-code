@@ -203,38 +203,70 @@ fn next_boundary(s: &str, from: usize) -> usize {
     i
 }
 
-/// Start of the next word, vi's `w`.
-fn word_forward(s: &str, from: usize) -> usize {
-    let bytes: Vec<(usize, char)> = s.char_indices().collect();
-    let mut idx = bytes
+/// Vi's three character classes. Lowercase `w` and `b` stop where the
+/// class changes, which is what makes them differ from `W`/`B`: in
+/// `foo.bar`, `w` stops on the dot rather than skipping the whole run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Space,
+    Word,
+    Punct,
+}
+
+fn class_of(c: char) -> Class {
+    if c.is_whitespace() {
+        Class::Space
+    } else if c.is_alphanumeric() || c == '_' {
+        Class::Word
+    } else {
+        Class::Punct
+    }
+}
+
+/// Index into `chars` of the character the cursor sits on.
+fn char_index(chars: &[(usize, char)], from: usize) -> usize {
+    chars
         .iter()
         .position(|(i, _)| *i >= from)
-        .unwrap_or(bytes.len());
-    // Skip the current word, then the whitespace after it.
-    while idx < bytes.len() && !bytes[idx].1.is_whitespace() {
+        .unwrap_or(chars.len())
+}
+
+/// Start of the next word, vi's `w`.
+fn word_forward(s: &str, from: usize) -> usize {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut idx = char_index(&chars, from);
+    // Leave the run the cursor is in, then any whitespace after it.
+    if let Some((_, c)) = chars.get(idx) {
+        let start_class = class_of(*c);
+        if start_class != Class::Space {
+            while idx < chars.len() && class_of(chars[idx].1) == start_class {
+                idx += 1;
+            }
+        }
+    }
+    while idx < chars.len() && class_of(chars[idx].1) == Class::Space {
         idx += 1;
     }
-    while idx < bytes.len() && bytes[idx].1.is_whitespace() {
-        idx += 1;
-    }
-    bytes.get(idx).map(|(i, _)| *i).unwrap_or(s.len())
+    chars.get(idx).map(|(i, _)| *i).unwrap_or(s.len())
 }
 
 /// Start of the previous word, vi's `b`.
 fn word_back(s: &str, from: usize) -> usize {
     let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut idx = chars
-        .iter()
-        .position(|(i, _)| *i >= from)
-        .unwrap_or(chars.len());
+    let mut idx = char_index(&chars, from);
     if idx == 0 {
         return 0;
     }
     idx -= 1;
-    while idx > 0 && chars[idx].1.is_whitespace() {
+    while idx > 0 && class_of(chars[idx].1) == Class::Space {
         idx -= 1;
     }
-    while idx > 0 && !chars[idx - 1].1.is_whitespace() {
+    if class_of(chars[idx].1) == Class::Space {
+        return chars.first().map(|(i, _)| *i).unwrap_or(0);
+    }
+    // Walk to the start of this run of one class.
+    let run = class_of(chars[idx].1);
+    while idx > 0 && class_of(chars[idx - 1].1) == run {
         idx -= 1;
     }
     chars.get(idx).map(|(i, _)| *i).unwrap_or(0)
@@ -416,6 +448,42 @@ mod tests {
         a.cursor = 0;
         a.vi_normal_key('w');
         assert!(a.cursor < a.input.len(), "w landed past the end");
+    }
+
+    /// Lowercase `w`/`b` stop where the character class changes. Treating
+    /// every non-space run as one word is `W`/`B` behaviour, which would
+    /// land later edits in the wrong place.
+    #[test]
+    fn word_motions_stop_at_punctuation() {
+        let mut a = vi_app("foo.bar baz");
+        a.cursor = 0;
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 3, "w skipped past the dot");
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 4, "w did not stop at the start of `bar`");
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 8, "w did not reach `baz`");
+
+        a.vi_normal_key('b');
+        assert_eq!(a.cursor, 4);
+        a.vi_normal_key('b');
+        assert_eq!(a.cursor, 3, "b skipped past the dot");
+        a.vi_normal_key('b');
+        assert_eq!(a.cursor, 0);
+
+        // A run of punctuation counts as one word.
+        let mut a = vi_app("a ==> b");
+        a.cursor = 0;
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 2);
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 6, "the punctuation run should be one word");
+
+        // Underscores are word characters, as in vi.
+        let mut a = vi_app("snake_case next");
+        a.cursor = 0;
+        a.vi_normal_key('w');
+        assert_eq!(a.cursor, 11, "an underscore split the word");
     }
 
     /// `h`, `l`, `a` and `x` must not step over a newline either — vi

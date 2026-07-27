@@ -1015,18 +1015,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
         return;
     }
-    // Whether this key could be a motion has to be judged before
-    // dispatch, since dispatch is what arms `d`.
-    let is_motion = bare_char(&key).is_some();
+    let was_armed = app.vi_pending_d;
 
     handle_key_inner(app, key);
 
     if app.in_normal_mode() {
-        // Anything that is not a motion aborts a half-typed operator, as
-        // vi does. This sits after dispatch so the branches that return
-        // early — Ctrl+C arming quit or cancelling a turn, Esc, a user
-        // binding — cannot carry a stale `d` into the next key.
-        if !is_motion {
+        // `vi_normal_key` always consumes a pending operator on its
+        // first branch, so one that was armed before dispatch and is
+        // still armed means the key never reached it — a modal answered
+        // with `y`, a chord, Ctrl+C arming quit. Dropping it here is
+        // what stops it acting as a motion for the next key. A `d` armed
+        // by this very key has `was_armed` false and survives.
+        if was_armed && app.vi_pending_d {
             app.reset_vi_operator();
         }
         // Normal mode has no cursor position after the last character,
@@ -1303,6 +1303,13 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
             // it, and it falls through to the chord dispatch below.
             KeyCode::Char(c) if bare_char(&key) == Some(c) => {
                 app.vi_normal_key(c);
+                return;
+            }
+            // Backspace moves left in normal mode, as vi does. Letting
+            // it through would delete the character before the cursor —
+            // destructive, undocumented, and there is no undo.
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                app.vi_normal_key('h');
                 return;
             }
             // Enter submits from normal mode even when Ctrl+M multiline
@@ -2451,6 +2458,57 @@ mod tests {
             KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
         );
         assert_eq!(app.input, "hello", "Shift+D stopped deleting to line end");
+    }
+
+    /// Backspace in normal mode is a left motion, not a delete. Letting
+    /// it reach `backspace()` destroyed a character with no undo.
+    #[test]
+    fn backspace_does_not_delete_in_normal_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "abc".into();
+        app.cursor = 2;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.input, "abc", "Backspace deleted in normal mode");
+        assert_eq!(app.cursor, 1, "Backspace should move left");
+
+        // Insert mode still deletes.
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.input = "abc".into();
+        app.cursor = 3;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.input, "ab", "Backspace stopped deleting in insert mode");
+    }
+
+    /// A modal that answers with a bare character never reaches the vi
+    /// handler, so the operator armed before it must not survive and eat
+    /// the first key typed afterwards.
+    #[test]
+    fn a_modal_answer_does_not_leave_the_operator_armed() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        app.input = "one\ntwo".into();
+        app.cursor = 0;
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert!(app.vi_pending_d);
+
+        // A permission modal takes the keyboard and swallows `y`.
+        app.phase = crate::ui::modern::app::Phase::Permission;
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        app.phase = crate::ui::modern::app::Phase::Idle;
+        assert!(
+            !app.vi_pending_d,
+            "the operator survived the modal answer and will eat the next key"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(
+            app.input, "one\ntwo",
+            "the stale operator turned the next `d` into a line delete"
+        );
     }
 
     /// `/emacs` must not advertise composer bindings that do not exist.
