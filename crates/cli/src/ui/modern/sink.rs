@@ -114,6 +114,10 @@ pub enum EngineEvent {
         /// renders it distinctly instead of splicing it into `description`.
         origin: Option<String>,
         input_preview: Option<String>,
+        /// A prefix the user could grant durably (`git status`), when the
+        /// gate can reason about the command. `None` means offer only an
+        /// exact grant.
+        suggested_prefix: Option<String>,
         respond: std::sync::mpsc::Sender<PermissionResponse>,
     },
     /// A plan was proposed via ExitPlanMode (plan §M6). Fire-and-forget:
@@ -156,6 +160,7 @@ impl PermissionPrompter for ModernPrompter {
         description: &str,
         input_preview: Option<&str>,
         origin: Option<&str>,
+        suggested_prefix: Option<&str>,
     ) -> PermissionResponse {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
         let sent = self.tx.send(EngineEvent::PermissionAsk {
@@ -163,6 +168,7 @@ impl PermissionPrompter for ModernPrompter {
             description: description.to_string(),
             origin: origin.filter(|o| !o.is_empty()).map(str::to_string),
             input_preview: input_preview.map(str::to_string),
+            suggested_prefix: suggested_prefix.map(str::to_string),
             respond: resp_tx,
         });
         if sent.is_err() {
@@ -689,7 +695,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
         drop(rx);
-        let resp = prompter.ask("Bash", "run", None, None);
+        let resp = prompter.ask("Bash", "run", None, None, None);
         assert!(matches!(resp, PermissionResponse::Deny));
     }
 
@@ -697,7 +703,7 @@ mod tests {
     fn prompter_denies_when_responder_dropped() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
-        let worker = std::thread::spawn(move || prompter.ask("Bash", "run", None, None));
+        let worker = std::thread::spawn(move || prompter.ask("Bash", "run", None, None, None));
         // Receive the ask, then drop it (and its responder) unanswered.
         let ev = loop {
             match rx.try_recv() {
@@ -714,7 +720,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let prompter = ModernPrompter::new(tx);
         let worker =
-            std::thread::spawn(move || prompter.ask("Bash", "cargo test", Some("{}"), None));
+            std::thread::spawn(move || prompter.ask("Bash", "cargo test", Some("{}"), None, None));
         let ev = loop {
             match rx.try_recv() {
                 Ok(ev) => break ev,

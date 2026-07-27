@@ -83,7 +83,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // length limit, and a truncating cast would wrap a huge plan
             // round to a one-row request.
             let needed = u16::try_from(
-                super::tasks::pane_rows_with_todos(&app.tasks, &app.todos).saturating_add(1),
+                super::tasks::pane_rows_with_todos(&app.tasks, &app.todos, &app.collapsed_groups)
+                    .saturating_add(1),
             )
             .unwrap_or(u16::MAX);
             let strip = needed
@@ -596,6 +597,52 @@ fn key_hint_line(text: impl Into<String>) -> Line<'static> {
     ))
 }
 
+/// The plain text of a line, for measuring how tall it will render.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Rows `text` occupies when word-wrapped into `width` columns, matching
+/// `Paragraph`'s greedy wrap: words move to the next row whole, and a
+/// word wider than the line is split across rows.
+///
+/// Measured in display columns, not characters. A CJK glyph or emoji
+/// occupies two cells, so counting characters underestimates the rows a
+/// line needs and the box would be sized too short — clipping the very
+/// text the user is answering about.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 {
+        return 1;
+    }
+    let width = width as usize;
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let w = UnicodeWidthStr::width(word);
+        if col > 0 && col + 1 + w > width {
+            rows += 1;
+            col = 0;
+        }
+        if w > width {
+            // Split by columns, not by characters: a double-width glyph
+            // straddling the edge moves to the next row whole.
+            // The check above already emptied a partly-filled row.
+            for ch in word.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + cw > width {
+                    rows += 1;
+                    col = 0;
+                }
+                col += cw;
+            }
+        } else {
+            col = if col == 0 { w } else { col + 1 + w };
+        }
+    }
+    rows.try_into().unwrap_or(u16::MAX)
+}
+
 /// Shared centered modal box with a border + title and an optional sticky
 /// footer (key hints). The footer is laid out in its own row so wrapped body
 /// text cannot push it off-screen.
@@ -608,9 +655,26 @@ fn draw_modal_box(
     footer: Option<Line<'static>>,
 ) {
     let width = area.width.saturating_sub(6).clamp(40, 76);
-    let footer_h: u16 = u16::from(footer.is_some());
+    // The footer gets the rows its hints actually need. It used to be a
+    // single row whatever it held, so on a narrow terminal ratatui
+    // clipped the tail — and the tail is `[n] deny`, the one binding
+    // that must never be the one to disappear while its key stays live.
+    let footer_h: u16 = footer
+        .as_ref()
+        .map(|l| wrapped_rows(&line_text(l), width.saturating_sub(2)))
+        .unwrap_or(0);
+    // Size the body from the rows the text will actually occupy once
+    // wrapped, not from the number of `Line`s. A single long line —
+    // the permission modal's durable-grant row is the one that can run
+    // long — otherwise claimed one row and was clipped after the modal
+    // had already been sized, hiding content the user is answering
+    // about.
+    let body_rows: u16 = lines
+        .iter()
+        .map(|l| wrapped_rows(&line_text(l), width.saturating_sub(2)))
+        .fold(0u16, |a, b| a.saturating_add(b));
     // +2 border, +footer, +1 breathing room for wrap
-    let wanted = (lines.len() as u16)
+    let wanted = body_rows
         .saturating_add(2)
         .saturating_add(footer_h)
         .saturating_add(1);
@@ -630,7 +694,8 @@ fn draw_modal_box(
     frame.render_widget(block, rect);
 
     if let Some(footer_line) = footer {
-        let body_h = inner.height.saturating_sub(1);
+        let foot_h = footer_h.min(inner.height);
+        let body_h = inner.height.saturating_sub(foot_h);
         let body = Rect {
             x: inner.x,
             y: inner.y,
@@ -641,11 +706,12 @@ fn draw_modal_box(
             x: inner.x,
             y: inner.y.saturating_add(body_h),
             width: inner.width,
-            height: 1,
+            height: foot_h,
         };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
-        // Fixed footer: key hints always land on the last inner row.
-        frame.render_widget(Paragraph::new(footer_line), foot);
+        // Sticky footer: key hints always land on the last inner rows,
+        // wrapping within them rather than being cut off.
+        frame.render_widget(Paragraph::new(footer_line).wrap(Wrap { trim: false }), foot);
     } else {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -721,6 +787,24 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// One selectable pane row, tied back to the task list it came from.
+///
+/// `task` is an index into `app.tasks` (what the selection stores), not
+/// a position among rendered rows — folding a group must not shift it.
+struct RowAnchor {
+    task: usize,
+    /// First line of this row: the one carrying the `❯` marker. Rows are
+    /// not a uniform height — a task is a status line plus a headline, a
+    /// folded heading is a single line — so this is recorded rather than
+    /// derived from `end`.
+    start: usize,
+    /// Line index this row's rendering ends on.
+    end: usize,
+    /// Tasks this row accounts for: 1 normally, the group size for a
+    /// folded heading.
+    covers: usize,
+}
+
 /// Tasks/agents pane: state-ordered subagent rows (plan §M8).
 fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use super::tasks::TaskState;
@@ -732,8 +816,11 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // measure the real content box instead of the outer area.
     let inner = block.inner(area);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Line index of each task's last row, for the overflow count below.
-    let mut task_ends: Vec<usize> = Vec::new();
+    // Where each pane row ends, keyed by the task index it belongs to —
+    // the selection is an index into `app.tasks`, so a folded group
+    // ahead of it must not shift the lookup. Used by the overflow
+    // windowing below.
+    let mut anchors: Vec<RowAnchor> = Vec::new();
     let inner_w = (inner.width as usize).saturating_sub(1);
     let max_rows = inner.height as usize;
     // Checklist first: it is what the model says it is doing, which
@@ -808,6 +895,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut last_source: Option<super::tasks::TaskSource> = None;
     for (idx, t) in app.tasks.iter().enumerate() {
+        let group_folded = app.collapsed_groups.contains(&t.source);
         let p = palette();
         let selected = idx == app.tasks_selected;
         // Group header when the source changes. Subagents and background
@@ -817,13 +905,41 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if last_source.is_some() {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                t.source.heading().to_string(),
-                Style::default()
-                    .fg(palette().muted)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            let count = app.tasks.iter().filter(|x| x.source == t.source).count();
+            // A folded group shows its size, so collapsing does not hide
+            // how much is behind it.
+            let heading = if group_folded {
+                format!("{} {} ({count})", "▸", t.source.heading())
+            } else {
+                format!("{} {}", "▾", t.source.heading())
+            };
+            // A folded group is selected through its heading, so the
+            // marker has to appear there or the pane looks unselected.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if group_folded && selected { "❯" } else { " " }.to_string(),
+                    Style::default().fg(p.accent),
+                ),
+                Span::styled(
+                    heading,
+                    Style::default().fg(p.muted).add_modifier(Modifier::BOLD),
+                ),
+            ]));
             last_source = Some(t.source);
+            if group_folded {
+                // The heading is the whole group's one row on screen, so
+                // it accounts for every task behind it.
+                anchors.push(RowAnchor {
+                    task: idx,
+                    start: lines.len() - 1,
+                    end: lines.len() - 1,
+                    covers: count,
+                });
+            }
+        }
+        // Folded: the heading above stands in for the group's rows.
+        if group_folded {
+            continue;
         }
         let color = match t.state {
             TaskState::Working => palette().accent,
@@ -853,7 +969,13 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!("  {head}"),
             Style::default().fg(palette().inactive),
         )));
-        task_ends.push(lines.len() - 1);
+        anchors.push(RowAnchor {
+            task: idx,
+            // Status line: pushed just above the headline.
+            start: lines.len() - 2,
+            end: lines.len() - 1,
+            covers: 1,
+        });
     }
     // When the area is still too short (many tasks, tiny terminal),
     // window the rows around the selection — Up/Down cycles the whole
@@ -862,11 +984,22 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // checklist above is already bounded and carries its own count, so
     // this footer speaks only for the rows the arrows navigate.
     if lines.len() > max_rows && max_rows > 0 {
-        let sel_end = task_ends.get(app.tasks_selected).copied().unwrap_or(0);
-        // The status row (with the ❯ marker) sits directly above the
-        // headline row; when space is too tight for both, the marker
-        // row is the one that must survive.
-        let sel_start = sel_end.saturating_sub(1);
+        let sel = anchors
+            .iter()
+            .find(|a| a.task == app.tasks_selected)
+            .or_else(|| {
+                // Selection inside a folded group but not on its first
+                // row: the nearest anchor at or before it is that
+                // group's heading.
+                anchors.iter().rev().find(|a| a.task <= app.tasks_selected)
+            });
+        let sel_end = sel.map(|a| a.end).unwrap_or(0);
+        // The row carrying the ❯ marker: the status line for a task, the
+        // heading itself for a folded group. When space is too tight for
+        // the whole row, this is the line that must survive — deriving it
+        // as `sel_end - 1` would step off a one-line folded heading onto
+        // the blank separator above it and hide the selection.
+        let sel_start = sel.map(|a| a.start).unwrap_or(0);
         if max_rows == 1 {
             let row = lines
                 .into_iter()
@@ -878,10 +1011,14 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let window = |visible_h: usize| {
                 let anchor = if visible_h >= 2 { sel_end } else { sel_start };
                 let offset = anchor.saturating_sub(visible_h - 1).min(total - visible_h);
-                let shown = task_ends
+                // A folded heading that survives the window accounts for
+                // its whole group: the user can read its "(n)", so those
+                // rows are not part of the "+n more" that scrolled away.
+                let shown: usize = anchors
                     .iter()
-                    .filter(|&&e| e >= offset && e < offset + visible_h)
-                    .count();
+                    .filter(|a| a.end >= offset && a.end < offset + visible_h)
+                    .map(|a| a.covers)
+                    .sum();
                 (offset, app.tasks.len().saturating_sub(shown))
             };
             // The footer costs a row, so it has to earn it. When every
@@ -913,6 +1050,24 @@ fn draw_permission_modal(
     scroll: usize,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // The durable grant leads the body, not the footer. The footer is a
+    // single fixed row that cannot wrap, so a narrow terminal truncated
+    // the tail of the prefix while `[P]` stayed live — a durable grant
+    // whose full scope the user could not read. Here it wraps, and being
+    // the first row it survives however short the modal gets. Escaped
+    // like every other untrusted string in this modal: the prefix is
+    // derived from a model-supplied command, and a bidi or zero-width
+    // control in it would make the grant read as something other than
+    // the bytes to be persisted.
+    if let Some(ref prefix) = pending.suggested_prefix {
+        lines.push(Line::from(Span::styled(
+            format!("[P] always allow: {}", escape_deceptive(prefix)),
+            Style::default()
+                .fg(palette().warning)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
     if pending_behind > 0 {
         lines.push(Line::from(Span::styled(
             format!("⚠ {pending_behind} more pending"),
@@ -988,7 +1143,13 @@ fn draw_permission_modal(
         // Keep ≤ 40 cols so min-width modals still show every binding —
         // the deny action must never be the one that gets clipped.
         // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
-        Some(key_hint_line("[y] once [a] session [A] always [n] deny")),
+        // The prefix itself is NOT named here: it is variable-length, and
+        // this row cannot wrap. The body row above carries the scope.
+        Some(key_hint_line(if pending.suggested_prefix.is_some() {
+            "[y] once [a] session [A] always [P] prefix [n] deny"
+        } else {
+            "[y] once [a] session [A] always [n] deny"
+        })),
     );
 }
 
@@ -1525,6 +1686,13 @@ pub fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The crate root allows dead code for its public API surface, which
+    // also silences a test that loses its `#[test]` — exactly what a
+    // merge did to `normal_mode_is_visible_in_the_prompt` here. Opt this
+    // module back in: an unannotated test is unreachable, so the
+    // compiler is the thing that should notice.
+    #![deny(dead_code)]
+
     use super::*;
     use crate::ui::modern::app::TranscriptItem;
     use ratatui::Terminal;
@@ -1577,6 +1745,7 @@ mod tests {
                     description: format!("Bash: run `{attack}`"),
                     origin: None,
                     input_preview: Some(format!("{{\n  \"command\": \"{attack}\"\n}}")),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -1587,6 +1756,237 @@ mod tests {
             "a bidi override reached the screen:\n{s}"
         );
         assert!(s.contains("<U+202E>"), "override not surfaced:\n{s}");
+    }
+
+    /// `[P]` approves a *durable* grant, so the prefix beside it has to
+    /// read as the bytes that will be persisted and later authorized. The
+    /// prefix is derived from the model-supplied command, so a bidi
+    /// override in it would make the footer advertise a different grant
+    /// from the one being made.
+    #[test]
+    fn permission_modal_reveals_a_bidi_override_in_the_offered_prefix() {
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: "Bash: run a command".into(),
+                    origin: None,
+                    input_preview: None,
+                    suggested_prefix: Some("git\u{202e}sutats".into()),
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            !s.contains('\u{202e}'),
+            "a bidi override in the offered prefix reached the screen:\n{s}"
+        );
+        assert!(
+            s.contains("git<U+202E>sutats"),
+            "override in the offered prefix not surfaced:\n{s}"
+        );
+    }
+
+    /// `[P]` creates a *durable* grant, so its full scope has to be
+    /// readable before the key is live. The hint used to live in the
+    /// one-row footer, which cannot wrap: at 60 columns the prefix tail
+    /// was truncated while `[P]` still worked.
+    #[test]
+    fn permission_modal_shows_the_whole_prefix_on_a_narrow_terminal() {
+        // Long enough that no single row of a narrow modal could hold it.
+        let prefix = "/usr/local/bin/kubectl rollout-status-with-a-long-name";
+        for cols in [46u16, 60, 80, 120] {
+            let backend = TestBackend::new(cols, 24);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: Some(prefix.into()),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            // The body wraps, so the prefix may be split across rows —
+            // possibly mid-word. Dropping borders and every space
+            // reassembles it either way.
+            let flat = squeeze(&s);
+            assert!(
+                flat.contains(&squeeze(prefix)),
+                "the prefix was not fully visible at {cols} columns:\n{s}"
+            );
+            assert!(
+                s.contains("[P]"),
+                "the prefix binding vanished at {cols} columns:\n{s}"
+            );
+            // Every binding stays readable. `[n] deny` is the one that
+            // used to fall off the end of a one-row footer while its key
+            // stayed live.
+            for hint in ["[y]", "[a]", "[A]", "[P]", "[n]deny"] {
+                assert!(
+                    flat.contains(hint),
+                    "binding {hint} was clipped at {cols} columns:\n{s}"
+                );
+            }
+        }
+    }
+
+    /// The deny binding must survive the narrowest supported modal even
+    /// when no prefix is offered — the plain footer is 40 columns and the
+    /// inner width at a 46-column terminal is 38.
+    #[test]
+    fn permission_modal_keeps_every_binding_at_the_narrowest_width() {
+        for prefix in [None, Some("git status".to_string())] {
+            let backend = TestBackend::new(46, 24);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: prefix.clone(),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            let flat = squeeze(&s);
+            for hint in ["[y]once", "[a]session", "[A]always", "[n]deny"] {
+                assert!(
+                    flat.contains(hint),
+                    "binding {hint} was clipped with prefix={prefix:?}:\n{s}"
+                );
+            }
+        }
+    }
+
+    /// The modal is sized from the rows its text actually occupies. A
+    /// prefix long enough to wrap several times counted as one line, so
+    /// the box was sized too short and clipped the rest of it — while
+    /// `[P]` stayed live over a scope the user could not finish reading.
+    #[test]
+    fn permission_modal_grows_for_a_prefix_that_wraps_many_rows() {
+        let prefix = format!(
+            "/opt/{}/bin/kubectl rollout",
+            "very-long-directory".repeat(6)
+        );
+        for cols in [60u16, 80, 120] {
+            let backend = TestBackend::new(cols, 40);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: Some(prefix.clone()),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            let flat = squeeze(&s);
+            assert!(
+                flat.contains(&squeeze(&prefix)),
+                "a wrapping prefix was clipped at {cols} columns:\n{s}"
+            );
+            // The description it pushed down must survive too.
+            assert!(
+                flat.contains(&squeeze("Bash: run a command")),
+                "the modal body was clipped at {cols} columns:\n{s}"
+            );
+        }
+    }
+
+    /// Screen text with the box borders and all whitespace removed, so a
+    /// string that wrapped across rows — even mid-word — can still be
+    /// searched for as one piece.
+    fn squeeze(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && !"│┌┐└┘─".contains(*c))
+            .collect()
+    }
+
+    #[test]
+    fn wrapped_rows_counts_greedy_word_wrap() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("short", 10), 1);
+        // Wraps whole words to the next row.
+        assert_eq!(wrapped_rows("aaaa bbbb cccc", 10), 2);
+        // A word wider than the line is split across rows.
+        assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
+        assert_eq!(wrapped_rows("ab", 0), 1);
+    }
+
+    /// Rows are display columns, not characters. A CJK glyph takes two
+    /// cells, so ten of them fill a 20-column line — counting characters
+    /// would call that one row and size the modal half as tall as it
+    /// needs to be.
+    #[test]
+    fn wrapped_rows_measures_display_width() {
+        let cjk = "日".repeat(10); // 10 chars, 20 columns
+        assert_eq!(wrapped_rows(&cjk, 20), 1);
+        assert_eq!(wrapped_rows(&cjk, 10), 2);
+        assert_eq!(wrapped_rows(&cjk, 6), 4);
+        // An odd width cannot split a double-width glyph, so the row
+        // ends one column early.
+        assert_eq!(wrapped_rows(&cjk, 5), 5);
+    }
+
+    /// The permission modal must grow for double-width text too, or the
+    /// durable-grant row is clipped exactly as it was for long prefixes.
+    #[test]
+    fn permission_modal_grows_for_double_width_text() {
+        let backend = TestBackend::new(60, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Permission;
+        let (respond, _rx) = std::sync::mpsc::channel();
+        let description = format!("Bash: {}", "日本語".repeat(20));
+        app.modals
+            .push_back(crate::ui::modern::app::Modal::Permission(
+                PendingPermission {
+                    name: "Bash".into(),
+                    description: description.clone(),
+                    origin: None,
+                    input_preview: None,
+                    suggested_prefix: Some("git status".into()),
+                    respond,
+                },
+            ));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        let flat = squeeze(&s);
+        assert!(
+            flat.contains(&squeeze(&description)),
+            "double-width text was clipped:\n{s}"
+        );
+        assert!(
+            flat.contains(&squeeze("git status")),
+            "the durable-grant row was pushed out:\n{s}"
+        );
     }
 
     /// The modal title names the tool being approved. A plugin manifest or
@@ -1606,6 +2006,7 @@ mod tests {
                     description: "run plugin".into(),
                     origin: None,
                     input_preview: None,
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2162,6 +2563,39 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_group_hides_its_rows_and_shows_its_size() {
+        use crate::ui::modern::tasks::TaskSource;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore the parser");
+        crate::ui::modern::tasks::upsert_with_source(
+            &mut app.tasks,
+            "b1",
+            "working",
+            "cargo build",
+            TaskSource::Background,
+        );
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let open = buffer_to_string(term.backend().buffer());
+        assert!(open.contains("explore the parser"), "buffer:\n{open}");
+        assert!(open.contains("▾ agents"), "no expanded marker:\n{open}");
+
+        app.collapsed_groups.push(TaskSource::Subagent);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let folded = buffer_to_string(term.backend().buffer());
+        assert!(
+            !folded.contains("explore the parser"),
+            "folding did not hide the row:\n{folded}"
+        );
+        // The count keeps the group honest about what it is hiding.
+        assert!(folded.contains("▸ agents (1)"), "buffer:\n{folded}");
+        // The other group is untouched.
+        assert!(folded.contains("cargo build"), "buffer:\n{folded}");
+    }
+
+    #[test]
     fn normal_mode_is_visible_in_the_prompt() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
@@ -2195,6 +2629,7 @@ mod tests {
                     description: "Bash: run `cargo publish`".into(),
                     origin: Some("subagent-2".into()),
                     input_preview: Some("{\n  \"command\": \"cargo publish\"\n}".into()),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2231,6 +2666,7 @@ mod tests {
                     description: "big input".into(),
                     origin: None,
                     input_preview: Some(preview),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2287,6 +2723,7 @@ mod tests {
                         "Bash: run a long pipeline that wraps across many columns and rows".into(),
                     origin: None,
                     input_preview: Some(preview),
+                    suggested_prefix: None,
                     respond,
                 },
             ));
@@ -2378,6 +2815,7 @@ mod tests {
                         description: format!("{name} ask"),
                         origin: None,
                         input_preview: None,
+                        suggested_prefix: None,
                         respond,
                     },
                 ));
@@ -2545,6 +2983,187 @@ mod tests {
             s.contains("job number 5"),
             "selected task scrolled out of view:\n{s}"
         );
+    }
+
+    /// A pane holding a big folded group ahead of a selected, expanded
+    /// one — the shape that broke the overflow window.
+    fn app_with_folded_group_then_background(agents: usize, jobs: usize) -> App {
+        let mut app = App::new("m", "/tmp", "s");
+        for i in 0..agents {
+            crate::ui::modern::tasks::upsert(
+                &mut app.tasks,
+                &format!("a{i}"),
+                "working",
+                &format!("agent number {i}"),
+            );
+        }
+        let rows = (0..jobs)
+            .map(|i| crate::ui::modern::tasks::ManagerRow {
+                id: format!("b{i}"),
+                state: "working".into(),
+                headline: format!("job number {i}"),
+                subagent_id: None,
+            })
+            .collect();
+        app.sync_background_tasks(rows);
+        app.collapsed_groups
+            .push(crate::ui::modern::tasks::TaskSource::Subagent);
+        app
+    }
+
+    /// The "… +n more" count.
+    fn hidden_count(s: &str) -> usize {
+        let tail = s.split("… +").nth(1).expect("no overflow indicator");
+        tail.split(' ')
+            .next()
+            .expect("no count")
+            .parse()
+            .expect("count not a number")
+    }
+
+    /// `task_ends` was a dense list of *rendered* rows indexed by the
+    /// absolute task index, so a folded group ahead of the selection
+    /// shifted the lookup: the window anchored on the wrong row (or fell
+    /// back to zero) and scrolled the selected task off screen.
+    #[test]
+    fn overflow_window_follows_selection_past_a_folded_group() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = app_with_folded_group_then_background(20, 6);
+        // Last background row: far below the folded group.
+        app.tasks_selected = app.tasks.len() - 1;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(
+            s.contains("job number 5"),
+            "selected task scrolled out of view past a folded group:\n{s}"
+        );
+    }
+
+    /// Walking down the visible group must keep every step on screen,
+    /// not just the first.
+    #[test]
+    fn stepping_through_a_group_after_a_folded_one_stays_visible() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = app_with_folded_group_then_background(20, 6);
+        app.tasks_selected =
+            crate::ui::modern::tasks::selectable_indices(&app.tasks, &app.collapsed_groups)[1];
+        for step in 0..6 {
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            let headline = format!("job number {step}");
+            assert!(
+                s.contains(&headline),
+                "step {step}: selected task not on screen:\n{s}"
+            );
+            app.tasks_select(1);
+        }
+    }
+
+    /// A folded heading that is on screen already tells the user how
+    /// many rows are behind it, so those must not be counted again in
+    /// the "+n more" tally.
+    #[test]
+    fn a_visible_folded_heading_accounts_for_its_own_rows() {
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = app_with_folded_group_then_background(20, 6);
+        app.tasks_selected =
+            crate::ui::modern::tasks::selectable_indices(&app.tasks, &app.collapsed_groups)[0];
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("▸ agents (20)"), "folded heading missing:\n{s}");
+        let hidden = hidden_count(&s);
+        assert!(
+            hidden <= 6,
+            "the 20 rows behind the visible folded heading were counted as hidden: +{hidden}\n{s}"
+        );
+    }
+
+    /// A folded heading is one line, but the window used to derive the
+    /// marker row as `end - 1` — the shape of a two-line task row. On a
+    /// short pane that stepped onto the blank separator above the
+    /// heading and dropped the selected group off screen entirely, so
+    /// the user had to unfold it blind. The second group is the folded
+    /// one here: the first group's heading sits at line 0, where the
+    /// off-by-one is invisible.
+    #[test]
+    fn a_selected_folded_heading_survives_every_pane_height() {
+        for h in 8..=22u16 {
+            let mut term = Terminal::new(TestBackend::new(100, h)).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            for i in 0..12 {
+                crate::ui::modern::tasks::upsert(
+                    &mut app.tasks,
+                    &format!("a{i}"),
+                    "working",
+                    &format!("agent number {i}"),
+                );
+            }
+            let rows = (0..3)
+                .map(|i| crate::ui::modern::tasks::ManagerRow {
+                    id: format!("b{i}"),
+                    state: "working".into(),
+                    headline: format!("job number {i}"),
+                    subagent_id: None,
+                })
+                .collect();
+            app.sync_background_tasks(rows);
+            // "background" sorts after "agents", so this is the second
+            // group.
+            app.collapsed_groups
+                .push(crate::ui::modern::tasks::TaskSource::Background);
+            app.tasks_selected = app
+                .tasks
+                .iter()
+                .position(|t| t.source == crate::ui::modern::tasks::TaskSource::Background)
+                .unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            assert!(
+                s.contains("❯▸ background (3)"),
+                "height {h}: selected folded heading not on screen:\n{s}"
+            );
+        }
+    }
+
+    /// The same window must still keep a selected *task* row's marker
+    /// on screen — the marker sits on the status line, above the
+    /// headline.
+    #[test]
+    fn a_selected_task_row_keeps_its_marker_at_every_pane_height() {
+        for h in 8..=22u16 {
+            let mut term = Terminal::new(TestBackend::new(100, h)).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            let rows = (0..8)
+                .map(|i| crate::ui::modern::tasks::ManagerRow {
+                    id: format!("b{i}"),
+                    state: "working".into(),
+                    headline: format!("job number {i}"),
+                    subagent_id: None,
+                })
+                .collect();
+            app.sync_background_tasks(rows);
+            app.tasks_selected = app.tasks.len() - 1;
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            assert!(s.contains('❯'), "height {h}: selection marker lost:\n{s}");
+        }
+    }
+
+    /// The selection marker has to render on the heading when the
+    /// selected group is folded, or the pane looks like it lost focus.
+    #[test]
+    fn a_folded_heading_shows_the_selection_marker() {
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = app_with_folded_group_then_background(2, 2);
+        app.tasks_selected =
+            crate::ui::modern::tasks::selectable_indices(&app.tasks, &app.collapsed_groups)[0];
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("❯▸ agents (2)"), "marker not on heading:\n{s}");
     }
 
     #[test]

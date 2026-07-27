@@ -74,6 +74,9 @@ pub struct QueryEngine {
     last_seen_denial_total: usize,
     extraction_state: Arc<tokio::sync::Mutex<crate::memory::extraction::ExtractionState>>,
     session_allows: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Content blocks to prepend to the next user message (images from
+    /// the composer). Consumed by the turn that follows.
+    pending_attachments: Vec<crate::llm::message::ContentBlock>,
     /// Grants that persist across sessions. `None` until a host opts in
     /// via [`Self::set_persistent_grants`] — library embedders get the
     /// previous behaviour (session-scoped only) unless they ask for it.
@@ -237,6 +240,7 @@ impl QueryEngine {
                 crate::memory::extraction::ExtractionState::new(),
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_attachments: Vec::new(),
             persistent_grants: None,
             permission_prompter: None,
             question_asker: None,
@@ -287,6 +291,14 @@ impl QueryEngine {
         // status-bar ratio until a per-model table is wired.
         const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
         sink.on_context_usage(used, DEFAULT_CONTEXT_WINDOW);
+    }
+
+    /// Attach content blocks to the next user turn.
+    ///
+    /// Replaces rather than appends, so a cancelled composer cannot
+    /// accumulate images across attempts.
+    pub fn set_pending_attachments(&mut self, blocks: Vec<crate::llm::message::ContentBlock>) {
+        self.pending_attachments = blocks;
     }
 
     /// Install the interactive permission prompter.
@@ -796,14 +808,49 @@ impl QueryEngine {
         user_input: &str,
         sink: &dyn StreamSink,
     ) -> crate::error::Result<()> {
-        // Add the user message to history.
-        let user_msg = user_message(user_input);
+        // Add the user message to history, with anything the caller
+        // attached for this turn. Taken rather than read: an attachment
+        // belongs to exactly one turn, and leaking it into the next one
+        // would re-send an image the user already shared.
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        // Described for the hooks below before the blocks are moved into
+        // the message. A `UserPromptSubmit` hook exists to see everything
+        // the turn sends; an image that only showed up as silence there
+        // would slip past exactly the audit it was configured for.
+        let attachment_info = crate::llm::message::describe_attachments(&attachments);
+        let user_msg = if attachments.is_empty() {
+            user_message(user_input)
+        } else {
+            crate::llm::message::user_message_with_attachments(user_input, attachments)
+        };
         self.state.push_message(user_msg);
+        // Images are the one block a token threshold cannot see: each is
+        // charged a flat vision estimate, so compaction never fires on the
+        // megabytes they actually add to every later request. Bound what
+        // history retains here instead, once the new turn's own images are
+        // in and counted as the most recent.
+        let dropped = compact::evict_old_images(
+            &mut self.state.messages,
+            compact::MAX_RETAINED_IMAGE_BYTES,
+            compact::MAX_RETAINED_IMAGES,
+        );
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "evicted image payloads beyond the retention budget"
+            );
+        }
 
         // UserPromptSubmit fires once per user turn, as soon as the
         // prompt is in history and before any PreTurn / LLM work. Hooks
         // at this event see the FULL prompt (no truncation) so they can
         // do content scanning, redaction logging, or compliance audits.
+        //
+        // Observation only: unlike PreToolUse, a non-zero exit here does
+        // not veto the turn. Wiring that up would start blocking prompts
+        // for every deployment whose prompt hook happens to exit non-zero
+        // today — a `grep` that finds nothing is enough — so it is a
+        // deliberate change for its own PR, not a side effect of this one.
         let _user_prompt_submit_results = self
             .hooks
             .run_hooks(
@@ -811,6 +858,7 @@ impl QueryEngine {
                 None,
                 &serde_json::json!({
                     "user_input": user_input,
+                    "attachments": attachment_info,
                     "turn": self.state.turn_count + 1,
                 }),
                 Some(&self.cancel),
@@ -831,6 +879,7 @@ impl QueryEngine {
                 &serde_json::json!({
                     "turn": self.state.turn_count + 1,
                     "user_input_preview": user_input.chars().take(200).collect::<String>(),
+                    "attachments": attachment_info,
                 }),
                 Some(&self.cancel),
             )

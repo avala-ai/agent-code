@@ -14,7 +14,8 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+D` | Quit (empty prompt only) |
 | `Ctrl+T` | Toggle tasks/agents pane |
 | `↑`/`↓` | Move the tasks-pane selection (pane open, empty composer) |
-| `Enter` | Open the selected background task's output (pane open, empty composer) |
+| `Enter` | Open the selected background task's output — on a folded group heading, unfold it (pane open, empty composer) |
+| `Space` | Fold / unfold the selected group in the tasks pane. A folded group stays selectable through its heading (`▸ agents (3)`) |
 | `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
@@ -191,3 +192,10 @@ double-press quit is still reachable. `/emacs` turns the vi bindings back
 off; the composer then behaves as it does everywhere else in this
 document. It does not add Emacs chords — the composer has none of its
 own, and `Ctrl+E` / `Ctrl+U` are the transcript controls listed above.
+
+## Images
+
+Mention an image the way you mention a file — `@screenshot.png` — and it is
+attached to the turn as an image rather than inlined as text. Supported:
+`png`, `jpg`/`jpeg`, `gif`, `webp`. Other binaries are still skipped with a
+reason.
