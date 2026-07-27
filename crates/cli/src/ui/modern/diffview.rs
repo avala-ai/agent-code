@@ -118,7 +118,7 @@ fn render_code_line(
     let mut char_idx = 0usize;
     let ranges = hl.highlight_line(content, syntax_set()).unwrap_or_default();
     for (sty, text) in ranges {
-        let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+        let fg = super::colors::syntax_color(sty.foreground.r, sty.foreground.g, sty.foreground.b);
         // Split this run char-by-char, coalescing adjacent chars with the
         // same background so we don't emit one span per character.
         let mut buf = String::new();

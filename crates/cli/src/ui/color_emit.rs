@@ -40,14 +40,62 @@ pub enum EmitMode {
 
 static EMIT_MODE: OnceLock<EmitMode> = OnceLock::new();
 
+// Test-only emit-mode override. Thread-local rather than global: the
+// test harness runs each test on its own thread, so a test that pins
+// Mono cannot bleed into a frame another test is rendering in parallel.
+#[cfg(test)]
+thread_local! {
+    static TEST_MODE: std::cell::Cell<Option<EmitMode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_override() -> Option<EmitMode> {
+    TEST_MODE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn test_override() -> Option<EmitMode> {
+    None
+}
+
+/// Pin the emit mode on this thread until the returned guard drops.
+///
+/// Without this a test cannot reach any mode but truecolor (see
+/// [`current`]), which makes "does the UI actually go monochrome under
+/// `NO_COLOR`?" untestable — the one question the palette routing exists
+/// to answer.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn pin_mode(mode: EmitMode) -> ModeGuard {
+    TEST_MODE.with(|m| m.set(Some(mode)));
+    ModeGuard
+}
+
+/// Restores the ambient emit mode on drop, including on panic — a failed
+/// assertion must not leave the rest of the thread's tests in Mono.
+#[cfg(test)]
+pub(crate) struct ModeGuard;
+
+#[cfg(test)]
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        TEST_MODE.with(|m| m.set(None));
+    }
+}
+
 /// Returns the cached emit mode, initializing it on first call.
 ///
-/// Under `cfg(test)` this is pinned to [`EmitMode::Truecolor`]: rendered
-/// frames — the golden snapshots above all — must be identical on every
-/// runner, not a function of the ambient `NO_COLOR` / `CLICOLOR` /
-/// `FORCE_COLOR` / `TERM` environment the tests happen to inherit.
-/// Detection itself stays covered through the pure [`detect_from_env`].
+/// Under `cfg(test)` this is pinned to [`EmitMode::Truecolor`] unless a
+/// test asked for something else via [`pin_mode`]: rendered frames — the
+/// golden snapshots above all — must be identical on every runner, not a
+/// function of the ambient `NO_COLOR` / `CLICOLOR` / `FORCE_COLOR` /
+/// `TERM` environment the tests happen to inherit. Detection itself
+/// stays covered through the pure [`detect_from_env`].
 pub fn current() -> EmitMode {
+    if let Some(mode) = test_override() {
+        return mode;
+    }
     if cfg!(test) {
         return EmitMode::Truecolor;
     }

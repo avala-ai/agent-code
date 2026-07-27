@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -182,9 +182,7 @@ impl Builder {
                 }
             }
             Event::Code(t) => {
-                let style = Style::default()
-                    .fg(Color::Rgb(220, 220, 170))
-                    .bg(Color::Rgb(45, 45, 55));
+                let style = Style::default().fg(palette().code_fg).bg(palette().code_bg);
                 self.push_text(&format!(" {t} "), style);
             }
             Event::SoftBreak => {
@@ -363,7 +361,7 @@ impl Builder {
         let accent = palette().accent;
         let muted = palette().muted;
         let gutter = Style::default().fg(muted);
-        let body_bg = Color::Rgb(24, 24, 32);
+        let body_bg = palette().code_bg;
         let tag = if lang.is_empty() {
             "code".to_string()
         } else {
@@ -378,7 +376,7 @@ impl Builder {
             Span::styled(
                 format!(" {tag} "),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(palette().on_accent)
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -419,7 +417,9 @@ impl Builder {
                         let c = sty.foreground;
                         spans.push(Span::styled(
                             t.to_string(),
-                            Style::default().fg(Color::Rgb(c.r, c.g, c.b)).bg(body_bg),
+                            Style::default()
+                                .fg(super::colors::syntax_color(c.r, c.g, c.b))
+                                .bg(body_bg),
                         ));
                         self.spans_emitted += 1;
                     }
@@ -457,6 +457,54 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Markdown was the last part of the transcript still painting
+    /// hardcoded RGB: the inline-code chip, the code-block background,
+    /// and syntect's own highlight palette. None of those reach
+    /// `adapt_for_emit` on their own, so under `NO_COLOR` they kept
+    /// emitting 24-bit colour long after the chrome had stopped.
+    #[test]
+    fn no_colour_mode_strips_inline_code_and_highlighting() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+
+        let md = render_markdown("uses `run()` here\n\n```rust\nfn main() { let x = 1; }\n```\n");
+        let mut offenders = Vec::new();
+        for line in &md.lines {
+            for span in &line.spans {
+                for (what, c) in [("fg", span.style.fg), ("bg", span.style.bg)] {
+                    if let Some(c) = c
+                        && c != ratatui::style::Color::Reset
+                    {
+                        offenders.push(format!("{what}={c:?} on {:?}", span.content));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "markdown still carries colour under NO_COLOR: {offenders:?}"
+        );
+    }
+
+    /// The inline-code chip and the fenced block share one pair of
+    /// palette slots, so a theme swap moves both together.
+    #[test]
+    fn inline_code_uses_the_theme_code_slots() {
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let md = render_markdown("uses `run()` here");
+        let chip = md
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("run()"))
+            .expect("inline code span");
+        assert_eq!(chip.style.fg, Some(palette().code_fg));
+        assert_eq!(chip.style.bg, Some(palette().code_bg));
     }
 
     #[test]

@@ -23,6 +23,11 @@ pub struct Palette {
     pub inactive: Color,
     pub text: Color,
     pub plan: Color,
+    /// Foreground for text sitting on an accent/warning fill.
+    pub on_accent: Color,
+    /// Inline-code / code-block foreground and background.
+    pub code_fg: Color,
+    pub code_bg: Color,
     // Diff rendering (inline edit cards).
     pub diff_add: Color,
     pub diff_remove: Color,
@@ -50,6 +55,9 @@ pub fn palette() -> Palette {
         inactive: theme_to_ratatui(t.inactive),
         text: theme_to_ratatui(t.text),
         plan: theme_to_ratatui(t.plan_mode),
+        on_accent: theme_to_ratatui(t.on_accent),
+        code_fg: theme_to_ratatui(t.code_fg),
+        code_bg: theme_to_ratatui(t.code_bg),
         diff_add: theme_to_ratatui(t.diff_add),
         diff_remove: theme_to_ratatui(t.diff_remove),
         diff_add_dim: theme_to_ratatui(t.diff_added_dimmed),
@@ -60,6 +68,20 @@ pub fn palette() -> Palette {
         bash_msg_bg: theme_to_ratatui(t.bash_message_bg),
         memory_msg_bg: theme_to_ratatui(t.memory_message_bg),
     }
+}
+
+/// Adapt a colour that did **not** come from the theme — the syntax
+/// highlighter ships its own palette — to the terminal's colour depth.
+///
+/// Highlighted code is still colour, and it is the one place in the UI
+/// that never passes through a theme slot, so it cannot reach
+/// `adapt_for_emit`. Without this hop a syntax-highlighted code block
+/// keeps emitting 24-bit RGB under `NO_COLOR`.
+pub fn syntax_color(r: u8, g: u8, b: u8) -> Color {
+    theme_to_ratatui(crate::ui::color_emit::adapt(
+        crate::ui::color_emit::current(),
+        crossterm::style::Color::Rgb { r, g, b },
+    ))
 }
 
 #[cfg(test)]

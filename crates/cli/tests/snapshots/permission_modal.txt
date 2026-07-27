@@ -59,4 +59,4 @@ e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
 f fg=Rgb(229, 192, 123) bg=Reset mods=BOLD
 g fg=Rgb(97, 175, 239) bg=Reset mods=NONE
 h fg=Rgb(171, 178, 191) bg=Reset mods=NONE
-i fg=Black bg=Rgb(229, 192, 123) mods=BOLD
+i fg=Rgb(40, 44, 52) bg=Rgb(229, 192, 123) mods=BOLD

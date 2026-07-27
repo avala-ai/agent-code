@@ -1057,7 +1057,7 @@ fn apply_selection_highlight(
             *line = Line::from(Span::styled(
                 plain,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(palette().on_accent)
                     .bg(accent)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -1067,8 +1067,8 @@ fn apply_selection_highlight(
 }
 
 /// Paint the row the `2/3` counter points at, so stepping through
-/// matches is visibly anchored. Warning-on-black to stay distinct from
-/// the accent-colored mouse selection.
+/// matches is visibly anchored. Filled with the warning colour to stay
+/// distinct from the accent-filled mouse selection.
 fn apply_search_highlight(
     mut view: Vec<Line<'static>>,
     top: usize,
@@ -1088,7 +1088,7 @@ fn apply_search_highlight(
         *line = Line::from(Span::styled(
             plain,
             Style::default()
-                .fg(Color::Black)
+                .fg(palette().on_accent)
                 .bg(palette().warning)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -1180,7 +1180,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 spans.push(Span::styled(
                     " action required ",
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(palette().on_accent)
                         .bg(warning)
                         .add_modifier(Modifier::BOLD),
                 ));
@@ -1681,24 +1681,13 @@ mod tests {
         );
     }
 
-    /// Every colour on screen must come from the theme.
-    ///
-    /// The theme adapts itself for the terminal's colour depth
-    /// (`adapt_for_emit`), so a hardcoded `Color::DarkGray` in the chrome
-    /// silently opts that cell out of the adaptation — under `NO_COLOR`
-    /// it stays coloured. One-dark's slots are all RGB, so any *named*
-    /// colour in the frame is a bypass.
-    #[test]
-    fn the_frame_uses_only_theme_colours() {
-        use ratatui::style::Color;
-        let _g = crate::ui::theme::test_lock();
-        crate::ui::theme::init("one-dark");
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
+    /// A frame exercising the chrome most tempting to hand-colour: an
+    /// error, a warning, thinking, the tasks pane, a failed tool, and
+    /// assistant markdown carrying both inline code and a fenced,
+    /// syntax-highlighted block.
+    fn colour_probe_app() -> App {
         let mut app = App::new("m", "/tmp", "s");
         app.transcript.push(TranscriptItem::User("hello".into()));
-        app.transcript
-            .push(TranscriptItem::Assistant("hi there".into()));
         app.transcript.push(TranscriptItem::Tool {
             call_id: "c1".into(),
             name: "Bash".into(),
@@ -1707,8 +1696,6 @@ mod tests {
             is_error: false,
             live: None,
         });
-        // Exercise the chrome that is most tempting to hand-colour:
-        // an error, a warning, thinking, and the tasks pane.
         app.transcript
             .push(TranscriptItem::Error("it broke".into()));
         app.transcript
@@ -1725,10 +1712,48 @@ mod tests {
             is_error: true,
             live: None,
         });
+        // Last, so the bottom-anchored transcript keeps it on screen:
+        // a colour test that silently scrolls its own subject out of the
+        // viewport passes for the wrong reason.
+        app.transcript.push(TranscriptItem::Assistant(
+            "call `run()` first\n\n```rust\nfn main() { let x = 1; }\n```\n".into(),
+        ));
         crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app
+    }
+
+    /// Guards [`colour_probe_app`] against going vacuous: both the
+    /// inline-code chip and the syntax-highlighted block must be on
+    /// screen for the colour assertions below to mean anything.
+    fn assert_probe_subject_visible(buf: &ratatui::buffer::Buffer) {
+        let s = buffer_to_string(buf);
+        assert!(s.contains("run()"), "inline code scrolled away:\n{s}");
+        assert!(s.contains("fn main"), "code block scrolled away:\n{s}");
+    }
+
+    /// Every colour on screen must come from the theme.
+    ///
+    /// The theme adapts itself for the terminal's colour depth
+    /// (`adapt_for_emit`), so a hardcoded `Color::DarkGray` in the chrome
+    /// silently opts that cell out of the adaptation — under `NO_COLOR`
+    /// it stays coloured. One-dark's slots are all RGB, so any *named*
+    /// colour in the frame is a bypass.
+    ///
+    /// This catches named literals only. A hardcoded `Color::Rgb` is
+    /// just as much a bypass and looks identical here — that is what
+    /// [`no_colour_mode_leaves_no_colour_on_screen`] is for.
+    #[test]
+    fn the_frame_uses_only_theme_colours() {
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
         let mut offenders: Vec<String> = Vec::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -1749,6 +1774,139 @@ mod tests {
             offenders.len(),
             offenders
         );
+    }
+
+    /// `NO_COLOR` asks for *no* colour, not less of it — so in
+    /// [`EmitMode::Mono`] every cell in a rendered frame must carry the
+    /// terminal default for both foreground and background. Modifiers
+    /// (bold, dim, italic) survive; hue does not.
+    ///
+    /// This is the assertion that a hardcoded colour cannot survive,
+    /// whatever form it takes: only values that reached the screen
+    /// through a palette slot (or through
+    /// [`crate::ui::modern::colors::syntax_color`]) get adapted, so any
+    /// literal — named *or* RGB — shows up here as a coloured cell.
+    #[test]
+    fn no_colour_mode_leaves_no_colour_on_screen() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let _mode = pin_mode(EmitMode::Mono);
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
+        // Both filled highlights (mouse selection, current search match)
+        // draw text on a coloured bar; a hardcoded black foreground there
+        // turns invisible once the fill collapses to the default.
+        app.open_search();
+        for c in "run".chars() {
+            app.search_insert_char(c);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
+        let mut offenders: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, c) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    if c != Color::Reset {
+                        offenders.push(format!("{what}={c:?} at {x},{y}"));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup_by(|a, b| a.split(" at").next() == b.split(" at").next());
+        assert!(
+            offenders.is_empty(),
+            "{} cells still carry colour under NO_COLOR: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// The mirror image of [`the_frame_uses_only_theme_colours`]: in
+    /// [`EmitMode::Ansi16`] every palette slot is quantized to a *named*
+    /// colour, so a surviving `Color::Rgb` is a value that never went
+    /// through the adaptation — the exact bypass a truecolor-only test
+    /// cannot see.
+    ///
+    /// Run against the `dark-ansi` accessibility palette, whose slots are
+    /// named to begin with, so the frame has to come out named end to end.
+    #[test]
+    fn ansi16_mode_quantizes_every_colour_on_screen() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("dark-ansi");
+        let _mode = pin_mode(EmitMode::Ansi16);
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = colour_probe_app();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        assert_probe_subject_visible(buf);
+        let mut offenders: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, c) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    if matches!(c, Color::Rgb(..)) {
+                        offenders.push(format!("{what}={c:?} at {x},{y}"));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup_by(|a, b| a.split(" at").next() == b.split(" at").next());
+        assert!(
+            offenders.is_empty(),
+            "{} cells kept 24-bit colour on a 16-colour terminal: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// The two filled highlight bars used to paint `Color::Black` text on
+    /// a coloured fill. That is wrong twice over: on a light theme the
+    /// fill is dark, and under `NO_COLOR` the fill collapses to the
+    /// terminal default while the black text stays black — invisible on
+    /// any dark terminal. Both foregrounds now come from `on_accent`.
+    #[test]
+    fn filled_highlights_take_their_foreground_from_the_palette() {
+        use crate::ui::color_emit::{EmitMode, pin_mode};
+        use ratatui::style::Color;
+        let _g = crate::ui::theme::test_lock();
+
+        // Light theme: the badge foreground must follow the theme
+        // background, not a hardcoded black.
+        crate::ui::theme::init("solarized-light");
+        let light_on_accent = palette().on_accent;
+        assert_ne!(
+            light_on_accent,
+            Color::Black,
+            "a light theme must not paint badge text black"
+        );
+        let view = vec![Line::from("match here")];
+        let sel = super::super::app::TextSelection {
+            start_line: 0,
+            end_line: 0,
+        };
+        let painted = apply_selection_highlight(view.clone(), 0, Some(sel));
+        assert_eq!(painted[0].spans[0].style.fg, Some(light_on_accent));
+
+        // Mono: the fill and its foreground both collapse to the default,
+        // so the row stays legible instead of going black-on-black.
+        let _mode = pin_mode(EmitMode::Mono);
+        let painted = apply_selection_highlight(view, 0, Some(sel));
+        assert_eq!(painted[0].spans[0].style.fg, Some(Color::Reset));
+        assert_eq!(painted[0].spans[0].style.bg, Some(Color::Reset));
     }
 
     #[test]
