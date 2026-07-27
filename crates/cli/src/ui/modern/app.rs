@@ -2748,6 +2748,19 @@ impl App {
         self.dirty = true;
     }
 
+    /// Drop anything that would send itself after a cancel.
+    ///
+    /// Interject cancels the live turn *in order to* send something it has
+    /// already staged, so a prompt waiting to submit means this is a
+    /// redirect rather than a stop — and a held prompt keeps its place
+    /// behind it. A bare Ctrl+C stages nothing, and then nothing may
+    /// follow on its own.
+    pub fn cancel_pending_followups(&mut self) {
+        if self.pending_submit.is_none() {
+            self.deferred_prompt = None;
+        }
+    }
+
     /// Send a deferred prompt once the turn it was waiting behind is gone.
     ///
     /// Restored with the blocks it was encoded with, so the file is never
@@ -5335,6 +5348,37 @@ mod tests {
             "sent a deferred prompt while another's descriptors were staged"
         );
         assert!(app.deferred_prompt.is_some(), "deferred prompt lost");
+    }
+
+    /// Ctrl+C on the turn a prompt is waiting behind must stop that prompt
+    /// too — otherwise the file goes out after the user stopped the flow.
+    #[test]
+    fn cancelling_a_turn_drops_a_prompt_waiting_behind_it() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        // A bare cancel: nothing staged to send.
+        app.cancel_pending_followups();
+        assert!(
+            app.deferred_prompt.is_none(),
+            "an image prompt would have sent itself after a cancel"
+        );
+    }
+
+    /// Interject cancels the live turn in order to send something else, so
+    /// the held prompt keeps its place behind the interjection.
+    #[test]
+    fn interjecting_keeps_a_prompt_waiting_behind_it() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        type_input(&mut app, "do this instead");
+        app.interject();
+        assert_eq!(app.pending_submit.as_deref(), Some("do this instead"));
+
+        app.cancel_pending_followups();
+        assert!(
+            app.deferred_prompt.is_some(),
+            "interject dropped a prompt it only meant to go ahead of"
+        );
     }
 
     /// A cancel means nothing more goes out on its own.

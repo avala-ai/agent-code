@@ -345,16 +345,18 @@ pub(super) async fn event_loop(
     // mount would stop redraws and Ctrl+C until the read finished.
     #[allow(clippy::type_complexity)]
     let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        u64,
         String,
         Vec<agent_code_lib::llm::message::ContentBlock>,
         Vec<String>,
     )>();
-    // Set while an encode is in flight: the turn it belongs to must not
-    // start without it, and a second one must not be queued behind it.
-    let mut encoding = false;
-    // A cancel that lands mid-encode cannot stop the read, so the result
-    // is dropped when it arrives instead.
-    let mut discard_encoding = false;
+    // Identifies the encode in flight, if any: the turn it belongs to must
+    // not start without it, and a second one must not be queued behind it.
+    // A cancel forgets the id rather than waiting — the read cannot be
+    // stopped, so its result is recognised as stale when it lands and the
+    // staged turn is released immediately.
+    let mut encode_seq = 0u64;
+    let mut active_encode: Option<u64> = None;
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -626,7 +628,7 @@ pub(super) async fn event_loop(
 
         // A prompt that was held aside for a turn that has since gone can
         // send now, with the blocks it was already encoded with.
-        if turn.is_none() && !encoding {
+        if turn.is_none() && active_encode.is_none() {
             app.rearm_deferred_prompt();
         }
 
@@ -636,22 +638,24 @@ pub(super) async fn event_loop(
         // prompt, which keeps this loop free to redraw and to take a Ctrl+C
         // while a slow mount is being read.
         if turn.is_none()
-            && !encoding
+            && active_encode.is_none()
             && !app.pending_images.is_empty()
             && let Some(prompt) = app.pending_submit.take()
         {
             let images = std::mem::take(&mut app.pending_images);
             let tx = img_tx.clone();
-            encoding = true;
+            encode_seq += 1;
+            let id = encode_seq;
+            active_encode = Some(id);
             tokio::task::spawn_blocking(move || {
                 let (blocks, notes) = super::mentions::encode_staged_images(images);
-                let _ = tx.send((prompt, blocks, notes));
+                let _ = tx.send((id, prompt, blocks, notes));
             });
         }
 
         // Start a pending turn if idle.
         if turn.is_none()
-            && !encoding
+            && active_encode.is_none()
             && let Some(prompt) = app.pending_submit.take()
         {
             let blocks = std::mem::take(&mut app.pending_attachments);
@@ -685,10 +689,16 @@ pub(super) async fn event_loop(
             if let Some(ref h) = turn {
                 h.cancel();
             }
-            // A read already handed to the blocking pool cannot be stopped,
-            // so its result is thrown away when it lands.
-            if encoding {
-                discard_encoding = true;
+            // Nothing may follow on its own after a cancel — including a
+            // prompt held aside behind the turn being cancelled. Interject
+            // is the exception and says so by having staged its own prompt.
+            app.cancel_pending_followups();
+            // A read already handed to the blocking pool cannot be stopped.
+            // Forget its id instead: the result is stale when it lands, and
+            // the staged turn is released now rather than after a read that
+            // may never finish.
+            if active_encode.take().is_some() {
+                app.abandon_staged_attachments();
             }
             app.cancel_requested = false;
         }
@@ -762,6 +772,12 @@ pub(super) async fn event_loop(
                     }
                 }
                 app.mark_turn_idle();
+
+                // A prompt held aside with its images was submitted before
+                // anything in the queue, so it goes first — and it goes now
+                // rather than waiting for whatever event next wakes the
+                // loop, since nothing else would arm it.
+                app.rearm_deferred_prompt();
 
                 // Queue handling (plan §M5): auto-send the head on a clean
                 // finish; on abort/error keep the queue and tell the user.
@@ -912,18 +928,13 @@ pub(super) async fn event_loop(
             // Encoded image attachments coming back from the blocking pool.
             // The prompt is re-armed with them so the turn starts on the
             // next pass through the loop above.
-            Some((prompt, blocks, notes)) = img_rx.recv() => {
-                encoding = false;
-                if discard_encoding {
-                    // Cancelled while the read was in flight: the bytes are
+            Some((id, prompt, blocks, notes)) = img_rx.recv() => {
+                if active_encode != Some(id) {
+                    // Cancelled while this read was in flight: the state it
+                    // belonged to was released then, so the bytes are simply
                     // dropped rather than sent with a turn nobody asked for.
-                    // The prompt was taken and no turn was ever spawned, so
-                    // nothing else will end the streaming phase — leaving it
-                    // set would queue every later prompt behind a turn that
-                    // does not exist.
-                    discard_encoding = false;
-                    app.abandon_staged_attachments();
                 } else {
+                    active_encode = None;
                     for note in notes {
                         app.transcript.push(super::app::TranscriptItem::System(note));
                     }
