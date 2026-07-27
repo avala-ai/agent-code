@@ -698,6 +698,9 @@ fn shell_statements(raw: &str) -> Vec<String> {
         Substitution,
         /// `( … )`: a compound command whose `)` ends the word.
         Subshell,
+        /// `(( … ))` and `$(( … ))`: arithmetic, where `<<` is a shift
+        /// rather than a heredoc.
+        Arith,
         Brace,
         Backtick,
     }
@@ -790,6 +793,14 @@ fn shell_statements(raw: &str) -> Vec<String> {
                 }
                 current.push(c);
             }
+            // `$(( … ))` is arithmetic, not a substitution around a
+            // subshell, and `<<` inside it shifts rather than opening
+            // a heredoc.
+            '$' if peek == Some('(') && text.get(i + 2) == Some(&'(') => {
+                i += 2;
+                stack.push(Context::Arith);
+                current.push_str("$((");
+            }
             '$' if peek == Some('(') => {
                 i += 1;
                 stack.push(Context::Substitution);
@@ -808,7 +819,10 @@ fn shell_statements(raw: &str) -> Vec<String> {
             // body at all. The declaration line keeps being split —
             // commands can follow the redirect — and only the body is
             // held back, when the line ends.
-            '<' if !in_double && peek == Some('<') => {
+            '<' if !in_double
+                && peek == Some('<')
+                && !stack.iter().any(|c| matches!(c, Context::Arith)) =>
+            {
                 let mut run = 0;
                 while text.get(i + run) == Some(&'<') {
                     run += 1;
@@ -840,6 +854,13 @@ fn shell_statements(raw: &str) -> Vec<String> {
                 current.push(c);
                 current.push('(');
             }
+            // `((` where a command can start is arithmetic; ` ( (` is
+            // a subshell in a subshell and keeps its space.
+            '(' if !in_double && peek == Some('(') && word_start => {
+                i += 1;
+                stack.push(Context::Arith);
+                current.push_str("((");
+            }
             '(' if !in_double => {
                 stack.push(Context::Subshell);
                 current.push(c);
@@ -847,6 +868,12 @@ fn shell_statements(raw: &str) -> Vec<String> {
             '{' if !in_double => {
                 stack.push(Context::Brace);
                 current.push(c);
+            }
+            ')' if matches!(stack.last(), Some(Context::Arith)) && peek == Some(')') => {
+                i += 1;
+                stack.pop();
+                current.push_str("))");
+                at_word_start = true;
             }
             ')' if matches!(
                 stack.last(),
@@ -1054,6 +1081,9 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
         Substitution,
         /// `( … )`, a compound command that ends the word.
         Subshell,
+        /// `(( … ))` and `$(( … ))`: arithmetic, where `<<` is a shift
+        /// rather than a heredoc.
+        Arith,
         Brace,
         Backtick,
     }
@@ -1139,6 +1169,11 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             // opens a translated string, but only where a `$` is
             // special — inside double quotes it is literal text.
             '$' => match peek {
+                // `$((` opens arithmetic, where `<<` is a shift.
+                Some('(') if text.get(i + 2) == Some(&'(') => {
+                    i += 2;
+                    stack.push(Context::Arith);
+                }
                 Some('(') => {
                     i += 1;
                     stack.push(Context::Substitution);
@@ -1165,7 +1200,10 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
             // scanned — commands can follow the redirect — and only
             // the body, which is data rather than syntax, is skipped
             // when the line ends.
-            '<' if !in_double && peek == Some('<') => {
+            '<' if !in_double
+                && peek == Some('<')
+                && !stack.iter().any(|c| matches!(c, Context::Arith)) =>
+            {
                 // The whole run of `<` is consumed at once, or the
                 // tail of `<<<` would be read as another `<<`.
                 let mut run = 0;
@@ -1207,8 +1245,18 @@ fn shell_text_facts(raw: &str) -> ShellTextFacts {
                 i += 1;
                 stack.push(Context::Substitution);
             }
+            // `((` where a command can start is arithmetic.
+            '(' if !in_double && peek == Some('(') && word_start => {
+                i += 1;
+                stack.push(Context::Arith);
+            }
             '(' if !in_double => stack.push(Context::Subshell),
             '{' if !in_double => stack.push(Context::Brace),
+            ')' if matches!(stack.last(), Some(Context::Arith)) && peek == Some(')') => {
+                i += 1;
+                stack.pop();
+                at_word_start = true;
+            }
             ')' if matches!(
                 stack.last(),
                 Some(Context::Substitution | Context::Subshell)
@@ -2773,6 +2821,12 @@ mod tests {
             // config, aliases and all.
             "HOME=/tmp/h git p",
             "XDG_CONFIG_HOME=/tmp/h git p",
+            // A `<<` in arithmetic shifts, so it opens no heredoc and
+            // holds no following line back: reading one as a heredoc
+            // would skip to the line naming its delimiter and hide the
+            // statements in between.
+            "((1 << 2))\nGIT_CONFIG_GLOBAL=/tmp/g git p\n2",
+            "echo $((1 << 2))\nGIT_CONFIG_GLOBAL=/tmp/g git p\n2",
             // Emptying them disables no file: git resolves the global
             // config of `HOME=` to `/.gitconfig`, so an alias can still
             // arrive from a file the command does not name.
@@ -3042,6 +3096,10 @@ mod tests {
             // invocation can read it; nothing here consumes the
             // variable.
             "GIT_CONFIG_GLOBAL=/tmp/g; echo x && echo y",
+            // Arithmetic is arithmetic: no heredoc, and a subshell in a
+            // subshell is still two subshells.
+            "echo $((1 + 2))",
+            "( (echo a) )",
             // The payload's own words say this git only reports its
             // version, so no alias of any origin dispatches.
             "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git --version'",
