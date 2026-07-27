@@ -398,9 +398,20 @@ fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
         .strip_prefix(root)
         .map_err(|_| "outside the workspace".to_string())?;
 
-    // The workspace root is the trust anchor: it is the directory the
-    // session was started in, not something a mention chose.
-    let mut dir = std::fs::File::open(root).map_err(|e| format!("unreadable ({})", e.kind()))?;
+    // The workspace root is the trust anchor, so it is opened with the same
+    // suspicion as every component below it: `root` is canonical, so its
+    // final component is a real directory unless someone replaced it since
+    // — which is exactly what `O_NOFOLLOW` refuses. A session started in a
+    // symlinked directory still works, because canonicalization resolved
+    // that symlink before this point.
+    let mut dir = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)
+            .map_err(|e| format!("unreadable ({})", e.kind()))?
+    };
 
     let components: Vec<_> = rel.components().collect();
     let Some((last, parents)) = components.split_last() else {
@@ -465,17 +476,40 @@ fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Windows has no `openat`; `FILE_FLAG_OPEN_REPARSE_POINT` opens a
-/// swapped-in symlink or junction *as* the reparse point, which then fails
-/// the regular-file check below rather than redirecting the read. Creating
-/// a symlink there needs a privilege ordinary accounts lack, so the
-/// remaining ancestor race is not reachable without one.
+/// Windows has no `openat`, so the ancestors are checked explicitly.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` covers the final component: a symlink or
+/// junction swapped in for the file is opened *as* the reparse point and
+/// fails the regular-file check below rather than redirecting the read.
+/// That flag does nothing for the directories above it, and creating a
+/// junction needs no special privilege, so every ancestor between the
+/// workspace root and the file is rejected outright if it has become a
+/// reparse point.
 #[cfg(not(unix))]
 fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    if !path.starts_with(root) {
-        return Err("outside the workspace".into());
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| "outside the workspace".to_string())?;
+
+    let mut ancestor = root.to_path_buf();
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err("not a usable path".into());
+        }
+        ancestor.push(component);
+        if ancestor == path {
+            break;
+        }
+        if std::fs::symlink_metadata(&ancestor)
+            .map_err(|e| format!("unreadable ({})", e.kind()))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("not a regular file".into());
+        }
     }
+
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -1180,6 +1214,43 @@ mod tests {
         assert_eq!(
             data, "iVBORw==",
             "read the swapped-in file, not the staged one"
+        );
+    }
+
+    /// The root is the trust anchor, so it gets the same treatment: if the
+    /// workspace directory itself has been replaced by a symlink, every
+    /// descriptor below it would be relative to the wrong tree.
+    #[cfg(unix)]
+    #[test]
+    fn opening_refuses_a_symlinked_workspace_root() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("shot.png"), b"exfiltrate me").unwrap();
+        let holder = tempfile::tempdir().expect("tempdir");
+        let root = holder.path().join("workspace");
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        assert!(
+            open_beneath(&root, &root.join("shot.png")).is_err(),
+            "opened through a symlinked workspace root"
+        );
+    }
+
+    /// …but a session legitimately started in a symlinked directory still
+    /// works, because the root is canonicalized before it is opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workspace_still_attaches_images() {
+        let real = tempfile::tempdir().expect("tempdir");
+        fs::write(real.path().join("shot.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let holder = tempfile::tempdir().expect("tempdir");
+        let link = holder.path().join("workspace");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let out = expand_mentions("@shot.png", &link).expect("expanded");
+        assert_eq!(
+            out.images.len(),
+            1,
+            "a symlinked workspace stopped working: {:?}",
+            out.notes
         );
     }
 
