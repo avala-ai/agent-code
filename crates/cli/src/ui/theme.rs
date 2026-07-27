@@ -577,22 +577,29 @@ pub(crate) fn catalog_ids(user: Vec<(String, String)>) -> Vec<String> {
 /// The runtime facade intercepts `auto` before any palette lookup, so it
 /// has to ask this before doing so — otherwise a user's `auto.toml` is
 /// advertised by the catalog but never actually applied.
-///
-/// A palette's id is its file stem, so this opens the one candidate file
-/// rather than loading the directory: startup takes this path on the
-/// default `theme = "auto"`, and it must not depend on unrelated entries
-/// in the themes directory being readable or well-formed.
 pub fn user_palette_exists(id: &str) -> bool {
-    user_themes_dir().is_some_and(|dir| palette_file_exists(&dir, id))
+    user_palette(id).is_some()
+}
+
+/// The user palette that owns `id`, if any.
+///
+/// Resolving a *single* id never loads the directory: a palette's id is
+/// its file stem, so there is exactly one candidate file. Startup takes
+/// this path for whatever `[ui].theme` names — including the default
+/// `auto` — and must not depend on unrelated entries in the themes
+/// directory being readable, well-formed, or even openable.
+/// [`load_palettes_dir`] stays for the pickers, which do want them all.
+fn user_palette(id: &str) -> Option<Palette> {
+    user_palette_in(&user_themes_dir()?, id)
 }
 
 /// Pure over the directory, like [`load_palettes_dir`], so the candidate
 /// rules are testable without a real themes directory.
-fn palette_file_exists(dir: &Path, id: &str) -> bool {
+fn user_palette_in(dir: &Path, id: &str) -> Option<Palette> {
     // `id` reaches the filesystem, so it has to name a file *in* `dir`
     // and not a path that walks out of it.
     if Path::new(id).components().count() != 1 || id.starts_with('.') {
-        return false;
+        return None;
     }
     let path = dir.join(format!("{id}.toml"));
     // Stat before reading: a `.toml` FIFO (or a symlink to one) is not a
@@ -601,9 +608,9 @@ fn palette_file_exists(dir: &Path, id: &str) -> bool {
         .map(|m| m.is_file())
         .unwrap_or(false)
     {
-        return false;
+        return None;
     }
-    load_palette_file(&path, id).is_some()
+    load_palette_file(&path, id)
 }
 
 fn user_palettes() -> Vec<Palette> {
@@ -677,7 +684,7 @@ fn lookup_palette(id: &str) -> Option<Palette> {
     standard_palettes()
         .into_iter()
         .find(|p| p.id.as_ref() == id)
-        .or_else(|| user_palettes().into_iter().find(|p| p.id.as_ref() == id))
+        .or_else(|| user_palette(id))
 }
 
 impl Theme {
@@ -1030,10 +1037,13 @@ accent = "#00ffff"
         std::fs::write(dir.path().join("broken.toml"), "not = valid = toml").unwrap();
         std::fs::create_dir(dir.path().join("nested.toml")).unwrap();
 
-        assert!(palette_file_exists(dir.path(), "auto"));
-        assert!(!palette_file_exists(dir.path(), "absent"));
-        assert!(!palette_file_exists(dir.path(), "broken"), "malformed");
-        assert!(!palette_file_exists(dir.path(), "nested"), "not a file");
+        assert!(user_palette_in(dir.path(), "auto").is_some());
+        assert!(user_palette_in(dir.path(), "absent").is_none());
+        assert!(user_palette_in(dir.path(), "broken").is_none(), "malformed");
+        assert!(
+            user_palette_in(dir.path(), "nested").is_none(),
+            "not a file"
+        );
     }
 
     #[test]
@@ -1044,7 +1054,7 @@ accent = "#00ffff"
         std::fs::write(&outside, MINIMAL_PALETTE).unwrap();
 
         for id in ["../escaped", "sub/auto", "/etc/passwd", "", "."] {
-            assert!(!palette_file_exists(dir.path(), id), "{id:?}");
+            assert!(user_palette_in(dir.path(), id).is_none(), "{id:?}");
         }
         let _ = std::fs::remove_file(outside);
     }
@@ -1067,11 +1077,40 @@ accent = "#00ffff"
         let probe = dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(palette_file_exists(&probe, "auto"));
+            let _ = tx.send(user_palette_in(&probe, "auto").is_some());
         });
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(found) => assert!(!found, "a FIFO is not a palette"),
             Err(_) => panic!("palette lookup blocked on a FIFO"),
+        }
+    }
+
+    /// Resolving one id must not depend on the *other* entries: a valid
+    /// `auto.toml` still resolves with an unreadable sibling alongside
+    /// it. Both the runtime's existence check and `lookup_palette` go
+    /// through this function, so a reintroduced directory scan on either
+    /// path fails here. Off-thread with a timeout for the same reason as
+    /// above — a scan would block on the sibling FIFO, not just be slow.
+    #[cfg(unix)]
+    #[test]
+    fn resolving_one_palette_ignores_its_siblings() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.toml"), MINIMAL_PALETTE).unwrap();
+        let sibling = dir.path().join("hostile.toml");
+        let c_path = CString::new(sibling.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let probe = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(user_palette_in(&probe, "auto").map(|p| p.label.into_owned()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert_eq!(found.as_deref(), Some("My Theme")),
+            Err(_) => panic!("resolving one palette read the whole directory"),
         }
     }
 }
