@@ -596,6 +596,40 @@ fn key_hint_line(text: impl Into<String>) -> Line<'static> {
     ))
 }
 
+/// The plain text of a line, for measuring how tall it will render.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Rows `text` occupies when word-wrapped into `width` columns, matching
+/// `Paragraph`'s greedy wrap: words move to the next row whole, and a
+/// word wider than the line is split across rows.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let width = width as usize;
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        if col > 0 && col + 1 + len > width {
+            rows += 1;
+            col = 0;
+        }
+        if len > width {
+            // The check above already moved a partly-filled row on, so
+            // the split always starts at column 0.
+            let extra = (len - 1) / width;
+            rows += extra;
+            col = len - extra * width;
+        } else {
+            col = if col == 0 { len } else { col + 1 + len };
+        }
+    }
+    rows.try_into().unwrap_or(u16::MAX)
+}
+
 /// Shared centered modal box with a border + title and an optional sticky
 /// footer (key hints). The footer is laid out in its own row so wrapped body
 /// text cannot push it off-screen.
@@ -609,8 +643,18 @@ fn draw_modal_box(
 ) {
     let width = area.width.saturating_sub(6).clamp(40, 76);
     let footer_h: u16 = u16::from(footer.is_some());
+    // Size the body from the rows the text will actually occupy once
+    // wrapped, not from the number of `Line`s. A single long line —
+    // the permission modal's durable-grant row is the one that can run
+    // long — otherwise claimed one row and was clipped after the modal
+    // had already been sized, hiding content the user is answering
+    // about.
+    let body_rows: u16 = lines
+        .iter()
+        .map(|l| wrapped_rows(&line_text(l), width.saturating_sub(2)))
+        .fold(0u16, |a, b| a.saturating_add(b));
     // +2 border, +footer, +1 breathing room for wrap
-    let wanted = (lines.len() as u16)
+    let wanted = body_rows
         .saturating_add(2)
         .saturating_add(footer_h)
         .saturating_add(1);
@@ -1673,16 +1717,12 @@ mod tests {
                 ));
             term.draw(|f| draw(f, &mut app)).unwrap();
             let s = buffer_to_string(term.backend().buffer());
-            // The body wraps, so the prefix may be split across rows;
-            // dropping the box borders and collapsing whitespace
-            // reassembles it.
-            let flat = s
-                .replace(['│', '┌', '┐', '└', '┘', '─'], " ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            // The body wraps, so the prefix may be split across rows —
+            // possibly mid-word. Dropping borders and every space
+            // reassembles it either way.
+            let flat = squeeze(&s);
             assert!(
-                flat.contains(prefix),
+                flat.contains(&squeeze(prefix)),
                 "the prefix was not fully visible at {cols} columns:\n{s}"
             );
             assert!(
@@ -1690,6 +1730,68 @@ mod tests {
                 "the prefix binding vanished at {cols} columns:\n{s}"
             );
         }
+    }
+
+    /// The modal is sized from the rows its text actually occupies. A
+    /// prefix long enough to wrap several times counted as one line, so
+    /// the box was sized too short and clipped the rest of it — while
+    /// `[P]` stayed live over a scope the user could not finish reading.
+    #[test]
+    fn permission_modal_grows_for_a_prefix_that_wraps_many_rows() {
+        let prefix = format!(
+            "/opt/{}/bin/kubectl rollout",
+            "very-long-directory".repeat(6)
+        );
+        for cols in [60u16, 80, 120] {
+            let backend = TestBackend::new(cols, 40);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: Some(prefix.clone()),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            let flat = squeeze(&s);
+            assert!(
+                flat.contains(&squeeze(&prefix)),
+                "a wrapping prefix was clipped at {cols} columns:\n{s}"
+            );
+            // The description it pushed down must survive too.
+            assert!(
+                flat.contains(&squeeze("Bash: run a command")),
+                "the modal body was clipped at {cols} columns:\n{s}"
+            );
+        }
+    }
+
+    /// Screen text with the box borders and all whitespace removed, so a
+    /// string that wrapped across rows — even mid-word — can still be
+    /// searched for as one piece.
+    fn squeeze(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && !"│┌┐└┘─".contains(*c))
+            .collect()
+    }
+
+    #[test]
+    fn wrapped_rows_counts_greedy_word_wrap() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("short", 10), 1);
+        // Wraps whole words to the next row.
+        assert_eq!(wrapped_rows("aaaa bbbb cccc", 10), 2);
+        // A word wider than the line is split across rows.
+        assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
+        assert_eq!(wrapped_rows("ab", 0), 1);
     }
 
     /// The modal title names the tool being approved. A plugin manifest or

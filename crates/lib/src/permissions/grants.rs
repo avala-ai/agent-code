@@ -492,8 +492,10 @@ mod tests {
             r"./\* status",
             r"'*' status",
             r"\? status",
-            "./ru?ner build",
-            "./run*er build",
+            // Path-qualified spellings of a tool that IS listed, so the
+            // glob rule is what rejects these rather than the tool list.
+            "/usr/*/git status",
+            "/usr/bin/gi?/git status",
         ] {
             assert_eq!(
                 derive_prefix(cmd),
@@ -501,6 +503,68 @@ mod tests {
                 "a glob metacharacter reached the offered prefix for {cmd}"
             );
         }
+    }
+
+    /// A wrapper's first argument is another command, not a subcommand.
+    /// `env git status` offering `env git` would cover
+    /// `env git push --force` — the bare-binary widening, one token
+    /// along.
+    #[test]
+    fn derive_prefix_refuses_command_wrappers() {
+        for cmd in [
+            "env git status",
+            "env -u PATH git status",
+            "command git status",
+            "nohup git status",
+            "setsid git status",
+            "sudo git status",
+            "timeout 5 git status",
+            "nice git status",
+            "xargs git status",
+        ] {
+            assert_eq!(
+                derive_prefix(cmd),
+                None,
+                "offered a prefix over a wrapper for {cmd}"
+            );
+        }
+
+        // What that would have cost.
+        let mut store = GrantStore::ephemeral();
+        store.insert_prefix("env git", "ctx", "").unwrap();
+        assert!(
+            store.allows_prefix("env git push --force", "ctx"),
+            "precondition: a wrapper prefix really does reach every subcommand"
+        );
+    }
+
+    /// A character-shape test cannot tell a subcommand from data: an API
+    /// key is shaped exactly like one. Only knowing which tools take
+    /// subcommands keeps a secret out of the config directory.
+    #[test]
+    fn derive_prefix_refuses_tools_that_take_no_subcommand() {
+        for cmd in [
+            // Reads as a subcommand by shape; is in fact a secret.
+            "echo 0123456789abcdef0123456789abcdef",
+            "export AKIAIOSFODNN7EXAMPLE",
+            "base64 c2VjcmV0dmFsdWU",
+            "./deploy.sh staging",
+            "python manage.py",
+            "node server.js",
+        ] {
+            assert_eq!(
+                derive_prefix(cmd),
+                None,
+                "offered a prefix carrying an arbitrary argument for {cmd}"
+            );
+        }
+
+        // The listed tools still work, path-qualified or not.
+        assert_eq!(derive_prefix("git status").as_deref(), Some("git status"));
+        assert_eq!(
+            derive_prefix("/usr/local/bin/cargo test --lib").as_deref(),
+            Some("/usr/local/bin/cargo test")
+        );
     }
 
     /// The universal-pattern short-circuit is what makes the rule above
@@ -603,9 +667,9 @@ mod tests {
             "git status --porcelain",
             "cargo build --release",
             "/usr/bin/git status",
-            "./deploy.sh staging",
             "npm run build",
             "docker compose up",
+            "kubectl get pods",
         ] {
             let prefix = derive_prefix(cmd).unwrap_or_else(|| panic!("no prefix for {cmd}"));
             let mut store = GrantStore::ephemeral();
@@ -1229,6 +1293,73 @@ impl PrefixEntry {
     }
 }
 
+/// Executables whose first positional argument is a subcommand keyword
+/// drawn from a set the tool itself defines — `git status`,
+/// `cargo build`, `docker compose`.
+///
+/// This is the semantic knowledge that a character-shape test cannot
+/// supply. `echo 0123456789abcdef0123456789abcdef` has an argument
+/// shaped exactly like a subcommand, and an API key has that shape too;
+/// only knowing that `echo` does not take subcommands, while `git` does,
+/// separates the two. Without it, pressing `P` could write a secret into
+/// the config directory, which AGENTS.md forbids outright.
+///
+/// This is **not** an allowlist of "probably fine" tools of the kind
+/// AGENTS.md rules out. Nothing here is allowed to run, and nothing
+/// skips a prompt: the list only limits which commands may be *offered*
+/// a durable grant after the user has already approved this call by
+/// hand. An unlisted tool is simply never offered one — it can still be
+/// approved with `[y]`, `[a]` or `[A]`. Adding an entry widens nothing
+/// on its own; it lets a human be asked one fewer question about a tool
+/// whose argument grammar is known.
+///
+/// Deliberately excludes wrappers (`env`, `sudo`, `timeout`, `nohup`):
+/// their first argument is another command, so a prefix over it would
+/// cover every command that wrapper can reach.
+const SUBCOMMAND_TOOLS: &[&str] = &[
+    "apt",
+    "apt-get",
+    "aws",
+    "az",
+    "brew",
+    "bun",
+    "bundle",
+    "cargo",
+    "deno",
+    "dnf",
+    "docker",
+    "dotnet",
+    "flutter",
+    "gcloud",
+    "gem",
+    "gh",
+    "git",
+    "go",
+    "helm",
+    "kubectl",
+    "nix",
+    "npm",
+    "pip",
+    "pip3",
+    "pnpm",
+    "podman",
+    "poetry",
+    "rustup",
+    "systemctl",
+    "terraform",
+    "uv",
+    "yarn",
+];
+
+/// True when `binary`'s first positional argument is a subcommand rather
+/// than data. Judged on the base name, so `/usr/bin/git` counts as
+/// `git` — while the prefix itself keeps the full spelling it was
+/// invoked with, which is what the matcher will see.
+fn dispatches_subcommands(binary: &str) -> bool {
+    let name = crate::tools::bash_parse::base_name(binary);
+    SUBCOMMAND_TOOLS.contains(&name.as_str())
+}
+
 /// Tokens that may be persisted as the argument half of a prefix.
 ///
 /// A subcommand is a short identifier the tool itself defines — `status`,
@@ -1319,6 +1450,9 @@ fn prefix_covers(prefix: &str, command: &str) -> bool {
 ///
 /// * Commands the gate cannot reason about — multiple invocations,
 ///   substitutions, subshells, redirection, assignment.
+/// * A binary that does not take subcommands at all
+///   ([`SUBCOMMAND_TOOLS`]), including every command wrapper: `env git
+///   status` would otherwise offer `env git`, covering `env git push`.
 /// * A first non-flag argument that is data rather than a subcommand
 ///   ([`is_subcommand_token`]): `curl https://token@host` must not put a
 ///   credential in the config directory.
@@ -1343,6 +1477,16 @@ pub fn derive_prefix(command: &str) -> Option<String> {
     if parsed.command_texts.len() != 1 {
         return None;
     }
+    // A wrapper's name says nothing about what actually executes, so the
+    // token after it is a command, not a subcommand: `env git status`
+    // would offer `env git`, and that covers `env git push --force`.
+    // `SUBCOMMAND_TOOLS` already excludes the wrapper names; this also
+    // catches a wrapped invocation of a listed tool.
+    if crate::tools::bash_parse::has_dynamic_wrapper(&parsed)
+        || !crate::tools::bash_parse::unwrapped_invocation_texts(&parsed).is_empty()
+    {
+        return None;
+    }
     let invocation = parsed.invocations.first()?;
     let mut tokens = invocation
         .iter()
@@ -1355,6 +1499,11 @@ pub fn derive_prefix(command: &str) -> Option<String> {
     // additionally hid the separators that mark an argument as data.
     let binary = tokens.next()?;
     if !is_literal_binary_token(&binary) {
+        return None;
+    }
+    // The one question a character-shape test cannot answer: is the next
+    // token a subcommand, or is it data?
+    if !dispatches_subcommands(&binary) {
         return None;
     }
     // Both halves are required: see the bare-binary note above.
