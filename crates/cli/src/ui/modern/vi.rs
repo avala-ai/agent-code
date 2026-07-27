@@ -41,6 +41,14 @@ impl App {
         self.dirty = true;
     }
 
+    /// An in-place edit leaves prompt-history browsing, exactly as
+    /// typing does. A draft recalled with ↑ that is still marked as
+    /// browsed would be replaced wholesale by the next ↓, throwing the
+    /// edit away.
+    fn vi_edited_draft(&mut self) {
+        self.history_browse = None;
+    }
+
     /// Drop a half-typed operator. A pending `d` is only meaningful
     /// between the two keys of one command, so every path that sends,
     /// replaces or discards the draft clears it — otherwise it is still
@@ -111,6 +119,7 @@ impl App {
             'x' => {
                 if self.cursor < end {
                     self.input.remove(self.cursor);
+                    self.vi_edited_draft();
                     // Deleting the last character on the line leaves the
                     // cursor on the new last one, as vi does.
                     let (_, new_end) = line_bounds(&self.input, self.cursor);
@@ -121,12 +130,14 @@ impl App {
             }
             'D' => {
                 self.input.replace_range(self.cursor..end, "");
+                self.vi_edited_draft();
                 if self.cursor > start {
                     self.cursor = prev_boundary(&self.input, self.cursor).max(start);
                 }
             }
             'C' => {
                 self.input.replace_range(self.cursor..end, "");
+                self.vi_edited_draft();
                 self.vi_enter_insert();
             }
             'd' => self.vi_pending_d = true,
@@ -140,6 +151,7 @@ impl App {
 
     /// `dd`: drop the line under the cursor, not the whole draft.
     fn delete_current_line(&mut self) {
+        self.vi_edited_draft();
         let (start, end) = line_bounds(&self.input, self.cursor);
         if end < self.input.len() {
             // A following line exists: take this line and its newline,
@@ -511,6 +523,30 @@ mod tests {
         a.cursor = 3;
         a.vi_normal_key('x');
         assert_eq!(a.input, "ab\n\ncd", "x swallowed a newline");
+    }
+
+    /// A vi edit to a draft recalled from history detaches it, as typing
+    /// does. Otherwise the next ↓ replaced the edited draft with a
+    /// history entry and the edit was lost.
+    #[test]
+    fn editing_a_recalled_draft_leaves_history_browsing() {
+        for k in ['x', 'D', 'C'] {
+            let mut a = vi_app("recalled prompt");
+            a.cursor = 0;
+            a.history_browse = Some(0);
+            a.vi_normal_key(k);
+            assert!(
+                a.history_browse.is_none(),
+                "`{k}` kept the draft attached to history browsing"
+            );
+        }
+
+        let mut a = vi_app("recalled prompt");
+        a.cursor = 0;
+        a.history_browse = Some(0);
+        a.vi_normal_key('d');
+        a.vi_normal_key('d');
+        assert!(a.history_browse.is_none(), "`dd` kept history browsing on");
     }
 
     /// An unhandled normal-mode key must be swallowed, not passed on —
