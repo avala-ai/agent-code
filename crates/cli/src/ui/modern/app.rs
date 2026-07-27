@@ -446,12 +446,16 @@ pub struct App {
     /// The same images once read and encoded off the UI thread, waiting for
     /// the turn they belong to to start.
     pub pending_attachments: Vec<agent_code_lib::llm::message::ContentBlock>,
-    /// A prompt whose images were already read when another prompt took
-    /// the turn, held with those images so it can be sent as it was.
-    /// Never queued as text: the queue re-expands what it holds, which
-    /// would resolve the mention a second time and read the file again.
+    /// Prompts whose images were already read when another prompt took
+    /// the turn, each held with its own images so it can be sent as it
+    /// was. Never queued as text: the queue re-expands what it holds,
+    /// which would resolve the mention a second time and read the file
+    /// again. A deque because a second one can be held before the first
+    /// has gone, and the order they were submitted in is the order they
+    /// must be sent in.
     #[allow(clippy::type_complexity)]
-    pub deferred_prompt: Option<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
+    pub deferred_prompts:
+        std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
     /// Whether `ui.edit_mode` asked for vi bindings.
     pub vi_mode: bool,
     /// Composer mode when `vi_mode` is on.
@@ -636,7 +640,7 @@ impl App {
             model_picker: None,
             pending_images: Vec::new(),
             pending_attachments: Vec::new(),
-            deferred_prompt: None,
+            deferred_prompts: std::collections::VecDeque::new(),
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
             vi_pending_d: false,
@@ -2434,6 +2438,12 @@ impl App {
     pub fn new_conversation(&mut self) {
         self.conversation_epoch = self.conversation_epoch.wrapping_add(1);
         self.todos.clear();
+        // Anything staged belonged to the conversation being replaced.
+        // Sending it into the new one would attach a file to a thread the
+        // user never attached it to.
+        self.deferred_prompts.clear();
+        self.pending_images.clear();
+        self.pending_attachments.clear();
         self.dirty = true;
     }
 
@@ -2739,7 +2749,7 @@ impl App {
             self.transcript.push(TranscriptItem::System(
                 "another prompt was sent first — sending this one with its images next".into(),
             ));
-            self.deferred_prompt = Some((prompt, blocks));
+            self.deferred_prompts.push_back((prompt, blocks));
             self.dirty = true;
             return;
         }
@@ -2757,7 +2767,7 @@ impl App {
     /// follow on its own.
     pub fn cancel_pending_followups(&mut self) {
         if self.pending_submit.is_none() {
-            self.deferred_prompt = None;
+            self.deferred_prompts.clear();
         }
     }
 
@@ -2770,7 +2780,7 @@ impl App {
         if self.pending_submit.is_some() || !self.pending_images.is_empty() {
             return;
         }
-        if let Some((prompt, blocks)) = self.deferred_prompt.take() {
+        if let Some((prompt, blocks)) = self.deferred_prompts.pop_front() {
             self.pending_attachments = blocks;
             self.pending_submit = Some(prompt);
             self.phase = Phase::Streaming;
@@ -2792,8 +2802,10 @@ impl App {
     /// interjection with its own images — and clearing that would send it
     /// as a text-only turn.
     pub fn abandon_staged_attachments(&mut self) {
-        // A cancel means nothing more should go out on its own.
-        self.deferred_prompt = None;
+        // Held prompts are not touched here: whether they survive is the
+        // cancel policy's call (`cancel_pending_followups`), and an
+        // interject reaching this path still means only that *this* read
+        // is being dropped.
         self.turn_live = false;
         self.turn_started_at = None;
         self.phase = if self.pending_submit.is_some() {
@@ -5298,7 +5310,7 @@ mod tests {
             "the newer prompt inherited another prompt's image"
         );
         assert!(
-            app.deferred_prompt.is_some(),
+            !app.deferred_prompts.is_empty(),
             "the superseded prompt was dropped"
         );
         assert!(
@@ -5327,7 +5339,10 @@ mod tests {
             1,
             "the deferred prompt lost its images"
         );
-        assert!(app.deferred_prompt.is_none(), "deferred prompt sent twice");
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "deferred prompt sent twice"
+        );
     }
 
     /// Re-arming must not race another prompt's staged descriptors: those
@@ -5335,7 +5350,8 @@ mod tests {
     #[test]
     fn a_deferred_prompt_waits_for_staged_descriptors_to_clear() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
         write_png(&app, "later.png");
         type_input(&mut app, "later @later.png");
         app.submit();
@@ -5347,7 +5363,7 @@ mod tests {
             app.pending_submit.is_none(),
             "sent a deferred prompt while another's descriptors were staged"
         );
-        assert!(app.deferred_prompt.is_some(), "deferred prompt lost");
+        assert!(!app.deferred_prompts.is_empty(), "deferred prompt lost");
     }
 
     /// Ctrl+C on the turn a prompt is waiting behind must stop that prompt
@@ -5355,11 +5371,12 @@ mod tests {
     #[test]
     fn cancelling_a_turn_drops_a_prompt_waiting_behind_it() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
         // A bare cancel: nothing staged to send.
         app.cancel_pending_followups();
         assert!(
-            app.deferred_prompt.is_none(),
+            app.deferred_prompts.is_empty(),
             "an image prompt would have sent itself after a cancel"
         );
     }
@@ -5369,25 +5386,77 @@ mod tests {
     #[test]
     fn interjecting_keeps_a_prompt_waiting_behind_it() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
         type_input(&mut app, "do this instead");
         app.interject();
         assert_eq!(app.pending_submit.as_deref(), Some("do this instead"));
 
         app.cancel_pending_followups();
         assert!(
-            app.deferred_prompt.is_some(),
+            !app.deferred_prompts.is_empty(),
             "interject dropped a prompt it only meant to go ahead of"
         );
     }
 
-    /// A cancel means nothing more goes out on its own.
+    /// Dropping the read in flight says nothing about prompts already
+    /// held: whether those survive is the cancel policy's call, and an
+    /// interject that lands mid-encode must not lose them.
     #[test]
-    fn cancelling_drops_a_deferred_prompt() {
+    fn abandoning_a_read_leaves_held_prompts_alone() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompt = Some(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        type_input(&mut app, "do this instead");
+        app.interject();
+
+        app.cancel_pending_followups();
         app.abandon_staged_attachments();
-        assert!(app.deferred_prompt.is_none(), "cancel left a prompt armed");
+
+        assert_eq!(
+            app.deferred_prompts.len(),
+            1,
+            "an interject during an encode lost a held prompt"
+        );
+    }
+
+    /// Held prompts are sent in the order they were submitted, so a second
+    /// one cannot overwrite the first.
+    #[test]
+    fn held_prompts_keep_their_order() {
+        let (_dir, mut app) = app_in_workspace();
+        app.enqueue_turn_from_command("busy".into());
+        app.accept_encoded_attachments("first @a.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments("second @b.png".into(), vec![png_block()]);
+        assert_eq!(app.deferred_prompts.len(), 2, "a held prompt was dropped");
+
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+        assert_eq!(app.pending_submit.as_deref(), Some("first @a.png"));
+        let _ = app.pending_submit.take();
+        app.rearm_deferred_prompt();
+        assert_eq!(app.pending_submit.as_deref(), Some("second @b.png"));
+    }
+
+    /// A cleared, resumed or rewound conversation takes its attachments
+    /// with it: a file staged for the old thread must not surface in the
+    /// new one.
+    #[test]
+    fn a_replaced_conversation_drops_staged_attachments() {
+        let (_dir, mut app) = app_in_workspace();
+        app.deferred_prompts
+            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.pending_attachments = vec![png_block()];
+        write_png(&app, "shot.png");
+        type_input(&mut app, "look at @shot.png");
+        app.submit();
+        assert_eq!(app.pending_images.len(), 1, "precondition");
+
+        app.new_conversation();
+
+        assert!(app.deferred_prompts.is_empty(), "held prompt survived");
+        assert!(app.pending_images.is_empty(), "descriptors survived");
+        assert!(app.pending_attachments.is_empty(), "blocks survived");
     }
 
     /// A cancel abandons only the prompt that was being read for. If the

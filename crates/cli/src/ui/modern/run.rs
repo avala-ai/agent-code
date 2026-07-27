@@ -346,6 +346,7 @@ pub(super) async fn event_loop(
     #[allow(clippy::type_complexity)]
     let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel::<(
         u64,
+        u64,
         String,
         Vec<agent_code_lib::llm::message::ContentBlock>,
         Vec<String>,
@@ -623,9 +624,13 @@ pub(super) async fn event_loop(
             encode_seq += 1;
             let id = encode_seq;
             active_encode = Some(id);
+            // Stamped with the conversation it was submitted in: the engine
+            // lock is free while this runs, so `/clear`, `/resume` or
+            // `/rewind` can replace the conversation underneath it.
+            let epoch = app.conversation_epoch;
             tokio::task::spawn_blocking(move || {
                 let (blocks, notes) = super::mentions::encode_staged_images(images);
-                let _ = tx.send((id, prompt, blocks, notes));
+                let _ = tx.send((id, epoch, prompt, blocks, notes));
             });
         }
 
@@ -904,11 +909,17 @@ pub(super) async fn event_loop(
             // Encoded image attachments coming back from the blocking pool.
             // The prompt is re-armed with them so the turn starts on the
             // next pass through the loop above.
-            Some((id, prompt, blocks, notes)) = img_rx.recv() => {
+            Some((id, epoch, prompt, blocks, notes)) = img_rx.recv() => {
                 if active_encode != Some(id) {
                     // Cancelled while this read was in flight: the state it
                     // belonged to was released then, so the bytes are simply
                     // dropped rather than sent with a turn nobody asked for.
+                } else if epoch != app.conversation_epoch {
+                    // The conversation it was submitted in has been cleared,
+                    // resumed or rewound. Starting it now would attach the
+                    // file to a thread the user never attached it to.
+                    active_encode = None;
+                    app.abandon_staged_attachments();
                 } else {
                     active_encode = None;
                     for note in notes {
