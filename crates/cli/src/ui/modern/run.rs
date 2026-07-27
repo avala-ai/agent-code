@@ -68,7 +68,42 @@ fn mcp_fingerprint(
     servers: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
 ) -> Option<String> {
     let ordered: std::collections::BTreeMap<_, _> = servers.iter().collect();
-    serde_json::to_string(&ordered).ok()
+    serde_json::to_value(&ordered)
+        .ok()
+        .map(|v| canonical_json(&v))
+}
+
+/// Render JSON with every object key sorted, at every depth.
+///
+/// Sorting only the outer map was not enough: an entry's `env` is its own
+/// `HashMap` and serializes in iteration order, so two loads of identical
+/// settings could fingerprint differently and disconnect working proxies
+/// that then need a restart to come back. Depth matters, not just the
+/// top level — and this stays correct whichever map type `serde_json` is
+/// built with.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, &serde_json::Value> =
+                map.iter().collect();
+            let body: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String(k.clone()),
+                        canonical_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// The next terminal event, taking anything buffered during work the
@@ -4830,6 +4865,52 @@ mod tests {
             mcp_fingerprint(&a),
             mcp_fingerprint(&HashMap::new()),
             "a destination configuring no servers must not keep the source's"
+        );
+    }
+
+    /// An entry's `env` is its own map and serializes in iteration order,
+    /// so identical settings could fingerprint differently and disconnect
+    /// proxies that were working — a restart to recover, for nothing.
+    #[test]
+    fn the_mcp_fingerprint_is_stable_across_nested_map_order() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let with_env = |pairs: &[(&str, &str)]| {
+            let env: serde_json::Map<String, serde_json::Value> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_string(),
+                        serde_json::Value::String((*v).to_string()),
+                    )
+                })
+                .collect();
+            let entry: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "command": "docs-server",
+                "args": [],
+                "env": env,
+            }))
+            .expect("entry");
+            let mut m: HashMap<String, McpServerEntry> = HashMap::new();
+            m.insert("docs".into(), entry);
+            m
+        };
+
+        let forward = with_env(&[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")]);
+        let reverse = with_env(&[("D", "4"), ("C", "3"), ("B", "2"), ("A", "1")]);
+
+        assert_eq!(
+            mcp_fingerprint(&forward),
+            mcp_fingerprint(&reverse),
+            "the same environment written in another order must compare equal"
+        );
+
+        let changed = with_env(&[("A", "1"), ("B", "changed"), ("C", "3"), ("D", "4")]);
+        assert_ne!(
+            mcp_fingerprint(&forward),
+            mcp_fingerprint(&changed),
+            "a changed environment value must still compare unequal"
         );
     }
 }
