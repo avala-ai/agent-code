@@ -562,6 +562,16 @@ fn catalog(user: Vec<(String, String)>) -> Vec<(String, String)> {
     opts
 }
 
+/// The catalog ids for a given set of user palettes — the hermetic
+/// half of [`Theme::all_names`], which reads the user's themes
+/// directory. Tests that assert on the *built-in* catalog use this with
+/// an empty input rather than traversing whatever the developer (or a
+/// CI image) happens to have on disk: a stray `.toml` there changes the
+/// answer, and a special file such as a FIFO can block the read.
+pub(crate) fn catalog_ids(user: Vec<(String, String)>) -> Vec<String> {
+    catalog(user).into_iter().map(|(id, _)| id).collect()
+}
+
 /// Whether a user palette file owns `id`.
 ///
 /// The runtime facade intercepts `auto` before any palette lookup, so it
@@ -901,7 +911,10 @@ mod tests {
 
     #[test]
     fn all_names_starts_with_auto_and_lists_standard_ids() {
-        let names = Theme::all_names();
+        // The built-in catalog, not the disk: `all_names()` traverses the
+        // user's themes directory, so asserting on it here would depend
+        // on the developer's machine.
+        let names = super::catalog_ids(Vec::new());
         assert_eq!(names.first().map(String::as_str), Some("auto"));
         for id in [
             "monokai",
@@ -918,7 +931,9 @@ mod tests {
 
     #[test]
     fn every_named_theme_resolves_with_populated_slots() {
-        for name in Theme::all_names() {
+        // Built-ins only: a malformed palette in the developer's themes
+        // directory is not this test's subject.
+        for name in super::catalog_ids(Vec::new()) {
             let t = Theme::from_name(&name);
             assert!(
                 !matches!(t.accent, Color::Reset),
@@ -991,7 +1006,7 @@ mod accessibility_tests {
     /// the first-run config after the palettes were rewritten.
     #[test]
     fn shipped_default_theme_ids_resolve() {
-        let names = Theme::all_names();
+        let names = super::catalog_ids(Vec::new());
         // The id the first-run config writes must be a real registry option,
         // not something that silently falls back to the default.
         assert!(
@@ -1014,7 +1029,7 @@ mod accessibility_tests {
     /// affordances, not cosmetics: they must stay in the registry.
     #[test]
     fn accessibility_themes_are_registered() {
-        let names = Theme::all_names();
+        let names = super::catalog_ids(Vec::new());
         for id in [
             "dark-colorblind",
             "light-colorblind",
@@ -1060,7 +1075,10 @@ mod documented_names {
     /// accepted, or the docs are promising a theme `/color` will reject.
     #[test]
     fn every_documented_theme_name_is_accepted() {
-        let accepted = super::Theme::all_names();
+        // Built-ins only: the docs advertise the shipped palettes, and
+        // reading the user's themes directory would make this depend on
+        // the developer's machine (and can block on a special file).
+        let accepted = super::catalog_ids(Vec::new());
         // Read the identifiers out of the docs rather than restating
         // them: a copied list keeps passing when the docs add or rename
         // a theme, which is exactly the drift this test exists to catch.
