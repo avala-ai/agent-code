@@ -74,7 +74,10 @@ pub fn parse_target(args: Option<&str>) -> ReviewTarget {
         None => (args, ""),
     };
     match head {
-        "uncommitted" | "working" => ReviewTarget::Uncommitted,
+        // Only when nothing follows. `/review working on authentication`
+        // is a request with a focus, not the bare alias plus noise, and
+        // dropping the rest would quietly review everything instead.
+        "uncommitted" | "working" if rest.is_empty() => ReviewTarget::Uncommitted,
         "base" if !rest.is_empty() => ReviewTarget::BaseBranch {
             base: rest.to_string(),
         },
@@ -329,6 +332,26 @@ mod tests {
                 instructions: "base".into()
             }
         );
+    }
+
+    /// `/review working on authentication` asks for a focused review.
+    /// Matching the bare alias and discarding the rest would silently
+    /// widen it to everything in the tree — the opposite of what was
+    /// asked, with no indication the focus was dropped.
+    #[test]
+    fn a_working_tree_alias_with_more_words_stays_instructions() {
+        for args in ["working on authentication", "uncommitted parser changes"] {
+            assert_eq!(
+                parse_target(Some(args)),
+                ReviewTarget::Custom {
+                    instructions: args.into()
+                },
+                "`{args}` lost its focus"
+            );
+        }
+        // The bare aliases still mean the working tree.
+        assert_eq!(parse_target(Some("working")), ReviewTarget::Uncommitted);
+        assert_eq!(parse_target(Some("uncommitted")), ReviewTarget::Uncommitted);
     }
 
     /// The prompt must tell the reviewer how to *find* the change. A
