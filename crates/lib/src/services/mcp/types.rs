@@ -758,6 +758,34 @@ mod binding_tests {
 
     /// An SSE endpoint has no executable to resolve, so the launch
     /// directory must not enter its binding — it would re-prompt for a
+    /// `Command::new(r".\\bin\\srv")` still launches `srv.exe`, so a
+    /// path-qualified extensionless command must resolve rather than
+    /// fall through to `unresolved` — otherwise the real executable can
+    /// be swapped under an unchanged binding.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_qualified_command_appends_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("srv.exe"), "MZ").unwrap();
+
+        let qualified = bin.join("srv");
+        let resolved =
+            resolve_executable(qualified.to_str().unwrap(), Path::new("/"), &HashMap::new())
+                .expect("a path-qualified command must resolve to its .exe");
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            std::ffi::OsStr::new("srv.exe")
+        );
+
+        // And it does not collapse onto the unresolved marker.
+        assert_ne!(
+            stdio(qualified.to_str().unwrap(), &[]).binding_fingerprint(Path::new("/")),
+            stdio(bin.join("nope").to_str().unwrap(), &[]).binding_fingerprint(Path::new("/")),
+        );
+    }
+
     /// remote server that never changed.
     #[test]
     fn an_sse_binding_ignores_the_launch_directory() {

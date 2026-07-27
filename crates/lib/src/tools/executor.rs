@@ -226,6 +226,14 @@ async fn execute_single_tool(
     let decision = tool
         .check_permissions(&call.input, permission_checker)
         .await;
+    // The binding this call was judged against, when it has one. A
+    // permission modal can stay open for minutes, and an id-addressed
+    // record or an MCP server definition can be rewritten in that time,
+    // so the binding is re-read immediately before dispatch and the call
+    // refused if it moved. This narrows the read-to-act window to the
+    // few statements below; closing it entirely would need the stores to
+    // support conditional writes.
+    let mut approved_binding: Option<super::GrantBinding> = None;
     match decision {
         PermissionDecision::Allow => {}
         PermissionDecision::Deny(reason) => {
@@ -256,7 +264,8 @@ async fn execute_single_tool(
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
             let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
-            let binding = tool.grant_binding(&call.input);
+            approved_binding = tool.grant_binding(&call.input);
+            let binding = approved_binding.clone();
             let destinations = tool.grant_destinations(&call.input);
             let grant_key = persistent_grant_key(
                 &call.name,
@@ -362,6 +371,26 @@ async fn execute_single_tool(
                 }
             } // close else block
         }
+    }
+
+    // Re-read the binding now that the answer is in. If the record the
+    // call names was rewritten while the prompt was open — or between a
+    // silent grant match and here — the approval no longer describes what
+    // would run, so refuse rather than act on the replacement. The model
+    // can retry, which prompts afresh against the new record.
+    if let Some(ref approved) = approved_binding
+        && tool.grant_binding(&call.input).as_ref() != Some(approved)
+    {
+        return ToolCallResult {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            result: ToolResult::error(
+                "Permission target changed after approval: what this call refers to \
+                 was modified while the request was being approved. Nothing was run. \
+                 Retry to review the current definition."
+                    .to_string(),
+            ),
+        };
     }
 
     // Defensive `validate_input` — the query loop already runs this
@@ -1525,6 +1554,123 @@ mod parallel_batch_tests {
             self.asked.fetch_add(1, Ordering::SeqCst);
             PermissionResponse::Deny
         }
+    }
+
+    /// A tool whose binding moves while the permission modal is open.
+    /// The prompter mutates it as a stand-in for another process
+    /// rewriting the record between the read and the act.
+    struct ShiftingBindingTool {
+        ran: Arc<AtomicUsize>,
+        digest: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl Tool for ShiftingBindingTool {
+        fn name(&self) -> &'static str {
+            "Shifting"
+        }
+        fn description(&self) -> &'static str {
+            "test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn grant_binding(&self, _input: &serde_json::Value) -> Option<super::super::GrantBinding> {
+            Some(super::super::GrantBinding {
+                digest: self.digest.lock().unwrap().clone(),
+                cwd_sensitive: true,
+            })
+        }
+        async fn check_permissions(
+            &self,
+            _input: &serde_json::Value,
+            _checker: &crate::permissions::PermissionChecker,
+        ) -> PermissionDecision {
+            PermissionDecision::Ask("mutating test tool".into())
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("ok".to_string()))
+        }
+    }
+
+    /// Answers "allow once", and rewrites the binding while doing so —
+    /// the record swapped under an open modal.
+    struct SwappingPrompter {
+        digest: Arc<std::sync::Mutex<String>>,
+        swap_to: Option<String>,
+    }
+    impl PermissionPrompter for SwappingPrompter {
+        fn ask(
+            &self,
+            _tool_name: &str,
+            _description: &str,
+            _input_preview: Option<&str>,
+            _origin: Option<&str>,
+        ) -> PermissionResponse {
+            if let Some(ref next) = self.swap_to {
+                *self.digest.lock().unwrap() = next.clone();
+            }
+            PermissionResponse::AllowOnce
+        }
+    }
+
+    async fn run_shifting(swap_to: Option<&str>) -> (Vec<ToolCallResult>, usize) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let digest = Arc::new(std::sync::Mutex::new("routine-v1".to_string()));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ShiftingBindingTool {
+            ran: ran.clone(),
+            digest: digest.clone(),
+        })];
+
+        let mut ctx = ToolContext::minimal(
+            std::env::temp_dir(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        ctx.permission_prompter = Some(Arc::new(SwappingPrompter {
+            digest,
+            swap_to: swap_to.map(|s| s.to_string()),
+        }));
+
+        let calls = vec![PendingToolCall {
+            id: "c1".into(),
+            name: "Shifting".into(),
+            input: serde_json::json!({"id": "daily"}),
+        }];
+        let checker = crate::permissions::PermissionChecker::allow_all();
+        let results = execute_tool_calls(&calls, &tools, &ctx, &checker).await;
+        let count = ran.load(Ordering::SeqCst);
+        (results, count)
+    }
+
+    /// A record rewritten while the modal was open must not be acted on:
+    /// the approval described the old one. The call is refused, not run.
+    #[tokio::test]
+    async fn a_binding_that_moves_during_approval_refuses_the_call() {
+        let (results, ran) = run_shifting(Some("routine-v2")).await;
+        assert_eq!(ran, 0, "the replacement record was acted on");
+        assert!(results[0].result.is_error);
+        assert!(
+            results[0].result.content.contains("changed after approval"),
+            "unexpected message: {}",
+            results[0].result.content
+        );
+    }
+
+    /// The check must not fire when nothing moved, or every approval of
+    /// an externally bound tool would fail.
+    #[tokio::test]
+    async fn a_stable_binding_still_executes() {
+        let (results, ran) = run_shifting(None).await;
+        assert_eq!(ran, 1, "a stable binding must still run");
+        assert!(!results[0].result.is_error);
     }
 
     /// A mutating concurrency-safe tool must NOT ride the parallel branch
