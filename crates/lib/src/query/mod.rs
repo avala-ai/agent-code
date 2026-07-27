@@ -78,6 +78,12 @@ pub struct QueryEngine {
     question_asker: Option<Arc<dyn crate::tools::QuestionAsker>>,
     /// Cached system prompt (rebuilt only when inputs change).
     cached_system_prompt: Option<(u64, String)>, // (hash, prompt)
+    /// `disk_output_style` as it stood when the engine was built, i.e.
+    /// the startup/env-configured default. A session swap restores this
+    /// rather than `None`, so resetting an `/output-style` chosen in the
+    /// discarded conversation does not also discard the user's
+    /// configured default for the rest of the process.
+    initial_disk_output_style: Option<crate::output_styles::OutputStyle>,
     /// Publishes the current turn's [`TurnStatus`] to observers.
     turn_status: tokio::sync::watch::Sender<TurnStatus>,
     /// Sender side of the steering channel. Cloned out via
@@ -197,6 +203,9 @@ impl QueryEngine {
         let cancel = CancellationToken::new();
         let cancel_shared = Arc::new(std::sync::Mutex::new(cancel.clone()));
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Snapshot before `state` is moved: this is the configured
+        // default a session swap restores to.
+        let initial_disk_output_style = state.disk_output_style.clone();
         let live_plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(state.plan_mode));
         Self {
             llm,
@@ -219,6 +228,7 @@ impl QueryEngine {
                 crate::memory::extraction::ExtractionState::new(),
             )),
             session_allows: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            initial_disk_output_style: initial_disk_output_style.clone(),
             permission_prompter: None,
             question_asker: None,
             cached_system_prompt: None,
@@ -239,16 +249,60 @@ impl QueryEngine {
         self.live_plan_mode.clone()
     }
 
-    /// Drop every "allow for this session" grant.
+    /// Reset every piece of conversation-scoped state that a saved
+    /// session does not carry, before adopting a different conversation
+    /// into this live engine (`/resume`).
     ///
-    /// These approvals are scoped to the conversation they were given in.
-    /// When a UI swaps a different saved session into an existing engine
-    /// (`/resume`), the grants must not travel with it: the executor
-    /// consults this store *before* prompting, so a carried-over entry
-    /// silently skips the permission ask for a conversation the user
-    /// never approved it in.
-    pub async fn clear_session_allows(&self) {
+    /// A session swap reuses the engine and overwrites only what
+    /// `SessionData` stores. Everything else scoped to "the current
+    /// conversation" would otherwise survive into the restored session
+    /// and either describe it wrongly or, worse, authorise it: the
+    /// permission grants and `/add-dir` paths below are both things the
+    /// user allowed *somewhere else*.
+    ///
+    /// This is deliberately one call rather than a checklist at the call
+    /// site — a swap that forgets a field is exactly the bug this
+    /// prevents, and new session-local state should be added here.
+    pub async fn reset_for_session_swap(&mut self) {
+        // The executor consults this store *before* prompting, so a
+        // carried-over entry silently skips the ask.
         self.session_allows.lock().await.clear();
+        // Keyed by a hash over model and cwd, neither of which need
+        // change across a resume — but the prompt embeds memories chosen
+        // from the recent messages, so the key is blind to the swap.
+        self.reset_system_prompt_cache();
+        // A cursor into the message vector we are replacing: left alone
+        // it either skips the restored session's messages or reprocesses
+        // an unrelated suffix of them.
+        *self.extraction_state.lock().await = crate::memory::extraction::ExtractionState::new();
+        // Denials recorded in the old conversation would otherwise fire
+        // hooks stamped with the restored session's id.
+        self.denial_tracker.lock().await.clear();
+        self.last_seen_denial_total = 0;
+
+        // Cumulative per-conversation cache statistics.
+        self.cache_tracker = crate::services::cache_tracking::CacheTracker::new();
+        // Steered text typed at the old conversation but never drained
+        // would be injected as a user message into the restored one.
+        while self.steer_rx.try_recv().is_ok() {}
+
+        let initial_style = self.initial_disk_output_style.clone();
+        let state = &mut self.state;
+        // `/add-dir` tells the model it may read and edit these paths
+        // without re-asking. That permission was given to the previous
+        // conversation.
+        state.additional_dirs.clear();
+        state.brief_mode = false;
+        state.response_style = crate::state::ResponseStyle::default();
+        // Back to the configured default, not to nothing.
+        state.disk_output_style = initial_style;
+        // `/fast` restores this on its next toggle, but the restore takes
+        // the model from the session, so there is nothing to go back to.
+        state.pre_fast_model = None;
+        state.break_cache_next = false;
+        // Per-model breakdown behind `/cost`; the totals are restored
+        // from the session file, so a stale breakdown would not add up.
+        state.model_usage.clear();
     }
 
     /// Set plan mode for the next permission / executor check without
@@ -3410,26 +3464,114 @@ mod tests {
         );
     }
 
-    /// "Allow for this session" is scoped to the conversation it was
-    /// granted in. A UI that swaps a saved session into a live engine
-    /// (`/resume`) must be able to drop those grants, or the resumed
-    /// conversation inherits approvals the user never gave it — the
-    /// executor consults this store *before* prompting.
+    /// Everything scoped to the current conversation but absent from the
+    /// saved session must be dropped when a different conversation is
+    /// swapped into a live engine (`/resume`). The two that matter most
+    /// are authorisations the user granted somewhere else: session
+    /// permission allowances and `/add-dir` paths.
     #[tokio::test]
-    async fn clearing_session_allows_drops_grants_from_the_previous_session() {
-        let engine = build_engine(Arc::new(CompletingProvider));
+    async fn a_session_swap_drops_conversation_scoped_state() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
         engine
             .session_allows
             .lock()
             .await
             .insert("Bash:rm -rf build".to_string());
-        assert!(!engine.session_allows.lock().await.is_empty());
+        engine.denial_tracker.lock().await.record(
+            "Bash",
+            "toolu_old",
+            "blocked",
+            &serde_json::json!({"command": "rm -rf /"}),
+        );
+        engine.last_seen_denial_total = 7;
+        engine.cached_system_prompt = Some((1234, "stale prompt".into()));
+        engine.state.additional_dirs.push("/srv/secrets".into());
+        engine.state.brief_mode = true;
+        engine.state.pre_fast_model = Some("slow-model".into());
+        engine.state.break_cache_next = true;
+        engine
+            .state
+            .model_usage
+            .insert("old-model".into(), Usage::default());
 
-        engine.clear_session_allows().await;
+        engine.reset_for_session_swap().await;
 
         assert!(
             engine.session_allows.lock().await.is_empty(),
-            "a session-scoped grant survived the session swap"
+            "a permission grant survived into a conversation that never approved it"
+        );
+        assert!(
+            engine.state.additional_dirs.is_empty(),
+            "/add-dir access survived into a conversation that was never granted it"
+        );
+        assert_eq!(engine.denial_tracker.lock().await.total(), 0);
+        assert_eq!(engine.last_seen_denial_total, 0);
+        assert!(engine.cached_system_prompt.is_none());
+        assert!(!engine.state.brief_mode);
+        assert!(engine.state.pre_fast_model.is_none());
+        assert!(!engine.state.break_cache_next);
+        assert!(engine.state.model_usage.is_empty());
+    }
+
+    /// The memory-extraction cursor is an absolute index into the
+    /// message vector being replaced. Carried over, it either skips the
+    /// restored session's messages or mines an unrelated suffix.
+    #[tokio::test]
+    async fn a_session_swap_rewinds_the_memory_extraction_cursor() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        engine
+            .extraction_state
+            .lock()
+            .await
+            .set_last_processed_index(400);
+
+        engine.reset_for_session_swap().await;
+
+        assert_eq!(
+            engine.extraction_state.lock().await.last_processed_index(),
+            0,
+            "the cursor still points into the discarded conversation"
+        );
+    }
+
+    /// Steered text queued against the old conversation would otherwise
+    /// be drained into the restored one as a user message.
+    #[tokio::test]
+    async fn a_session_swap_drops_undelivered_steering() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        let _ = engine
+            .steer_sender()
+            .send("meant for the old session".to_string());
+
+        engine.reset_for_session_swap().await;
+
+        assert!(
+            engine.steer_rx.try_recv().is_err(),
+            "steered text leaked into the resumed conversation"
+        );
+    }
+
+    /// An `/output-style` chosen in the discarded conversation must go,
+    /// but a startup-configured default must survive.
+    #[tokio::test]
+    async fn a_session_swap_returns_to_the_configured_output_style() {
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        assert!(engine.initial_disk_output_style.is_none());
+        engine.state.disk_output_style = Some(crate::output_styles::OutputStyle {
+            name: "chosen-in-the-old-session".into(),
+            description: String::new(),
+            body: String::new(),
+            applies_to: Vec::new(),
+            source: crate::output_styles::OutputStyleSource::User,
+            source_path: None,
+            content_hash: [0u8; 12],
+        });
+
+        engine.reset_for_session_swap().await;
+
+        assert!(
+            engine.state.disk_output_style.is_none(),
+            "an in-conversation output style survived the swap"
         );
     }
 

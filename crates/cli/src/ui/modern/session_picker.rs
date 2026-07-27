@@ -293,6 +293,17 @@ impl App {
     /// user was trying to leave — a prompt or `!cmd` would take real tool
     /// and filesystem side effects there — so it is cancelled and shown.
     pub fn cancel_deferred_resume_work(&mut self) {
+        self.cancel_pending_session_work("cancelled — held for the session that failed to load:");
+    }
+
+    /// Session-scoped work staged against a conversation that is being
+    /// left behind.
+    ///
+    /// It cannot run where it was written (that conversation is going
+    /// away) and must not run anywhere else, so it is cancelled — but
+    /// reproduced verbatim, never reduced to a count. The submitted
+    /// prompt goes back to the composer when the composer is free.
+    fn cancel_pending_session_work(&mut self, why: &str) {
         let mut cancelled: Vec<String> = Vec::new();
         if self.pending_clear {
             self.pending_clear = false;
@@ -307,12 +318,11 @@ impl App {
         if let Some(cmd) = self.pending_shell.take() {
             cancelled.push(format!("!{cmd}"));
         }
-        self.reclaim_staged_prompts("not sent — the resume failed:", &mut cancelled);
+        self.reclaim_staged_prompts("not sent:", &mut cancelled);
         if !cancelled.is_empty() {
             let body = cancelled.join("\n");
-            self.transcript.push(TranscriptItem::System(format!(
-                "cancelled — held for the session that failed to load:\n{body}"
-            )));
+            self.transcript
+                .push(TranscriptItem::System(format!("{why}\n{body}")));
             self.scroll_to_bottom();
             self.dirty = true;
         }
@@ -410,6 +420,12 @@ impl App {
             return;
         };
         self.close_session_picker();
+        // Work already staged against the conversation we are leaving is
+        // resolved here, at the moment of the decision. Left alone the
+        // resume gates would merely *hold* it, and it would then land on
+        // the restored session — a `/clear` issued against the old
+        // conversation would clear the new one.
+        self.cancel_pending_session_work("cancelled — issued before you resumed another session:");
         self.pending_resume = Some(id.clone());
         self.status_message = format!("resuming {}…", &id[..id.len().min(8)]);
         self.dirty = true;
@@ -1077,6 +1093,44 @@ mod tests {
             "a queued prompt was eaten: {:?}",
             app.transcript
         );
+    }
+
+    /// Work staged *before* the picker was accepted belongs to the
+    /// conversation being left. Merely gating it would hold it until the
+    /// restore, at which point a `/clear` issued against the old session
+    /// would clear the newly restored one.
+    #[test]
+    fn accepting_cancels_work_staged_against_the_old_session() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_clear = true;
+        app.pending_slash = Some("/cost".into());
+        app.pending_shell = Some("make clean".into());
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+
+        app.session_picker_accept();
+
+        assert_eq!(app.pending_resume.as_deref(), Some("aaa11111"));
+        assert!(
+            !app.pending_clear,
+            "/clear would have cleared the restored session"
+        );
+        assert!(app.pending_slash.is_none());
+        assert!(app.pending_shell.is_none());
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["/clear", "/cost", "!make clean"] {
+            assert!(
+                said.contains(expected),
+                "{expected} was cancelled silently: {said}"
+            );
+        }
     }
 
     /// A prompt submitted while the session was still loading never ran

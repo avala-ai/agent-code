@@ -32,6 +32,18 @@ pub struct ExtractionState {
 }
 
 impl ExtractionState {
+    /// How far extraction has consumed the conversation. Exposed so a
+    /// session swap can assert the cursor was rewound — it indexes the
+    /// message vector, so it is meaningless against a different one.
+    pub(crate) fn last_processed_index(&self) -> usize {
+        self.last_processed_index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_processed_index(&mut self, index: usize) {
+        self.last_processed_index = index;
+    }
+
     pub fn new() -> Self {
         Self {
             last_processed_index: 0,

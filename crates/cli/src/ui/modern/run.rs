@@ -496,8 +496,16 @@ pub(super) async fn event_loop(
                             st.messages = data.messages;
                             st.turn_count = data.turn_count;
                             st.total_cost_usd = data.total_cost_usd;
-                            st.total_usage.input_tokens = data.total_input_tokens;
-                            st.total_usage.output_tokens = data.total_output_tokens;
+                            // Replace the whole Usage, not two fields of
+                            // it: the cache-token counters are not saved
+                            // in a session, so assigning piecemeal left
+                            // the discarded conversation's cache figures
+                            // adding into the restored session's `/cost`.
+                            st.total_usage = agent_code_lib::llm::message::Usage {
+                                input_tokens: data.total_input_tokens,
+                                output_tokens: data.total_output_tokens,
+                                ..Default::default()
+                            };
                             if !data.model.is_empty() {
                                 st.config.api.model = data.model.clone();
                             }
@@ -507,14 +515,12 @@ pub(super) async fn event_loop(
                         // reused across the swap, so without this the
                         // resumed session inherits approvals the user
                         // never gave it and the executor skips the ask.
-                        eng.clear_session_allows().await;
-                        // The system prompt is cached by a hash over model
-                        // and cwd, neither of which need change here — but
-                        // `build_system_prompt` selects memories from the
-                        // recent messages, so a stale entry would hand the
-                        // first resumed turn a prompt built for the
-                        // conversation just discarded.
-                        eng.reset_system_prompt_cache();
+                        // Permission grants, `/add-dir` paths, the prompt
+                        // cache, the memory-extraction cursor, the denial
+                        // tracker and the rest of the conversation-scoped
+                        // state the session file does not carry. One call,
+                        // so a swap cannot forget a field.
+                        eng.reset_for_session_swap().await;
                         app.restore_transcript(items, &id, turns);
                         let stored_mode = app.adopt_restored_session(&restored);
                         let mode = user_mode.unwrap_or(stored_mode);
