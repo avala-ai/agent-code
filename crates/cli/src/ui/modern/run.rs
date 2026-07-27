@@ -29,6 +29,9 @@ use tokio::sync::mpsc;
 /// Second Ctrl+C within this window (on an empty prompt) quits.
 const QUIT_ARM_WINDOW: Duration = Duration::from_millis(1500);
 
+/// How many recent sessions `/resume` offers.
+const SESSION_PICKER_LIMIT: usize = 50;
+
 use agent_code_lib::config::PermissionMode;
 use agent_code_lib::query::{QueryEngine, Session, TurnHandle};
 use agent_code_lib::services::notifier::{NotificationKind, NotifierService};
@@ -333,6 +336,11 @@ pub(super) async fn event_loop(
     // back here, so a slow filesystem never blocks the event loop.
     let (task_out_tx, mut task_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
+    // `/resume` session discovery, same shape: the scan runs on a blocking
+    // thread and the rows come back here (see the select arms).
+    let (session_list_tx, mut session_list_rx) = tokio::sync::mpsc::unbounded_channel::<
+        Vec<agent_code_lib::services::session::SessionSummary>,
+    >();
     // Seed the pane once so tasks adopted from a previous process show
     // before the first turn arms the periodic poll.
     app.sync_background_tasks(manager_rows(&task_manager).await);
@@ -403,15 +411,34 @@ pub(super) async fn event_loop(
             }
         }
 
-        // Load a session chosen in the picker: engine state *and* the
-        // visible transcript, so the user can see what they resumed.
-        if let Some(id) = app.pending_resume.take() {
+        // Load a session chosen in the picker: engine state, the visible
+        // transcript, *and* every App mirror, so the header, the mode
+        // badge and `/cost` describe what was actually restored.
+        //
+        // Gated on `turn.is_none()`, not just on the engine mutex being
+        // free. A finishing turn releases the mutex before the reaper
+        // below takes its handle, drains its trailing events and flushes
+        // its buffered text — all of which would land in the transcript
+        // we just replaced, against the conversation we just discarded.
+        // Waiting for the reap is the only ordering that cannot interleave.
+        if turn.is_none()
+            && let Some(id) = app.pending_resume.take()
+        {
             match agent_code_lib::services::session::load_session(&id) {
                 Ok(data) => match session.engine().try_lock() {
                     Ok(mut eng) => {
                         let items = super::session_picker::transcript_from_messages(&data.messages);
-                        let turns = data.turn_count;
+                        let restored = super::session_picker::RestoredState {
+                            id: id.clone(),
+                            model: data.model.clone(),
+                            turn_count: data.turn_count,
+                            tokens_in: data.total_input_tokens,
+                            tokens_out: data.total_output_tokens,
+                            cost_usd: data.total_cost_usd,
+                            plan_mode: data.plan_mode,
+                        };
                         let plan = data.plan_mode;
+                        let turns = data.turn_count;
                         {
                             let st = eng.state_mut();
                             st.messages = data.messages;
@@ -424,8 +451,20 @@ pub(super) async fn event_loop(
                                 st.config.api.model = data.model.clone();
                             }
                         }
-                        eng.set_live_plan_mode(plan);
                         app.restore_transcript(items, &id, turns);
+                        let mode = app.adopt_restored_session(&restored);
+                        // Keep the loop's mode tracker in step, or the
+                        // `app.mode != last_mode` gate at the top would
+                        // re-apply (or, worse, silently skip) the mode we
+                        // are about to install.
+                        last_mode = mode;
+                        // Live handles, not just the config copy: the
+                        // permission-checker default has to move with the
+                        // restored plan flag, or a resumed plan session
+                        // answers permission checks as the old one did.
+                        let hint = mode.permission_hint().unwrap_or(base_permission_mode);
+                        session.apply_live_mode(plan, hint);
+                        eng.state_mut().config.permissions.default_mode = hint;
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
@@ -713,10 +752,13 @@ pub(super) async fn event_loop(
                         "queued prompts kept — press Enter to send".into(),
                     ));
                 }
-                // Start a pending turn NOW (auto-queue head or interject).
-                // The spawn check lives at the top of the loop; falling
-                // through to `select!` would park until an unrelated event.
-                if app.pending_submit.is_some() {
+                // Start a pending turn NOW (auto-queue head or interject),
+                // or apply a resume that was waiting for this turn to be
+                // reaped. Both checks live at the top of the loop; falling
+                // through to `select!` would park until an unrelated event
+                // — leaving the user staring at "resuming …" until they
+                // pressed a key.
+                if app.pending_submit.is_some() || app.pending_resume.is_some() {
                     continue;
                 }
             }
@@ -847,6 +889,26 @@ pub(super) async fn event_loop(
             }
             Some((id, out)) = task_out_rx.recv() => {
                 app.show_task_output(&id, out);
+            }
+            // `/resume`: enumerating sessions stats and parses every file
+            // in the sessions directory. Done inline in the key handler it
+            // froze input and repaint for as long as that took, so it goes
+            // to a blocking thread and returns through the arm below.
+            _ = std::future::ready(()), if app.pending_session_list => {
+                app.pending_session_list = false;
+                let tx = session_list_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    // Summary-only listing: it is index-cached and skips
+                    // deserializing every transcript, which is the entire
+                    // cost of the full read for data the picker never shows.
+                    let rows = agent_code_lib::services::session::list_session_summaries(
+                        SESSION_PICKER_LIMIT,
+                    );
+                    let _ = tx.send(rows);
+                });
+            }
+            Some(rows) = session_list_rx.recv() => {
+                app.show_session_picker(rows);
             }
             // Background-task rows (`&` shell jobs, workflows, monitors).
             // Gated on work that can still change: polling while any

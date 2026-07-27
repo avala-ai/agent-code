@@ -176,7 +176,7 @@ pub fn list_sessions(limit: usize) -> Vec<SessionSummary> {
 
     // Drop sidecar entries for sessions that no longer exist, so a session's
     // cached metadata never outlives its file — this full-read path (used by
-    // `/sessions` and the resume picker) does not otherwise touch the index.
+    // `/sessions`) does not otherwise touch the index.
     reconcile_index(&dir);
 
     let mut sessions: Vec<SessionSummary> = std::fs::read_dir(&dir)

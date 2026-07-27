@@ -13,6 +13,7 @@
 use agent_code_lib::services::session::SessionSummary;
 
 use super::app::{App, TranscriptItem};
+use super::mode::SessionMode;
 
 /// Overlay state for the session picker.
 #[derive(Debug, Clone)]
@@ -54,6 +55,10 @@ impl SessionPicker {
 }
 
 /// One display row: what the picker shows for a session.
+///
+/// Sizes the session by turn count rather than message count: the picker
+/// is fed by the cached summary-only listing, which deliberately does not
+/// deserialize transcripts, so `message_count` is not populated there.
 pub fn summary_line(s: &SessionSummary) -> String {
     let label = s.label.clone().unwrap_or_else(|| {
         // No label: the working directory is the next most recognisable
@@ -64,10 +69,25 @@ pub fn summary_line(s: &SessionSummary) -> String {
             .unwrap_or_else(|| s.cwd.clone())
     });
     let short_id: String = s.id.chars().take(8).collect();
+    let turns = s.turn_count;
+    let plural = if turns == 1 { "" } else { "s" };
     format!(
-        "{short_id}  {label}  ·  {} msg  ·  {}",
-        s.message_count, s.updated_at
+        "{short_id}  {label}  ·  {turns} turn{plural}  ·  {}",
+        s.updated_at
     )
+}
+
+/// Engine-side values a restored session carries, lifted out so the App
+/// mirrors can be updated in one place (and tested without an engine).
+#[derive(Debug, Clone, Default)]
+pub struct RestoredState {
+    pub id: String,
+    pub model: String,
+    pub turn_count: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub plan_mode: bool,
 }
 
 /// Rebuild transcript items from a restored conversation.
@@ -186,6 +206,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Result of the run loop's off-thread session scan.
+    pub fn show_session_picker(&mut self, entries: Vec<SessionSummary>) {
+        if entries.is_empty() {
+            self.status_message.clear();
+            self.transcript
+                .push(TranscriptItem::System("no saved sessions found".into()));
+            self.dirty = true;
+            return;
+        }
+        self.open_session_picker(entries);
+    }
+
     pub fn session_picker_open(&self) -> bool {
         self.session_picker.is_some()
     }
@@ -263,6 +295,50 @@ impl App {
         self.scroll_to_bottom();
         self.status_message.clear();
         self.dirty = true;
+    }
+
+    /// Point every App mirror at the session just restored.
+    ///
+    /// The engine is only half the story: the header, the mode badge and
+    /// `/cost` all read App's own copies. Leaving them behind makes the
+    /// UI describe the session the user just left — a NORMAL badge over a
+    /// read-only plan-mode context, the old model name, the old spend.
+    ///
+    /// Returns the [`SessionMode`] the caller must push into the *live*
+    /// engine handles (plan atomic + permission-checker default); App
+    /// deliberately holds no engine Arc, so it cannot do that itself.
+    pub fn adopt_restored_session(&mut self, s: &RestoredState) -> SessionMode {
+        self.session_id = s.id.clone();
+        if !s.model.is_empty() {
+            self.model = s.model.clone();
+        }
+        self.turn_count = s.turn_count;
+        self.tokens_in = s.tokens_in;
+        self.tokens_out = s.tokens_out;
+        self.cost_usd = s.cost_usd;
+        // Belongs to the conversation that was just replaced; the next
+        // turn re-reports it for the restored one.
+        self.ctx_meter = None;
+        self.mode = if s.plan_mode {
+            SessionMode::Plan
+        } else {
+            SessionMode::Normal
+        };
+
+        // Prompts staged against the previous conversation must not be
+        // auto-dispatched into the session that replaced it.
+        self.pending_submit = None;
+        let dropped = self.queue.len();
+        self.queue.clear();
+        self.queue_selected = 0;
+        if dropped > 0 {
+            self.transcript.push(TranscriptItem::System(format!(
+                "discarded {dropped} queued prompt(s) written for the previous session"
+            )));
+            self.scroll_to_bottom();
+        }
+        self.dirty = true;
+        self.mode
     }
 }
 
@@ -425,6 +501,171 @@ mod tests {
             is_compact_summary: false,
         })];
         assert!(transcript_from_messages(&messages).is_empty());
+    }
+
+    /// `/resume` must not scan the sessions directory on the thread that
+    /// draws frames and reads keys — it only raises a request.
+    #[test]
+    fn resume_only_requests_the_session_list() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "/resume".into();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(
+            app.pending_session_list,
+            "the run loop was never asked for the session list"
+        );
+        assert!(
+            !app.session_picker_open(),
+            "the picker opened before the list was fetched — the scan ran inline"
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn an_empty_session_list_reports_instead_of_opening_the_picker() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_session_picker(Vec::new());
+        assert!(!app.session_picker_open());
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("no saved sessions"))),
+        );
+    }
+
+    #[test]
+    fn a_returned_session_list_opens_the_picker() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.show_session_picker(vec![summary("aaa11111", None, "/a")]);
+        assert!(app.session_picker_open());
+    }
+
+    /// The picker is fed by the index-cached summary listing, which does
+    /// not deserialize transcripts — so rows must not be sized by a
+    /// `message_count` that path never populates.
+    #[test]
+    fn rows_are_sized_by_turns_not_unpopulated_message_counts() {
+        let mut s = summary("aaa11111", Some("auth work"), "/home/u/api");
+        s.message_count = 0;
+        s.turn_count = 3;
+        let line = summary_line(&s);
+        assert!(line.contains("3 turns"), "got {line}");
+        assert!(
+            !line.contains("0 msg"),
+            "row reports a count it never read: {line}"
+        );
+
+        s.turn_count = 1;
+        assert!(summary_line(&s).contains("1 turn "), "{}", summary_line(&s));
+    }
+
+    fn restored() -> RestoredState {
+        RestoredState {
+            id: "abcdef123456".into(),
+            model: "restored-model".into(),
+            turn_count: 7,
+            tokens_in: 1234,
+            tokens_out: 567,
+            cost_usd: 4.25,
+            plan_mode: true,
+        }
+    }
+
+    /// The engine is only half a resume: the header, the badge and
+    /// `/cost` all read App's own copies of this state.
+    #[test]
+    fn restored_state_is_mirrored_into_the_app() {
+        let mut app = App::new("old-model", "/tmp", "old-session");
+        app.mode = SessionMode::Normal;
+        app.turn_count = 99;
+        app.tokens_in = 1;
+        app.tokens_out = 2;
+        app.cost_usd = 99.0;
+        app.ctx_meter = Some((10, 20));
+
+        let mode = app.adopt_restored_session(&restored());
+
+        assert_eq!(mode, SessionMode::Plan, "caller cannot apply the live mode");
+        assert_eq!(
+            app.mode,
+            SessionMode::Plan,
+            "badge still shows the old mode"
+        );
+        assert_eq!(app.model, "restored-model");
+        assert_eq!(app.session_id, "abcdef123456");
+        assert_eq!(app.turn_count, 7);
+        assert_eq!(app.tokens_in, 1234);
+        assert_eq!(app.tokens_out, 567);
+        assert_eq!(app.cost_usd, 4.25);
+        assert!(
+            app.ctx_meter.is_none(),
+            "context meter still describes the discarded conversation"
+        );
+    }
+
+    /// A non-plan session must clear a plan badge inherited from the
+    /// session being replaced, not just fail to set one.
+    #[test]
+    fn restoring_a_non_plan_session_leaves_plan_mode() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.mode = SessionMode::Plan;
+        let mode = app.adopt_restored_session(&RestoredState {
+            plan_mode: false,
+            ..restored()
+        });
+        assert_eq!(mode, SessionMode::Normal);
+        assert_eq!(app.mode, SessionMode::Normal);
+    }
+
+    /// An empty stored model must not blank the header.
+    #[test]
+    fn an_empty_restored_model_keeps_the_current_one() {
+        let mut app = App::new("current-model", "/tmp", "s");
+        app.adopt_restored_session(&RestoredState {
+            model: String::new(),
+            ..restored()
+        });
+        assert_eq!(app.model, "current-model");
+    }
+
+    /// Prompts typed against the previous conversation must not be fired
+    /// at the session that replaced it.
+    #[test]
+    fn resuming_drops_prompts_staged_for_the_previous_session() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_submit = Some("for the old session".into());
+        app.queue.push_back("also for the old session".into());
+        app.adopt_restored_session(&restored());
+        assert!(
+            app.pending_submit.is_none(),
+            "old prompt survived the resume"
+        );
+        assert!(app.queue.is_empty(), "old queue survived the resume");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::System(t) if t.contains("discarded 1"))),
+            "prompts were dropped without telling the user"
+        );
+    }
+
+    /// The resume waits for the live turn to be reaped; the reaper's
+    /// clean-finish path must not send the old queue in the meantime.
+    #[test]
+    fn a_pending_resume_suppresses_queue_auto_dispatch() {
+        use super::super::app::Phase;
+        let mut app = App::new("m", "/tmp", "s");
+        app.phase = Phase::Streaming;
+        app.queue.push_back("old conversation prompt".into());
+        app.pending_resume = Some("abcdef123456".into());
+        app.mark_turn_idle();
+        app.dispatch_queue_head();
+        assert!(
+            app.pending_submit.is_none(),
+            "queued prompt was dispatched into the session being resumed"
+        );
+        assert_eq!(app.queue.len(), 1, "the prompt should still be queued");
     }
 
     #[test]

@@ -427,6 +427,10 @@ pub struct App {
     pub session_picker: Option<super::session_picker::SessionPicker>,
     /// Session id the run loop should load.
     pub pending_resume: Option<String>,
+    /// `/resume` asked for the session list. Enumerating sessions is
+    /// filesystem work, so the run loop does it off this thread and
+    /// hands the result back through `show_session_picker`.
+    pub pending_session_list: bool,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -603,6 +607,7 @@ impl App {
             model_picker: None,
             session_picker: None,
             pending_resume: None,
+            pending_session_list: false,
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
@@ -1349,15 +1354,17 @@ impl App {
         if text == "/resume" {
             // Bare `/resume` opens the picker. `/resume <id>` is left to
             // the command bridge, which already loads by id.
-            let sessions = agent_code_lib::services::session::list_sessions(50);
-            if sessions.is_empty() {
-                self.transcript
-                    .push(TranscriptItem::System("no saved sessions found".into()));
-            } else {
-                self.open_session_picker(sessions);
-            }
+            //
+            // Only *ask* for the list here: enumerating sessions stats and
+            // parses every file in the sessions directory, and this runs on
+            // the thread that draws frames and reads keys. The run loop
+            // does the scan on a blocking thread and calls back into
+            // `show_session_picker`.
+            self.pending_session_list = true;
+            self.status_message = "loading sessions…".into();
             self.input.clear();
             self.cursor = 0;
+            self.dirty = true;
             return;
         }
         if text == "/theme" {
@@ -1960,6 +1967,13 @@ impl App {
     /// `queue.auto_send`, default on).
     pub fn dispatch_queue_head(&mut self) {
         if self.phase != Phase::Idle || self.pending_submit.is_some() {
+            return;
+        }
+        // A resume is waiting for this turn to be reaped. The queue was
+        // composed against the conversation that is about to be replaced,
+        // so sending its head now would run it against a different
+        // session than the user wrote it for.
+        if self.pending_resume.is_some() {
             return;
         }
         if let Some(text) = self.queue.pop_front() {
