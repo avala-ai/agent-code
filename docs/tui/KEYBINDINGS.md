@@ -15,6 +15,7 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+T` | Toggle tasks/agents pane |
 | `↑`/`↓` | Move the tasks-pane selection (pane open, empty composer) |
 | `Enter` | Open the selected background task's output (pane open, empty composer) |
+| `Space` | Fold / unfold the selected group in the tasks pane |
 | `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |

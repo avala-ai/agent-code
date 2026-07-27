@@ -1273,6 +1273,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.tasks_select(1);
         }
         // Retained prompts win the empty Enter: after an aborted turn the
+        // Space folds/unfolds the selected group. Safe to claim here
+        // because this branch only runs with an empty composer, so it is
+        // not a space the user is trying to type.
+        (m, KeyCode::Char(' '))
+            if m.is_empty()
+                && app.tasks_visible()
+                && !app.show_queue_pane
+                && app.input.is_empty() =>
+        {
+            app.toggle_selected_group();
+        }
         // UI promises "press Enter to send", so drill-in only claims the
         // key when no queued prompt is waiting for dispatch.
         (m, KeyCode::Enter)

@@ -107,6 +107,14 @@ pub struct ManagerRow {
 /// blank line between groups, and two lines per task. The layout uses
 /// this to size the below-transcript strip on narrow terminals.
 pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
+    pane_rows_collapsed(tasks, &[])
+}
+
+/// Row count with `collapsed` groups folded to their heading.
+///
+/// The pane is sized from this, so a collapsed group has to shrink the
+/// strip too — otherwise collapsing frees no space and buys nothing.
+pub fn pane_rows_collapsed(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> usize {
     let mut rows = 0;
     let mut last: Option<TaskSource> = None;
     for t in tasks {
@@ -117,9 +125,22 @@ pub fn pane_rows(tasks: &[TaskEntry]) -> usize {
             rows += 1;
             last = Some(t.source);
         }
-        rows += 2;
+        if !collapsed.contains(&t.source) {
+            rows += 2;
+        }
     }
     rows
+}
+
+/// Rows the user can move a selection through: a collapsed group's
+/// members are not reachable, so the selection must skip them.
+pub fn visible_indices(tasks: &[TaskEntry], collapsed: &[TaskSource]) -> Vec<usize> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !collapsed.contains(&t.source))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Upsert a subagent update into `tasks`, keeping entries ordered by state
@@ -166,6 +187,57 @@ pub fn upsert_with_source(
 
 #[cfg(test)]
 mod tests {
+    fn two_groups() -> Vec<TaskEntry> {
+        let mut t = Vec::new();
+        upsert(&mut t, "a1", "working", "explore");
+        upsert(&mut t, "a2", "working", "audit");
+        upsert_with_source(&mut t, "b1", "working", "build", TaskSource::Background);
+        t
+    }
+
+    /// Collapsing has to shrink the pane, or it frees no space and buys
+    /// the user nothing.
+    #[test]
+    fn a_collapsed_group_costs_only_its_heading() {
+        let tasks = two_groups();
+        let open = pane_rows_collapsed(&tasks, &[]);
+        let folded = pane_rows_collapsed(&tasks, &[TaskSource::Subagent]);
+        assert!(
+            folded < open,
+            "collapsing did not shrink the pane: {folded} vs {open}"
+        );
+        // Two agent rows at 2 lines each disappear; the heading stays.
+        assert_eq!(open - folded, 4);
+    }
+
+    #[test]
+    fn pane_rows_matches_the_uncollapsed_count() {
+        let tasks = two_groups();
+        assert_eq!(pane_rows(&tasks), pane_rows_collapsed(&tasks, &[]));
+    }
+
+    /// The selection must not be able to land on a row that is folded
+    /// away — it would look like the pane stopped responding.
+    #[test]
+    fn folded_rows_are_not_selectable() {
+        let tasks = two_groups();
+        let visible = visible_indices(&tasks, &[TaskSource::Subagent]);
+        assert!(
+            visible
+                .iter()
+                .all(|i| tasks[*i].source == TaskSource::Background),
+            "a folded row remained selectable"
+        );
+        assert_eq!(visible_indices(&tasks, &[]).len(), tasks.len());
+    }
+
+    #[test]
+    fn folding_everything_leaves_nothing_selectable() {
+        let tasks = two_groups();
+        let visible = visible_indices(&tasks, &[TaskSource::Subagent, TaskSource::Background]);
+        assert!(visible.is_empty());
+    }
+
     /// The pane was fed only by `EngineEvent::SubagentUpdate`, so a
     /// background job (`&` shell, workflow, monitor) never appeared in it
     /// at all — the user had to run `/tasks list` to see one.

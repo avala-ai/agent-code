@@ -79,7 +79,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // the transcript keeps at least half the area; the pane
             // shows a "+n more" line when it still cannot fit.
             // +1 for the block title row the pane spends.
-            let needed = super::tasks::pane_rows(&app.tasks) as u16 + 1;
+            let needed =
+                super::tasks::pane_rows_collapsed(&app.tasks, &app.collapsed_groups) as u16 + 1;
             let strip = needed
                 .min(chunks[1].height / 2)
                 .min(chunks[1].height.saturating_sub(3));
@@ -731,6 +732,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner_w = (inner.width as usize).saturating_sub(1);
     let mut last_source: Option<super::tasks::TaskSource> = None;
     for (idx, t) in app.tasks.iter().enumerate() {
+        let group_folded = app.collapsed_groups.contains(&t.source);
         let p = palette();
         let selected = idx == app.tasks_selected;
         // Group header when the source changes. Subagents and background
@@ -740,13 +742,26 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if last_source.is_some() {
                 lines.push(Line::from(""));
             }
+            let folded = app.collapsed_groups.contains(&t.source);
+            let count = app.tasks.iter().filter(|x| x.source == t.source).count();
+            // A folded group shows its size, so collapsing does not hide
+            // how much is behind it.
+            let heading = if folded {
+                format!("{} {} ({count})", "▸", t.source.heading())
+            } else {
+                format!("{} {}", "▾", t.source.heading())
+            };
             lines.push(Line::from(Span::styled(
-                t.source.heading().to_string(),
+                heading,
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             )));
             last_source = Some(t.source);
+        }
+        // Folded: the heading above stands in for the group's rows.
+        if group_folded {
+            continue;
         }
         let color = match t.state {
             TaskState::Working => Color::Blue,
@@ -1679,6 +1694,39 @@ mod tests {
             corners_before,
             "search bar must not eat a border row:\n{s}"
         );
+    }
+
+    #[test]
+    fn a_folded_group_hides_its_rows_and_shows_its_size() {
+        use crate::ui::modern::tasks::TaskSource;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore the parser");
+        crate::ui::modern::tasks::upsert_with_source(
+            &mut app.tasks,
+            "b1",
+            "working",
+            "cargo build",
+            TaskSource::Background,
+        );
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let open = buffer_to_string(term.backend().buffer());
+        assert!(open.contains("explore the parser"), "buffer:\n{open}");
+        assert!(open.contains("▾ agents"), "no expanded marker:\n{open}");
+
+        app.collapsed_groups.push(TaskSource::Subagent);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let folded = buffer_to_string(term.backend().buffer());
+        assert!(
+            !folded.contains("explore the parser"),
+            "folding did not hide the row:\n{folded}"
+        );
+        // The count keeps the group honest about what it is hiding.
+        assert!(folded.contains("▸ agents (1)"), "buffer:\n{folded}");
+        // The other group is untouched.
+        assert!(folded.contains("cargo build"), "buffer:\n{folded}");
     }
 
     #[test]

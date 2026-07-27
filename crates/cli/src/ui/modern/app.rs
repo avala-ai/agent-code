@@ -417,6 +417,8 @@ pub struct App {
     pub queue_selected: usize,
     /// Selected row in the tasks pane, for drill-in.
     pub tasks_selected: usize,
+    /// Groups folded to their heading in the tasks pane.
+    pub collapsed_groups: Vec<super::tasks::TaskSource>,
     /// Task id whose output the run loop should fetch and show.
     pub pending_task_output: Option<String>,
     /// Ctrl+P command palette (slash command picker).
@@ -594,6 +596,7 @@ impl App {
             show_queue_pane: false,
             queue_selected: 0,
             tasks_selected: 0,
+            collapsed_groups: Vec::new(),
             pending_task_output: None,
             command_palette: None,
             model_picker: None,
@@ -2214,11 +2217,38 @@ impl App {
 
     /// Move the tasks-pane selection, clamped to the row count.
     pub fn tasks_select(&mut self, delta: i32) {
-        if self.tasks.is_empty() {
+        // A collapsed group's rows are not on screen, so the selection
+        // must step over them rather than landing somewhere invisible.
+        let visible = super::tasks::visible_indices(&self.tasks, &self.collapsed_groups);
+        if visible.is_empty() {
             return;
         }
-        let n = self.tasks.len() as i32;
-        self.tasks_selected = (self.tasks_selected as i32 + delta).rem_euclid(n) as usize;
+        let here = visible
+            .iter()
+            .position(|i| *i == self.tasks_selected)
+            .unwrap_or(0);
+        let n = visible.len() as i32;
+        let next = (here as i32 + delta).rem_euclid(n) as usize;
+        self.tasks_selected = visible[next];
+        self.dirty = true;
+    }
+
+    /// Fold or unfold the group the selection is in.
+    ///
+    /// Collapsing the group that holds the selection would leave it
+    /// pointing at a hidden row, so the selection moves to the first
+    /// row that is still visible.
+    pub fn toggle_selected_group(&mut self) {
+        let Some(source) = self.tasks.get(self.tasks_selected).map(|t| t.source) else {
+            return;
+        };
+        if let Some(pos) = self.collapsed_groups.iter().position(|s| *s == source) {
+            self.collapsed_groups.remove(pos);
+        } else {
+            self.collapsed_groups.push(source);
+            let visible = super::tasks::visible_indices(&self.tasks, &self.collapsed_groups);
+            self.tasks_selected = visible.first().copied().unwrap_or(0);
+        }
         self.dirty = true;
     }
 
@@ -3475,6 +3505,73 @@ mod tests {
             headline: headline.into(),
             subagent_id: None,
         }
+    }
+
+    #[test]
+    fn collapsing_moves_a_selection_off_a_hidden_row() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        crate::ui::modern::tasks::upsert_with_source(
+            &mut app.tasks,
+            "b1",
+            "working",
+            "build",
+            TaskSource::Background,
+        );
+        // Select the agent row, then fold its group.
+        let agent_idx = app
+            .tasks
+            .iter()
+            .position(|t| t.source == TaskSource::Subagent)
+            .unwrap();
+        app.tasks_selected = agent_idx;
+        app.toggle_selected_group();
+
+        assert!(app.collapsed_groups.contains(&TaskSource::Subagent));
+        assert_eq!(
+            app.tasks[app.tasks_selected].source,
+            TaskSource::Background,
+            "selection stayed on a row that is no longer shown"
+        );
+    }
+
+    #[test]
+    fn selection_steps_over_a_folded_group() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a2", "working", "audit");
+        crate::ui::modern::tasks::upsert_with_source(
+            &mut app.tasks,
+            "b1",
+            "working",
+            "build",
+            TaskSource::Background,
+        );
+        app.collapsed_groups.push(TaskSource::Subagent);
+        app.tasks_selected = app
+            .tasks
+            .iter()
+            .position(|t| t.source == TaskSource::Background)
+            .unwrap();
+        // Only one visible row: moving must stay on it, not walk into
+        // the folded group.
+        app.tasks_select(1);
+        assert_eq!(app.tasks[app.tasks_selected].source, TaskSource::Background);
+        app.tasks_select(-1);
+        assert_eq!(app.tasks[app.tasks_selected].source, TaskSource::Background);
+    }
+
+    #[test]
+    fn unfolding_restores_the_group() {
+        use crate::ui::modern::tasks::TaskSource;
+        let mut app = App::new("m", "/tmp", "s");
+        crate::ui::modern::tasks::upsert(&mut app.tasks, "a1", "working", "explore");
+        app.toggle_selected_group();
+        assert!(app.collapsed_groups.contains(&TaskSource::Subagent));
+        app.toggle_selected_group();
+        assert!(app.collapsed_groups.is_empty());
     }
 
     #[test]
