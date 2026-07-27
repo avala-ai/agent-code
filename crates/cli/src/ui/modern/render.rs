@@ -722,6 +722,11 @@ fn draw_queue_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// a position among rendered rows — folding a group must not shift it.
 struct RowAnchor {
     task: usize,
+    /// First line of this row: the one carrying the `❯` marker. Rows are
+    /// not a uniform height — a task is a status line plus a headline, a
+    /// folded heading is a single line — so this is recorded rather than
+    /// derived from `end`.
+    start: usize,
     /// Line index this row's rendering ends on.
     end: usize,
     /// Tasks this row accounts for: 1 normally, the group size for a
@@ -786,6 +791,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 // it accounts for every task behind it.
                 anchors.push(RowAnchor {
                     task: idx,
+                    start: lines.len() - 1,
                     end: lines.len() - 1,
                     covers: count,
                 });
@@ -825,6 +831,8 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )));
         anchors.push(RowAnchor {
             task: idx,
+            // Status line: pushed just above the headline.
+            start: lines.len() - 2,
             end: lines.len() - 1,
             covers: 1,
         });
@@ -835,7 +843,7 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // tasks are hidden rather than silently truncating mid-task.
     let max_rows = inner.height as usize;
     if lines.len() > max_rows && max_rows > 0 {
-        let sel_end = anchors
+        let sel = anchors
             .iter()
             .find(|a| a.task == app.tasks_selected)
             .or_else(|| {
@@ -843,13 +851,14 @@ fn draw_tasks_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 // row: the nearest anchor at or before it is that
                 // group's heading.
                 anchors.iter().rev().find(|a| a.task <= app.tasks_selected)
-            })
-            .map(|a| a.end)
-            .unwrap_or(0);
-        // The status row (with the ❯ marker) sits directly above the
-        // headline row; when space is too tight for both, the marker
-        // row is the one that must survive.
-        let sel_start = sel_end.saturating_sub(1);
+            });
+        let sel_end = sel.map(|a| a.end).unwrap_or(0);
+        // The row carrying the ❯ marker: the status line for a task, the
+        // heading itself for a folded group. When space is too tight for
+        // the whole row, this is the line that must survive — deriving it
+        // as `sel_end - 1` would step off a one-line folded heading onto
+        // the blank separator above it and hide the selection.
+        let sel_start = sel.map(|a| a.start).unwrap_or(0);
         if max_rows == 1 {
             let row = lines
                 .into_iter()
@@ -2239,6 +2248,77 @@ mod tests {
             hidden <= 6,
             "the 20 rows behind the visible folded heading were counted as hidden: +{hidden}\n{s}"
         );
+    }
+
+    /// A folded heading is one line, but the window used to derive the
+    /// marker row as `end - 1` — the shape of a two-line task row. On a
+    /// short pane that stepped onto the blank separator above the
+    /// heading and dropped the selected group off screen entirely, so
+    /// the user had to unfold it blind. The second group is the folded
+    /// one here: the first group's heading sits at line 0, where the
+    /// off-by-one is invisible.
+    #[test]
+    fn a_selected_folded_heading_survives_every_pane_height() {
+        for h in 8..=22u16 {
+            let mut term = Terminal::new(TestBackend::new(100, h)).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            for i in 0..12 {
+                crate::ui::modern::tasks::upsert(
+                    &mut app.tasks,
+                    &format!("a{i}"),
+                    "working",
+                    &format!("agent number {i}"),
+                );
+            }
+            let rows = (0..3)
+                .map(|i| crate::ui::modern::tasks::ManagerRow {
+                    id: format!("b{i}"),
+                    state: "working".into(),
+                    headline: format!("job number {i}"),
+                    subagent_id: None,
+                })
+                .collect();
+            app.sync_background_tasks(rows);
+            // "background" sorts after "agents", so this is the second
+            // group.
+            app.collapsed_groups
+                .push(crate::ui::modern::tasks::TaskSource::Background);
+            app.tasks_selected = app
+                .tasks
+                .iter()
+                .position(|t| t.source == crate::ui::modern::tasks::TaskSource::Background)
+                .unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            assert!(
+                s.contains("❯▸ background (3)"),
+                "height {h}: selected folded heading not on screen:\n{s}"
+            );
+        }
+    }
+
+    /// The same window must still keep a selected *task* row's marker
+    /// on screen — the marker sits on the status line, above the
+    /// headline.
+    #[test]
+    fn a_selected_task_row_keeps_its_marker_at_every_pane_height() {
+        for h in 8..=22u16 {
+            let mut term = Terminal::new(TestBackend::new(100, h)).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            let rows = (0..8)
+                .map(|i| crate::ui::modern::tasks::ManagerRow {
+                    id: format!("b{i}"),
+                    state: "working".into(),
+                    headline: format!("job number {i}"),
+                    subagent_id: None,
+                })
+                .collect();
+            app.sync_background_tasks(rows);
+            app.tasks_selected = app.tasks.len() - 1;
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            assert!(s.contains('❯'), "height {h}: selection marker lost:\n{s}");
+        }
     }
 
     /// The selection marker has to render on the heading when the
