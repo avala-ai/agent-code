@@ -2478,6 +2478,16 @@ impl App {
         self.dirty = true;
     }
 
+    /// Whether an unmodified Space belongs to the pane's fold binding
+    /// rather than to the composer.
+    ///
+    /// Two dispatch sites need this answer — the fold arm claims the
+    /// key, and vi normal mode's bare-character arm has to fall through
+    /// for it — so they share one predicate instead of drifting apart.
+    pub fn space_folds_group(&self) -> bool {
+        self.tasks_nav_active() && !self.show_queue_pane && self.input.is_empty()
+    }
+
     /// Whether the pane's arrow/Enter bindings may claim the key. Visible
     /// is not enough: a checklist-only pane has nothing to select, and
     /// swallowing the keys there would make prompt history unreachable
