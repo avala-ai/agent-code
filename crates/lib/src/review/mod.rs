@@ -138,10 +138,15 @@ pub fn resolve(target: ReviewTarget, cwd: &Path) -> Result<ResolvedReview, Inval
                 Some(t) if !t.is_empty() => format!(" (\"{t}\")"),
                 _ => String::new(),
             };
+            // `--first-parent` is what makes a merge commit reviewable:
+            // plain `git show` prints a combined diff that is usually
+            // empty, so the reviewer gets a header and nothing to read.
+            // On an ordinary or root commit the flag changes nothing.
             format!(
-                "Review the changes introduced by commit {sha}{named}. Run `git show {sha}` to \
-                 inspect them, then read the surrounding code as needed. Report prioritized, \
-                 actionable findings."
+                "Review the changes introduced by commit {sha}{named}. Run `git show \
+                 --first-parent {sha}` to inspect them — that form also works on a merge commit, \
+                 where plain `git show` prints no patch — then read the surrounding code as \
+                 needed. Report prioritized, actionable findings."
             )
         }
         ReviewTarget::Custom { instructions } => format!(
@@ -201,11 +206,16 @@ fn validate_commit(cwd: &Path, sha: &str) -> Result<String, InvalidTarget> {
 /// outside the index, so `git diff` and `git diff --staged` both skip
 /// them and `git status` lists only their paths. A brand-new file is
 /// exactly the kind of code a review should not miss.
+///
+/// The `:/` pathspec matters as much as the flags. `git ls-files` is
+/// scoped to the current prefix, so run from a subdirectory it silently
+/// omits new files elsewhere in the repository.
 const UNCOMMITTED_PROMPT: &str = "Review the current uncommitted changes — staged, unstaged and \
      untracked. Run `git status`, then `git diff` and `git diff --staged` for edits to tracked \
      files. Untracked files appear in neither diff, so list them with `git ls-files --others \
-     --exclude-standard` and read each one in full. Then read the surrounding code as needed. \
-     Report prioritized, actionable findings.";
+     --exclude-standard -- :/` — the `:/` covers the whole repository, not just the current \
+     directory — and read each one in full. Then read the surrounding code as needed. Report \
+     prioritized, actionable findings.";
 
 fn hint_for(target: &ReviewTarget) -> String {
     match target {
@@ -382,14 +392,41 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let r = resolve(ReviewTarget::Uncommitted, &cwd).expect("the working tree always resolves");
         assert!(
+            // `:/` because ls-files is scoped to the current prefix: run
+            // from a subdirectory it hides new files elsewhere in the repo.
             r.prompt
-                .contains("git ls-files --others --exclude-standard"),
-            "no way to enumerate untracked files: {}",
+                .contains("git ls-files --others --exclude-standard -- :/"),
+            "untracked files are enumerated only under the cwd: {}",
             r.prompt
         );
         assert!(
             r.prompt.contains("read each one"),
             "untracked files are listed but never opened: {}",
+            r.prompt
+        );
+    }
+
+    /// `git show <merge>` prints a combined diff, which for a routine
+    /// merge is empty — the reviewer gets a header and no code to read.
+    /// The reviewable form is the diff against the first parent.
+    #[test]
+    fn a_commit_prompt_can_show_a_merge_commit() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(head) = run_git(&cwd, &["rev-parse", "HEAD"]) else {
+            return; // not a git checkout
+        };
+        let r = resolve(
+            ReviewTarget::Commit {
+                sha: head.clone(),
+                title: None,
+            },
+            &cwd,
+        )
+        .expect("HEAD must resolve");
+        assert!(
+            r.prompt
+                .contains(&format!("git show --first-parent {head}")),
+            "a merge commit would be shown with no patch: {}",
             r.prompt
         );
     }
