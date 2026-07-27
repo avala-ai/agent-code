@@ -192,34 +192,59 @@ pub(super) struct ScriptedTerm {
 /// than an ordinary one.
 pub(super) const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 
-impl ScriptedTerm {
-    pub(super) fn play(script: Vec<(Duration, Event)>) -> Self {
-        Self::play_gated(script, || true)
+/// A condition a beat waits for before its key is delivered.
+pub(super) type Gate = Box<dyn Fn() -> bool + Send>;
+
+/// One scripted keystroke: when to press it, and optionally what has to
+/// be true first.
+///
+/// An offset says when to *press* a key, which is only the right moment
+/// if the thing the key answers has arrived by then. A key that lands
+/// early is not late — it is *lost*: a `y` delivered before the
+/// permission modal exists answers nothing, the modal is never
+/// dismissed, and the tool it would have allowed never runs. That
+/// failure looks exactly like slowness and is not fixed by waiting
+/// longer anywhere else, so a beat whose moment depends on the app
+/// waits for the app.
+pub(super) struct Beat {
+    at: Duration,
+    ev: Event,
+    gate: Option<Gate>,
+}
+
+impl Beat {
+    pub(super) fn at(at: Duration, ev: Event) -> Self {
+        Self { at, ev, gate: None }
     }
 
-    /// Play the script, but hold the last event until `ready` reports
-    /// the effect under test has actually happened.
-    ///
-    /// A script names fixed offsets, which say when to *press* a key,
-    /// not when the work behind it is done. A test that asserts on that
-    /// work must wait for the work: under coverage instrumentation the
-    /// same run takes many times longer, and a fixed offset that fits
-    /// on one machine quits before the tool has written its file on
-    /// another. Waiting on the condition removes the race in both
-    /// directions — it also returns as soon as the effect lands, so the
-    /// ordinary run gets no slower.
-    pub(super) fn play_gated(
-        script: Vec<(Duration, Event)>,
-        ready: impl Fn() -> bool + Send + 'static,
-    ) -> Self {
+    /// Press no earlier than `at`, and not until `gate` holds.
+    pub(super) fn when(at: Duration, ev: Event, gate: Gate) -> Self {
+        Self {
+            at,
+            ev,
+            gate: Some(gate),
+        }
+    }
+}
+
+impl ScriptedTerm {
+    pub(super) fn play(script: Vec<(Duration, Event)>) -> Self {
+        Self::play_beats(
+            script
+                .into_iter()
+                .map(|(at, ev)| Beat::at(at, ev))
+                .collect(),
+        )
+    }
+
+    pub(super) fn play_beats(beats: Vec<Beat>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let last = script.len().saturating_sub(1);
             let trace = std::env::var("FAKE_ENGINE_TRACE").is_ok();
             let start = tokio::time::Instant::now();
-            for (index, (at, ev)) in script.into_iter().enumerate() {
+            for Beat { at, ev, gate } in beats {
                 tokio::time::sleep_until(start + at).await;
-                if index == last {
+                if let Some(ready) = gate {
                     let deadline = tokio::time::Instant::now() + GATE_TIMEOUT;
                     while !ready() && tokio::time::Instant::now() < deadline {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -334,21 +359,48 @@ pub(super) fn harness(provider: ScriptedProvider, cwd: &std::path::Path) -> Harn
 /// to a `TestBackend`. Returns the final `App` for assertions plus the
 /// number of frames drawn.
 pub(super) async fn run_script(h: Harness, term_script: Vec<(Duration, Event)>) -> (App, usize) {
-    run_script_gated(h, term_script, || true).await
+    let beats = term_script
+        .into_iter()
+        .map(|(at, ev)| Beat::at(at, ev))
+        .collect();
+    run_beats(h, beats, Seen::default()).await
 }
 
-/// [`run_script`], holding the script's last event until `ready`.
-pub(super) async fn run_script_gated(
-    mut h: Harness,
-    term_script: Vec<(Duration, Event)>,
-    ready: impl Fn() -> bool + Send + 'static,
-) -> (App, usize) {
+/// What the app has been seen to show, for beats that must wait on it.
+/// The event loop owns the `App`, so a script can only observe it
+/// through the frames it draws.
+#[derive(Clone, Default)]
+pub(super) struct Seen {
+    answers_armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Seen {
+    /// True once the front modal will actually take an answer key.
+    ///
+    /// A drawn modal is not enough: answer keys arm only after the user
+    /// has seen a paint *plus* [`HITL_ANSWER_GRACE`], so that a
+    /// keystroke already in flight cannot auto-allow a tool (#431). A
+    /// `y` pressed before that is discarded by design, the modal is
+    /// never answered, and the tool never runs — so this is the
+    /// condition a script must wait for, not the modal's appearance.
+    pub(super) fn answers_armed(&self) -> bool {
+        self.answers_armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`run_script`] over beats, with `seen` updated from every frame so
+/// gates can wait on what the app is showing.
+pub(super) async fn run_beats(mut h: Harness, beats: Vec<Beat>, seen: Seen) -> (App, usize) {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
     let mut frames = 0usize;
     let mut draw = |app: &mut App| -> anyhow::Result<()> {
         terminal.draw(|f| super::render::draw(f, app))?;
         frames += 1;
+        if app.hitl_answers_ready() {
+            seen.answers_armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if std::env::var("FAKE_ENGINE_TRACE").is_ok() {
             eprintln!(
                 "[fake_engine] frame={} phase={:?} modals={} transcript={}",
@@ -360,7 +412,7 @@ pub(super) async fn run_script_gated(
         }
         Ok(())
     };
-    let mut term_events = ScriptedTerm::play_gated(term_script, ready);
+    let mut term_events = ScriptedTerm::play_beats(beats);
     super::run::event_loop(
         &h.session,
         &mut h.app,
@@ -473,19 +525,32 @@ mod tests {
         ]);
         let h = harness(provider, tmp.path());
 
-        let mut script = type_str("write it", ms(1));
-        script.push((ms(2), key(KeyCode::Enter)));
-        // The modal pops once the tool's Ask decision reaches the prompter;
-        // answer it with 'y' (allow once) a bit later in virtual time.
-        script.push((ms(800), key(KeyCode::Char('y'))));
-        script.push((ms(3000), key(KeyCode::Char(' '))));
-
-        // Quit once the tool has actually written, not at a fixed
-        // offset: the assertion below is about the write having
-        // happened, and an instrumented run reaches it later than a
-        // plain one.
+        let mut beats: Vec<Beat> = type_str("write it", ms(1))
+            .into_iter()
+            .map(|(at, ev)| Beat::at(at, ev))
+            .collect();
+        beats.push(Beat::at(ms(2), key(KeyCode::Enter)));
+        // Answer with 'y' (allow once) once answer keys are armed.
+        // Pressing at a fixed offset answers nothing if the modal has
+        // not been painted and its grace elapsed: the key is discarded
+        // by design, so the tool it would have allowed never runs.
+        let seen = Seen::default();
+        let armed = seen.clone();
+        beats.push(Beat::when(
+            ms(800),
+            key(KeyCode::Char('y')),
+            Box::new(move || armed.answers_armed()),
+        ));
+        // And quit once the tool has actually written, rather than at
+        // an offset that assumes how long that took.
         let written = target.clone();
-        let (app, _frames) = run_script_gated(h, script, move || written.exists()).await;
+        beats.push(Beat::when(
+            ms(3000),
+            key(KeyCode::Char(' ')),
+            Box::new(move || written.exists()),
+        ));
+
+        let (app, _frames) = run_beats(h, beats, seen).await;
 
         assert!(
             target.exists(),

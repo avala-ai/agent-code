@@ -369,8 +369,22 @@ fn find_destructive_depth(cmd: &ParsedCommand, depth: u8) -> Vec<DestructiveFind
                 .iter()
                 .map(|(name, value)| (unquote_token(name), unquote_token(value))),
         );
+        // An environment the walk could not read to the end is not an
+        // empty one. Refusing here is the categorical answer to a whole
+        // class of misses: an `env` spelling this does not model costs
+        // a prompt rather than passing as safe.
+        let mut env_unread = false;
         for invocation in &parsed.invocations {
-            pairs.extend(runner_env_pairs(invocation));
+            let (found, read_fully) = runner_env(invocation);
+            pairs.extend(found);
+            env_unread = env_unread || !read_fully;
+        }
+        if env_unread {
+            findings.push(DestructiveFinding {
+                level: DestructivenessLevel::Destructive,
+                reason: "an env option this does not model decides the environment; what it runs                          cannot be determined"
+                    .to_string(),
+            });
         }
         // A `GIT_CONFIG…` word the positional walk did not account for
         // is the end of the argument: the walk models one option
@@ -968,6 +982,10 @@ const GIT_CONFIG_SELECTORS: &[&str] = &[
     "GIT_CONFIG_COUNT",
     "HOME",
     "XDG_CONFIG_HOME",
+    // `$GIT_DIR/config` and `$GIT_COMMON_DIR/config` are read like any
+    // other, so a repository these name defines aliases too.
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
 ];
 
 /// Every run of whitespace as a single space, so a decoded tab or
@@ -1915,12 +1933,45 @@ const ENV_OPERAND_OPTIONS: &[&str] = &["-u", "--unset", "-C", "--chdir"];
 /// `printf '%s\n' 'GIT_CONFIG_KEY_0=alias.p' git` prints two words and
 /// sets nothing.
 fn runner_env_pairs(invocation: &[String]) -> Vec<(String, String)> {
+    runner_env(invocation).0
+}
+
+/// Options of the `env` family whose effect on the words after them
+/// this walk models. Anything else leaves the rest of the invocation
+/// unread — the list is allowed to be short, because being absent from
+/// it costs a prompt rather than a miss.
+fn env_option_is_modelled(option: &str) -> bool {
+    ENV_OPERAND_OPTIONS.contains(&option)
+        || matches!(
+            option,
+            "-i" | "--ignore-environment"
+                | "-0"
+                | "--null"
+                | "-"
+                // A wrapper that prints and exits runs no command, so
+                // nothing after it is environment for anything.
+                | "--help"
+                | "--version"
+                | "-v"
+                | "--debug"
+        )
+        || option.starts_with("--unset=")
+        || option.starts_with("--chdir=")
+        || option.starts_with("-S")
+        || option.starts_with("--split-string")
+}
+
+/// The environment a runner sets, and whether the walk reached the end
+/// of it. `false` means an option changed the grammar in a way this
+/// does not model, so what the command runs with is unknown.
+fn runner_env(invocation: &[String]) -> (Vec<(String, String)>, bool) {
+    let mut unreadable = false;
     let mut pairs: Vec<(String, String)> = Vec::new();
     let head = invocation
         .first()
         .map(|t| base_name(&unquote_token(t)).to_lowercase());
     if !head.is_some_and(|h| COMMAND_RUNNER_WRAPPERS.contains(&h.as_str())) {
-        return pairs;
+        return (pairs, true);
     }
     let mut idx = 1;
     while let Some(token) = invocation.get(idx) {
@@ -1929,6 +1980,11 @@ fn runner_env_pairs(invocation: &[String]) -> Vec<(String, String)> {
         // word, and the wrapper parser consumes them rather than
         // handing them back, so neither view lists them separately.
         // Split that payload the way env does.
+        let attached_split = unquoted.starts_with('-')
+            && !unquoted.starts_with("--")
+            && unquoted.len() > 2
+            && unquoted.contains('S')
+            || unquoted.starts_with("--split-string=");
         if let Some(payload) = split_string_payload(&unquoted, invocation.get(idx + 1)) {
             // env's own splitting rules, not an approximation of them:
             // an unquoted `\_` separates words while a quoted one is a
@@ -1938,10 +1994,21 @@ fn runner_env_pairs(invocation: &[String]) -> Vec<(String, String)> {
             for word in words {
                 push_assignment(&mut pairs, &word);
             }
-            idx += 2;
+            // An attached operand is the whole of its token, so only
+            // that token is consumed: `env -S'A=1' B=2 git p` still has
+            // `B=2` to read, and skipping it lost the override.
+            idx += if attached_split { 1 } else { 2 };
             continue;
         }
         if unquoted.starts_with('-') {
+            // An option this does not model changes the grammar of
+            // everything after it, so the environment past here was not
+            // read. Say so rather than walking on as though the rest
+            // were plain assignments.
+            if !env_option_is_modelled(&unquoted) {
+                unreadable = true;
+                break;
+            }
             // An option with a separate operand takes the next token
             // with it — `env -u X GIT_CONFIG_GLOBAL=… git p` would
             // otherwise read `X` as the command and stop.
@@ -1965,7 +2032,7 @@ fn runner_env_pairs(invocation: &[String]) -> Vec<(String, String)> {
         }
         idx += 1;
     }
-    pairs
+    (pairs, !unreadable)
 }
 
 /// Record `word` as an environment assignment. A name carrying an
@@ -2059,7 +2126,13 @@ fn env_defines_opaque_git_alias(assignments: &[(String, String)]) -> bool {
         // `/.gitconfig`, which this scan can read no better than any
         // other file. Only a path git cannot read a config out of is
         // an exemption.
-        if matches!(name.as_str(), "HOME" | "XDG_CONFIG_HOME") {
+        // `GIT_DIR` and `GIT_COMMON_DIR` name a repository whose
+        // `config` is read like any other, so they select aliases the
+        // command text does not show, exactly as a home does.
+        if matches!(
+            name.as_str(),
+            "HOME" | "XDG_CONFIG_HOME" | "GIT_DIR" | "GIT_COMMON_DIR"
+        ) {
             return value != "/dev/null";
         }
         // A name the shell still has to expand cannot be ruled out:
@@ -2801,6 +2874,16 @@ mod tests {
             // `GIT_CONFIG…` names do, so every spelling that hides one
             // from the positional walk hides it too.
             "timeout 5 env HOME=/tmp/h git p",
+            // A repository the command names has a config of its own.
+            "GIT_DIR=/tmp/evil.git git p",
+            "GIT_COMMON_DIR=/tmp/evil.git git p",
+            // An attached `-S` operand is the whole of its token, so
+            // the assignment after it is still read.
+            "env -S'HOME=/dev/null' HOME=/tmp/evil git p",
+            // An env option whose grammar this does not model leaves
+            // the environment unread, which is not an empty one.
+            "env --frobnicate FOO=bar git status",
+            "env -X GIT_CONFIG_GLOBAL=/tmp/g git status",
             "env -S'HOME=/tmp/h' git p",
             "env -S'XDG_CONFIG_HOME=/tmp/h' git p",
             // An option operand must not be mistaken for the command.
@@ -3159,6 +3242,11 @@ mod tests {
             // invocation can read it; nothing here consumes the
             // variable.
             "GIT_CONFIG_GLOBAL=/tmp/g; echo x && echo y",
+            // An env option this does model leaves the walk able to
+            // read the environment to the end.
+            "env FOO=bar git status",
+            "env -i FOO=bar git status",
+            "env -u PATH FOO=bar git status",
             // Arithmetic is arithmetic: no heredoc, and a subshell in a
             // subshell is still two subshells.
             "echo $((1 + 2))",
