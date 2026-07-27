@@ -654,7 +654,14 @@ fn draw_modal_box(
     footer: Option<Line<'static>>,
 ) {
     let width = area.width.saturating_sub(6).clamp(40, 76);
-    let footer_h: u16 = u16::from(footer.is_some());
+    // The footer gets the rows its hints actually need. It used to be a
+    // single row whatever it held, so on a narrow terminal ratatui
+    // clipped the tail — and the tail is `[n] deny`, the one binding
+    // that must never be the one to disappear while its key stays live.
+    let footer_h: u16 = footer
+        .as_ref()
+        .map(|l| wrapped_rows(&line_text(l), width.saturating_sub(2)))
+        .unwrap_or(0);
     // Size the body from the rows the text will actually occupy once
     // wrapped, not from the number of `Line`s. A single long line —
     // the permission modal's durable-grant row is the one that can run
@@ -686,7 +693,8 @@ fn draw_modal_box(
     frame.render_widget(block, rect);
 
     if let Some(footer_line) = footer {
-        let body_h = inner.height.saturating_sub(1);
+        let foot_h = footer_h.min(inner.height);
+        let body_h = inner.height.saturating_sub(foot_h);
         let body = Rect {
             x: inner.x,
             y: inner.y,
@@ -697,11 +705,12 @@ fn draw_modal_box(
             x: inner.x,
             y: inner.y.saturating_add(body_h),
             width: inner.width,
-            height: 1,
+            height: foot_h,
         };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
-        // Fixed footer: key hints always land on the last inner row.
-        frame.render_widget(Paragraph::new(footer_line), foot);
+        // Sticky footer: key hints always land on the last inner rows,
+        // wrapping within them rather than being cut off.
+        frame.render_widget(Paragraph::new(footer_line).wrap(Wrap { trim: false }), foot);
     } else {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -1741,6 +1750,49 @@ mod tests {
                 s.contains("[P]"),
                 "the prefix binding vanished at {cols} columns:\n{s}"
             );
+            // Every binding stays readable. `[n] deny` is the one that
+            // used to fall off the end of a one-row footer while its key
+            // stayed live.
+            for hint in ["[y]", "[a]", "[A]", "[P]", "[n]deny"] {
+                assert!(
+                    flat.contains(hint),
+                    "binding {hint} was clipped at {cols} columns:\n{s}"
+                );
+            }
+        }
+    }
+
+    /// The deny binding must survive the narrowest supported modal even
+    /// when no prefix is offered — the plain footer is 40 columns and the
+    /// inner width at a 46-column terminal is 38.
+    #[test]
+    fn permission_modal_keeps_every_binding_at_the_narrowest_width() {
+        for prefix in [None, Some("git status".to_string())] {
+            let backend = TestBackend::new(46, 24);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut app = App::new("m", "/tmp", "s");
+            app.phase = Phase::Permission;
+            let (respond, _rx) = std::sync::mpsc::channel();
+            app.modals
+                .push_back(crate::ui::modern::app::Modal::Permission(
+                    PendingPermission {
+                        name: "Bash".into(),
+                        description: "Bash: run a command".into(),
+                        origin: None,
+                        input_preview: None,
+                        suggested_prefix: prefix.clone(),
+                        respond,
+                    },
+                ));
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = buffer_to_string(term.backend().buffer());
+            let flat = squeeze(&s);
+            for hint in ["[y]once", "[a]session", "[A]always", "[n]deny"] {
+                assert!(
+                    flat.contains(hint),
+                    "binding {hint} was clipped with prefix={prefix:?}:\n{s}"
+                );
+            }
         }
     }
 
