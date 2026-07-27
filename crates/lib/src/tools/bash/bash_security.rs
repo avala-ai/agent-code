@@ -1784,6 +1784,14 @@ fn split_alias_value(value: &str) -> Vec<String> {
 /// the user's config is invisible here, and the raw scans remain the
 /// only cover for that.
 fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
+    // Config options are global, so only a token before the command
+    // word can carry a definition: `git status -- -c 'alias.status=push
+    // --force'` hands `-c` to `status` as a pathspec and runs an
+    // ordinary status, and git answers a post-command `-c` with
+    // `unknown switch` rather than defining anything. Reading no
+    // further also means a git that dispatches nothing at all — a
+    // report-only global, or no command word — expands nothing.
+    let idx = git_command_index(tokens)?;
     let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
     // Aliases whose value cannot be read from the command text:
     // `--config-env=alias.p=A` takes it from the environment, and a
@@ -1792,7 +1800,7 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
     // Set by a standalone `-c`, so the next token is read as its
     // operand rather than as a word of its own.
     let mut config_operand = false;
-    for (i, token) in tokens.iter().enumerate() {
+    for (i, token) in tokens[..idx].iter().enumerate() {
         if let Some(definition) = token.strip_prefix("--config-env=").or_else(|| {
             (token == "--config-env")
                 .then(|| tokens.get(i + 1))?
@@ -1876,7 +1884,6 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
             .map(|(_, expansion)| expansion.clone())
     };
 
-    let idx = git_command_index(tokens)?;
     let command = tokens.get(idx)?.to_lowercase();
     // A command that an opaque definition names runs something this
     // check cannot read, so it must not be treated as safe.
@@ -2609,6 +2616,12 @@ mod tests {
             "git status -- 'alias.status=push --force'",
             "git status -- 'include.path=/tmp/g'",
             "git log --grep 'alias.log=push --force'",
+            // Config options are global, so a `-c` past the command
+            // word is an argument of that command: git answers
+            // `git status -c …` with `unknown switch`, and past `--`
+            // both words are pathspecs.
+            "git status -- -c 'alias.status=push --force'",
+            "git log -c 'alias.log=push --force'",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
