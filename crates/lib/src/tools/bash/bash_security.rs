@@ -1789,6 +1789,9 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
     // `--config-env=alias.p=A` takes it from the environment, and a
     // value carrying an expansion is decided at run time.
     let mut opaque: Vec<String> = Vec::new();
+    // Set by a standalone `-c`, so the next token is read as its
+    // operand rather than as a word of its own.
+    let mut config_operand = false;
     for (i, token) in tokens.iter().enumerate() {
         if let Some(definition) = token.strip_prefix("--config-env=").or_else(|| {
             (token == "--config-env")
@@ -1809,9 +1812,24 @@ fn expand_command_alias(tokens: &[String]) -> Option<AliasExpansion> {
                 opaque.push(name);
             }
         }
-        // `-c alias.p=push` arrives as two tokens; `-calias.p=push`
-        // as one.
-        let body = token.strip_prefix("-c").unwrap_or(token);
+        // Git reads a definition only as the operand of `-c`, so only
+        // one is a definition here. A bare word that happens to be
+        // spelled like one is data: `git status -- 'alias.status=push
+        // --force'` runs an ordinary `status` with that pathspec.
+        // `git -calias.p=push` is refused by git rather than run, but
+        // reading the attached form as a definition costs nothing and
+        // keeps a git that does accept it covered.
+        let body = if std::mem::take(&mut config_operand) {
+            token.as_str()
+        } else if token == "-c" {
+            config_operand = true;
+            continue;
+        } else {
+            match token.strip_prefix("-c") {
+                Some(attached) if !attached.is_empty() => attached,
+                _ => continue,
+            }
+        };
         // An include supplied the same way pulls in aliases this scan
         // cannot read.
         if config_key_is_opaque(body) && alias_key_name(body).is_none() {
@@ -2266,6 +2284,8 @@ mod tests {
             // Aliases defined in the same command.
             "git -c alias.p=push p -uf origin main",
             "git -c alias.p='push --force' p origin main",
+            // The attached spelling of the same operand.
+            "git -calias.p='push --force' p origin main",
             // Git takes the last value for a repeated key.
             "git -c alias.p=status -c 'alias.p=push --force' p origin main",
             // An alias that names another alias.
@@ -2583,6 +2603,12 @@ mod tests {
             // An alias name reused as an operand of another
             // subcommand is not the command token.
             "git -c 'alias.p=push --force' status p",
+            // Git defines config only from a `-c` operand, so a word
+            // merely spelled like a definition is data: these run an
+            // ordinary `status` with that pathspec.
+            "git status -- 'alias.status=push --force'",
+            "git status -- 'include.path=/tmp/g'",
+            "git log --grep 'alias.log=push --force'",
             // A global that prints and exits dispatches no subcommand,
             // whether what follows is an alias or spelled out.
             "git -c 'alias.p=push -uf' --html-path p",
