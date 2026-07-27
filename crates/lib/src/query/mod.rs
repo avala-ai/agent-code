@@ -3867,6 +3867,11 @@ mod tests {
     /// dispatching the cwd-change event on the turn's token had
     /// `run_hooks` reject it before it started, and watchers were never
     /// told the tracked directories had gone.
+    // Spawns a real shell hook, and hooks run through `bash -c`, which
+    // Windows CI has no usable bash for (the same reason `hooks::tests`
+    // is `#[cfg(all(test, unix))]`). Gated rather than rewritten: the
+    // point of the test is that a real hook process actually runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_session_swap_notifies_cwd_hooks_after_an_aborted_turn() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
