@@ -1747,14 +1747,19 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
                         if clearing {
                             let n = guard.len();
                             match guard.clear() {
-                                Ok(()) => format!("Cleared {n} saved grant(s)."),
-                                Err(e) => format!("Could not clear saved grants: {e}"),
+                                Ok(()) => format!("Cleared {n} always-allow grant(s)."),
+                                Err(e) => format!("Could not clear always-allow grants: {e}"),
                             }
                         } else if guard.is_empty() {
-                            "Saved grants: none".to_string()
+                            "Always-allow grants: none".to_string()
                         } else {
+                            // "Always-allow", not "Saved": the listing also
+                            // covers grants that could not be written to
+                            // disk and live only in this process. They
+                            // suppress prompts all the same, so the user
+                            // has to be able to see them.
                             let mut out = format!(
-                                "Saved grants: {} — `/permissions clear` to forget them",
+                                "Always-allow grants: {} — `/permissions clear` to forget them",
                                 guard.len()
                             );
                             for label in guard.labels() {

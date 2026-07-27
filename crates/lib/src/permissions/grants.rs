@@ -25,7 +25,7 @@
 //! never inside the repository, so a checkout cannot ship its own
 //! approvals to whoever clones it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -59,9 +59,10 @@ pub struct GrantStore {
     keys: HashSet<String>,
     labels: Vec<(String, String)>,
     /// Exact keys the user answered "always" to that could not be
-    /// written to disk. Honored for this process only, and held apart
-    /// from `keys` so a refresh cannot mistake them for on-disk state.
-    session_fallback: HashSet<String>,
+    /// written to disk, with their labels. Honored for this process
+    /// only, and held apart from `keys` so a refresh cannot mistake them
+    /// for on-disk state.
+    session_fallback: HashMap<String, String>,
 }
 
 impl GrantStore {
@@ -78,7 +79,7 @@ impl GrantStore {
         let mut store = Self {
             path,
             keys: HashSet::new(),
-            session_fallback: HashSet::new(),
+            session_fallback: HashMap::new(),
             labels: Vec::new(),
         };
         let Some(ref p) = store.path else {
@@ -103,7 +104,7 @@ impl GrantStore {
         Self {
             path: None,
             keys: HashSet::new(),
-            session_fallback: HashSet::new(),
+            session_fallback: HashMap::new(),
             labels: Vec::new(),
         }
     }
@@ -116,7 +117,7 @@ impl GrantStore {
     /// for calls that would otherwise prompt a human.
     pub fn contains(&mut self, key: &str) -> bool {
         self.refresh();
-        self.keys.contains(key) || self.session_fallback.contains(key)
+        self.keys.contains(key) || self.session_fallback.contains_key(key)
     }
 
     /// Replace the cached view with the file as it exists on disk.
@@ -132,12 +133,18 @@ impl GrantStore {
         self.labels = disk.grants.into_iter().map(|g| (g.key, g.label)).collect();
     }
 
+    /// True when nothing is in force — on disk *or* in the session-only
+    /// fallback. A fallback grant still suppresses prompts, so reporting
+    /// "none" while one is active would hide an effective approval.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.keys.is_empty() && self.session_fallback.is_empty()
     }
 
+    /// How many grants are in force, counting the session-only fallback.
+    /// [`Self::clear`] revokes both, so this is also the number a clear
+    /// forgets.
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.keys.len() + self.session_fallback.len()
     }
 
     /// Record a grant and persist it. Returns whether anything was
@@ -155,7 +162,7 @@ impl GrantStore {
     /// instead would resurrect every grant another session cleared after
     /// we loaded — a stale process must never widen what is on disk.
     pub fn insert(&mut self, key: &str, label: &str) -> Result<bool, String> {
-        if self.keys.contains(key) || self.session_fallback.contains(key) {
+        if self.keys.contains(key) || self.session_fallback.contains_key(key) {
             return Ok(false);
         }
         let Some(path) = self.path.clone() else {
@@ -167,7 +174,8 @@ impl GrantStore {
         match self.insert_durable(&path, key, label) {
             Ok(()) => Ok(true),
             Err(e) => {
-                self.session_fallback.insert(key.to_string());
+                self.session_fallback
+                    .insert(key.to_string(), label.to_string());
                 Err(e)
             }
         }
@@ -221,8 +229,22 @@ impl GrantStore {
     }
 
     /// Human-readable labels, for a "what have I approved" listing.
-    pub fn labels(&self) -> impl Iterator<Item = &str> {
-        self.labels.iter().map(|(_, l)| l.as_str())
+    ///
+    /// Session-only fallback grants are listed too, marked as such: they
+    /// suppress prompts exactly like the persisted ones, so omitting them
+    /// would leave an active approval invisible to the user it is meant
+    /// to inform. The marker keeps the two distinguishable — a fallback
+    /// grant disappears when the process exits, a persisted one does not.
+    /// Ordered: disk order first, then fallback grants sorted, so
+    /// repeated listings do not shuffle.
+    pub fn labels(&self) -> impl Iterator<Item = String> {
+        let mut fallback: Vec<String> = self
+            .session_fallback
+            .values()
+            .map(|l| format!("{l} [session only — could not be saved to disk]"))
+            .collect();
+        fallback.sort();
+        self.labels.iter().map(|(_, l)| l.clone()).chain(fallback)
     }
 
     /// Write `file` to `path`. Caller must hold the grant-file lock.
@@ -620,6 +642,90 @@ mod tests {
         assert!(
             !store.contains("Bash\0ls"),
             "clear left a session-fallback grant alive"
+        );
+    }
+
+    /// A session-fallback grant suppresses prompts exactly like a
+    /// persisted one, so `/permissions` must show it — otherwise an
+    /// approval is in force that the user cannot see and therefore
+    /// cannot decide to revoke. It stays distinguishable from the
+    /// persisted grants, which outlive the process.
+    #[test]
+    fn a_session_fallback_grant_appears_in_the_listing() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        // Same trick as the write-failure test: occupy the grants
+        // directory's path with a regular file so every write fails.
+        let path = grant_file_path(project.path()).unwrap();
+        let grants_dir = path.parent().unwrap();
+        std::fs::create_dir_all(grants_dir.parent().unwrap()).unwrap();
+        std::fs::write(grants_dir, b"not a directory").unwrap();
+
+        let mut store = GrantStore::load(project.path());
+        assert!(store.is_empty());
+        assert!(
+            store
+                .insert("Bash\0ls", "Bash: one exact command (stored as digest)")
+                .is_err(),
+            "precondition: the write must fail"
+        );
+
+        // The listing path refreshes first; that must not drop the
+        // fallback, which lives outside the on-disk view.
+        store.refresh();
+        assert!(
+            !store.is_empty(),
+            "listing reported no grants while one was suppressing prompts"
+        );
+        assert_eq!(store.len(), 1);
+
+        let labels: Vec<String> = store.labels().collect();
+        assert_eq!(labels.len(), 1, "fallback grant missing from the listing");
+        assert!(
+            labels[0].starts_with("Bash: one exact command (stored as digest)"),
+            "label lost: {}",
+            labels[0]
+        );
+        assert!(
+            labels[0].contains("session only"),
+            "a session-only grant was shown as if it were saved to disk: {}",
+            labels[0]
+        );
+
+        // Clearing still revokes it, and the listing goes back to empty.
+        let _ = store.clear();
+        assert!(store.is_empty());
+        assert_eq!(store.labels().count(), 0);
+    }
+
+    /// The fallback listing must not disturb the persisted one: disk
+    /// grants keep their labels unmarked, and both are counted.
+    #[test]
+    fn persisted_and_fallback_grants_are_listed_side_by_side() {
+        let _s = Sandbox::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut store = GrantStore::load(project.path());
+        store.insert("Bash\0on-disk", "Bash: saved").unwrap();
+
+        // Break the directory only now, so the second insert falls back.
+        let path = grant_file_path(project.path()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap(), b"not a directory").unwrap();
+
+        assert!(store.insert("Bash\0in-memory", "Bash: fell back").is_err());
+        assert_eq!(store.len(), 2, "both in-force grants must be counted");
+
+        let labels: Vec<String> = store.labels().collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Bash: saved".to_string(),
+                "Bash: fell back [session only — could not be saved to disk]".to_string(),
+            ],
+            "persisted grants must stay unmarked and ordered before fallbacks"
         );
     }
 

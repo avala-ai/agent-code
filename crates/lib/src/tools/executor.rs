@@ -255,15 +255,7 @@ async fn execute_single_tool(
             // adjacent to it. Reached only from `Ask`, so it can never
             // override a `deny`, and destructive commands are already
             // rejected by `validate_input` before any of this runs.
-            // "none" when nothing actively isolates subprocesses (no
-            // sandbox, disabled, or degraded open); otherwise a
-            // fingerprint of the effective policy, so a grant recorded
-            // under one isolation regime stops matching when the regime
-            // weakens between sessions.
-            let sandbox_state = match ctx.sandbox {
-                Some(ref s) if s.is_active() => s.isolation_fingerprint(),
-                _ => "none".to_string(),
-            };
+            let sandbox_state = sandbox_grant_state(ctx.sandbox.as_deref());
             let grant_key = persistent_grant_key(&call.name, &call.input, &sandbox_state, &ctx.cwd);
             let granted = match ctx.persistent_grants {
                 Some(ref grants) => grants.lock().await.contains(&grant_key),
@@ -445,6 +437,31 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
     format!("{tool}\0{shape}")
 }
 
+/// The `sandbox_state` component of a durable grant key: what actually
+/// isolates subprocesses in this session.
+///
+/// A fingerprint of the effective policy while the sandbox really wraps
+/// commands, so a grant recorded under one isolation regime stops
+/// matching once the regime weakens (network enabled, write paths
+/// widened, strategy changed) — the user is re-asked instead.
+///
+/// `"none"` when nothing isolates: no sandbox, disabled, or enabled but
+/// degraded to a no-op with `fail_closed = false`.
+///
+/// A degraded sandbox that *refuses* to run (`fail_closed = true`) gets
+/// its own state, because `is_active()` is false for a degraded sandbox
+/// either way and the two would otherwise share `"none"`. The user can
+/// answer "always" to a call that `must_block_when_degraded()` then
+/// rejects; flipping `sandbox.fail_closed` to false must not turn that
+/// grant into standing permission to run the command unsandboxed.
+pub fn sandbox_grant_state(sandbox: Option<&crate::sandbox::SandboxExecutor>) -> String {
+    match sandbox {
+        Some(s) if s.is_active() => s.isolation_fingerprint(),
+        Some(s) if s.must_block_when_degraded() => "degraded-blocked".to_string(),
+        _ => "none".to_string(),
+    }
+}
+
 /// Key for a grant that outlives the session (`AllowAlways`).
 ///
 /// Deliberately stricter than [`session_allow_key`]: a durable grant must
@@ -464,8 +481,8 @@ pub fn session_allow_key(tool: &str, input: &serde_json::Value) -> String {
 ///   same command when the sandbox is off, degraded open, or merely
 ///   *weaker* in a later session. Only `description` is advisory and
 ///   excluded.
-/// - `WebFetch`: a digest of the URL, prefixed by the host for the
-///   audit trail. Not cwd-bound — a fetch means the same thing from any
+/// - `WebFetch`: a digest of the URL, prefixed by a digest of the
+///   authority. Not cwd-bound — a fetch means the same thing from any
 ///   directory.
 /// - Everything else, including every write tool, keys on the full input:
 ///   serde_json maps serialize with sorted keys (`preserve_order` is off),
@@ -520,9 +537,15 @@ pub fn persistent_grant_key(
         }
         "WebFetch" => {
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            // The authority is digested like everything else. A hostname
+            // is user-controlled and not guaranteed secret-free — a valid
+            // URL can carry a credential in the authority itself
+            // (`https://<api-key>.api.example/`), which the userinfo and
+            // path/query sanitizing in `url_host` does not touch — and
+            // this key is persisted into the config directory.
             format!(
-                "host:{}\0url-sha256:{}",
-                url_host(url),
+                "host-sha256:{}\0url-sha256:{}",
+                sha256_hex(url_host(url).as_bytes()),
                 sha256_hex(url.as_bytes())
             )
         }
@@ -544,20 +567,18 @@ pub fn persistent_grant_key(
 /// Label safe to persist next to a grant key. The description shown in
 /// the live modal may embed the full command line or URL, which can
 /// carry inline credentials, and *any* user-controlled token — program
-/// path, file path, leading assignment — can too. So the persisted
-/// label is fixed per tool, with the host as the single exception
-/// (WebFetch), where the conservative `url_host` parser fails closed.
-pub fn persistent_grant_label(tool: &str, input: &serde_json::Value) -> String {
+/// path, file path, leading assignment, hostname — can too. So the
+/// persisted label is fixed per tool and discloses no part of the input.
+pub fn persistent_grant_label(tool: &str, _input: &serde_json::Value) -> String {
     match tool {
         // Not even the first token: it can be an executable path like
         // `/tmp/export-<secret>/run`, and a persisted guess is a leak.
         "Bash" | "PowerShell" => {
             format!("{tool}: one exact command (stored as digest)")
         }
-        "WebFetch" => {
-            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            format!("WebFetch: {} (exact URL; not stored)", url_host(url))
-        }
+        // Not even the host: an authority can itself be the credential,
+        // as in `https://<api-key>.api.example/`.
+        "WebFetch" => "WebFetch: one exact URL (stored as digest)".to_string(),
         _ => format!("{tool}: one exact call (input stored as digest)"),
     }
 }
@@ -570,9 +591,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Scheme+host prefix of a URL, without path or query — the only parts
-/// of a URL that are safe to persist (paths and queries carry signed
-/// tokens and other secrets).
+/// Scheme+host prefix of a URL, without path, query or userinfo.
+///
+/// Never persisted verbatim — the authority itself can be a credential
+/// (`https://<api-key>.api.example/`), so callers digest the result. It
+/// exists so that two URLs differing only below the authority still
+/// agree on this component of the key.
 ///
 /// Fail closed: this is a hand parser, and lenient fetchers accept
 /// delimiters it may not know about (`\` is the known one and is
@@ -824,8 +848,8 @@ mod session_allow_tests {
 
     /// Grant keys and labels are persisted into the config directory,
     /// where secrets must never be written: a command line or URL can
-    /// embed inline credentials, so neither may appear verbatim — only
-    /// digests, program names, and hosts.
+    /// embed inline credentials, so nothing user-controlled may appear
+    /// verbatim — only digests.
     #[test]
     fn persisted_keys_and_labels_never_contain_the_command_or_url() {
         let secret = "hunter2-super-secret";
@@ -852,8 +876,8 @@ mod session_allow_tests {
         assert!(!key.contains(secret), "secret leaked into the URL key");
         assert!(!label.contains(secret), "secret leaked into the URL label");
         assert!(
-            key.contains("files.example.com"),
-            "host missing from the audit trail: {key}"
+            !key.contains("files.example.com"),
+            "authority persisted verbatim: {key}"
         );
         assert_ne!(
             key,
@@ -900,22 +924,127 @@ mod session_allow_tests {
         }
 
         // Backslash after the authority: lenient fetchers treat it as a
-        // path separator, so the persisted host must stop there too.
-        let input = serde_json::json!({
-            "url": format!("https://files.example.com\\{secret}?sig={secret}")
-        });
+        // path separator, so the authority must stop there too — the
+        // digested component must match the clean host's, not carry the
+        // secret bytes into a distinct hash.
+        let url = format!("https://files.example.com\\{secret}?sig={secret}");
+        let input = serde_json::json!({ "url": url });
         let key = pkey("WebFetch", &input);
         let label = persistent_grant_label("WebFetch", &input);
         assert!(!key.contains("hunter2"), "secret leaked into key: {key}");
         assert!(!label.contains("hunter2"), "secret leaked: {label}");
-        assert!(key.contains("host:https://files.example.com\0"), "{key}");
-
-        // Anything that does not look like a host is not persisted at
-        // all — fail closed instead of guessing.
-        let weird = serde_json::json!({ "url": format!("https://{secret}=v al?x") });
+        assert_eq!(url_host(&url), "https://files.example.com");
         assert!(
-            persistent_grant_label("WebFetch", &weird).contains("(url)"),
+            key.contains(&format!(
+                "host-sha256:{}\0",
+                sha256_hex(b"https://files.example.com")
+            )),
+            "authority digest did not stop at the backslash: {key}"
+        );
+
+        // Anything that does not look like a host is not parsed at all —
+        // fail closed instead of guessing.
+        assert_eq!(
+            url_host(&format!("https://{secret}=v al?x")),
+            "(url)",
             "implausible authority must collapse to (url)"
+        );
+    }
+
+    /// A credential can live in the authority itself
+    /// (`https://<api-key>.api.example/`), where the userinfo and
+    /// path/query sanitizing in `url_host` never reaches it. The
+    /// authority therefore gets the same digest treatment as the URL,
+    /// and the label discloses no part of it.
+    #[test]
+    fn a_webfetch_grant_never_persists_the_authority() {
+        let secret = "hunter2-super-secret";
+        let input = serde_json::json!({
+            "url": format!("https://{secret}.api.example/path")
+        });
+        let key = pkey("WebFetch", &input);
+        let label = persistent_grant_label("WebFetch", &input);
+
+        assert!(
+            !key.contains(secret),
+            "authority credential written into the grant key: {key}"
+        );
+        assert!(
+            !label.contains(secret),
+            "authority credential written into the label: {label}"
+        );
+        assert!(
+            !key.contains("api.example") && !label.contains("api.example"),
+            "authority persisted verbatim: {key} / {label}"
+        );
+        assert_eq!(
+            label, "WebFetch: one exact URL (stored as digest)",
+            "the WebFetch label must be fixed — an authority can itself be a secret"
+        );
+
+        // Still exact: the same URL matches, a different one does not.
+        assert_eq!(key, pkey("WebFetch", &input));
+        assert_ne!(
+            key,
+            pkey(
+                "WebFetch",
+                &serde_json::json!({"url": "https://other.api.example/path"})
+            ),
+            "different authorities must not share a grant"
+        );
+    }
+
+    /// `is_active()` is false for a degraded sandbox whether it fails
+    /// closed or open, so both states would key as `"none"`. A grant
+    /// recorded while the backend was missing and the call was being
+    /// *refused* must not become standing permission to run the same
+    /// command unsandboxed after `sandbox.fail_closed` is flipped off.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_degraded_fail_closed_sandbox_keys_apart_from_fail_open() {
+        // seatbelt is unavailable off macOS, so an enabled seatbelt
+        // config degrades to a no-op on this platform.
+        let mut cfg = crate::config::SandboxConfig {
+            enabled: true,
+            strategy: "seatbelt".to_string(),
+            ..Default::default()
+        };
+        cfg.fail_closed = true;
+        let blocked = crate::sandbox::SandboxExecutor::from_config(&cfg, std::path::Path::new("/"));
+        cfg.fail_closed = false;
+        let permitted =
+            crate::sandbox::SandboxExecutor::from_config(&cfg, std::path::Path::new("/"));
+
+        assert!(
+            blocked.is_degraded() && !blocked.is_active(),
+            "precondition: fail-closed sandbox is degraded and inactive"
+        );
+        assert!(
+            permitted.is_degraded() && !permitted.is_active(),
+            "precondition: fail-open sandbox is degraded and inactive"
+        );
+        assert!(blocked.must_block_when_degraded());
+        assert!(!permitted.must_block_when_degraded());
+
+        let blocked_state = sandbox_grant_state(Some(&blocked));
+        let permitted_state = sandbox_grant_state(Some(&permitted));
+        assert_ne!(
+            blocked_state, permitted_state,
+            "a refused call and a permitted unsandboxed call shared a sandbox state"
+        );
+        assert_eq!(
+            permitted_state,
+            sandbox_grant_state(None),
+            "degrading open is the same absence of isolation as no sandbox"
+        );
+
+        let input = serde_json::json!({"command": "make"});
+        let cwd = std::path::Path::new("/test-cwd");
+        assert_ne!(
+            persistent_grant_key("Bash", &input, &blocked_state, cwd),
+            persistent_grant_key("Bash", &input, &permitted_state, cwd),
+            "a grant stored while degraded-and-refusing carried into a \
+             degraded-but-permitted session"
         );
     }
 
