@@ -1099,8 +1099,12 @@ fn resolve_symlinked_ancestor(path: &str) -> Option<String> {
     }
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
-    // Bounded so a pathological path cannot spin here.
-    for _ in 0..64 {
+    // Bounded by the path's own components — each pass consumes one —
+    // rather than by an arbitrary cap. A cap that expires mid-walk
+    // returns `None`, which reads as "no symlinked ancestor" and drops
+    // the resolved form the protected-dir check needs; a deep enough
+    // path would hide `/etc` behind a link.
+    for _ in 0..=p.components().count() {
         if let Ok(real) = cur.canonicalize() {
             let mut out = real;
             for part in suffix.iter().rev() {
@@ -1312,6 +1316,24 @@ mod tests {
         }
         let cmd = format!("echo x > {}/passwd", link.display());
         assert!(check(&cmd).is_err(), "symlink hid the destination: {cmd}");
+    }
+
+    /// Padding the path with components must not exhaust the ancestor
+    /// walk into a `None` that reads as "nothing symlinked here".
+    #[cfg(unix)]
+    #[test]
+    fn a_deep_path_cannot_outrun_the_symlinked_ancestor_walk() {
+        let td = tempfile::tempdir().unwrap();
+        let link = td.path().join("e");
+        if std::os::unix::fs::symlink("/etc", &link).is_err() {
+            return; // no permission to symlink here; nothing to assert
+        }
+        let deep = "d/".repeat(128);
+        let cmd = format!("echo x > {}/{deep}passwd", link.display());
+        assert!(
+            check(&cmd).is_err(),
+            "a deep path outran the ancestor walk and hid the destination: {cmd}"
+        );
     }
 
     /// The normalization must not turn ordinary writes into refusals —
