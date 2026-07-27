@@ -28,6 +28,7 @@ mod tasks;
 mod terminal_caps;
 pub mod theme_picker;
 mod toolcard;
+mod vi;
 
 pub use run::run_modern_tui;
 

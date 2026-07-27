@@ -233,6 +233,16 @@ pub(crate) fn try_expand_skill_slash_full(
 }
 
 /// One row in the scrollable transcript.
+/// Composer editing mode under vi bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposerMode {
+    /// Ordinary typing. The only mode when vi bindings are off.
+    #[default]
+    Insert,
+    /// Vi normal mode: keys are motions and operators.
+    Normal,
+}
+
 #[derive(Debug, Clone, Hash)]
 pub enum TranscriptItem {
     User(String),
@@ -444,6 +454,12 @@ pub struct App {
     /// Notes reported before a resume replaces the transcript, re-emitted
     /// afterwards so the swap does not erase them.
     pub resume_notices: Vec<String>,
+    /// Whether `ui.edit_mode` asked for vi bindings.
+    pub vi_mode: bool,
+    /// Composer mode when `vi_mode` is on.
+    pub composer_mode: ComposerMode,
+    /// A `d` awaiting its motion.
+    pub vi_pending_d: bool,
     /// User keybindings. Construction installs the built-in defaults
     /// only; the run loop injects the registry loaded from
     /// `keybindings.json` at startup. Constructors must not read the
@@ -625,6 +641,9 @@ impl App {
             pending_session_list: false,
             deferred_sessions: None,
             resume_notices: Vec::new(),
+            vi_mode: false,
+            composer_mode: ComposerMode::Insert,
+            vi_pending_d: false,
             keybindings: std::sync::Arc::new(
                 crate::ui::keybindings::KeybindingRegistry::defaults(),
             ),
@@ -754,6 +773,15 @@ impl App {
         match ev {
             // Deltas handled above.
             EngineEvent::Text(_) | EngineEvent::Thinking(_) => unreachable!(),
+            EngineEvent::SubagentOutput {
+                agent_id,
+                call_id,
+                output,
+            } => {
+                if super::tasks::set_output(&mut self.tasks, &agent_id, &call_id, &output) {
+                    self.dirty = true;
+                }
+            }
             EngineEvent::TodoUpdate { epoch, items } => {
                 // A turn outlives the conversation that started it. When
                 // `/clear`, `/resume`, `/rewind` or `/snip` lands mid-turn,
@@ -1271,6 +1299,7 @@ impl App {
     }
 
     pub fn submit(&mut self) {
+        self.reset_vi_operator();
         let text = self.input.trim().to_string();
         if text.is_empty() {
             // Empty-Enter while idle sends the next queued prompt — after an
@@ -1421,16 +1450,10 @@ impl App {
             self.cursor = 0;
             return;
         }
-        if text == "/permissions" {
-            self.transcript.push(TranscriptItem::System(format!(
-                "permissions: mode={} · Shift+Tab cycles Manual/Normal/AcceptEdits/Auto/Plan · \
-                 modal: y once / a session / n deny",
-                self.mode.label()
-            )));
-            self.input.clear();
-            self.cursor = 0;
-            return;
-        }
+        // `/permissions` is deliberately NOT intercepted here: the
+        // command bridge owns it, so the listing includes rules and the
+        // saved always-allow grants — an approval the user cannot see is
+        // one they cannot revoke.
         if text == "/keybindings" {
             // List the registry this session actually dispatches from, not
             // a fresh load of the file — after a mid-session edit those
@@ -2030,6 +2053,7 @@ impl App {
     /// composer text — or the head of the queue when the composer is empty.
     /// Idle with text behaves like a normal submit.
     pub fn interject(&mut self) {
+        self.reset_vi_operator();
         let text = if !self.input.trim().is_empty() {
             let t = std::mem::take(&mut self.input);
             self.cursor = 0;
@@ -2126,6 +2150,7 @@ impl App {
 
     /// Clear the prompt editor (idle interrupt with non-empty input).
     pub fn clear_prompt(&mut self) {
+        self.reset_vi_operator();
         self.input.clear();
         self.cursor = 0;
     }
@@ -2196,6 +2221,7 @@ impl App {
                         headline: row.headline,
                         source: TaskSource::Subagent,
                         task_id: Some(row.id),
+                        outputs: Vec::new(),
                     });
                     claimed.push(true);
                 }
@@ -2208,6 +2234,7 @@ impl App {
                 headline: row.headline,
                 source: TaskSource::Background,
                 task_id: Some(row.id),
+                outputs: Vec::new(),
             });
         }
         // A manager-backed agent row whose record vanished (e.g.
@@ -2216,8 +2243,21 @@ impl App {
         let mut next: Vec<TaskEntry> = next
             .into_iter()
             .zip(claimed)
-            .filter(|(t, c)| *c || t.task_id.is_none())
-            .map(|(t, _)| t)
+            .filter_map(|(mut t, c)| {
+                if c || t.task_id.is_none() {
+                    return Some(t);
+                }
+                // The manager record behind this row is gone. A row that
+                // also captured an inline result still has something to
+                // open — a description-derived id can fold a manager-backed
+                // run and an inline one onto one row — so keep it and drop
+                // only the dead file reference.
+                if t.outputs.is_empty() {
+                    return None;
+                }
+                t.task_id = None;
+                Some(t)
+            })
             .collect();
         next.sort_by_key(|t| (t.source.heading(), t.state.order()));
 
@@ -2301,6 +2341,27 @@ impl App {
         self.dirty = true;
     }
 
+    /// One (label, body) card per captured inline result.
+    ///
+    /// Usually one card. A row holds several results only when distinct
+    /// Agent calls collapsed onto it (their descriptions share a prefix),
+    /// and then each becomes its own card labelled by its tool call.
+    /// Joining them into one body instead would push the earlier results
+    /// — and their labels — out of the transcript card's line tail,
+    /// leaving a finished agent's output unreachable.
+    fn captured_cards(
+        agent_id: &str,
+        outputs: &[super::tasks::CapturedOutput],
+    ) -> Vec<(String, String)> {
+        match outputs {
+            [only] => vec![(agent_id.to_string(), only.body.clone())],
+            many => many
+                .iter()
+                .map(|o| (format!("{agent_id} · call {}", o.call_id), o.body.clone()))
+                .collect(),
+        }
+    }
+
     /// Ask the run loop for the selected task's output (D4-27 drill-in).
     ///
     /// Only rows backed by a `TaskManager` id have output to show —
@@ -2311,15 +2372,30 @@ impl App {
         let Some(row) = self.tasks.get(self.tasks_selected) else {
             return;
         };
-        match &row.task_id {
+        // A row can hold both kinds of output: `agent_id` is derived from
+        // the call description, so a manager-backed run and an inline one
+        // can fold onto a single row. Show what is already in hand *and*
+        // still ask for the file, so neither source is hidden behind the
+        // other.
+        let captured = Self::captured_cards(&row.agent_id, &row.outputs);
+        let task_id = row.task_id.clone();
+        let had_captured = !captured.is_empty();
+        // Inline results were captured when the subagent finished,
+        // because an inline run has no output file to read. One card each,
+        // so each result gets its own line tail.
+        for (id, body) in captured {
+            self.show_task_output(&id, Ok(body));
+        }
+        match task_id {
+            // Backed by a TaskManager task: read the file on the run loop.
             Some(id) => {
-                self.pending_task_output = Some(id.clone());
                 self.status_message = format!("loading output for {id}…");
+                self.pending_task_output = Some(id);
             }
-            None => {
-                self.status_message =
-                    "inline subagents have no separate output to open".to_string();
+            None if !had_captured => {
+                self.status_message = "this agent has not produced output yet".to_string();
             }
+            None => {}
         }
         self.dirty = true;
     }
@@ -3715,6 +3791,21 @@ mod tests {
         );
     }
 
+    /// `(detail, body)` for every tool card in the transcript, in order.
+    /// Drill-in opens one card per captured result, so tests read the
+    /// list rather than only the last item.
+    fn tool_cards(app: &App) -> Vec<(String, String)> {
+        app.transcript
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Tool { detail, result, .. } => {
+                    Some((detail.clone(), result.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn bg(id: &str, state: &str, headline: &str) -> crate::ui::modern::tasks::ManagerRow {
         crate::ui::modern::tasks::ManagerRow {
             id: id.into(),
@@ -3742,6 +3833,224 @@ mod tests {
 
     /// Drill-in asks the run loop for output rather than reading it on
     /// the UI path, so the request is what the test can observe.
+    /// End to end: the engine reports a finished inline subagent's
+    /// output, and drilling into its row opens it. Before this the row
+    /// said "no separate output to open" and led nowhere.
+    #[test]
+    fn drilling_into_a_finished_inline_subagent_shows_its_output() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "explorer".into(),
+            state: "done".into(),
+            headline: "[general-purpose] look around".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: "explorer".into(),
+            call_id: "toolu_01".into(),
+            output: "found the bug in auth.rs".into(),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { detail, result, .. } => {
+                assert_eq!(detail, "explorer");
+                assert!(
+                    result.as_deref().unwrap().contains("found the bug"),
+                    "the subagent's output was not opened: {result:?}"
+                );
+            }
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+        assert!(
+            app.pending_task_output.is_none(),
+            "an inline subagent has no task file to read"
+        );
+    }
+
+    /// Two Agent calls whose descriptions share a prefix collapse onto
+    /// one row. Drill-in must show both results, each labelled by its
+    /// call — before this the second overwrote the first and one
+    /// finished agent's work was unreachable.
+    #[test]
+    fn a_shared_row_opens_every_captured_result() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "done".into(),
+            headline: "audit".into(),
+        });
+        for (call, body) in [("call-a", "A found a bug"), ("call-b", "B found nothing")] {
+            app.apply_engine(EngineEvent::SubagentOutput {
+                agent_id: shared.into(),
+                call_id: call.into(),
+                output: body.into(),
+            });
+        }
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        let cards = tool_cards(&app);
+        assert_eq!(cards.len(), 2, "one card per captured result");
+        assert!(cards[0].0.contains("call-a"), "label: {}", cards[0].0);
+        assert!(cards[0].1.contains("A found a bug"), "first result lost");
+        assert!(cards[1].0.contains("call-b"), "label: {}", cards[1].0);
+        assert!(cards[1].1.contains("B found nothing"), "second result lost");
+    }
+
+    /// Each captured result gets its own card, so the transcript's
+    /// line tail applies to each separately. Joined into one body, a long
+    /// later result would push every earlier one — and its label — out of
+    /// the tail entirely, leaving that agent's work unreachable.
+    #[test]
+    fn a_long_later_result_does_not_evict_an_earlier_one() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "done".into(),
+            headline: "audit".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-a".into(),
+            output: "A found a bug".into(),
+        });
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-b".into(),
+            output: (0..500)
+                .map(|i| format!("B line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        let cards = tool_cards(&app);
+        assert_eq!(cards.len(), 2);
+        assert!(
+            cards[0].1.contains("A found a bug"),
+            "the earlier result was tailed away by the later one: {}",
+            cards[0].1
+        );
+        assert!(cards[1].1.contains("B line 499"), "the later result's tail");
+    }
+
+    /// A manager-backed run and an inline one can fold onto one row when
+    /// their descriptions share a prefix. Drill-in used to prefer the
+    /// task file and never show the captured inline result, making it
+    /// unreachable. Both are offered now.
+    #[test]
+    fn a_row_backed_by_both_shows_the_inline_result_and_asks_for_the_file() {
+        use crate::ui::modern::sink::EngineEvent;
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "working".into(),
+            headline: "audit".into(),
+        });
+        // A manager record folds into that row, giving it a task_id.
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a9".into(),
+            state: "working".into(),
+            headline: "audit".into(),
+            subagent_id: Some(shared.into()),
+        }]);
+        assert_eq!(app.tasks[0].task_id.as_deref(), Some("a9"));
+        // A later inline call resolves to the same description-derived id.
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-inline".into(),
+            output: "the inline agent found a bug".into(),
+        });
+
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => assert!(
+                result.as_deref().unwrap().contains("found a bug"),
+                "the captured inline result was hidden behind the task file"
+            ),
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+        assert_eq!(
+            app.pending_task_output.as_deref(),
+            Some("a9"),
+            "the manager-backed output was dropped instead of also being requested"
+        );
+    }
+
+    /// Clearing the manager record used to drop such a row wholesale,
+    /// taking the captured inline result with it. The row survives with
+    /// its dead file reference removed.
+    #[test]
+    fn clearing_the_manager_record_keeps_a_row_that_captured_a_result() {
+        use crate::ui::modern::sink::EngineEvent;
+        use crate::ui::modern::tasks::ManagerRow;
+        let mut app = App::new("m", "/tmp", "s");
+        let shared = "audit the authentication module for";
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: shared.into(),
+            state: "working".into(),
+            headline: "audit".into(),
+        });
+        app.sync_background_tasks(vec![ManagerRow {
+            id: "a9".into(),
+            state: "working".into(),
+            headline: "audit".into(),
+            subagent_id: Some(shared.into()),
+        }]);
+        app.apply_engine(EngineEvent::SubagentOutput {
+            agent_id: shared.into(),
+            call_id: "call-inline".into(),
+            output: "the inline agent found a bug".into(),
+        });
+
+        app.sync_background_tasks(Vec::new());
+
+        assert_eq!(app.tasks.len(), 1, "the row was dropped with its result");
+        assert!(
+            app.tasks[0].task_id.is_none(),
+            "a dead task file reference was kept"
+        );
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+        assert!(app.pending_task_output.is_none());
+        match app.transcript.last().expect("an item") {
+            TranscriptItem::Tool { result, .. } => {
+                assert!(result.as_deref().unwrap().contains("found a bug"))
+            }
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+    }
+
+    /// A subagent still running has nothing to show yet, and must say so
+    /// rather than opening an empty card.
+    #[test]
+    fn drilling_into_a_running_inline_subagent_says_there_is_nothing_yet() {
+        use crate::ui::modern::sink::EngineEvent;
+        let mut app = App::new("m", "/tmp", "s");
+        app.apply_engine(EngineEvent::SubagentUpdate {
+            agent_id: "explorer".into(),
+            state: "working".into(),
+            headline: "looking".into(),
+        });
+        app.tasks_selected = 0;
+        app.drill_into_selected_task();
+        assert!(app.status_message.contains("not produced output yet"));
+    }
+
     #[test]
     fn drilling_into_a_background_row_requests_its_output() {
         let mut app = App::new("m", "/tmp", "s");
@@ -3768,18 +4077,20 @@ mod tests {
         assert_eq!(app.pending_task_output.as_deref(), Some("a3"));
     }
 
-    /// A subagent row's id is a subagent *type*, not a task id, so there
-    /// is nothing to read. Saying so beats opening an empty pane.
+    /// Superseded behaviour, kept as a pin. This used to assert that an
+    /// inline subagent row "has no separate output to open" — true when
+    /// nothing captured the result. The engine now reports it, so the
+    /// row leads somewhere; what remains true is that no TaskManager
+    /// file is read for one.
     #[test]
-    fn drilling_into_a_subagent_row_explains_there_is_no_output() {
+    fn an_inline_subagent_row_never_reads_a_task_file() {
         let mut app = App::new("m", "/tmp", "s");
         crate::ui::modern::tasks::upsert(&mut app.tasks, "explorer", "working", "look");
         app.drill_into_selected_task();
         assert!(
             app.pending_task_output.is_none(),
-            "asked for output that cannot exist"
+            "asked the TaskManager for output that cannot exist there"
         );
-        assert!(app.status_message.contains("no separate output"));
     }
 
     #[test]
@@ -4270,6 +4581,25 @@ mod tests {
                 "{cmd} must reach the command bridge"
             );
             assert_eq!(app.show_tasks, before, "{cmd} must not toggle the pane");
+        }
+    }
+
+    /// `/permissions` must reach the command bridge (which lists rules
+    /// and saved always-allow grants), not a local static message that
+    /// would hide the grant listing from the only surface that can
+    /// create grants.
+    #[test]
+    fn permissions_reaches_the_command_bridge() {
+        for cmd in ["/permissions", "/permissions clear"] {
+            let mut app = App::new("m", "/tmp", "s");
+            app.input = cmd.into();
+            app.cursor = app.input.len();
+            app.submit();
+            assert_eq!(
+                app.pending_slash.as_deref(),
+                Some(cmd),
+                "{cmd} must reach the command bridge"
+            );
         }
     }
 

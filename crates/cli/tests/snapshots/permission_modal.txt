@@ -13,7 +13,7 @@ er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
    │  "command": "cargo test"                                               │
    │}                                                                       │
    │                                                                        │
-   │[y] once   [a] session   [n]/[Esc] deny                                 │
+   │[y] once [a] session [A] always [n] deny                                │
    └────────────────────────────────────────────────────────────────────────┘
 
 
@@ -39,7 +39,7 @@ bbbgcbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
 bbbgcccccccccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
 bbbgcbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
 bbbgbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
-bbbgfffffffffffffffffffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
+bbbgffffffffffffffffffffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbgbbb
 bbbggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

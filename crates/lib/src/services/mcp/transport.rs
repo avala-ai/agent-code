@@ -44,7 +44,12 @@ impl McpTransportConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        for (key, value) in env {
+        // Fixed order, not `HashMap` order: on Windows `Command::env` is
+        // case-insensitive, so with both `PATH` and `Path` configured the
+        // last call decides the child's search path. Applying them in the
+        // order `ordered_env` defines keeps that choice stable across
+        // runs and identical to the one the grant fingerprint recorded.
+        for (key, value) in super::types::ordered_env(env) {
             cmd.env(key, value);
         }
 

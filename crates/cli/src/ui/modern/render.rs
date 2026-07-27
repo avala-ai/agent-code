@@ -1047,9 +1047,10 @@ fn draw_permission_modal(
         // so it is untrusted like the rest of the modal text.
         &format!(" permission · {} ", escape_deceptive(&pending.name)),
         accent,
-        // Keep ≤ ~40 cols so min-width modals still show every binding
-        // (digits 1/2/3 work the same as y/a/n; listed in /help).
-        Some(key_hint_line("[y] once   [a] session   [n]/[Esc] deny")),
+        // Keep ≤ 40 cols so min-width modals still show every binding —
+        // the deny action must never be the one that gets clipped.
+        // Esc denies too, and digits 1/2/4 mirror y/a/A; both in /help.
+        Some(key_hint_line("[y] once [a] session [A] always [n] deny")),
     );
 }
 
@@ -1410,6 +1411,9 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let body_style = Style::default().fg(p.text);
     let prefix_style = Style::default().fg(border).add_modifier(Modifier::BOLD);
+    // Vi is modal, so the mode has to be visible: an invisible mode is
+    // how you delete a line you meant to type.
+    let prompt_marker = if app.in_normal_mode() { "▪ " } else { "❯ " };
 
     // Build per-line display with ❯ only on the first row.
     let input_lines: Vec<&str> = if app.input.is_empty() {
@@ -1430,7 +1434,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (i, segment) in input_lines.iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
-            spans.push(Span::styled("❯ ".to_string(), prefix_style));
+            spans.push(Span::styled(prompt_marker.to_string(), prefix_style));
         } else {
             spans.push(Span::raw("  ".to_string())); // indent continuation
         }
@@ -2255,6 +2259,26 @@ mod tests {
         // the next most recognisable thing about them.
         assert!(s.contains("webapp"), "cwd fallback missing:\n{s}");
         assert!(s.contains("aaa11111"), "short id missing:\n{s}");
+    }
+
+    #[test]
+    fn normal_mode_is_visible_in_the_prompt() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.vi_mode = true;
+        app.input = "hello".into();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let insert = buffer_to_string(term.backend().buffer());
+        assert!(insert.contains("❯ hello"), "buffer:\n{insert}");
+
+        app.composer_mode = crate::ui::modern::app::ComposerMode::Normal;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let normal = buffer_to_string(term.backend().buffer());
+        assert!(
+            normal.contains("▪ hello"),
+            "normal mode is indistinguishable from insert:\n{normal}"
+        );
     }
 
     #[test]
