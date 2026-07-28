@@ -433,7 +433,31 @@ impl App {
     fn reclaim_staged_prompts(&mut self, header: &str, spill: &mut Vec<String>) {
         let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
+        // A prompt whose images are still being encoded is inside the
+        // blocking task, not in `pending_submit`, so nothing else here
+        // can reach it — and the restore bumps the epoch, which makes
+        // the eventual result be discarded. Without this it disappeared
+        // silently, which is the one thing this function exists to
+        // prevent.
+        if let Some(text) = self.encoding_display.take() {
+            // Reporting the text is only half of it: the encode is still
+            // running, and its result must not re-arm the prompt we have
+            // just told the user was not sent — which is what happened
+            // when a restore failed, or when the encode won the race.
+            self.encode_abandoned = true;
+            self.remove_staged_row(&text);
+            carried.push(text);
+        }
         if let Some(payload) = self.pending_submit.take() {
+            // Its images go back with it. The descriptors and any bytes
+            // already read from them belong to *this* prompt, and the
+            // text returned to the composer still carries the `@path`
+            // mention, so resubmitting re-stages them. Leaving them here
+            // would bind them to whatever the user types next and send a
+            // file they did not mean to attach — the same hazard
+            // `enqueue_turn` and `new_conversation` clear for.
+            self.pending_images.clear();
+            self.pending_attachments.clear();
             // The line the user typed, not the engine payload: that has
             // `@path` mentions and skill bodies already inlined, and
             // handing it back would drop a whole file into the composer
@@ -1124,6 +1148,7 @@ mod tests {
             description: "run".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond: tx,
         });
 
@@ -1311,6 +1336,7 @@ mod tests {
             description: "run".into(),
             origin: None,
             input_preview: None,
+            suggested_prefix: None,
             respond: tx,
         }));
         app.phase = Phase::Permission;
@@ -2023,6 +2049,73 @@ work",
         assert!(
             reported.contains("resume you cancelled"),
             "the cancellation was not attributed to the user: {reported}"
+        );
+    }
+
+    /// A prompt submitted while the selected session is still loading is
+    /// handed back to the composer. Its images must not stay staged: the
+    /// user edits or replaces that draft, and the run loop would bind the
+    /// descriptor left behind to the *new* prompt and send a local file
+    /// they never meant to attach. The returned text still carries the
+    /// `@path` mention, so resubmitting re-stages the image and nothing
+    /// is lost by clearing.
+    #[test]
+    fn reclaiming_a_resume_time_prompt_unstages_its_images() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_submit = Some("look at @shot.png please".into());
+        app.pending_submit_display = Some("look at @shot.png please".into());
+        app.pending_images = vec![super::super::mentions::StagedImage {
+            path: tmp.path().to_path_buf(),
+            file: std::sync::Arc::new(std::fs::File::open(tmp.path()).unwrap()),
+        }];
+        app.pending_attachments = vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "iVBORw==".into(),
+        }];
+
+        let mut spill = Vec::new();
+        app.reclaim_staged_prompts("not sent:", &mut spill);
+
+        assert_eq!(
+            app.input, "look at @shot.png please",
+            "the prompt should come back to the composer"
+        );
+        assert!(
+            app.pending_images.is_empty(),
+            "a descriptor stayed staged and would attach to the next prompt"
+        );
+        assert!(
+            app.pending_attachments.is_empty(),
+            "encoded bytes stayed staged and would attach to the next prompt"
+        );
+    }
+
+    /// A prompt whose images are still encoding lives inside the
+    /// blocking task, not in `pending_submit`. The restore bumps the
+    /// conversation epoch, so the encode result is discarded when it
+    /// lands — without reclaiming the text here the user's typed words
+    /// vanish with it, which is exactly what this path exists to stop.
+    #[test]
+    fn a_prompt_still_encoding_is_reported_not_lost() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.encoding_display = Some("look at @shot.png please".into());
+
+        let mut spill = Vec::new();
+        app.reclaim_staged_prompts("not sent:", &mut spill);
+
+        assert!(
+            spill.iter().any(|s| s.contains("look at @shot.png please")),
+            "the in-flight prompt was not reported back: {spill:?}"
+        );
+        assert!(
+            app.encoding_display.is_none(),
+            "the stash must be consumed, or it would be reported twice"
+        );
+        assert!(
+            app.encode_abandoned,
+            "the encode must be invalidated too, or its result re-arms a \
+             prompt the user was told was not sent"
         );
     }
 }

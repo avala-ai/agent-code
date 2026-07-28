@@ -86,7 +86,10 @@ impl Theme {
     /// name — including the `dark`/`light` aliases and user palette ids
     /// — is resolved by the data-driven [`legacy::Theme::from_name`].
     pub fn from_name(name: &str) -> Self {
-        if name == "auto" {
+        // A user palette named `auto` owns the id: the catalog lists it
+        // as the only `auto` row, so intercepting it here would apply a
+        // detected built-in instead of the palette the user picked.
+        if auto_detection_applies(name, || legacy::user_palette_exists("auto")) {
             let id = if detect_system_theme() == "light" {
                 "solarized-light"
             } else {
@@ -215,9 +218,29 @@ pub fn detect_system_theme() -> &'static str {
     super::terminal_query::system_theme().as_str()
 }
 
+/// Whether `name` should be resolved by terminal-background detection
+/// rather than by the palette catalog.
+///
+/// Only the literal `auto` triggers detection, and only while no user
+/// palette owns that id — `<config>/themes/auto.toml` shadows the alias
+/// exactly the way it shadows `dark`/`light`, and the catalog lists it
+/// as the sole `auto` row, so detection here would apply a built-in the
+/// user did not choose.
+///
+/// The ownership check is a closure so it only runs for the one name
+/// that can be shadowed: it reads and parses every user theme file, and
+/// the onboarding picker resolves a theme on each redraw, so evaluating
+/// it eagerly would scan the disk merely to arrow through the standard
+/// palettes. Pure, so the rule stays testable without touching the
+/// process environment or the filesystem.
+fn auto_detection_applies(name: &str, user_owns_auto: impl FnOnce() -> bool) -> bool {
+    name == "auto" && !user_owns_auto()
+}
+
 /// Resolve a config theme name, handling "auto".
 pub fn resolve_theme(configured: &str) -> String {
-    if configured == "auto" {
+    // Same rule as `Theme::from_name`: a user `auto.toml` owns the id.
+    if auto_detection_applies(configured, || legacy::user_palette_exists("auto")) {
         if detect_system_theme() == "light" {
             "solarized-light".to_string()
         } else {
@@ -286,7 +309,12 @@ pub fn init_with_options(theme_name: &str, configured_name: &str, inherit_fg: bo
     }
     if let Ok(mut guard) = ACTIVE_OPTIONS.write() {
         *guard = ActiveOptions {
-            auto: configured_name == "auto",
+            // Only *detected* auto counts: a user `themes/auto.toml`
+            // is an explicit palette that happens to own the id, and
+            // `inherit_fg` must not rewrite its `text` slot. Same
+            // predicate the resolution path uses, so the two cannot
+            // disagree about what "auto" meant.
+            auto: auto_detection_applies(configured_name, || legacy::user_palette_exists("auto")),
             inherit_fg,
         };
     }
@@ -409,6 +437,39 @@ fn adapt_for_emit_with(theme: Theme, mode: super::color_emit::EmitMode) -> Theme
 
 #[cfg(test)]
 mod tests {
+
+    /// A user `auto.toml` owns the id, so detection must step aside —
+    /// the catalog advertises that palette as the only `auto` row, and
+    /// intercepting here would apply a built-in the user never chose.
+    #[test]
+    fn a_user_auto_palette_suppresses_detection() {
+        assert!(super::auto_detection_applies("auto", || false));
+        assert!(!super::auto_detection_applies("auto", || true));
+        // Every other name is resolved by the catalog either way.
+        for name in ["dark", "light", "one-dark", "my-theme"] {
+            assert!(!super::auto_detection_applies(name, || false), "{name}");
+            assert!(!super::auto_detection_applies(name, || true), "{name}");
+        }
+
+        // A shadowing palette makes `auto` an explicit choice, which is
+        // what `init_with_options` keys `ActiveOptions::auto` on — so a
+        // custom auto palette keeps its own `text` slot under
+        // `inherit_fg` instead of being treated as detected.
+        assert!(
+            !super::auto_detection_applies("auto", || true),
+            "a user auto palette must not be treated as detected"
+        );
+
+        // The ownership check must not run for a name that cannot be
+        // shadowed — it scans the user themes directory, and the picker
+        // resolves a theme on every redraw.
+        let mut scanned = false;
+        super::auto_detection_applies("one-dark", || {
+            scanned = true;
+            true
+        });
+        assert!(!scanned, "scanned the themes dir for a non-auto name");
+    }
     use super::*;
 
     #[test]
