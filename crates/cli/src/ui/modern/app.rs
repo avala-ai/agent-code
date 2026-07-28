@@ -404,24 +404,14 @@ pub struct App {
     pub status_message: String,
 
     pub should_quit: bool,
-    /// Prompt waiting to be started as a turn by the runtime. This is
-    /// the *engine* payload: `@path` mentions and skill bodies are
-    /// already expanded into it.
-    pub pending_submit: Option<String>,
-    /// The line the user actually typed for `pending_submit`, kept so a
-    /// submission handed back during a resume returns as their words
-    /// rather than as an inlined file or skill body.
-    pub pending_submit_display: Option<String>,
-    /// `/model` action waiting for the run loop (needs the engine lock).
-    pub pending_model: Option<PendingModelAction>,
-    /// `/clear` also clears the ENGINE conversation; applied by the run
-    /// loop under try_lock (mirrors `pending_model`).
-    pub pending_clear: bool,
-    /// Classic slash line deferred to the run loop (needs engine + stdout
-    /// capture). Full built-in command parity with the classic REPL.
-    pub pending_slash: Option<String>,
-    /// `!cmd` shell passthrough deferred to the run loop.
-    pub pending_shell: Option<String>,
+    /// Work staged against the conversation currently in front: a
+    /// submitted prompt, `/model`, `/clear`, a bridged slash line, a
+    /// `!cmd`. All of it needs the engine lock or an idle turn slot, so
+    /// the run loop picks it up an iteration or more later — and a
+    /// `/resume` landing in between replaces the conversation it was
+    /// written for. The fields are private for that reason; see
+    /// [`super::session_work`].
+    pub work: super::session_work::SessionWork,
     /// Whether a turn task currently exists (set by the run loop). Lets
     /// modal resolution decide between returning to Streaming (turn still
     /// running) and Idle (modal outlived its turn).
@@ -688,12 +678,7 @@ impl App {
             ctx_meter: None,
             status_message: String::new(),
             should_quit: false,
-            pending_submit: None,
-            pending_submit_display: None,
-            pending_model: None,
-            pending_clear: false,
-            pending_slash: None,
-            pending_shell: None,
+            work: super::session_work::SessionWork::default(),
             turn_live: false,
             transcript_bottom_row: 0,
             queue: std::collections::VecDeque::new(),
@@ -1413,7 +1398,7 @@ impl App {
             // Also clear the ENGINE conversation (classic parity): clearing
             // only the view silently kept paying for the entire prior
             // context. The run loop applies this under try_lock.
-            self.pending_clear = true;
+            self.work.stage_clear();
             self.input.clear();
             self.cursor = 0;
             return;
@@ -1595,7 +1580,7 @@ impl App {
         // /model and /effort need the engine lock (run loop applies).
         // Handled even mid-turn so a switch is not sent to the LLM as a prompt.
         if let Some(action) = parse_model_slash(&text).or_else(|| parse_effort_slash(&text)) {
-            self.pending_model = Some(action);
+            self.work.stage_model(action);
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
@@ -1609,11 +1594,11 @@ impl App {
             // first would silently discard it — the run never happens and
             // its row sits in the transcript as if it had. Refuse instead,
             // keeping the text in the composer.
-            if self.pending_shell.is_some() {
+            if self.work.shell_staged().is_some() {
                 self.note_deferred_slot_busy("a shell command");
                 return;
             }
-            self.pending_shell = Some(cmd.to_string());
+            self.work.stage_shell(cmd.to_string());
             self.transcript
                 .push(TranscriptItem::User(format!("!{cmd}")));
             self.input.clear();
@@ -1631,11 +1616,11 @@ impl App {
                 .unwrap_or("");
             if crate::commands::is_builtin_command(name) {
                 // Same single slot as `pending_shell`.
-                if self.pending_slash.is_some() {
+                if self.work.slash_staged().is_some() {
                     self.note_deferred_slot_busy("a command");
                     return;
                 }
-                self.pending_slash = Some(text.clone());
+                self.work.stage_slash(text.clone());
                 self.input.clear();
                 self.cursor = 0;
                 self.dirty = true;
@@ -1886,12 +1871,12 @@ impl App {
                         let e = expanded.effort.as_deref().unwrap_or("-");
                         chrome.push_str(&format!(" · model {m} · effort {e}"));
                         if let Some(m) = expanded.model {
-                            self.pending_model = Some(PendingModelAction::Set {
+                            self.work.stage_model(PendingModelAction::Set {
                                 model: m,
                                 effort: expanded.effort.clone(),
                             });
                         } else if let Some(e) = expanded.effort {
-                            self.pending_model = Some(PendingModelAction::SetEffort(e));
+                            self.work.stage_model(PendingModelAction::SetEffort(e));
                         }
                     }
                     self.transcript.push(TranscriptItem::System(chrome));
@@ -1927,7 +1912,7 @@ impl App {
                 }
             };
         self.push_prompt_history(&display);
-        self.pending_submit_display = Some(display.clone());
+        let typed = display.clone();
         self.transcript.push(TranscriptItem::User(display));
         if !mention_notes.is_empty() {
             self.transcript.push(TranscriptItem::System(format!(
@@ -1938,7 +1923,7 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.history_browse = None;
-        self.pending_submit = Some(prompt);
+        self.work.stage_submit(prompt, Some(typed));
         self.phase = Phase::Streaming;
         // Jump back to the live tail when the user sends.
         self.scroll = ScrollState::Follow;
@@ -2152,7 +2137,7 @@ impl App {
     /// Called by the run loop when a turn finishes successfully (plan §M5:
     /// `queue.auto_send`, default on).
     pub fn dispatch_queue_head(&mut self) {
-        if self.phase != Phase::Idle || self.pending_submit.is_some() {
+        if self.phase != Phase::Idle || self.work.submit_staged() {
             return;
         }
         // A resume is waiting for this turn to be reaped. The queue was
@@ -2622,31 +2607,33 @@ impl App {
 
     // ---- Session-scoped deferred work ----
     //
-    // Each accessor asks the resume state before yielding its value, so
-    // the gate cannot be forgotten: there is no other way to reach the
-    // field. Previously every consumer wrote `pending_resume.is_none()`
-    // by hand, and a deferred action added without that line ran against
-    // the session a restore was about to replace — which is exactly what
-    // two review findings were.
+    // Pairing the staged work with the resume state is the whole of the
+    // gate. `SessionWork`'s fields are private and every take demands a
+    // `ResumeState` to consult, so a consumer cannot reach the value
+    // without passing one — the check is no longer something a call site
+    // can forget. Previously each consumer wrote `pending_resume
+    // .is_none()` by hand, and a deferred action added without that line
+    // ran against the session a restore was about to replace, which is
+    // exactly what two review findings were.
 
     /// Take a deferred `/model` action, unless a resume holds it.
     pub fn take_pending_model(&mut self) -> Option<PendingModelAction> {
-        self.take_session_scoped(|a| a.pending_model.take())
+        self.work.take_model(&self.resume)
     }
 
     /// Take a deferred bridged slash command, unless a resume holds it.
     pub fn take_pending_slash(&mut self) -> Option<String> {
-        self.take_session_scoped(|a| a.pending_slash.take())
+        self.work.take_slash(&self.resume)
     }
 
     /// Take a deferred `!cmd`, unless a resume holds it.
     pub fn take_pending_shell(&mut self) -> Option<String> {
-        self.take_session_scoped(|a| a.pending_shell.take())
+        self.work.take_shell(&self.resume)
     }
 
-    /// Take a deferred prompt, unless a resume holds it.
-    pub fn take_pending_submit(&mut self) -> Option<String> {
-        self.take_session_scoped(|a| a.pending_submit.take())
+    /// Take a deferred prompt to start a turn, unless a resume holds it.
+    pub fn take_pending_submit(&mut self) -> Option<super::session_work::Submission> {
+        self.work.take_submit(&self.resume)
     }
 
     /// Claim a deferred `/clear`, unless a resume holds it.
@@ -2654,19 +2641,7 @@ impl App {
     /// Returns whether it was claimed; the flag is cleared only when it
     /// is, so a held `/clear` stays pending rather than being dropped.
     pub fn claim_pending_clear(&mut self) -> bool {
-        if !self.pending_clear || !self.resume.allows(WorkScope::Session) {
-            return false;
-        }
-        self.pending_clear = false;
-        true
-    }
-
-    /// The one place the session gate is applied to a take.
-    fn take_session_scoped<T>(&mut self, take: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
-        if !self.resume.allows(WorkScope::Session) {
-            return None;
-        }
-        take(self)
+        self.work.claim_clear(&self.resume)
     }
 
     pub fn toggle_tasks(&mut self) {
@@ -3009,7 +2984,7 @@ impl App {
         prompt: String,
         blocks: Vec<agent_code_lib::llm::message::ContentBlock>,
     ) {
-        if self.pending_submit.is_some() {
+        if self.work.submit_staged() {
             self.transcript.push(TranscriptItem::System(
                 "another prompt was sent first — sending this one with its images next".into(),
             ));
@@ -3018,7 +2993,7 @@ impl App {
             return;
         }
         self.pending_attachments = blocks;
-        self.pending_submit = Some(prompt);
+        self.work.stage_submit(prompt, None);
         self.dirty = true;
     }
 
@@ -3042,12 +3017,12 @@ impl App {
     /// read again. Held back while another prompt's descriptors are still
     /// staged, so the two cannot be mixed.
     pub fn rearm_deferred_prompt(&mut self) {
-        if self.pending_submit.is_some() || !self.pending_images.is_empty() {
+        if self.work.submit_staged() || !self.pending_images.is_empty() {
             return;
         }
         if let Some((prompt, blocks)) = self.deferred_prompts.pop_front() {
             self.pending_attachments = blocks;
-            self.pending_submit = Some(prompt);
+            self.work.stage_submit(prompt, None);
             self.phase = Phase::Streaming;
             self.dirty = true;
         }
@@ -3073,7 +3048,7 @@ impl App {
         // is being dropped.
         self.turn_live = false;
         self.turn_started_at = None;
-        self.phase = if self.pending_submit.is_some() {
+        self.phase = if self.work.submit_staged() {
             // A replacement prompt is already waiting; it still has a turn
             // coming, so the streaming phase is still true.
             Phase::Streaming
@@ -3116,11 +3091,11 @@ mod tests {
     #[test]
     fn session_scoped_work_is_withheld_while_a_resume_loads() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_model = Some(PendingModelAction::Show);
-        app.pending_slash = Some("/status".into());
-        app.pending_shell = Some("ls".into());
-        app.pending_submit = Some("a prompt".into());
-        app.pending_clear = true;
+        app.work.stage_model(PendingModelAction::Show);
+        app.work.stage_slash("/status".into());
+        app.work.stage_shell("ls".into());
+        app.work.stage_submit("a prompt".into(), None);
+        app.work.stage_clear();
 
         app.resume.begin("other-session");
 
@@ -3131,16 +3106,19 @@ mod tests {
         assert!(!app.claim_pending_clear(), "/clear escaped");
 
         // Withheld, not consumed: it must still be there afterwards.
-        assert!(app.pending_model.is_some(), "the held action was dropped");
-        assert!(app.pending_clear, "the held /clear was dropped");
+        assert!(
+            app.work.model_staged().is_some(),
+            "the held action was dropped"
+        );
+        assert!(app.work.clear_staged(), "the held /clear was dropped");
     }
 
     /// Once the resume settles, the same work is available again.
     #[test]
     fn session_scoped_work_is_released_when_the_resume_settles() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_slash = Some("/status".into());
-        app.pending_clear = true;
+        app.work.stage_slash("/status".into());
+        app.work.stage_clear();
         app.resume.begin("other-session");
         assert!(app.take_pending_slash().is_none());
 
@@ -3148,7 +3126,7 @@ mod tests {
 
         assert_eq!(app.take_pending_slash().as_deref(), Some("/status"));
         assert!(app.claim_pending_clear());
-        assert!(!app.pending_clear, "claiming must consume the flag");
+        assert!(!app.work.clear_staged(), "claiming must consume the flag");
     }
 
     /// Global work is not session state and must not be held — holding it
@@ -3390,8 +3368,8 @@ mod tests {
         app.input = "/model".into();
         app.cursor = app.input.len();
         app.submit();
-        assert_eq!(app.pending_model, Some(PendingModelAction::Show));
-        assert!(app.pending_submit.is_none());
+        assert_eq!(app.work.model_staged(), Some(&PendingModelAction::Show));
+        assert!(!app.work.submit_staged());
         assert!(app.input.is_empty());
         assert_eq!(app.phase, Phase::Idle);
     }
@@ -3404,8 +3382,8 @@ mod tests {
         app.cursor = app.input.len();
         app.submit();
         assert_eq!(
-            app.pending_model,
-            Some(PendingModelAction::Set {
+            app.work.model_staged(),
+            Some(&PendingModelAction::Set {
                 model: "grok-4.5".into(),
                 effort: None
             })
@@ -3414,7 +3392,7 @@ mod tests {
             app.queue.is_empty(),
             "/model must not be queued as a prompt"
         );
-        assert!(app.pending_submit.is_none());
+        assert!(!app.work.submit_staged());
     }
 
     #[test]
@@ -3436,7 +3414,7 @@ mod tests {
         assert_eq!(engine_effort.as_deref(), Some("high"));
         assert_eq!(app.model, "new-model");
         assert_eq!(app.effort.as_deref(), Some("high"));
-        assert!(app.pending_model.is_none());
+        assert!(app.work.model_staged().is_none());
         match app.transcript.last() {
             Some(TranscriptItem::System(s)) => assert!(s.contains("new-model")),
             other => panic!("expected System line, got {other:?}"),
@@ -3497,7 +3475,10 @@ mod tests {
             Some(TranscriptItem::User(s)) => assert_eq!(s, "/verify"),
             other => panic!("expected User(/verify), got {other:?}"),
         }
-        let pending = app.pending_submit.expect("skill should produce a turn");
+        let pending = app
+            .work
+            .submit_payload()
+            .expect("skill should produce a turn");
         assert!(
             !pending.starts_with('/'),
             "engine must receive the expanded skill body, got: {pending}"
@@ -3564,7 +3545,7 @@ mod tests {
         app.input.clear();
         app.cursor = 0;
         app.submit();
-        assert_eq!(app.pending_submit.as_deref(), Some("queued one"));
+        assert_eq!(app.work.submit_payload(), Some("queued one"));
         assert!(app.queue.is_empty());
     }
 
@@ -3577,7 +3558,7 @@ mod tests {
         app.cursor = app.input.len();
         app.interject();
         assert!(app.cancel_requested, "interject must cancel the live turn");
-        assert_eq!(app.pending_submit.as_deref(), Some("stop and do this"));
+        assert_eq!(app.work.submit_payload(), Some("stop and do this"));
         assert!(app.input.is_empty());
         assert!(
             app.transcript
@@ -3595,7 +3576,7 @@ mod tests {
         app.queue.push_back("from queue".into());
         app.interject();
         assert!(app.cancel_requested);
-        assert_eq!(app.pending_submit.as_deref(), Some("from queue"));
+        assert_eq!(app.work.submit_payload(), Some("from queue"));
         assert!(app.queue.is_empty());
     }
 
@@ -3606,7 +3587,7 @@ mod tests {
         app.cursor = 5;
         app.interject();
         assert!(!app.cancel_requested);
-        assert_eq!(app.pending_submit.as_deref(), Some("hello"));
+        assert_eq!(app.work.submit_payload(), Some("hello"));
     }
 
     #[test]
@@ -3640,10 +3621,10 @@ mod tests {
     fn prompt_history_up_down() {
         let mut app = App::new("m", "/tmp", "s");
         app.enqueue_turn("first".into());
-        app.pending_submit = None;
+        app.work.discard_submit();
         app.phase = Phase::Idle;
         app.enqueue_turn("second".into());
-        app.pending_submit = None;
+        app.work.discard_submit();
         app.phase = Phase::Idle;
         app.input.clear();
         app.history_older();
@@ -3707,7 +3688,7 @@ mod tests {
         app.show_queue_pane = true;
         app.queue_selected = 1;
         app.queue_send_selected();
-        assert_eq!(app.pending_submit.as_deref(), Some("b"));
+        assert_eq!(app.work.submit_payload(), Some("b"));
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue.front().map(|s| s.as_str()), Some("a"));
     }
@@ -3754,7 +3735,7 @@ mod tests {
         app.input = "/definitely-not-a-command".into();
         app.cursor = app.input.len();
         app.submit();
-        assert!(app.pending_submit.is_none(), "must not become a model turn");
+        assert!(!app.work.submit_staged(), "must not become a model turn");
         assert!(
             app.transcript
                 .iter()
@@ -3771,7 +3752,7 @@ mod tests {
         app.input = "/clear".into();
         app.cursor = 6;
         app.submit();
-        assert!(app.pending_clear, "engine clear deferred to run loop");
+        assert!(app.work.clear_staged(), "engine clear deferred to run loop");
         assert!(app.transcript.is_empty());
     }
 
@@ -3811,11 +3792,11 @@ mod tests {
         app.cursor = app.input.len();
         app.submit();
         assert!(
-            !app.pending_clear,
+            !app.work.clear_staged(),
             "the exact-match /clear path should not have fired"
         );
         assert_eq!(
-            app.pending_slash.as_deref(),
+            app.work.slash_staged(),
             Some("/clear anything"),
             "the argument form did not reach the bridge"
         );
@@ -3875,7 +3856,7 @@ mod tests {
         app.cursor = 6;
         app.submit();
         assert!(
-            app.pending_clear,
+            app.work.clear_staged(),
             "the engine clear should still be pending"
         );
 
@@ -3900,7 +3881,7 @@ mod tests {
         // been applied — it is still writing about the discarded
         // conversation. The `pending_clear` window this used to key on
         // would have reopened here and let it back in.
-        app.pending_clear = false;
+        app.work.discard_clear();
         app.apply_engine(EngineEvent::TodoUpdate {
             epoch: 0,
             items: vec![("9".into(), "still the discarded turn".into(), "done".into())],
@@ -3966,7 +3947,7 @@ mod tests {
         app.input = "/keybindings".into();
         app.cursor = app.input.len();
         app.submit();
-        assert!(app.pending_submit.is_none(), "listing became a turn");
+        assert!(!app.work.submit_staged(), "listing became a turn");
         let listing = match app.transcript.last() {
             Some(TranscriptItem::System(s)) => s.clone(),
             other => panic!("expected a system listing, got {other:?}"),
@@ -3987,7 +3968,7 @@ mod tests {
         app.input = "hello world".into();
         app.cursor = app.input.len();
         app.submit();
-        assert_eq!(app.pending_submit.as_deref(), Some("hello world"));
+        assert_eq!(app.work.submit_payload(), Some("hello world"));
         assert!(app.input.is_empty());
         assert_eq!(app.phase, Phase::Streaming);
         assert!(matches!(
@@ -4003,7 +3984,7 @@ mod tests {
         app.cursor = 5;
         app.submit();
         assert!(app.should_quit);
-        assert!(app.pending_submit.is_none());
+        assert!(!app.work.submit_staged());
     }
 
     #[test]
@@ -4133,10 +4114,7 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue.front().unwrap(), "fix the flaky test");
         assert!(app.input.is_empty());
-        assert!(
-            app.pending_submit.is_none(),
-            "must not start a turn mid-turn"
-        );
+        assert!(!app.work.submit_staged(), "must not start a turn mid-turn");
     }
 
     #[test]
@@ -4148,7 +4126,7 @@ mod tests {
         // Turn ends.
         app.mark_turn_idle();
         app.dispatch_queue_head();
-        assert_eq!(app.pending_submit.as_deref(), Some("first"));
+        assert_eq!(app.work.submit_payload(), Some("first"));
         assert_eq!(app.phase, Phase::Streaming);
         assert_eq!(app.queue.len(), 1, "second stays queued");
     }
@@ -4159,7 +4137,7 @@ mod tests {
         app.phase = Phase::Streaming;
         app.queue.push_back("later".into());
         app.dispatch_queue_head();
-        assert!(app.pending_submit.is_none());
+        assert!(!app.work.submit_staged());
         assert_eq!(app.queue.len(), 1);
     }
 
@@ -4188,10 +4166,7 @@ mod tests {
         // advertised a picker. Layout stays on `/minimal`/`/fullscreen`.
         assert!(app.theme_picker_open(), "/theme must open the picker");
         assert_eq!(app.skin, Skin::Fullscreen, "/theme must not touch skin");
-        assert!(
-            app.pending_submit.is_none(),
-            "opening a picker is not a turn"
-        );
+        assert!(!app.work.submit_staged(), "opening a picker is not a turn");
     }
 
     /// `(detail, body)` for every tool card in the transcript, in order.
@@ -4932,7 +4907,7 @@ mod tests {
         app.cursor = app.input.len();
         app.submit();
         assert_eq!(app.skin, Skin::Minimal);
-        assert!(app.pending_submit.is_none(), "skin toggle is not a turn");
+        assert!(!app.work.submit_staged(), "skin toggle is not a turn");
         app.input = "/fullscreen".into();
         app.cursor = app.input.len();
         app.submit();
@@ -5119,7 +5094,7 @@ mod tests {
         app.submit();
         assert_eq!(app.show_tasks, !before, "bare /tasks toggles the pane");
         assert!(
-            app.pending_slash.is_none(),
+            app.work.slash_staged().is_none(),
             "bare /tasks must not hit the command bridge"
         );
 
@@ -5137,7 +5112,7 @@ mod tests {
             app.cursor = app.input.len();
             app.submit();
             assert_eq!(
-                app.pending_slash.as_deref(),
+                app.work.slash_staged(),
                 Some(cmd),
                 "{cmd} must reach the command bridge"
             );
@@ -5157,7 +5132,7 @@ mod tests {
             app.cursor = app.input.len();
             app.submit();
             assert_eq!(
-                app.pending_slash.as_deref(),
+                app.work.slash_staged(),
                 Some(cmd),
                 "{cmd} must reach the command bridge"
             );
@@ -5607,7 +5582,7 @@ mod tests {
         let (_dir, mut app) = app_in_workspace();
         type_input(&mut app, "explain @src/main.rs");
         app.submit();
-        let prompt = app.pending_submit.clone().expect("turn started");
+        let prompt = app.work.submit_payload().expect("turn started");
         assert!(prompt.starts_with("explain @src/main.rs"));
         assert!(prompt.contains("<file path=\"src/main.rs\">"));
         assert!(prompt.contains("fn main() {}"));
@@ -5624,7 +5599,7 @@ mod tests {
         let (_dir, mut app) = app_in_workspace();
         type_input(&mut app, "read @src/nope.rs");
         app.submit();
-        assert_eq!(app.pending_submit.as_deref(), Some("read @src/nope.rs"));
+        assert_eq!(app.work.submit_payload(), Some("read @src/nope.rs"));
         assert!(
             app.transcript.iter().any(
                 |i| matches!(i, TranscriptItem::System(s) if s.contains("@mentions:")
@@ -5639,7 +5614,7 @@ mod tests {
         let (_dir, mut app) = app_in_workspace();
         type_input(&mut app, "hello there");
         app.submit();
-        assert_eq!(app.pending_submit.as_deref(), Some("hello there"));
+        assert_eq!(app.work.submit_payload(), Some("hello there"));
     }
 
     fn write_png(app: &App, name: &str) {
@@ -5673,7 +5648,7 @@ mod tests {
         // Interject again with a prompt that mentions nothing.
         type_input(&mut app, "actually never mind");
         app.interject();
-        assert_eq!(app.pending_submit.as_deref(), Some("actually never mind"));
+        assert_eq!(app.work.submit_payload(), Some("actually never mind"));
         assert!(
             app.pending_images.is_empty(),
             "stale image carried onto the replacement prompt"
@@ -5710,7 +5685,7 @@ mod tests {
 
         // The run loop takes the prompt *and* its descriptors to start the
         // encode; the user cancels before the read comes back.
-        let _ = app.pending_submit.take();
+        let _ = app.work.discard_submit();
         let _ = std::mem::take(&mut app.pending_images);
         app.abandon_staged_attachments();
 
@@ -5726,7 +5701,7 @@ mod tests {
         // turn that never was.
         type_input(&mut app, "next");
         app.submit();
-        assert_eq!(app.pending_submit.as_deref(), Some("next"));
+        assert_eq!(app.work.submit_payload(), Some("next"));
         assert!(app.queue.is_empty(), "prompt was queued, not sent");
     }
 
@@ -5772,7 +5747,7 @@ mod tests {
     fn encoded_attachments_arm_their_own_prompt() {
         let (_dir, mut app) = app_in_workspace();
         app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
-        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(app.work.submit_payload(), Some("look at @shot.png"));
         assert_eq!(app.pending_attachments.len(), 1);
     }
 
@@ -5784,12 +5759,12 @@ mod tests {
     fn a_prompt_sent_while_encoding_is_not_overwritten() {
         let (_dir, mut app) = app_in_workspace();
         app.enqueue_turn_from_command("show me the diff".into());
-        assert_eq!(app.pending_submit.as_deref(), Some("show me the diff"));
+        assert_eq!(app.work.submit_payload(), Some("show me the diff"));
 
         app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
 
         assert_eq!(
-            app.pending_submit.as_deref(),
+            app.work.submit_payload(),
             Some("show me the diff"),
             "the newer prompt was overwritten"
         );
@@ -5818,10 +5793,10 @@ mod tests {
         app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
 
         // The turn it was waiting behind starts and finishes.
-        let _ = app.pending_submit.take();
+        let _ = app.work.discard_submit();
         app.rearm_deferred_prompt();
 
-        assert_eq!(app.pending_submit.as_deref(), Some("look at @shot.png"));
+        assert_eq!(app.work.submit_payload(), Some("look at @shot.png"));
         assert_eq!(
             app.pending_attachments.len(),
             1,
@@ -5843,12 +5818,12 @@ mod tests {
         write_png(&app, "later.png");
         type_input(&mut app, "later @later.png");
         app.submit();
-        let _ = app.pending_submit.take();
+        let _ = app.work.discard_submit();
         assert_eq!(app.pending_images.len(), 1, "precondition");
 
         app.rearm_deferred_prompt();
         assert!(
-            app.pending_submit.is_none(),
+            !app.work.submit_staged(),
             "sent a deferred prompt while another's descriptors were staged"
         );
         assert!(!app.deferred_prompts.is_empty(), "deferred prompt lost");
@@ -5880,7 +5855,7 @@ mod tests {
         app.phase = Phase::Streaming;
         type_input(&mut app, "do this instead");
         app.interject();
-        assert_eq!(app.pending_submit.as_deref(), Some("do this instead"));
+        assert_eq!(app.work.submit_payload(), Some("do this instead"));
 
         app.cancel_pending_followups();
         assert!(
@@ -5900,7 +5875,7 @@ mod tests {
             .push_back(("earlier @a.png".into(), vec![png_block()]));
         // A slash command stages its prompt directly, without interjecting.
         app.enqueue_turn_from_command("show me the diff".into());
-        assert!(app.pending_submit.is_some(), "precondition");
+        assert!(app.work.submit_staged(), "precondition");
 
         app.cancel_pending_followups();
         assert!(
@@ -5959,12 +5934,12 @@ mod tests {
         app.accept_encoded_attachments("second @b.png".into(), vec![png_block()]);
         assert_eq!(app.deferred_prompts.len(), 2, "a held prompt was dropped");
 
-        let _ = app.pending_submit.take();
+        let _ = app.work.discard_submit();
         app.rearm_deferred_prompt();
-        assert_eq!(app.pending_submit.as_deref(), Some("first @a.png"));
-        let _ = app.pending_submit.take();
+        assert_eq!(app.work.submit_payload(), Some("first @a.png"));
+        let _ = app.work.discard_submit();
         app.rearm_deferred_prompt();
-        assert_eq!(app.pending_submit.as_deref(), Some("second @b.png"));
+        assert_eq!(app.work.submit_payload(), Some("second @b.png"));
     }
 
     /// A cleared, resumed or rewound conversation takes its attachments
@@ -6001,7 +5976,7 @@ mod tests {
         app.submit();
 
         // The run loop takes the first prompt and its descriptors.
-        let _ = app.pending_submit.take();
+        let _ = app.work.discard_submit();
         let _ = std::mem::take(&mut app.pending_images);
 
         // The user interjects with a second image-bearing prompt, then the
@@ -6012,7 +5987,7 @@ mod tests {
         app.abandon_staged_attachments();
 
         assert_eq!(
-            app.pending_submit.as_deref(),
+            app.work.submit_payload(),
             Some("actually @second.png"),
             "replacement prompt lost"
         );

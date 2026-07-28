@@ -866,7 +866,7 @@ pub(super) async fn event_loop(
                     }
                 }
                 Err(_) => {
-                    app.pending_model = Some(action);
+                    app.work.stage_model(action);
                 }
             }
         }
@@ -1377,12 +1377,11 @@ pub(super) async fn event_loop(
         // Apply a deferred `/clear` to the engine conversation (classic
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
-        if app.pending_clear
-            && app.resume.allows(WorkScope::Session)
+        if app.work.clear_staged()
             && let Ok(mut eng) = session.engine().try_lock()
+            && app.claim_pending_clear()
         {
             eng.state_mut().messages.clear();
-            app.pending_clear = false;
             // `submit` already cleared the view, but a `/clear` held back
             // for a resume lands *after* the restore repainted the
             // screen. Without this the restored history stays on display
@@ -1483,7 +1482,7 @@ pub(super) async fn event_loop(
                 }
                 Err(_) => {
                     // Turn holds the lock — retry next loop.
-                    app.pending_slash = Some(slash);
+                    app.work.stage_slash(slash);
                 }
             }
         }
@@ -1543,7 +1542,7 @@ pub(super) async fn event_loop(
                     app.dirty = true;
                 }
                 Err(_) => {
-                    app.pending_shell = Some(cmd);
+                    app.work.stage_shell(cmd);
                 }
             }
         }
@@ -1585,18 +1584,15 @@ pub(super) async fn event_loop(
         // conversation being thrown away.
         if turn.is_none()
             && active_encode.is_none()
-            && app.resume.allows(WorkScope::Session)
             && !app.pending_images.is_empty()
-            && let Some(prompt) = app.pending_submit.take()
+            && let Some(submission) = app.take_pending_submit()
         {
             let images = std::mem::take(&mut app.pending_images);
+            let prompt = submission.payload.clone();
             // Keep the user's own words where the UI can still reach
             // them: `prompt` is about to move into the blocking task,
             // and a resume accepted before it lands drops the result.
-            app.encoding_display = app
-                .pending_submit_display
-                .take()
-                .or_else(|| Some(prompt.clone()));
+            app.encoding_display = Some(submission.user_text());
             let tx = img_tx.clone();
             encode_seq += 1;
             let id = encode_seq;
@@ -1621,10 +1617,12 @@ pub(super) async fn event_loop(
         // handed back to the composer when the restore lands.
         if turn.is_none()
             && active_encode.is_none()
-            && app.resume.allows(WorkScope::Session)
-            && let Some(prompt) = app.pending_submit.take()
+            && let Some(submission) = app.take_pending_submit()
         {
-            app.pending_submit_display = None;
+            // The typed line travels with the payload, so taking the
+            // submission drops it too — it only meant anything as the
+            // display for this prompt.
+            let prompt = submission.payload;
             let blocks = std::mem::take(&mut app.pending_attachments);
             // Set unconditionally, awaiting the lock rather than skipping on
             // contention: an empty set clears anything a previous attempt
@@ -1643,7 +1641,7 @@ pub(super) async fn event_loop(
                     // Should be rare: TUI serializes turns. Put the prompt
                     // and its attachments back so the next idle loop retries
                     // them together.
-                    app.pending_submit = Some(prompt);
+                    app.work.stage_submit(prompt, None);
                     app.pending_attachments = blocks;
                     app.status_message = format!("turn busy: {e}");
                     app.dirty = true;
@@ -1752,7 +1750,7 @@ pub(super) async fn event_loop(
                 // after Aborted (send-now cancel-and-send).
                 if completed_ok {
                     app.dispatch_queue_head();
-                } else if app.pending_submit.is_none() && !app.queue.is_empty() {
+                } else if !app.work.submit_staged() && !app.queue.is_empty() {
                     app.transcript.push(super::app::TranscriptItem::System(
                         "queued prompts kept — press Enter to send".into(),
                     ));
@@ -1763,7 +1761,7 @@ pub(super) async fn event_loop(
                 // through to `select!` would park until an unrelated event
                 // — leaving the user staring at "resuming …" until they
                 // pressed a key.
-                if app.pending_submit.is_some() || app.resume.is_loading() {
+                if app.work.submit_staged() || app.resume.is_loading() {
                     continue;
                 }
             }
@@ -3432,7 +3430,7 @@ mod tests {
             "drill-in stole the queue-dispatch Enter"
         );
         assert!(
-            app.queue.is_empty() && app.pending_submit.is_some(),
+            app.queue.is_empty() && app.work.submit_staged(),
             "queued prompt was not dispatched"
         );
     }
@@ -3555,7 +3553,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
         );
         assert_eq!(
-            app.pending_submit.as_deref(),
+            app.work.submit_payload(),
             Some("run the tests"),
             "the bound prompt was not submitted"
         );
@@ -3578,7 +3576,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
         );
         assert_eq!(
-            app.pending_submit.as_deref(),
+            app.work.submit_payload(),
             Some("run the tests"),
             "the initial press did not fire"
         );
@@ -3628,7 +3626,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
         );
         assert_eq!(
-            app.pending_submit.as_deref(),
+            app.work.submit_payload(),
             Some("run the tests"),
             "the bound prompt was not submitted"
         );
@@ -3666,7 +3664,7 @@ mod tests {
         app.phase = Phase::Streaming;
         handle_key(&mut app, ctrl('c'));
         assert!(app.cancel_requested, "Ctrl+C no longer cancels");
-        assert!(app.pending_submit.is_none(), "Ctrl+C submitted a prompt");
+        assert!(!app.work.submit_staged(), "Ctrl+C submitted a prompt");
     }
 
     /// The bug this closes: `ui.edit_mode = "vi"` was read by nothing,
@@ -3737,7 +3735,7 @@ mod tests {
             app.input
         );
         assert!(
-            app.pending_submit.is_some() || app.input.is_empty(),
+            app.work.submit_staged() || app.input.is_empty(),
             "Enter did not submit from normal mode"
         );
 
@@ -4293,7 +4291,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.search_open(), "Enter must close the bar");
         assert_eq!(app.scroll, at_match, "Enter must keep the match position");
-        assert!(app.pending_submit.is_none(), "Enter must not submit a turn");
+        assert!(!app.work.submit_staged(), "Enter must not submit a turn");
     }
 
     #[test]
@@ -4399,7 +4397,7 @@ mod tests {
         app.cursor = 2;
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(app.input, "hi\n");
-        assert!(app.pending_submit.is_none());
+        assert!(!app.work.submit_staged());
     }
 
     #[test]
@@ -4419,9 +4417,9 @@ mod tests {
         app.cursor = 4;
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.input, "line\n");
-        assert!(app.pending_submit.is_none());
+        assert!(!app.work.submit_staged());
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert_eq!(app.pending_submit.as_deref(), Some("line"));
+        assert_eq!(app.work.submit_payload(), Some("line"));
     }
 
     #[test]
@@ -4429,8 +4427,8 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         handle_key(&mut app, ctrl('m'));
         assert_eq!(
-            app.pending_model,
-            Some(super::super::app::PendingModelAction::Show)
+            app.work.model_staged(),
+            Some(&super::super::app::PendingModelAction::Show)
         );
         assert!(!app.multiline_mode);
     }
@@ -4442,7 +4440,7 @@ mod tests {
         app.cursor = 5;
         handle_key(&mut app, ctrl('m'));
         assert!(app.multiline_mode);
-        assert!(app.pending_model.is_none());
+        assert!(app.work.model_staged().is_none());
         handle_key(&mut app, ctrl('m'));
         assert!(!app.multiline_mode);
     }
@@ -4459,7 +4457,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
         );
         assert!(app.cancel_requested);
-        assert_eq!(app.pending_submit.as_deref(), Some("now"));
+        assert_eq!(app.work.submit_payload(), Some("now"));
     }
 
     #[test]
@@ -4471,7 +4469,7 @@ mod tests {
         app.cursor = 3;
         handle_key(&mut app, ctrl('i'));
         assert!(app.cancel_requested);
-        assert_eq!(app.pending_submit.as_deref(), Some("alt"));
+        assert_eq!(app.work.submit_payload(), Some("alt"));
     }
 
     #[test]

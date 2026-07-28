@@ -405,17 +405,16 @@ impl App {
     /// otherwise wipe the report before the user ever read it.
     fn cancel_pending_session_work(&mut self, why: &str, carry: bool) {
         let mut cancelled: Vec<String> = Vec::new();
-        if self.pending_clear {
-            self.pending_clear = false;
+        if self.work.discard_clear() {
             cancelled.push("/clear".into());
         }
-        if self.pending_model.take().is_some() {
+        if self.work.discard_model() {
             cancelled.push("/model".into());
         }
-        if let Some(slash) = self.pending_slash.take() {
+        if let Some(slash) = self.work.discard_slash() {
             cancelled.push(slash);
         }
-        if let Some(cmd) = self.pending_shell.take() {
+        if let Some(cmd) = self.work.discard_shell() {
             let row = format!("!{cmd}");
             self.remove_staged_row(&row);
             cancelled.push(row);
@@ -456,7 +455,7 @@ impl App {
             self.remove_staged_row(&text);
             carried.push(text);
         }
-        if let Some(payload) = self.pending_submit.take() {
+        if let Some(submission) = self.work.discard_submit() {
             // Its images go back with it. The descriptors and any bytes
             // already read from them belong to *this* prompt, and the
             // text returned to the composer still carries the `@path`
@@ -470,7 +469,7 @@ impl App {
             // `@path` mentions and skill bodies already inlined, and
             // handing it back would drop a whole file into the composer
             // and expand the mention a second time on resubmission.
-            let text = self.pending_submit_display.take().unwrap_or(payload);
+            let text = submission.user_text();
             // The row `submit` drew is a claim this was sent. It never
             // ran, so it goes with the prompt.
             self.remove_staged_row(&text);
@@ -1180,7 +1179,7 @@ mod tests {
         app.input = "/clear".into();
         app.cursor = app.input.len();
         app.submit();
-        assert!(app.pending_clear, "engine clear was not deferred");
+        assert!(app.work.clear_staged(), "engine clear was not deferred");
         assert!(app.transcript.is_empty());
 
         // The restore repopulates the screen while the engine clear is
@@ -1237,24 +1236,27 @@ mod tests {
     fn a_failed_resume_cancels_the_work_it_deferred() {
         let mut app = App::new("m", "/tmp", "s");
         app.resume.begin("abcdef123456");
-        app.pending_clear = true;
-        app.pending_slash = Some("/cost".into());
-        app.pending_shell = Some("rm -rf build".into());
-        app.pending_submit = Some("keep going".into());
+        app.work.stage_clear();
+        app.work.stage_slash("/cost".into());
+        app.work.stage_shell("rm -rf build".into());
+        app.work.stage_submit("keep going".into(), None);
 
         app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
 
-        assert!(!app.pending_clear, "/clear would run on the old session");
         assert!(
-            app.pending_slash.is_none(),
+            !app.work.clear_staged(),
+            "/clear would run on the old session"
+        );
+        assert!(
+            app.work.slash_staged().is_none(),
             "slash command would run on the old session"
         );
         assert!(
-            app.pending_shell.is_none(),
+            app.work.shell_staged().is_none(),
             "shell command would run on the old session"
         );
         assert!(
-            app.pending_submit.is_none(),
+            !app.work.submit_staged(),
             "prompt would start a turn on the old session"
         );
         // Nothing vanishes: the prompt returns to the composer and the
@@ -1465,13 +1467,10 @@ mod tests {
     #[test]
     fn resuming_drops_prompts_staged_for_the_previous_session() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_submit = Some("for the old session".into());
+        app.work.stage_submit("for the old session".into(), None);
         app.queue.push_back("also for the old session".into());
         app.adopt_restored_session(&restored());
-        assert!(
-            app.pending_submit.is_none(),
-            "old prompt survived the resume"
-        );
+        assert!(!app.work.submit_staged(), "old prompt survived the resume");
         assert!(app.queue.is_empty(), "old queue survived the resume");
         // The staged prompt goes back to the (empty) composer; the queued
         // one is reproduced verbatim rather than reduced to a count.
@@ -1493,20 +1492,20 @@ mod tests {
     #[test]
     fn accepting_cancels_work_staged_against_the_old_session() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_clear = true;
-        app.pending_slash = Some("/cost".into());
-        app.pending_shell = Some("make clean".into());
+        app.work.stage_clear();
+        app.work.stage_slash("/cost".into());
+        app.work.stage_shell("make clean".into());
         app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
 
         app.session_picker_accept();
 
         assert_eq!(app.resume.loading_id(), Some("aaa11111"));
         assert!(
-            !app.pending_clear,
+            !app.work.clear_staged(),
             "/clear would have cleared the restored session"
         );
-        assert!(app.pending_slash.is_none());
-        assert!(app.pending_shell.is_none());
+        assert!(app.work.slash_staged().is_none());
+        assert!(app.work.shell_staged().is_none());
         let said = app
             .transcript
             .iter()
@@ -1530,7 +1529,7 @@ mod tests {
     #[test]
     fn the_cancellation_report_survives_the_transcript_swap() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_shell = Some("make clean".into());
+        app.work.stage_shell("make clean".into());
         app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
         app.session_picker_accept();
 
@@ -1562,7 +1561,7 @@ mod tests {
     #[test]
     fn a_failed_resume_does_not_leave_its_report_for_the_next_one() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_shell = Some("make clean".into());
+        app.work.stage_shell("make clean".into());
         app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
         app.session_picker_accept();
         assert!(!app.resume_notices.is_empty(), "nothing was carried");
@@ -1717,14 +1716,14 @@ mod tests {
         app.input = "!one".into();
         app.cursor = app.input.len();
         app.submit();
-        assert_eq!(app.pending_shell.as_deref(), Some("one"));
+        assert_eq!(app.work.shell_staged(), Some("one"));
 
         app.input = "!two".into();
         app.cursor = app.input.len();
         app.submit();
 
         assert_eq!(
-            app.pending_shell.as_deref(),
+            app.work.shell_staged(),
             Some("one"),
             "the queued command was overwritten and never ran"
         );
@@ -1746,7 +1745,7 @@ mod tests {
         app.cursor = app.input.len();
         app.submit();
 
-        assert!(app.pending_clear, "the engine clear was not staged");
+        assert!(app.work.clear_staged(), "the engine clear was not staged");
         assert!(
             !app.transcript.is_empty(),
             "the screen was blanked before the resume was known to succeed"
@@ -1754,7 +1753,7 @@ mod tests {
 
         // The load fails: the clear is cancelled and the history stands.
         app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
-        assert!(!app.pending_clear);
+        assert!(!app.work.clear_staged());
         assert!(
             app.transcript
                 .iter()
@@ -1801,12 +1800,10 @@ mod tests {
     #[test]
     fn reclaiming_returns_the_typed_line_not_the_expanded_payload() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_submit = Some(
-            "look at @src/main.rs
-<file>…thousands of lines…</file>"
-                .into(),
+        app.work.stage_submit(
+            "look at @src/main.rs\n<file>…thousands of lines…</file>".into(),
+            Some("look at @src/main.rs".into()),
         );
-        app.pending_submit_display = Some("look at @src/main.rs".into());
 
         app.adopt_restored_session(&restored());
 
@@ -1814,7 +1811,7 @@ mod tests {
             app.input, "look at @src/main.rs",
             "the expanded payload was pasted into the composer"
         );
-        assert!(app.pending_submit_display.is_none());
+        assert!(app.work.submit_display().is_none());
     }
 
     /// Ids come from session filenames, so an imported or hand-renamed
@@ -1875,12 +1872,9 @@ work",
     #[test]
     fn a_prompt_submitted_during_the_load_returns_to_the_composer() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_submit = Some("check the parser".into());
+        app.work.stage_submit("check the parser".into(), None);
         app.adopt_restored_session(&restored());
-        assert!(
-            app.pending_submit.is_none(),
-            "prompt would still start a turn"
-        );
+        assert!(!app.work.submit_staged(), "prompt would still start a turn");
         assert_eq!(app.input, "check the parser", "the typed prompt was lost");
         assert_eq!(app.cursor, "check the parser".len());
     }
@@ -1914,7 +1908,7 @@ work",
         let mut app = App::new("m", "/tmp", "s");
         app.mark_turn_started();
         assert!(app.turn_live, "fixture did not start a turn");
-        app.pending_submit = Some("staged".into());
+        app.work.stage_submit("staged".into(), None);
 
         app.adopt_restored_session(&restored());
 
@@ -1931,7 +1925,7 @@ work",
     fn reclaiming_does_not_steal_the_phase_from_a_modal() {
         let mut app = App::new("m", "/tmp", "s");
         let _rx = a_modal(&mut app);
-        app.pending_submit = Some("staged".into());
+        app.work.stage_submit("staged".into(), None);
         app.adopt_restored_session(&restored());
         assert_eq!(app.phase, Phase::Permission, "the modal lost its phase");
     }
@@ -1942,7 +1936,7 @@ work",
     fn a_staged_prompt_is_reported_when_the_composer_is_busy() {
         let mut app = App::new("m", "/tmp", "s");
         app.input = "half-written draft".into();
-        app.pending_submit = Some("check the parser".into());
+        app.work.stage_submit("check the parser".into(), None);
         app.adopt_restored_session(&restored());
         assert_eq!(app.input, "half-written draft", "draft was clobbered");
         assert!(
@@ -1966,7 +1960,7 @@ work",
         app.mark_turn_idle();
         app.dispatch_queue_head();
         assert!(
-            app.pending_submit.is_none(),
+            !app.work.submit_staged(),
             "queued prompt was dispatched into the session being resumed"
         );
         assert_eq!(app.queue.len(), 1, "the prompt should still be queued");
@@ -2027,7 +2021,7 @@ work",
         let mut app = App::new("m", "/tmp", "s");
         app.session_id = "current-session".to_string();
         app.resume.begin("other-session".to_string());
-        app.pending_clear = true;
+        app.work.stage_clear();
         app.resume_notices.push("stale notice".into());
         app.open_session_picker(vec![summary("current-session", None, "/a")]);
 
@@ -2035,7 +2029,7 @@ work",
 
         assert!(app.resume.allows(WorkScope::Session), "gate not released");
         assert!(
-            !app.pending_clear,
+            !app.work.clear_staged(),
             "a /clear staged for the abandoned resume would land on this session"
         );
         assert!(
@@ -2075,8 +2069,10 @@ work",
     fn reclaiming_a_resume_time_prompt_unstages_its_images() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_submit = Some("look at @shot.png please".into());
-        app.pending_submit_display = Some("look at @shot.png please".into());
+        app.work.stage_submit(
+            "look at @shot.png please".into(),
+            Some("look at @shot.png please".into()),
+        );
         app.pending_images = vec![super::super::mentions::StagedImage {
             path: tmp.path().to_path_buf(),
             file: std::sync::Arc::new(std::fs::File::open(tmp.path()).unwrap()),

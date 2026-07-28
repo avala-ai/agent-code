@@ -22,6 +22,7 @@ mod scroll;
 mod search;
 mod session_picker;
 mod session_views;
+pub mod session_work;
 mod sink;
 #[cfg(test)]
 mod snapshot;

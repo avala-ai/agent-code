@@ -15,7 +15,7 @@
 //! if app.pending_resume.is_none() && let Some(x) = app.pending_model.take()
 //! ```
 //!
-//! Seven near-identical guards, one per deferred action. Adding an eighth
+//! Nine near-identical guards, one per deferred action. Adding a tenth
 //! deferred action meant *remembering* the condition, and forgetting it
 //! was invisible — the code compiled and worked whenever no resume was in
 //! flight, which is almost always. Two separate review findings came from
@@ -124,7 +124,7 @@ mod tests {
         assert!(s.allows(WorkScope::Global));
     }
 
-    /// The property the seven hand-written guards were each trying to
+    /// The property the nine hand-written guards were each trying to
     /// express, now expressed once.
     #[test]
     fn loading_holds_session_work_but_not_global_work() {

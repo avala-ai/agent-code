@@ -46,7 +46,7 @@ impl App {
         if self.front_modal().is_some() {
             return;
         }
-        self.pending_model = Some(PendingModelAction::Show);
+        self.work.stage_model(PendingModelAction::Show);
         self.dirty = true;
     }
 
@@ -141,7 +141,7 @@ impl App {
                 effort
             };
             self.close_model_picker();
-            self.pending_model = Some(PendingModelAction::Set {
+            self.work.stage_model(PendingModelAction::Set {
                 model: model_id.to_string(),
                 effort: Some(effort),
             });
@@ -153,7 +153,7 @@ impl App {
             return;
         };
         self.close_model_picker();
-        self.pending_model = Some(PendingModelAction::Set {
+        self.work.stage_model(PendingModelAction::Set {
             model: model_id.to_string(),
             effort: None,
         });
@@ -184,8 +184,8 @@ mod tests {
         app.model_picker_accept();
         assert!(!app.model_picker_open());
         assert_eq!(
-            app.pending_model,
-            Some(PendingModelAction::Set {
+            app.work.model_staged(),
+            Some(&PendingModelAction::Set {
                 model: "o3".into(),
                 effort: None
             })
@@ -203,8 +203,8 @@ mod tests {
         app.model_picker.as_mut().unwrap().effort_selected = high_idx;
         app.model_picker_accept();
         assert_eq!(
-            app.pending_model,
-            Some(PendingModelAction::Set {
+            app.work.model_staged(),
+            Some(&PendingModelAction::Set {
                 model: "o3".into(),
                 effort: Some("high".into())
             })
