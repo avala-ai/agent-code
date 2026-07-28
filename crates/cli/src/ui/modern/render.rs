@@ -2771,6 +2771,7 @@ mod tests {
                 expanded: Default::default(),
                 selected_item: None,
             },
+            1,
         );
         app.open_session_picker(vec![
             mk("sess-current", "the one I am in"),

@@ -51,6 +51,26 @@ pub struct SessionView {
 #[derive(Debug, Clone)]
 struct Entry {
     view: SessionView,
+    /// Messages in the conversation this view was built from.
+    ///
+    /// The cache is only valid while the conversation still says what it
+    /// said when we left. Another agent process can advance a session
+    /// that is not in front here, and the resume path reloads those
+    /// messages into the engine — so restoring the remembered view
+    /// unconditionally shows history the model is no longer reasoning
+    /// from.
+    ///
+    /// Message count rather than turn count: `/rewind` and `/snip`
+    /// rewrite `messages` without touching `turn_count`, so a rewound
+    /// session can report the same turns as the view we cached while
+    /// holding a different conversation. Counting messages catches
+    /// growth *and* truncation.
+    ///
+    /// It is a witness, not a hash — a conversation rewound and regrown
+    /// to exactly the same length while we were away still matches. That
+    /// needs a revision counter on the conversation itself, which the
+    /// engine does not carry today.
+    messages: usize,
     /// Charged against [`MAX_BYTES`]; recorded at insert so eviction
     /// never has to re-walk a transcript to know what it frees.
     bytes: usize,
@@ -83,7 +103,7 @@ impl SessionViews {
     /// one would mean flushing every other session's place *and* still
     /// blowing the bound, which is the failure this cap exists to
     /// prevent; that session falls back to the engine's rebuild.
-    pub fn save(&mut self, session_id: &str, view: SessionView) {
+    pub fn save(&mut self, session_id: &str, view: SessionView, messages: usize) {
         if session_id.is_empty() || view.transcript.is_empty() {
             return;
         }
@@ -102,16 +122,37 @@ impl SessionViews {
         }
         self.order.push(session_id.to_string());
         self.bytes += bytes;
-        self.views
-            .insert(session_id.to_string(), Entry { view, bytes });
+        self.views.insert(
+            session_id.to_string(),
+            Entry {
+                view,
+                bytes,
+                messages,
+            },
+        );
     }
 
-    /// Take back a remembered view, if there is one.
+    /// Take back a remembered view, if it still matches the session.
     ///
     /// Removed rather than cloned: the caller is about to become the
     /// live view, and a stale copy left behind would be restored over
     /// newer content the next time round.
-    pub fn take(&mut self, session_id: &str) -> Option<SessionView> {
+    ///
+    /// `messages` is what the conversation just loaded into the engine
+    /// holds. A view remembered at a different count describes a session
+    /// that has since moved on — under another agent process, say — so
+    /// it is dropped and the caller falls back to the rebuild. Erring
+    /// this way costs the reader their scroll position; erring the other
+    /// way shows them a transcript the model has already left behind.
+    pub fn take(&mut self, session_id: &str, messages: usize) -> Option<SessionView> {
+        if self
+            .views
+            .get(session_id)
+            .is_some_and(|e| e.messages != messages)
+        {
+            self.remove(session_id);
+            return None;
+        }
         self.remove(session_id)
     }
 
@@ -241,12 +282,46 @@ mod tests {
     #[test]
     fn a_saved_view_comes_back_intact() {
         let mut views = SessionViews::default();
-        views.save("a", view("hello"));
-        let got = views.take("a").expect("saved view");
+        views.save("a", view("hello"), 1);
+        let got = views.take("a", 1).expect("saved view");
         assert!(matches!(&got.transcript[0], TranscriptItem::User(t) if t == "hello"));
         assert_eq!(got.scroll, ScrollState::Free { top_line: 42 });
         assert!(got.expanded.contains(&1));
         assert_eq!(got.selected_item, Some(1));
+    }
+
+    /// Another agent process can advance a session that is not in front
+    /// here. The resume path reloads those messages into the engine, so
+    /// handing back the remembered view would show history the model has
+    /// already moved past — the user reads one conversation while the
+    /// model reasons from another.
+    #[test]
+    fn a_view_is_dropped_when_the_session_advanced_elsewhere() {
+        let mut views = SessionViews::default();
+        views.save("a", view("hello"), 3);
+
+        assert!(
+            views.take("a", 5).is_none(),
+            "a view from a 3-message conversation was restored over a 5-message one"
+        );
+        // And it is gone, not merely refused: keeping it would hand the
+        // same stale transcript back on the next switch.
+        assert!(!views.contains("a"));
+    }
+
+    /// The common case is our own process advancing the session, where
+    /// the remembered view is exactly right — invalidating there would
+    /// cost the reader their place on every switch and defeat the cache.
+    /// App's mirror is kept in step with the engine each iteration, so
+    /// our own growth is already reflected in what we stashed.
+    #[test]
+    fn a_view_survives_when_the_session_is_unchanged() {
+        let mut views = SessionViews::default();
+        views.save("a", view("hello"), 3);
+        assert!(
+            views.take("a", 3).is_some(),
+            "an unchanged view was dropped"
+        );
     }
 
     /// Taking removes: the caller becomes the live view, and a copy left
@@ -254,9 +329,9 @@ mod tests {
     #[test]
     fn taking_a_view_removes_it() {
         let mut views = SessionViews::default();
-        views.save("a", view("hello"));
-        assert!(views.take("a").is_some());
-        assert!(views.take("a").is_none());
+        views.save("a", view("hello"), 1);
+        assert!(views.take("a", 1).is_some());
+        assert!(views.take("a", 1).is_none());
     }
 
     /// An empty transcript means the session was never really visited.
@@ -273,18 +348,19 @@ mod tests {
                 expanded: Default::default(),
                 selected_item: None,
             },
+            1,
         );
         assert!(views.is_empty());
-        assert!(views.take("a").is_none());
+        assert!(views.take("a", 1).is_none());
     }
 
     #[test]
     fn views_are_kept_per_session() {
         let mut views = SessionViews::default();
-        views.save("a", view("from a"));
-        views.save("b", view("from b"));
+        views.save("a", view("from a"), 1);
+        views.save("b", view("from b"), 1);
         assert_eq!(views.len(), 2);
-        let a = views.take("a").unwrap();
+        let a = views.take("a", 1).unwrap();
         assert!(matches!(&a.transcript[0], TranscriptItem::User(t) if t == "from a"));
         assert!(views.contains("b"), "taking one session dropped another");
     }
@@ -292,15 +368,15 @@ mod tests {
     #[test]
     fn forgetting_drops_a_view() {
         let mut views = SessionViews::default();
-        views.save("a", view("hello"));
+        views.save("a", view("hello"), 1);
         views.forget("a");
-        assert!(views.take("a").is_none());
+        assert!(views.take("a", 1).is_none());
     }
 
     #[test]
     fn a_session_with_no_id_is_not_saved() {
         let mut views = SessionViews::default();
-        views.save("", view("hello"));
+        views.save("", view("hello"), 1);
         assert!(views.is_empty());
     }
 
@@ -310,7 +386,7 @@ mod tests {
     fn visiting_many_sessions_evicts_the_oldest() {
         let mut views = SessionViews::default();
         for i in 0..MAX_VIEWS + 3 {
-            views.save(&format!("s{i}"), view("hello"));
+            views.save(&format!("s{i}"), view("hello"), 1);
         }
         assert_eq!(views.len(), MAX_VIEWS);
         assert!(!views.contains("s0"), "oldest view survived the cap");
@@ -326,10 +402,10 @@ mod tests {
     #[test]
     fn large_transcripts_are_evicted_before_the_entry_cap() {
         let mut views = SessionViews::default();
-        views.save("a", view_of_size(HALF));
-        views.save("b", view_of_size(HALF));
+        views.save("a", view_of_size(HALF), 1);
+        views.save("b", view_of_size(HALF), 1);
         assert_eq!(views.len(), 2, "two views inside the budget did not fit");
-        views.save("c", view_of_size(HALF));
+        views.save("c", view_of_size(HALF), 1);
         assert!(views.len() < 3, "three oversized views all stayed resident");
         assert!(views.contains("c"), "the newest view was the one dropped");
         assert!(!views.contains("a"), "the oldest view was kept");
@@ -341,9 +417,9 @@ mod tests {
     fn resaving_a_session_replaces_its_entry() {
         let mut views = SessionViews::default();
         for _ in 0..6 {
-            views.save("a", view_of_size(HALF));
+            views.save("a", view_of_size(HALF), 1);
         }
-        views.save("b", view_of_size(HALF));
+        views.save("b", view_of_size(HALF), 1);
         assert!(
             views.contains("a") && views.contains("b"),
             "repeated saves of one session leaked budget"
@@ -355,8 +431,8 @@ mod tests {
     #[test]
     fn a_view_larger_than_the_budget_is_not_cached() {
         let mut views = SessionViews::default();
-        views.save("small", view("hello"));
-        views.save("huge", view_of_size(MAX_BYTES + 1));
+        views.save("small", view("hello"), 1);
+        views.save("huge", view_of_size(MAX_BYTES + 1), 1);
         assert!(!views.contains("huge"), "an oversized view was cached");
         assert!(
             views.contains("small"),
@@ -378,6 +454,7 @@ mod tests {
                 expanded: Default::default(),
                 selected_item: None,
             },
+            1,
         );
         assert!(
             !views.contains("many"),
@@ -415,6 +492,7 @@ mod tests {
                 expanded: Default::default(),
                 selected_item: None,
             },
+            1,
         );
 
         assert!(
@@ -441,6 +519,7 @@ mod tests {
                 expanded: Default::default(),
                 selected_item: None,
             },
+            1,
         );
 
         assert!(

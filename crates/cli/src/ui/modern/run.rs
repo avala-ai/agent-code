@@ -1256,7 +1256,7 @@ pub(super) async fn event_loop(
                         // or the pane keeps showing the old session's
                         // work.
                         app.adopt_restored_todos(&eng.state().messages);
-                        app.restore_transcript(items, &id, turns);
+                        app.restore_transcript(items, &id, turns, eng.state().messages.len());
                         let stored_mode = app.adopt_restored_session(&restored);
                         let mode = user_mode.unwrap_or(stored_mode);
                         app.mode = mode;
@@ -1701,6 +1701,7 @@ pub(super) async fn event_loop(
                         app.tokens_in = eng.state().total_usage.input_tokens;
                         app.tokens_out = eng.state().total_usage.output_tokens;
                         app.turn_count = eng.state().turn_count;
+                        app.conversation_len = eng.state().messages.len();
                         app.model = eng.state().config.api.model.clone();
 
                         // The model can toggle plan mode itself
