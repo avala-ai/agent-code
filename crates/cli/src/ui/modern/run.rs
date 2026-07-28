@@ -286,6 +286,28 @@ pub struct CliPermissionOverride {
 }
 
 impl CliPermissionOverride {
+    /// Whether disabling the sandbox in this project is a change worth
+    /// announcing.
+    ///
+    /// Warn where the flag takes effect, not only where it was typed:
+    /// starting in a project that forbids bypasses emits "--no-sandbox
+    /// ignored", and without this that stays the only notice the
+    /// operator ever sees — describing the opposite of the security
+    /// state once the session resumes somewhere the flag does apply.
+    ///
+    /// Only on the transition. A destination whose own config already
+    /// disables the sandbox is not becoming less isolated by being
+    /// resumed into, and a locked one refuses the flag outright, so
+    /// neither has anything to announce.
+    ///
+    /// Split out from [`Self::apply`] to be testable: the warning
+    /// registry de-duplicates by message, so asserting that a *new*
+    /// entry appeared depends on whether some earlier test in the same
+    /// binary already pushed the identical text.
+    fn announces_bypass(&self, cfg: &agent_code_lib::config::Config) -> bool {
+        self.no_sandbox && !cfg.security.disable_bypass_permissions && cfg.sandbox.enabled
+    }
+
     /// Re-apply in the same order startup does: the mode first, then the
     /// overlay composed on top, so a deny rule in the overlay still wins.
     fn apply(&self, cfg: &mut agent_code_lib::config::Config) {
@@ -308,23 +330,13 @@ impl CliPermissionOverride {
         // more permissive than the operator asked for is the opposite of
         // what it is for.
         let locked = cfg.security.disable_bypass_permissions;
+        if self.announces_bypass(cfg) {
+            agent_code_lib::services::warnings::warn(
+                "Process-level sandbox disabled for this project (--no-sandbox). Tool \
+                 calls are not isolated.",
+            );
+        }
         if self.no_sandbox && !locked {
-            // Warn where the flag takes effect, not only where it was
-            // typed. Starting in a project that forbids bypasses emits
-            // "--no-sandbox ignored"; without this, that stays the only
-            // notice the operator ever sees, and it describes the
-            // opposite of the security state once the session resumes
-            // somewhere the flag does apply.
-            //
-            // Only on the transition: a destination whose own config
-            // already disables the sandbox is not becoming less isolated
-            // by being resumed into.
-            if cfg.sandbox.enabled {
-                agent_code_lib::services::warnings::warn(
-                    "Process-level sandbox disabled for this project (--no-sandbox). Tool \
-                     calls are not isolated.",
-                );
-            }
             cfg.sandbox.enabled = false;
         }
         if let Some(mode) = self.default_mode
@@ -5134,14 +5146,13 @@ mod tests {
     /// apply — the operator would have been told they were sandboxed
     /// while tool calls ran unisolated.
     ///
-    /// Drives `apply` directly rather than `load_project_config`: the
-    /// latter reads the user config layer through `XDG_CONFIG_HOME`, so
-    /// what it returns depends on the environment the suite happens to
-    /// run in. Snapshots either side rather than clearing, because the
-    /// warning registry is process-global and shared with every other
-    /// test in this binary.
+    /// Asserts the decision rather than the registry. `warnings::push`
+    /// de-duplicates by message, so "did a new entry appear" answers
+    /// differently depending on whether an earlier test in this binary
+    /// already pushed the identical text — which is exactly how the
+    /// first version of this test passed locally and failed in CI.
     #[test]
-    fn taking_effect_in_a_new_project_warns_again() {
+    fn taking_effect_in_a_new_project_is_announced() {
         let requested = CliPermissionOverride {
             default_mode: None,
             no_sandbox: true,
@@ -5152,18 +5163,12 @@ mod tests {
         cfg.security.disable_bypass_permissions = false;
         cfg.sandbox.enabled = true;
 
-        let before = agent_code_lib::services::warnings::snapshot().len();
-        requested.apply(&mut cfg);
-        let after = agent_code_lib::services::warnings::snapshot();
-
-        assert!(!cfg.sandbox.enabled, "precondition: the flag applied here");
         assert!(
-            after[before..]
-                .iter()
-                .any(|w| w.message.contains("sandbox disabled for this project")),
-            "the sandbox was disabled with no warning at the moment it happened: {:?}",
-            &after[before..]
+            requested.announces_bypass(&cfg),
+            "the sandbox came down with nothing said about it"
         );
+        requested.apply(&mut cfg);
+        assert!(!cfg.sandbox.enabled, "precondition: the flag applied here");
     }
 
     /// A destination that already disables the sandbox itself is not
@@ -5180,22 +5185,16 @@ mod tests {
         cfg.security.disable_bypass_permissions = false;
         cfg.sandbox.enabled = false;
 
-        let before = agent_code_lib::services::warnings::snapshot().len();
-        requested.apply(&mut cfg);
-        let after = agent_code_lib::services::warnings::snapshot();
-
         assert!(
-            !after[before..]
-                .iter()
-                .any(|w| w.message.contains("sandbox disabled for this project")),
-            "warned about a change that did not happen"
+            !requested.announces_bypass(&cfg),
+            "announced a change that did not happen"
         );
     }
 
-    /// And a locked destination still refuses the flag outright, so no
-    /// warning is due there either — the sandbox never came down.
+    /// A locked destination refuses the flag outright, so nothing came
+    /// down and nothing is due.
     #[test]
-    fn a_locked_destination_neither_disables_nor_warns() {
+    fn a_locked_destination_neither_disables_nor_announces() {
         let requested = CliPermissionOverride {
             default_mode: None,
             no_sandbox: true,
@@ -5205,16 +5204,46 @@ mod tests {
         cfg.security.disable_bypass_permissions = true;
         cfg.sandbox.enabled = true;
 
-        let before = agent_code_lib::services::warnings::snapshot().len();
-        requested.apply(&mut cfg);
-        let after = agent_code_lib::services::warnings::snapshot();
-
-        assert!(cfg.sandbox.enabled, "a locked project lost its sandbox");
         assert!(
-            !after[before..]
+            !requested.announces_bypass(&cfg),
+            "announced a bypass the lock refused"
+        );
+        requested.apply(&mut cfg);
+        assert!(cfg.sandbox.enabled, "a locked project lost its sandbox");
+    }
+
+    /// Without the flag there is nothing to announce, however the
+    /// destination is configured.
+    #[test]
+    fn no_flag_means_no_announcement() {
+        let plain = CliPermissionOverride::default();
+        let mut cfg = agent_code_lib::config::Config::default();
+        cfg.sandbox.enabled = true;
+        assert!(!plain.announces_bypass(&cfg));
+    }
+
+    /// The message really is emitted when the decision says so — the
+    /// predicate would otherwise be a fact about a function nobody
+    /// called. Presence, not novelty, so de-duplication cannot make this
+    /// depend on test order.
+    #[test]
+    fn the_announcement_reaches_the_operator() {
+        let requested = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: true,
+            overlay: None,
+        };
+        let mut cfg = agent_code_lib::config::Config::default();
+        cfg.security.disable_bypass_permissions = false;
+        cfg.sandbox.enabled = true;
+
+        requested.apply(&mut cfg);
+
+        assert!(
+            agent_code_lib::services::warnings::snapshot()
                 .iter()
                 .any(|w| w.message.contains("sandbox disabled for this project")),
-            "announced a bypass that the lock refused"
+            "the transition was decided but never surfaced"
         );
     }
 
