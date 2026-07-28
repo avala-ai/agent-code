@@ -6,12 +6,19 @@ How to cut a new release of agent-code.
 
 - Push access to `main`
 - GitHub secrets configured:
-  - `CARGO_REGISTRY_TOKEN` - crates.io publish token
-  - `HOMEBREW_TAP_TOKEN` - GitHub PAT with `contents:write` on `avala-ai/homebrew-tap`
+  - `HOMEBREW_TAP_TOKEN` - GitHub PAT with `contents:write` on `avala-ai/homebrew-tap`.
+    The token's owner also needs **write** on that repo — a scope alone is not enough,
+    and a read-only collaborator produces the same `403 Resource not accessible` as a
+    missing scope. This silently failed eight consecutive releases.
 - npm publishing uses an **OIDC trusted publisher** (no `NPM_TOKEN` secret). The trusted
   publisher must be configured on npmjs.com for `@avala-ai/agent-code` (Publisher: GitHub
   Actions, repo `avala-ai/agent-code`, workflow file `release.yml`) before the tag is pushed,
   or the `publish-npm` job's OIDC exchange is rejected.
+- crates.io publishing also uses an **OIDC trusted publisher** (no `CARGO_REGISTRY_TOKEN`
+  secret). It is registered **per crate**, so both `agent-code-lib` and `agent-code` need a
+  trusted publisher on crates.io naming repository `avala-ai/agent-code` and workflow file
+  `release.yml` (the repository name, not the crate name). `publish-crate` publishes the lib
+  first, so a missing publisher on `agent-code-lib` fails the job before the CLI is reached.
 
 ## Release naming standard
 

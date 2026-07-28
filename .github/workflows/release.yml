@@ -88,12 +88,30 @@ jobs:
     name: Publish to crates.io
     needs: build
     runs-on: ubuntu-latest
+    # OIDC trusted publishing, same shape as the npm job below: the job
+    # mints a short-lived id-token that crates.io exchanges for publish
+    # rights, so there is no long-lived CARGO_REGISTRY_TOKEN. Registered
+    # per crate on crates.io — both `agent-code-lib` and `agent-code`
+    # name this repository and this workflow file.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p agent-code-lib --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # Exchanges the id-token for a crates.io token valid ~30 minutes,
+      # which covers both publishes and the indexing wait below.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # Passed by environment rather than `--token`: that flag is
+      # deprecated and printed a warning on the v0.29.0 release.
+      - run: cargo publish -p agent-code-lib
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - run: sleep 30  # Wait for crates.io to index the lib crate
-      - run: cargo publish -p agent-code --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish -p agent-code
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   update-homebrew:
     name: Update Homebrew tap
