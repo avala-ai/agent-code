@@ -1831,6 +1831,16 @@ pub(super) async fn event_loop(
                         app.turn_count = eng.state().turn_count;
                         app.model = eng.state().config.api.model.clone();
 
+                        // Checkpoint the conversation now that the turn is
+                        // reaped and the engine's totals are final.
+                        if let Err(e) = persist_session(&eng) {
+                            app.transcript
+                                .push(super::app::TranscriptItem::System(format!(
+                                    "could not save session: {e}"
+                                )));
+                            app.dirty = true;
+                        }
+
                         // The model can toggle plan mode itself
                         // (EnterPlanMode/ExitPlanMode tools). Sync the badge
                         // — and the permission override — back from the
@@ -2242,6 +2252,17 @@ pub(super) async fn event_loop(
         }
     }
 
+    // Persist before tearing down. A turn still running is cancelled
+    // below, so its partial output is deliberately not what gets saved —
+    // the last checkpoint is the last completed turn.
+    {
+        let engine_arc = session.engine();
+        let eng = engine_arc.lock().await;
+        if let Err(e) = persist_session(&eng) {
+            tracing::warn!("could not save session on exit: {e}");
+        }
+    }
+
     // Cancel any in-flight turn on exit. Deny every pending permission
     // first: turn tasks blocked inside the prompter would otherwise
     // deadlock the `join()` below.
@@ -2255,6 +2276,44 @@ pub(super) async fn event_loop(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Write the live conversation to the sessions directory.
+///
+/// `/resume` reads that directory, so without this the picker can only
+/// ever list sessions created by `/fork` or a scheduled run — an
+/// interactive session was never persisted at all, and quitting lost it.
+///
+/// Called after every completed turn and once on exit rather than only
+/// on exit, so a crash or a kill costs at most the turn in progress.
+/// `save_session_full` re-reads the existing file to preserve
+/// `created_at`, `label` and `tags`, so repeated saves are cheap to
+/// reason about and do not clobber metadata set elsewhere.
+///
+/// A conversation with no messages is not written: launching and
+/// quitting without asking anything should not leave a session behind
+/// for the picker to list.
+///
+/// Failures are reported to the transcript and otherwise ignored — a
+/// full disk or an unwritable config dir must not take down the turn
+/// loop or block exit.
+fn persist_session(eng: &agent_code_lib::query::QueryEngine) -> Result<(), String> {
+    let st = eng.state();
+    if st.messages.is_empty() {
+        return Ok(());
+    }
+    agent_code_lib::services::session::save_session_full(
+        &st.session_id,
+        &st.messages,
+        &st.cwd,
+        &st.config.api.model,
+        st.turn_count,
+        st.total_cost_usd,
+        st.total_usage.input_tokens,
+        st.total_usage.output_tokens,
+        st.plan_mode,
+    )
+    .map(|_| ())
 }
 
 /// Snapshot the shared `TaskManager` as tasks-pane rows.
@@ -5229,6 +5288,98 @@ mod tests {
             cfg.sandbox.enabled,
             "--no-sandbox was carried into a locked project that enables the sandbox"
         );
+    }
+
+    /// Build a minimal engine whose state is the thing under test.
+    fn engine_with(messages: Vec<agent_code_lib::llm::message::Message>) -> QueryEngine {
+        use agent_code_lib::config::Config;
+        use agent_code_lib::output_styles::AgentKind;
+        use agent_code_lib::permissions::PermissionChecker;
+        use agent_code_lib::query::QueryEngineConfig;
+        use agent_code_lib::state::AppState;
+        use agent_code_lib::tools::registry::ToolRegistry;
+
+        let config = Config::default();
+        let permissions = PermissionChecker::from_config(&config.permissions);
+        let mut state = AppState::new(config);
+        state.session_id = "sess-persist-test".into();
+        state.cwd = "/tmp/project".into();
+        state.turn_count = 3;
+        state.total_cost_usd = 1.25;
+        state.plan_mode = true;
+        state.messages = messages;
+
+        QueryEngine::new(
+            std::sync::Arc::new(super::super::fake_engine::ScriptedProvider::new(Vec::new())),
+            ToolRegistry::default_tools(),
+            permissions,
+            state,
+            QueryEngineConfig {
+                max_turns: Some(1),
+                verbose: false,
+                unattended: true,
+                agent_kind: AgentKind::Main,
+            },
+        )
+    }
+
+    /// The whole point of #553: `/resume` reads the sessions directory,
+    /// and an interactive session never wrote to it, so the picker had
+    /// nothing to list. Asserts the round trip rather than the call.
+    #[test]
+    fn a_persisted_session_is_listable_afterwards() {
+        let _guard = crate::ui::test_locks::env();
+        let home = tempfile::tempdir().expect("tempdir");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
+
+        let msg = agent_code_lib::llm::message::Message::User(
+            agent_code_lib::llm::message::UserMessage {
+                uuid: uuid::Uuid::new_v4(),
+                timestamp: String::new(),
+                content: vec![agent_code_lib::llm::message::ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                is_meta: false,
+                is_compact_summary: false,
+            },
+        );
+        let eng = engine_with(vec![msg]);
+        persist_session(&eng).expect("save");
+
+        let found = agent_code_lib::services::session::list_session_summaries(10);
+        let it = found
+            .iter()
+            .find(|s| s.id == "sess-persist-test")
+            .expect("the saved session was not listable — /resume would not see it");
+        assert_eq!(it.turn_count, 3);
+
+        let data =
+            agent_code_lib::services::session::load_session("sess-persist-test").expect("load");
+        assert_eq!(data.total_cost_usd, 1.25);
+        assert!(
+            data.plan_mode,
+            "plan_mode was dropped — `save_session` hardcodes false, so this must use \
+             `save_session_full`"
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// Launching and quitting without asking anything should not leave a
+    /// session behind for the picker to list.
+    #[test]
+    fn an_empty_conversation_is_not_persisted() {
+        let _guard = crate::ui::test_locks::env();
+        let home = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
+
+        persist_session(&engine_with(Vec::new())).expect("no-op save");
+
+        assert!(
+            agent_code_lib::services::session::list_session_summaries(10).is_empty(),
+            "an empty conversation was written to the sessions directory"
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     /// Starting in a locked project emits "--no-sandbox ignored". If
