@@ -44,16 +44,30 @@ pub enum WorkScope {
 }
 
 /// Where a resume is in its lifecycle.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeState {
     /// Nothing outstanding. Session-scoped work may run.
-    #[default]
-    Idle,
-    /// A session load is in flight. The id is kept so a result arriving
-    /// for a *superseded* request can be recognised and dropped — a
-    /// second `/resume`, or a cancel, must not be overwritten by the
-    /// first load finishing late.
-    Loading { id: String },
+    ///
+    /// The counter survives here so a generation is never reused: a read
+    /// abandoned before a cancel must not collide with one issued after
+    /// it, or the stale result would be accepted as the new request's.
+    Idle { issued: u64 },
+    /// A session load is in flight, tagged with the attempt that asked
+    /// for it. A result arriving for a *superseded* request is then
+    /// recognisable and dropped — a second `/resume`, or a cancel, must
+    /// not be overwritten by the first load finishing late.
+    ///
+    /// The generation and not merely the id: selecting A, then B, then A
+    /// again is three attempts, and the first A's result must not
+    /// satisfy the third. It may carry an error, or a snapshot taken
+    /// before another process wrote the session.
+    Loading { id: String, generation: u64 },
+}
+
+impl Default for ResumeState {
+    fn default() -> Self {
+        ResumeState::Idle { issued: 0 }
+    }
 }
 
 impl ResumeState {
@@ -64,15 +78,23 @@ impl ResumeState {
     pub fn allows(&self, scope: WorkScope) -> bool {
         match scope {
             WorkScope::Global => true,
-            WorkScope::Session => matches!(self, ResumeState::Idle),
+            WorkScope::Session => matches!(self, ResumeState::Idle { .. }),
         }
     }
 
     /// The session id being loaded, if any.
     pub fn loading_id(&self) -> Option<&str> {
         match self {
-            ResumeState::Loading { id } => Some(id.as_str()),
-            ResumeState::Idle => None,
+            ResumeState::Loading { id, .. } => Some(id.as_str()),
+            ResumeState::Idle { .. } => None,
+        }
+    }
+
+    /// The attempt currently outstanding, if any.
+    pub fn generation(&self) -> Option<u64> {
+        match self {
+            ResumeState::Loading { generation, .. } => Some(*generation),
+            ResumeState::Idle { .. } => None,
         }
     }
 
@@ -80,12 +102,35 @@ impl ResumeState {
         matches!(self, ResumeState::Loading { .. })
     }
 
-    /// True when `id` is the load currently outstanding.
+    /// True when `generation` is the attempt currently outstanding.
     ///
-    /// Used to drop a result whose request was superseded or cancelled;
-    /// comparing ids is what makes late arrivals safe.
-    pub fn is_awaiting(&self, id: &str) -> bool {
-        self.loading_id() == Some(id)
+    /// Used to drop a result whose request was superseded or cancelled.
+    /// Comparing attempts rather than ids is what makes returning to a
+    /// session safe: the same id can be asked for twice, and only the
+    /// later ask should be answered.
+    pub fn is_awaiting(&self, generation: u64) -> bool {
+        self.generation() == Some(generation)
+    }
+
+    /// The load that should be started, given what is already running.
+    ///
+    /// `None` when nothing is awaited, or when the awaited load is the
+    /// one already in flight. The comparison is by id and not by a bare
+    /// "a read is running" flag, because those two are not the same
+    /// question: a second `/resume` supersedes the first, and with a
+    /// flag the superseding load could not start until the one it
+    /// replaced returned. A session sitting on an unavailable mount then
+    /// held the picker behind a result nobody wanted.
+    ///
+    /// The superseded read is left to finish and be discarded on
+    /// arrival — [`Self::is_awaiting`] already refuses it.
+    pub fn load_to_start<'a>(&'a self, in_flight: &[u64]) -> Option<(&'a str, u64)> {
+        match self {
+            ResumeState::Loading { id, generation } if !in_flight.contains(generation) => {
+                Some((id.as_str(), *generation))
+            }
+            _ => None,
+        }
     }
 
     /// Begin a load, replacing any outstanding one.
@@ -93,8 +138,21 @@ impl ResumeState {
     /// Replacing is deliberate: a second `/resume` supersedes the first,
     /// and the earlier load's result is dropped when it arrives because
     /// [`Self::is_awaiting`] no longer matches it.
-    pub fn begin(&mut self, id: impl Into<String>) {
-        *self = ResumeState::Loading { id: id.into() };
+    pub fn begin(&mut self, id: impl Into<String>) -> u64 {
+        let generation = self.issued().wrapping_add(1);
+        *self = ResumeState::Loading {
+            id: id.into(),
+            generation,
+        };
+        generation
+    }
+
+    /// The highest attempt number handed out so far.
+    fn issued(&self) -> u64 {
+        match self {
+            ResumeState::Idle { issued } => *issued,
+            ResumeState::Loading { generation, .. } => *generation,
+        }
     }
 
     /// Return to idle, yielding the id that was outstanding.
@@ -108,7 +166,9 @@ impl ResumeState {
     /// someone remembered to call the cancel helper first.
     pub fn settle(&mut self) -> Option<String> {
         let was = self.loading_id().map(str::to_string);
-        *self = ResumeState::Idle;
+        *self = ResumeState::Idle {
+            issued: self.issued(),
+        };
         was
     }
 }
@@ -119,7 +179,7 @@ mod tests {
 
     #[test]
     fn idle_allows_everything() {
-        let s = ResumeState::Idle;
+        let s = ResumeState::default();
         assert!(s.allows(WorkScope::Session));
         assert!(s.allows(WorkScope::Global));
     }
@@ -128,7 +188,10 @@ mod tests {
     /// express, now expressed once.
     #[test]
     fn loading_holds_session_work_but_not_global_work() {
-        let s = ResumeState::Loading { id: "abc".into() };
+        let s = ResumeState::Loading {
+            id: "abc".into(),
+            generation: 1,
+        };
         assert!(
             !s.allows(WorkScope::Session),
             "session work ran while a resume was loading"
@@ -144,35 +207,106 @@ mod tests {
     /// on from.
     #[test]
     fn a_superseded_load_is_no_longer_awaited() {
-        let mut s = ResumeState::Idle;
-        s.begin("first");
-        assert!(s.is_awaiting("first"));
+        let mut s = ResumeState::default();
+        let first = s.begin("first");
+        assert!(s.is_awaiting(first));
 
-        s.begin("second");
+        let second = s.begin("second");
         assert!(
-            !s.is_awaiting("first"),
+            !s.is_awaiting(first),
             "the superseded load would still have been applied"
         );
-        assert!(s.is_awaiting("second"));
+        assert!(s.is_awaiting(second));
     }
 
     /// Cancelling means nothing is awaited — a result arriving later is
     /// dropped rather than restoring a session the user decided against.
     #[test]
     fn settling_stops_awaiting_anything() {
-        let mut s = ResumeState::Idle;
-        s.begin("abc");
+        let mut s = ResumeState::default();
+        let attempt = s.begin("abc");
         assert_eq!(s.settle().as_deref(), Some("abc"));
-        assert_eq!(s, ResumeState::Idle);
-        assert!(!s.is_awaiting("abc"));
+        assert!(!s.is_loading());
+        assert!(!s.is_awaiting(attempt));
         // Settling again is harmless and yields nothing.
         assert_eq!(s.settle(), None);
     }
 
+    /// A `/resume` that supersedes another must start immediately. The
+    /// read it replaced may be blocked on an unavailable mount, and
+    /// waiting for it means the user's newer choice never loads.
+    #[test]
+    fn a_superseding_load_starts_while_the_old_one_is_still_running() {
+        let mut s = ResumeState::default();
+        let first = s.begin("first");
+        assert_eq!(s.load_to_start(&[]), Some(("first", first)));
+
+        // "first" is now off-thread; nothing further to start for it.
+        let running = vec![first];
+        assert_eq!(s.load_to_start(&running), None);
+
+        // The user picks another session while "first" is still stuck.
+        let second = s.begin("second");
+        assert_eq!(
+            s.load_to_start(&running),
+            Some(("second", second)),
+            "the superseding load waited for the read it replaced"
+        );
+    }
+
+    /// Selecting A, then B, then A again is three attempts. The first
+    /// A read is still in flight, so an id-only check would treat it as
+    /// already satisfying the third and start nothing — then accept its
+    /// result. That result may carry an error from the first attempt, or
+    /// a snapshot taken before another process wrote the session.
+    #[test]
+    fn returning_to_a_session_is_a_new_attempt_not_the_one_still_running() {
+        let mut s = ResumeState::default();
+        let first_a = s.begin("A");
+        let b = s.begin("B");
+        let running = vec![first_a, b];
+
+        let second_a = s.begin("A");
+        assert_ne!(second_a, first_a, "the same id reused its old attempt");
+        assert_eq!(
+            s.load_to_start(&running),
+            Some(("A", second_a)),
+            "re-selecting A was answered by the read already in flight"
+        );
+        assert!(
+            !s.is_awaiting(first_a),
+            "the first A read would have satisfied the third selection"
+        );
+        assert!(s.is_awaiting(second_a));
+    }
+
+    /// An attempt number is never reused, even across a cancel: a read
+    /// abandoned before one must not be mistaken for a request made
+    /// after it.
+    #[test]
+    fn attempt_numbers_survive_a_settle() {
+        let mut s = ResumeState::default();
+        let abandoned = s.begin("A");
+        s.settle();
+        let fresh = s.begin("A");
+        assert_ne!(
+            fresh, abandoned,
+            "a cancelled attempt's number came back around"
+        );
+        assert!(!s.is_awaiting(abandoned));
+    }
+
+    #[test]
+    fn nothing_starts_when_no_resume_is_awaited() {
+        let s = ResumeState::default();
+        assert_eq!(s.load_to_start(&[]), None);
+        assert_eq!(s.load_to_start(&[7]), None);
+    }
+
     #[test]
     fn idle_awaits_nothing() {
-        let s = ResumeState::Idle;
-        assert!(!s.is_awaiting("abc"));
+        let s = ResumeState::default();
+        assert!(!s.is_awaiting(1));
         assert!(!s.is_loading());
         assert_eq!(s.loading_id(), None);
     }
