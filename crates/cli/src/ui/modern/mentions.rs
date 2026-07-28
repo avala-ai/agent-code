@@ -1354,4 +1354,80 @@ mod tests {
         assert!(out.prompt.contains("fn main() {}"));
         assert!(out.notes.is_empty(), "{:?}", out.notes);
     }
+
+    /// `display_path` builds the `<file path="…">` tag the model reads,
+    /// so the same mention has to serialize identically regardless of
+    /// host OS — otherwise a session recorded on Windows cites paths
+    /// that no other tool, and no other machine, resolves.
+    ///
+    /// Rendering the relative path with `to_string_lossy` produced
+    /// `src\inner\deep.rs` there. Note this assertion is only
+    /// load-bearing **on Windows**: on Unix the component join and the
+    /// lossy render agree, which is precisely why the bug shipped and
+    /// why the Windows CI job is what makes this test bite.
+    #[test]
+    fn a_nested_mention_tag_uses_forward_slashes_on_every_platform() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().expect("canonical root");
+        let nested = root.join("src").join("inner").join("deep.rs");
+
+        let shown = display_path(&root, &nested, "@src/inner/deep.rs");
+
+        assert_eq!(shown, "src/inner/deep.rs");
+        assert!(
+            !shown.contains('\\'),
+            "a host separator leaked into the tag: {shown}"
+        );
+    }
+
+    /// The fix has to join path *components*, never substitute
+    /// characters. On Unix a backslash is an ordinary filename
+    /// character, so `replace('\\', "/")` would rewrite a legal name
+    /// into a directory path — the model would then cite a file that
+    /// does not exist, and re-mentioning it would fail to resolve.
+    ///
+    /// This is the assertion that separates the correct fix from the
+    /// obvious one, and unlike the test above it fails right here on
+    /// Linux.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_is_a_filename_character_not_a_separator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let odd = r"we\ird.rs";
+
+        let shown = display_path(&root, &root.join(odd), r"@we\ird.rs");
+
+        assert_eq!(
+            shown, odd,
+            "a legal filename was rewritten as if it were a path"
+        );
+    }
+
+    /// A path that is not under `cwd` has no relative form, so the tag
+    /// falls back to what the user typed instead of inventing one.
+    #[test]
+    fn a_path_outside_the_workspace_falls_back_to_the_raw_mention() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().expect("canonical root");
+
+        let shown = display_path(&root, Path::new("/etc/hosts"), "@/etc/hosts");
+
+        assert_eq!(shown, "@/etc/hosts");
+    }
+
+    /// The tag is `<file path="…">`, so a double quote in a name would
+    /// close the attribute early and the remainder would be read as
+    /// markup. Both branches substitute, so both are checked.
+    #[test]
+    fn a_double_quote_cannot_close_the_tag_attribute() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().expect("canonical root");
+
+        let inside = display_path(&root, &root.join(r#"od"d.rs"#), r#"@od"d.rs"#);
+        assert_eq!(inside, "od'd.rs");
+
+        let outside = display_path(&root, Path::new(r#"/x/od"d.rs"#), r#"@od"d.rs"#);
+        assert_eq!(outside, "@od'd.rs");
+    }
 }
