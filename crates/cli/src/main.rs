@@ -543,6 +543,7 @@ async fn async_main() -> anyhow::Result<()> {
         // session visits — including one it resumes into.
         api_base_url: cli.api_base_url.clone(),
         auth_mode: cli_auth_mode,
+        api_key_pinned: cli.api_key.is_some(),
         ..Default::default()
     };
     // Apply --no-sandbox before permission-mode handling so the bypass
