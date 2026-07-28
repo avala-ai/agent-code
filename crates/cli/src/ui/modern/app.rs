@@ -437,7 +437,17 @@ pub struct App {
     /// [`App::new_conversation`].
     pub conversation_epoch: u64,
     /// Task id whose output the run loop should fetch and show.
-    pub pending_task_output: Option<String>,
+    /// A drill-in output read the run loop should start, stamped with
+    /// the conversation that asked for it.
+    ///
+    /// Both halves are conversation-scoped: the request can be staged
+    /// and then superseded by a resume before the loop picks it up, and
+    /// the detached read can land after one. Either way the output
+    /// belongs to a conversation that is no longer in front, and
+    /// appending it to the restored transcript shows the user another
+    /// session's work — from another project, when the resume crossed
+    /// directories.
+    pub pending_task_output: Option<(String, u64)>,
     /// Ctrl+P command palette (slash command picker).
     pub command_palette: Option<super::palette::CommandPalette>,
     /// Ctrl+M / `/model` in-TUI model picker.
@@ -2561,7 +2571,7 @@ impl App {
             // Backed by a TaskManager task: read the file on the run loop.
             Some(id) => {
                 self.status_message = format!("loading output for {id}…");
-                self.pending_task_output = Some(id);
+                self.pending_task_output = Some((id, self.conversation_epoch));
             }
             None if !had_captured => {
                 self.status_message = "this agent has not produced output yet".to_string();
@@ -4524,7 +4534,7 @@ mod tests {
             other => panic!("expected a tool card, got {other:?}"),
         }
         assert_eq!(
-            app.pending_task_output.as_deref(),
+            app.pending_task_output.as_ref().map(|(id, _)| id.as_str()),
             Some("a9"),
             "the manager-backed output was dropped instead of also being requested"
         );
@@ -4595,7 +4605,45 @@ mod tests {
         let mut app = App::new("m", "/tmp", "s");
         app.sync_background_tasks(vec![bg("b7", "working", "build")]);
         app.drill_into_selected_task();
-        assert_eq!(app.pending_task_output.as_deref(), Some("b7"));
+        assert_eq!(
+            app.pending_task_output.as_ref().map(|(id, _)| id.as_str()),
+            Some("b7")
+        );
+    }
+
+    /// A drill-in read is answered by whichever conversation is in front
+    /// when it lands, so it carries the one that asked. Without that
+    /// stamp, resuming between Enter and the file arriving prints the
+    /// previous session's output into the restored transcript — from
+    /// another project, when the resume crossed directories.
+    ///
+    /// The epoch is the mechanism already used to disown in-flight image
+    /// encodes across the same boundary, rather than a second one.
+    #[test]
+    fn a_drill_in_request_is_stamped_with_the_conversation_that_asked() {
+        let mut app = App::new("m", "/tmp", "s");
+        // Move off epoch 0 first: a fresh App starts there, so a stamp
+        // hardcoded to zero would be indistinguishable from the real one
+        // and this test would pass against code that never stamps.
+        app.new_conversation();
+        app.new_conversation();
+        assert_ne!(app.conversation_epoch, 0, "precondition");
+
+        app.sync_background_tasks(vec![bg("b7", "working", "build")]);
+        app.drill_into_selected_task();
+
+        let (_, asked_in) = app
+            .pending_task_output
+            .clone()
+            .expect("the drill-in was staged");
+        assert_eq!(asked_in, app.conversation_epoch);
+
+        // A resume replaces the conversation the read belongs to.
+        app.new_conversation();
+        assert_ne!(
+            asked_in, app.conversation_epoch,
+            "a staged read stayed valid across a conversation it no longer belongs to"
+        );
     }
 
     /// A background Agent run folds into its subagent row but keeps the
@@ -4613,7 +4661,10 @@ mod tests {
         }]);
         assert_eq!(app.tasks.len(), 1);
         app.drill_into_selected_task();
-        assert_eq!(app.pending_task_output.as_deref(), Some("a3"));
+        assert_eq!(
+            app.pending_task_output.as_ref().map(|(id, _)| id.as_str()),
+            Some("a3")
+        );
     }
 
     /// Superseded behaviour, kept as a pin. This used to assert that an

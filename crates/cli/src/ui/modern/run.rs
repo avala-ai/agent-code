@@ -798,7 +798,7 @@ pub(super) async fn event_loop(
     // Drill-in output reads run detached (see the select arm) and land
     // back here, so a slow filesystem never blocks the event loop.
     let (task_out_tx, mut task_out_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<String, String>)>();
+        tokio::sync::mpsc::unbounded_channel::<(u64, String, Result<String, String>)>();
     // `/resume` session discovery, same shape: the scan runs on a blocking
     // thread and the rows come back here (see the select arms).
     let (session_list_tx, mut session_list_rx) = tokio::sync::mpsc::unbounded_channel::<(
@@ -1982,19 +1982,31 @@ pub(super) async fn event_loop(
             // slow output file never stalls input handling; the result
             // comes back through the channel arm below.
             _ = std::future::ready(()), if app.pending_task_output.is_some() => {
-                if let Some(id) = app.pending_task_output.take() {
+                if let Some((id, epoch)) = app.pending_task_output.take() {
+                    // Staged against a conversation the user has since
+                    // left: the read would answer a question nobody is
+                    // still asking.
+                    if epoch != app.conversation_epoch {
+                        continue;
+                    }
                     let tm = task_manager.clone();
                     let tx = task_out_tx.clone();
                     tokio::spawn(async move {
                         // Bounded: the card shows a tail anyway, so never
                         // materialize an arbitrarily large output file.
                         let out = tm.read_output_tail(&id, 256 * 1024).await;
-                        let _ = tx.send((id, out));
+                        let _ = tx.send((epoch, id, out));
                     });
                 }
             }
-            Some((id, out)) = task_out_rx.recv() => {
-                app.show_task_output(&id, out);
+            Some((epoch, id, out)) = task_out_rx.recv() => {
+                // Same gate on the way back. The read is detached, so a
+                // resume can land while it is still in flight, and the
+                // transcript it would print into is not the one that
+                // asked.
+                if epoch == app.conversation_epoch {
+                    app.show_task_output(&id, out);
+                }
             }
             // `/resume`: enumerating sessions stats and parses every file
             // in the sessions directory. Done inline in the key handler it
