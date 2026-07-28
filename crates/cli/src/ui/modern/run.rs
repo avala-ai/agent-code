@@ -619,7 +619,7 @@ pub(super) async fn event_loop(
                                              not be read ({e}) — staying in {previous_cwd}"
                                         ),
                                     ));
-                                    app.cancel_deferred_resume_work();
+                                    app.cancel_deferred_resume_work("cancelled — held for a session whose settings could not be read:");
                                     app.pending_resume = None;
                                     app.dirty = true;
                                     continue;
@@ -640,7 +640,7 @@ pub(super) async fn event_loop(
                                 // work held for a swap that is not going to
                                 // happen before the gate opens, or it lands
                                 // on the conversation being kept.
-                                app.cancel_deferred_resume_work();
+                                app.cancel_deferred_resume_work("cancelled — held for a session whose directory could not be entered:");
                                 app.pending_resume = None;
                                 app.dirty = true;
                                 continue;
@@ -713,7 +713,7 @@ pub(super) async fn event_loop(
                                 let eng = engine_arc.lock().await;
                                 let _ = eng.fire_session_start_hooks().await;
                             }
-                            app.cancel_deferred_resume_work();
+                            app.cancel_deferred_resume_work("cancelled — held for a session whose directory became unavailable:");
                             app.pending_resume = None;
                             app.dirty = true;
                             continue;
@@ -1465,7 +1465,9 @@ pub(super) async fn event_loop(
                             // never arrived, and releasing it would run it
                             // against the conversation the user was trying
                             // to leave.
-                            app.cancel_deferred_resume_work();
+                            app.cancel_deferred_resume_work(
+                                "cancelled — held for the session that failed to load:",
+                            );
                             app.pending_resume = None;
                             app.dirty = true;
                         }

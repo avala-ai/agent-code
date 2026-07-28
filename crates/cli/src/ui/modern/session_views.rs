@@ -127,6 +127,23 @@ impl SessionViews {
         self.views.is_empty()
     }
 
+    /// Sessions with a remembered view, i.e. ones visited in this
+    /// process. Used by the picker to mark rows the user can return to
+    /// without a rebuild.
+    pub fn visited(&self) -> impl Iterator<Item = &str> {
+        self.views.keys().map(String::as_str)
+    }
+
+    /// Whether a cached view exists for `session_id`.
+    ///
+    /// Read live by the roster rather than snapshotted when the picker
+    /// opens: a restore completing behind an open picker stashes the
+    /// departing session and may consume the destination's view, so any
+    /// copy taken at open time is already wrong by the time it is drawn.
+    pub fn is_visited(&self, session_id: &str) -> bool {
+        self.views.contains_key(session_id)
+    }
+
     /// Drop a session's view — used when its conversation is cleared, so
     /// a later switch does not restore a transcript the user deleted.
     pub fn forget(&mut self, session_id: &str) {
