@@ -535,6 +535,14 @@ impl QueryEngine {
         self.state.config.permissions.allowed_tools = cfg.permissions.allowed_tools;
         self.state.config.permissions.disallowed_tools = cfg.permissions.disallowed_tools;
         self.state.config.hooks = cfg.hooks;
+        // Feature flags are read from `state.config` on the turn that
+        // uses them, not captured at startup, so leaving the departing
+        // project's values here means the destination's own settings are
+        // simply ignored. `extract_memories` is the one that matters
+        // most: a project that turns it off would still have its
+        // conversation mined after a resume, writing into *its* memory
+        // directory under a policy it never set.
+        self.state.config.features = cfg.features;
         // The prompt describes the servers from config, so dropping the
         // proxies without this told the model to call tools that no
         // longer exist. The destination's own list takes its place —
@@ -3546,6 +3554,41 @@ mod tests {
             });
             Ok(rx)
         }
+    }
+
+    /// Everything project-scoped has to move together. Feature flags
+    /// are read from `state.config` on the turn that uses them rather
+    /// than captured at startup, so a destination that turns one off is
+    /// simply ignored unless adoption copies them.
+    ///
+    /// `extract_memories` is the one with teeth: a project that disables
+    /// it would still have its conversation mined after a resume, and
+    /// the extraction writes into *that* project's memory directory
+    /// under a policy it never set.
+    #[test]
+    fn adopting_a_project_takes_its_feature_flags() {
+        use crate::config::Config;
+
+        let mut engine = build_engine(Arc::new(CompletingProvider));
+        // The project being left mines memories and caches prompts.
+        engine.state.config.features.extract_memories = true;
+        engine.state.config.features.prompt_caching = true;
+
+        // The destination turns both off.
+        let mut destination = Config::default();
+        destination.features.extract_memories = false;
+        destination.features.prompt_caching = false;
+
+        engine.adopt_project(std::path::Path::new("/tmp"), destination, false);
+
+        assert!(
+            !engine.state.config.features.extract_memories,
+            "the destination's conversation would be mined under the departing project's policy"
+        );
+        assert!(
+            !engine.state.config.features.prompt_caching,
+            "the destination's feature settings were ignored after the move"
+        );
     }
 
     fn build_engine(llm: Arc<dyn Provider>) -> QueryEngine {
