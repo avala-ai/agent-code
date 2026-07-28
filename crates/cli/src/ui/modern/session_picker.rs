@@ -113,9 +113,17 @@ pub fn summary_line(s: &SessionSummary) -> String {
     let short_id = short_id(&s.id);
     let turns = s.turn_count;
     let plural = if turns == 1 { "" } else { "s" };
+    // Every dynamic field is escaped: a label, a directory name or an
+    // imported session id can carry a bidi override or a zero-width
+    // character, and this row is the thing a user reads before pressing
+    // Enter — which changes directory and runs lifecycle hooks. One row
+    // impersonating another is the whole attack.
+    let escape = crate::ui::text_safety::escape_deceptive;
     format!(
-        "{short_id}  {label}  ·  {turns} turn{plural}  ·  {}",
-        s.updated_at
+        "{}  {}  ·  {turns} turn{plural}  ·  {}",
+        escape(&short_id),
+        escape(&label),
+        escape(&s.updated_at)
     )
 }
 
@@ -2116,6 +2124,31 @@ work",
             app.encode_abandoned,
             "the encode must be invalidated too, or its result re-arms a \
              prompt the user was told was not sent"
+        );
+    }
+
+    /// A row is what the user reads before pressing Enter — which changes
+    /// directory and runs lifecycle hooks. A label or id carrying a bidi
+    /// override or zero-width character could make one session look like
+    /// another, so every dynamic field is escaped.
+    #[test]
+    fn picker_rows_escape_deceptive_text() {
+        let mut s = summary("aaa11111-2222", Some("safe\u{202e}gnp.exe"), "/a");
+        s.updated_at = "2026-07-27\u{200b}T10:00:00Z".into();
+
+        let row = summary_line(&s);
+
+        assert!(
+            !row.contains('\u{202e}'),
+            "a bidi override reached the row: {row:?}"
+        );
+        assert!(
+            !row.contains('\u{200b}'),
+            "a zero-width character reached the row: {row:?}"
+        );
+        assert!(
+            row.contains("<U+202E>"),
+            "the override should be shown, not dropped: {row:?}"
         );
     }
 }

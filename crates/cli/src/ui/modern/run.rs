@@ -35,10 +35,18 @@ const SESSION_PICKER_LIMIT: usize = 50;
 /// A session read from disk plus the transcript rebuilt from it: the id
 /// that was asked for, the restored data, and the display items. Produced
 /// on a blocking thread, applied by the event loop.
+/// A loaded session, plus the destination project's policy when the
+/// resume changes directory.
+///
+/// The policy is read in the same blocking task as the transcript, not
+/// awaited from the loop: awaiting a `spawn_blocking` handle moves the
+/// work off a worker but still suspends the single future that drives
+/// redraws and Ctrl+C, so the freeze it was meant to fix remained.
 type LoadedSession = (
     String,
     agent_code_lib::services::session::SessionData,
     Vec<super::app::TranscriptItem>,
+    Option<Result<agent_code_lib::config::Config, String>>,
 );
 
 use agent_code_lib::config::PermissionMode;
@@ -53,7 +61,273 @@ use super::sink::{ChannelSink, EngineEvent, ModernPrompter, ModernQuestionAsker}
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Run the modern full-screen TUI until the user quits.
-pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
+/// Whether the connected MCP proxies must be dropped when moving into a
+/// project whose configuration is `after`.
+///
+/// Two independent reasons, either of which is enough:
+///
+/// * The destination asks for different servers, so the connections in
+///   hand are not the ones it wants.
+/// * Any connected server is **stdio**. Those are spawned without
+///   `current_dir`, so the subprocess inherited the directory the process
+///   was in when it started, and a bare command or relative argument
+///   resolved there. After a move the connection is still rooted in the
+///   project being left, however identical the two config files look —
+///   which is exactly the case a textual comparison calls "the same".
+///
+/// Fail-closed when either side will not serialize: dropping costs a
+/// restart to reconnect, keeping the wrong ones leaves another project's
+/// servers reachable by the model.
+fn mcp_needs_reconnect(
+    before: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+    after: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+    after_policy: &agent_code_lib::config::SecurityConfig,
+) -> bool {
+    // A destination can define the same servers and still forbid them.
+    // Copying its `security` into state does not stop a connected proxy
+    // being dispatched — nothing consults these lists at call time — so
+    // a server this project excludes has to lose its connection here or
+    // it stays callable.
+    let excluded = |name: &String| {
+        let denied = after_policy.mcp_server_denylist.iter().any(|d| d == name);
+        let not_allowed = !after_policy.mcp_server_allowlist.is_empty()
+            && !after_policy.mcp_server_allowlist.iter().any(|a| a == name);
+        denied || not_allowed
+    };
+    if before.keys().any(excluded) {
+        return true;
+    }
+    // `command` is what makes an entry stdio; a `url` server is reached
+    // over the network and does not care where we stand.
+    if before.values().any(|e| e.command.is_some()) {
+        return true;
+    }
+    match (mcp_fingerprint(before), mcp_fingerprint(after)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
+/// A stable string for a set of MCP server entries, for deciding whether
+/// the destination project asks for the same servers as the one being
+/// left. Ordered so map iteration order cannot change the answer.
+fn mcp_fingerprint(
+    servers: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+) -> Option<String> {
+    let ordered: std::collections::BTreeMap<_, _> = servers.iter().collect();
+    serde_json::to_value(&ordered)
+        .ok()
+        .map(|v| canonical_json(&v))
+}
+
+/// Render JSON with every object key sorted, at every depth.
+///
+/// Sorting only the outer map was not enough: an entry's `env` is its own
+/// `HashMap` and serializes in iteration order, so two loads of identical
+/// settings could fingerprint differently and disconnect working proxies
+/// that then need a restart to come back. Depth matters, not just the
+/// top level — and this stays correct whichever map type `serde_json` is
+/// built with.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, &serde_json::Value> =
+                map.iter().collect();
+            let body: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String(k.clone()),
+                        canonical_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The project root that owns the settings `load_policy_from` will read
+/// from `dir`.
+///
+/// Derived from the settings *file* the loader finds, not from the
+/// nearest `.agent` directory: a subdirectory can hold an `.agent` with
+/// only skills in it, and stopping there scoped grants and the canonical
+/// team-memory check to a directory whose policy was never adopted.
+/// Using the same discovery call the loader uses makes the two agree by
+/// construction rather than by coincidence.
+///
+/// `None` when no project settings file governs `dir` — the caller then
+/// falls back to git/marker detection.
+fn policy_root_from_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // `<root>/.agent/settings.toml` → `<root>`.
+    let settings = agent_code_lib::config::find_project_config_from(dir)?;
+    let agent_dir = settings.parent()?;
+    agent_dir.parent().map(std::path::Path::to_path_buf)
+}
+
+/// Drive `work` to completion while the TUI keeps painting.
+///
+/// Awaiting a hook directly parks the sole event-loop future, so the
+/// screen stops repainting and raw-mode Ctrl+C never reaches the code
+/// that would act on it — the same freeze whichever hook it is. Terminal
+/// events that arrive meanwhile are buffered and replayed on exactly the
+/// path live events take.
+///
+/// Returns `true` if the user pressed the cancel chord while waiting.
+/// Acting on that is the caller's decision: what a cancel *means* differs
+/// between tearing the old session down and finishing the new one.
+async fn drive_while_painting<F>(
+    app: &mut App,
+    term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
+    draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
+    buffered: &mut std::collections::VecDeque<Event>,
+    work: F,
+) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(work);
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            () = &mut work => break,
+            maybe_ev = term_events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(key))) if is_cancel_chord(&key) => {
+                        cancelled = true;
+                        app.dirty = true;
+                    }
+                    Some(Ok(ev)) => buffered.push_back(ev),
+                    Some(Err(_)) | None => break,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(80)) => {
+                app.dirty = true;
+            }
+        }
+        if app.dirty {
+            let _ = draw(app);
+            app.dirty = false;
+        }
+    }
+    cancelled
+}
+
+/// The next terminal event, taking anything buffered during work the
+/// loop could not interrupt before reading the stream again.
+///
+/// Keeps replayed input on exactly the same path as live input, so the
+/// handling never diverges between the two.
+async fn next_terminal_event(
+    buffered: &mut std::collections::VecDeque<Event>,
+    stream: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
+) -> Option<std::io::Result<Event>> {
+    if let Some(ev) = buffered.pop_front() {
+        return Some(Ok(ev));
+    }
+    stream.next().await
+}
+
+/// Whether moving from `current` to `candidate` relaxes the default.
+///
+/// Only used to decide what a project that forbids bypassing will accept
+/// from the command line: a stricter default is always allowed through,
+/// a more permissive one is refused. `Deny` is the strictest, then `Ask`,
+/// then the edit-accepting modes, then `Allow`.
+fn loosens(
+    candidate: agent_code_lib::config::PermissionMode,
+    current: agent_code_lib::config::PermissionMode,
+) -> bool {
+    use agent_code_lib::config::PermissionMode as M;
+    fn rank(m: M) -> u8 {
+        match m {
+            M::Deny => 0,
+            // Plan blocks writes, so it sits with the asking modes.
+            M::Plan => 1,
+            M::Ask => 2,
+            M::AcceptEdits => 3,
+            M::Auto => 4,
+            M::Allow => 5,
+        }
+    }
+    rank(candidate) > rank(current)
+}
+
+/// The permission policy the *operator* set on the command line.
+///
+/// Applied at startup on top of the file and environment layers. A
+/// cross-project resume reloads those layers from the destination, so
+/// without reapplying this on top, a project whose own config says
+/// `allow` silently discards `--permission-mode deny` or a deny-rule
+/// overlay. The CLI layer belongs to the process, not to a directory.
+#[derive(Clone, Default)]
+pub struct CliPermissionOverride {
+    /// From `--permission-mode` / `--dangerously-skip-permissions`.
+    pub default_mode: Option<agent_code_lib::config::PermissionMode>,
+    /// The `[permissions]` section of `--permissions-overlay`.
+    pub overlay: Option<agent_code_lib::config::PermissionsConfig>,
+    /// From `--no-sandbox`. Every turn builds its executor from
+    /// `state.config`, so a project reload that restored the file value
+    /// silently re-enabled the sandbox the operator turned off.
+    pub no_sandbox: bool,
+}
+
+impl CliPermissionOverride {
+    /// Re-apply in the same order startup does: the mode first, then the
+    /// overlay composed on top, so a deny rule in the overlay still wins.
+    fn apply(&self, cfg: &mut agent_code_lib::config::Config) {
+        // The destination's lock decides, and it decides *first*. A
+        // project that sets `disable_bypass_permissions` cannot be
+        // loosened by anything the process started with — neither a
+        // permissive overlay nor an `Allow` carried from
+        // `--dangerously-skip-permissions`. Checking after the mode had
+        // been assigned blocked only half of it.
+        //
+        // Deliberately stricter than startup, which applies that flag
+        // before any project's lock has been read. Carrying a bypass
+        // *into* a project that forbids it is the case this path creates,
+        // and refusing it is the only answer that keeps the lock
+        // meaningful.
+        // A locked destination refuses overrides that *loosen* it. It is
+        // not a reason to drop restrictive ones: returning early here
+        // discarded `--permission-mode deny` too, which left the
+        // destination's own `allow` live — the lock making the session
+        // more permissive than the operator asked for is the opposite of
+        // what it is for.
+        let locked = cfg.security.disable_bypass_permissions;
+        if self.no_sandbox && !locked {
+            cfg.sandbox.enabled = false;
+        }
+        if let Some(mode) = self.default_mode
+            && !(locked && loosens(mode, cfg.permissions.default_mode))
+        {
+            cfg.permissions.default_mode = mode;
+        }
+        // The overlay can rewrite the whole rule set, so a locked project
+        // refuses it wholesale — the same call startup makes.
+        if locked {
+            return;
+        }
+        if let Some(overlay) = &self.overlay {
+            cfg.permissions = agent_code_lib::services::coordinator::compose_permissions_overlay(
+                &cfg.permissions,
+                overlay,
+            );
+        }
+    }
+}
+
+pub async fn run_modern_tui(
+    mut engine: QueryEngine,
+    cli_permissions: CliPermissionOverride,
+) -> anyhow::Result<()> {
     let model = engine.state().config.api.model.clone();
     let cwd = engine.state().cwd.clone();
     let session_id = engine.state().session_id.clone();
@@ -123,6 +397,7 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
         eng_tx,
         eng_rx,
         base_permission_mode,
+        &cli_permissions,
         &notifier,
         &mut term_events,
         &mut draw,
@@ -150,25 +425,31 @@ pub async fn run_modern_tui(mut engine: QueryEngine) -> anyhow::Result<()> {
 
 /// Read the destination project's config without committing to it.
 ///
-/// `Config::load` layers from the *process* working directory, and this
-/// has to answer "would this project's settings parse" before anything
-/// moves — a destination whose settings are broken must fail the resume
-/// while refusing is still free, not after the session has been adopted.
-/// So the directory is entered briefly and left again.
+/// Answers "would this project's settings parse" before anything moves —
+/// a destination whose settings are broken must fail the resume while
+/// refusing is still free, not after the session has been adopted.
 ///
-/// Safe at this one call site and nowhere else: the restore only runs
-/// with no turn in flight, so nothing is resolving a relative path
-/// underneath it. A `Config::load_from(&Path)` in the library would make
-/// that structural rather than situational; this is the smaller change.
-fn load_project_config(dir: &str) -> Result<agent_code_lib::config::Config, String> {
-    let previous = std::env::current_dir().map_err(|e| e.to_string())?;
-    std::env::set_current_dir(dir).map_err(|e| e.to_string())?;
-    let loaded = agent_code_lib::config::Config::load().map_err(|e| e.to_string());
-    // Restore before reporting either way: leaving the process in the
-    // destination after refusing the resume is the exact mismatch this
-    // whole path exists to avoid.
-    std::env::set_current_dir(&previous).map_err(|e| e.to_string())?;
-    loaded
+/// Reads the layers *from* the directory rather than entering it. The
+/// previous version chdir-ed in and back, which mutates global state for
+/// every thread and, if the return trip failed, left the process inside
+/// the destination while the caller believed the resume had been safely
+/// refused — source hooks would then run in the destination project.
+fn load_project_config(
+    dir: &str,
+    cli_permissions: &CliPermissionOverride,
+) -> Result<agent_code_lib::config::Config, String> {
+    // Policy only: this may still refuse the resume, and resolving the
+    // key would run the destination's `api_key_helper` through `bash -c`
+    // — a command from a project the session may never enter, executed on
+    // the event-loop thread, blocking redraws and Ctrl+C while it runs.
+    let mut cfg = agent_code_lib::config::Config::load_policy_from(std::path::Path::new(dir))
+        .map_err(|e| e.to_string())?;
+    // The command line is a layer above the files, and it belongs to the
+    // process rather than to any directory. Reloading only the file and
+    // environment layers would let a destination whose own config says
+    // `allow` discard the operator's `--permission-mode deny`.
+    cli_permissions.apply(&mut cfg);
+    Ok(cfg)
 }
 
 /// Whether a restored session's directory can be entered, without
@@ -210,7 +491,6 @@ async fn finish_cwd_adoption(
     app: &mut App,
     eng: &mut agent_code_lib::query::QueryEngine,
     dir: &std::path::Path,
-    previous_cwd: &str,
     cfg: agent_code_lib::config::Config,
 ) {
     let cwd = dir.display().to_string();
@@ -220,13 +500,52 @@ async fn finish_cwd_adoption(
     // rules, tool visibility, sandbox and bypass policy, hooks — from the
     // config the caller read before any of this began. Moving a subset
     // left part of the policy answering for the project we left.
-    eng.adopt_project(dir, cfg.clone());
+    // The *project root*, not the directory the session was saved in. A
+    // session saved in `/repo/crate` belongs to the project at `/repo`,
+    // and scoping grants and the canonical team-memory check to the
+    // subdirectory leaves `/repo/.agent/team-memory` outside the root —
+    // unprotected exactly where a resume crossed into it.
+    let project_root = match policy_root_from_config(dir) {
+        Some(root) => root,
+        None => agent_code_lib::services::session_env::project_root_for(dir).await,
+    };
+    // Keep the connected servers only when the destination asks for the
+    // *same* ones. The project root is the wrong question: config
+    // discovery walks up from the session directory and takes the nearest
+    // `.agent/settings.toml`, so two directories in one repository can
+    // resolve different MCP configuration while sharing a git root — and
+    // comparing roots left the source's proxies live and callable.
+    //
+    // Compared by canonical serialization because the entries have no
+    // `PartialEq`, and fail-closed if either side will not serialize:
+    // dropping proxies costs a restart to get them back, keeping the
+    // wrong ones leaves another project's servers reachable.
+    let drop_mcp = mcp_needs_reconnect(
+        &eng.state().config.mcp_servers,
+        &cfg.mcp_servers,
+        &cfg.security,
+    );
+    let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
+    // Keyed on whether this project's servers are connected, not on how
+    // many were removed: a destination that *introduces* MCP servers drops
+    // nothing and still has none connected, and suppressing the notice
+    // there left the user wondering why its tools were missing.
+    if drop_mcp {
+        let lost = if dropped_mcp > 0 {
+            format!("{dropped_mcp} MCP tool(s) from the previous project are no longer available")
+        } else {
+            "this project's MCP servers are not connected".to_string()
+        };
+        app.transcript
+            .push(super::app::TranscriptItem::System(format!(
+                "{lost} — restart in this directory to connect its own MCP servers"
+            )));
+    }
     // The TUI keeps its own copy of one policy bit, consulted on every
     // submit: left at the value the process started with, a project that
     // forbids shell-executing skills inherits one that allows it.
     app.disable_skill_shell = cfg.security.disable_skill_shell_execution;
     app.cwd = cwd;
-    let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
 
 fn probe_caps() -> TerminalCaps {
@@ -402,13 +721,19 @@ pub(super) async fn event_loop(
     app: &mut App,
     eng_tx: mpsc::UnboundedSender<EngineEvent>,
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
-    base_permission_mode: PermissionMode,
+    mut base_permission_mode: PermissionMode,
+    cli_permissions: &CliPermissionOverride,
     notifier: &NotifierService,
     term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut turn: Option<TurnHandle> = None;
     let mut loop_err: Option<anyhow::Error> = None;
+    // Terminal events that arrived while the loop was busy with work it
+    // could not interrupt (session teardown). Replayed through the same
+    // path as live events, so a slow hook delays input instead of
+    // swallowing it.
+    let mut pending_events: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
 
     // Spinner animation (~12 fps) and coalescer flush deadline (~10 fps).
     // Both are only *polled* while a turn is live / text is buffered, so an
@@ -580,7 +905,7 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(loaded) = pending_restore.take()
         {
-            let (id, data, items) = *loaded;
+            let (id, data, items, loaded_cfg) = *loaded;
             // Superseded by a newer selection made while this one was
             // still loading: drop it, the load arm fetches the new one.
             if app.pending_resume.as_deref() == Some(id.as_str()) {
@@ -606,24 +931,26 @@ pub(super) async fn event_loop(
                         // entered and settings that will not parse are
                         // both reasons to refuse the resume while
                         // refusing is still free.
-                        let destination_cfg = if data.cwd.is_empty() || data.cwd == previous_cwd {
-                            None
-                        } else {
-                            match load_project_config(&data.cwd) {
-                                Ok(cfg) => Some(cfg),
-                                Err(e) => {
-                                    app.status_message.clear();
-                                    app.transcript.push(super::app::TranscriptItem::Error(
-                                        format!(
-                                            "could not resume {id}: its project settings could \
+                        // Already read, in the same blocking task as the
+                        // transcript — nothing here touches the
+                        // filesystem, so the loop was never suspended
+                        // waiting for it.
+                        let destination_cfg = match loaded_cfg {
+                            None => None,
+                            Some(Ok(cfg)) => Some(cfg),
+                            Some(Err(e)) => {
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::Error(format!(
+                                        "could not resume {id}: its project settings could \
                                              not be read ({e}) — staying in {previous_cwd}"
-                                        ),
-                                    ));
-                                    app.cancel_deferred_resume_work("cancelled — held for a session whose settings could not be read:");
-                                    app.pending_resume = None;
-                                    app.dirty = true;
-                                    continue;
-                                }
+                                    )));
+                                app.cancel_deferred_resume_work(
+                                    "cancelled — held for a session whose settings could not be read:",
+                                );
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
                             }
                         };
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
@@ -655,16 +982,132 @@ pub(super) async fn event_loop(
                         // and no lifecycle at all for the restored session.
                         {
                             let engine_arc = session.engine();
+                            // Teardown runs as its own task and the loop
+                            // keeps painting while it does. Awaiting the
+                            // hooks here suspended the single future that
+                            // drives redraws and input, so a slow
+                            // `SessionStop` hook froze the TUI — including
+                            // the Ctrl+C that would have escaped it — for
+                            // up to the hook timeout.
+                            //
+                            // Keys that arrive meanwhile are buffered, not
+                            // dropped: the loop replays them from
+                            // `pending_events` as soon as it is free, so
+                            // the only cost of a slow hook is that input
+                            // lands late rather than vanishing.
+                            // The token the hooks will run under, taken
+                            // before the task starts so the loop can
+                            // cancel it. Buffering Ctrl+C here would make
+                            // the chord arrive *after* the restore it was
+                            // meant to stop, where it would arm quit or
+                            // act on the session the user never chose.
+                            let (teardown_tx, teardown_rx) = tokio::sync::oneshot::channel();
+                            let quiesce = tokio::spawn(async move {
+                                let mut eng = engine_arc.lock().await;
+                                // A cancelled turn leaves `cancel`
+                                // cancelled until the next `begin_turn`,
+                                // and `run_hooks` refuses a cancelled
+                                // scope — so resuming after a cancel would
+                                // have dropped both lifecycle events,
+                                // which is precisely when a teardown hook
+                                // matters most. No turn is in flight here,
+                                // so renewing is safe.
+                                eng.renew_cancel_scope();
+                                // Hand the scope out before running
+                                // anything under it.
+                                let _ = teardown_tx.send(eng.cancel_token());
+                                let _ = eng.fire_session_stop_hooks().await;
+                            });
+                            tokio::pin!(quiesce);
+                            let teardown_scope = teardown_rx.await.ok();
+                            let mut teardown_cancelled = false;
+                            loop {
+                                tokio::select! {
+                                    done = &mut quiesce => {
+                                        if let Err(e) = done {
+                                            tracing::warn!("session teardown task failed: {e}");
+                                        }
+                                        break;
+                                    }
+                                    maybe_ev = term_events.next() => {
+                                        match maybe_ev {
+                                            Some(Ok(Event::Key(key))) if is_cancel_chord(&key) => {
+                                                // Acted on now, not queued:
+                                                // this is the escape from a
+                                                // hook that will not finish.
+                                                teardown_cancelled = true;
+                                                if let Some(scope) = &teardown_scope {
+                                                    scope.cancel();
+                                                }
+                                                app.status_message =
+                                                    "cancelling resume…".to_string();
+                                                app.dirty = true;
+                                            }
+                                            Some(Ok(ev)) => pending_events.push_back(ev),
+                                            Some(Err(_)) | None => break,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(
+                                        std::time::Duration::from_millis(80),
+                                    ) => {
+                                        app.dirty = true;
+                                    }
+                                }
+                                if app.dirty {
+                                    let _ = draw(app);
+                                    app.dirty = false;
+                                }
+                            }
+                            if teardown_cancelled {
+                                // The user asked to stop while the old
+                                // session was being torn down. Its hooks
+                                // did not all run, so continuing would
+                                // adopt the destination on top of a
+                                // half-quiesced session — and it is not
+                                // what was asked for. Nothing has moved
+                                // yet, so refusing is still clean.
+                                app.status_message.clear();
+                                app.transcript
+                                    .push(super::app::TranscriptItem::System(format!(
+                                        "resume of {id} cancelled — staying here"
+                                    )));
+                                let engine_arc = session.engine();
+                                // Painted through like the rest: the user
+                                // has just pressed Ctrl+C, and freezing on
+                                // the frame that acknowledges it is the
+                                // worst moment to stop redrawing. A second
+                                // cancel here changes nothing — the resume
+                                // is already being refused.
+                                let _ = drive_while_painting(
+                                    app,
+                                    term_events,
+                                    draw,
+                                    &mut pending_events,
+                                    async {
+                                        let mut eng = engine_arc.lock().await;
+                                        // The scope Ctrl+C just cancelled
+                                        // is the one these would run
+                                        // under, so without a fresh one
+                                        // `run_hooks` rejects every
+                                        // compensating start before it
+                                        // begins — leaving whatever an
+                                        // already-completed SessionStop
+                                        // tore down still down, for a
+                                        // session the user is keeping.
+                                        eng.renew_cancel_scope();
+                                        let _ = eng.fire_session_start_hooks().await;
+                                    },
+                                )
+                                .await;
+                                app.cancel_deferred_resume_work(
+                                    "cancelled — held for a resume that could not be applied:",
+                                );
+                                app.pending_resume = None;
+                                app.dirty = true;
+                                continue;
+                            }
+                            let engine_arc = session.engine();
                             let mut eng = engine_arc.lock().await;
-                            // A cancelled turn leaves `cancel` cancelled
-                            // until the next `begin_turn`, and `run_hooks`
-                            // refuses a cancelled scope — so resuming
-                            // after a cancel would have dropped both
-                            // lifecycle events, which is precisely when a
-                            // teardown hook matters most. No turn is in
-                            // flight here, so renewing is safe.
-                            eng.renew_cancel_scope();
-                            let _ = eng.fire_session_stop_hooks().await;
                             // Also here, and for the same reason: this
                             // tears down the departing session — grants,
                             // `/add-dir` paths, the prompt cache, the
@@ -701,17 +1144,41 @@ pub(super) async fn event_loop(
                                  ({e}) — staying in {previous_cwd}",
                                     data.cwd
                                 )));
-                            // The session being kept has already been
-                            // told it stopped. Start it again so the
-                            // lifecycle stays paired: without this its
-                            // watchers and cleanup hooks stay torn down
-                            // for a session that goes on being used, and
-                            // the eventual exit emits a second stop with
-                            // no start between them.
+                            // The working set was announced as dropped
+                            // before the move, so every watcher has been
+                            // told to stop tracking directories this
+                            // session still uses. Announce them back.
+                            // Both painted through, like every other hook
+                            // on this path: these run user shell commands,
+                            // and a slow one here froze the UI on the very
+                            // screen that is reporting a failure. The
+                            // session is being kept either way, so a
+                            // cancel is honoured afterwards.
+                            let engine_arc = session.engine();
+                            if drive_while_painting(
+                                app,
+                                term_events,
+                                draw,
+                                &mut pending_events,
+                                async {
+                                    let mut eng = engine_arc.lock().await;
+                                    // The working set was announced as
+                                    // dropped before the move, so every
+                                    // watcher was told to stop tracking
+                                    // directories this session still uses.
+                                    eng.notify_working_set_restored().await;
+                                    // And the kept session was told it
+                                    // stopped: start it again so the
+                                    // lifecycle stays paired, under a
+                                    // fresh scope in case a cancel during
+                                    // teardown left the old one cancelled.
+                                    eng.renew_cancel_scope();
+                                    let _ = eng.fire_session_start_hooks().await;
+                                },
+                            )
+                            .await
                             {
-                                let engine_arc = session.engine();
-                                let eng = engine_arc.lock().await;
-                                let _ = eng.fire_session_start_hooks().await;
+                                app.cancel_requested = true;
                             }
                             app.cancel_deferred_resume_work("cancelled — held for a session whose directory became unavailable:");
                             app.pending_resume = None;
@@ -808,6 +1275,17 @@ pub(super) async fn event_loop(
                         // permission-checker default has to move with the
                         // restored plan flag, or a resumed plan session
                         // answers permission checks as the old one did.
+                        // The destination's default decides unmatched tools
+                        // from here on, and it has to be in place *before*
+                        // the hint is derived: computing it from the old
+                        // base and updating afterwards left the live
+                        // checker on the previous project's default with
+                        // nothing to correct it later.
+                        if entered.is_some()
+                            && let Some(cfg) = destination_cfg.as_ref()
+                        {
+                            base_permission_mode = cfg.permissions.default_mode;
+                        }
                         let hint = mode.permission_hint().unwrap_or(base_permission_mode);
                         session.apply_live_mode(plan, hint);
                         eng.state_mut().config.permissions.default_mode = hint;
@@ -824,7 +1302,26 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
-                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
+                            finish_cwd_adoption(app, &mut eng, dir, cfg).await;
+                            // Fired here rather than inside, so the loop
+                            // can keep painting through a slow watcher
+                            // hook. A cancel during it is noted and
+                            // honoured after: the move has already
+                            // happened, so there is nothing to refuse.
+                            if drive_while_painting(
+                                app,
+                                term_events,
+                                draw,
+                                &mut pending_events,
+                                async {
+                                    let _ =
+                                        eng.fire_cwd_changed_hooks(&previous_cwd, "resume").await;
+                                },
+                            )
+                            .await
+                            {
+                                app.cancel_requested = true;
+                            }
                         }
                         app.pending_resume = None;
                         drop(eng);
@@ -833,9 +1330,24 @@ pub(super) async fn event_loop(
                         // SessionStop above, a resume reads as one session
                         // ending and another beginning — which is what
                         // per-session setup (watchers, audit) keys off.
+                        // Painted through for the same reason the teardown
+                        // is: a slow setup hook here froze the restored
+                        // session's first frame and its Ctrl+C with it.
+                        // A cancel is honoured after — the session is
+                        // already installed, so there is nothing to undo.
+                        if drive_while_painting(
+                            app,
+                            term_events,
+                            draw,
+                            &mut pending_events,
+                            async {
+                                let eng = engine_arc.lock().await;
+                                let _ = eng.fire_session_start_hooks().await;
+                            },
+                        )
+                        .await
                         {
-                            let eng = engine_arc.lock().await;
-                            let _ = eng.fire_session_start_hooks().await;
+                            app.cancel_requested = true;
                         }
                         // Restart the loop so the handlers *above* this one
                         // get their turn now that the resume gate is open.
@@ -847,7 +1359,7 @@ pub(super) async fn event_loop(
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
-                    Err(_) => pending_restore = Some(Box::new((id, data, items))),
+                    Err(_) => pending_restore = Some(Box::new((id, data, items, loaded_cfg))),
                 }
             }
         }
@@ -1314,8 +1826,33 @@ pub(super) async fn event_loop(
 
         tokio::select! {
             // Terminal input.
-            maybe_ev = term_events.next() => {
+            maybe_ev = next_terminal_event(&mut pending_events, term_events) => {
                 match maybe_ev {
+                    Some(Ok(Event::Key(key))) if is_cancel_chord(&key)
+                        && app.pending_resume.is_some() =>
+                    {
+                        // A resume whose session or policy is still being
+                        // read off a slow mount. Nothing is applied until
+                        // it lands, and the apply is gated on
+                        // `pending_resume` still naming it — so clearing
+                        // that *is* the cancellation: the read finishes
+                        // into a result nobody wants and is dropped.
+                        //
+                        // Without this the app is `Idle` while the load is
+                        // outstanding, so Ctrl+C only armed quit, and the
+                        // session the user had decided against was
+                        // restored whenever the filesystem got round to
+                        // it. Their only escape was leaving the TUI.
+                        let id = app.pending_resume.take().unwrap_or_default();
+                        app.cancel_deferred_resume_work(
+                            "cancelled — held for the resume you cancelled:",
+                        );
+                        app.status_message.clear();
+                        app.transcript.push(super::app::TranscriptItem::System(format!(
+                            "resume of {id} cancelled — staying here"
+                        )));
+                        app.dirty = true;
+                    }
                     Some(Ok(Event::Key(key))) => {
                         // Disarm a stale quit before routing the key so a late
                         // second Ctrl+C re-arms instead of quitting.
@@ -1434,6 +1971,8 @@ pub(super) async fn event_loop(
                     // Read the display setting here: the blocking task
                     // cannot touch `app`.
                     let show_thinking = app.show_thinking_blocks;
+                    let here = app.cwd.clone();
+                    let cli_for_cfg = cli_permissions.clone();
                     tokio::task::spawn_blocking(move || {
                         let loaded = agent_code_lib::services::session::load_session(&id)
                             .map(|data| {
@@ -1441,7 +1980,15 @@ pub(super) async fn event_loop(
                                     &data.messages,
                                     show_thinking,
                                 );
-                                Box::new((id.clone(), data, items))
+                                // Same task, same thread: the destination's
+                                // policy is filesystem work too, and the
+                                // loop must not wait on it either.
+                                let cfg = if data.cwd.is_empty() || data.cwd == here {
+                                    None
+                                } else {
+                                    Some(load_project_config(&data.cwd, &cli_for_cfg))
+                                };
+                                Box::new((id.clone(), data, items, cfg))
                             });
                         let _ = tx.send((id, loaded));
                     });
@@ -1449,9 +1996,11 @@ pub(super) async fn event_loop(
             }
             Some((id, loaded)) = resume_rx.recv() => {
                 resume_loading = false;
-                // A second `/resume` while this one was loading wins; drop
-                // the stale result rather than restoring a session the
-                // user has already moved on from.
+                // Dropped unless `pending_resume` still names this one.
+                // Two things clear it: a second `/resume` supersedes the
+                // first, and Ctrl+C cancels it outright — restoring a
+                // session the user has moved on from, or decided against,
+                // is the same mistake either way.
                 if app.pending_resume.as_deref() == Some(id.as_str()) {
                     match loaded {
                         Ok(l) => pending_restore = Some(l),
@@ -4300,6 +4849,32 @@ mod tests {
         );
     }
 
+    /// A resume waiting on a slow filesystem is abandoned by Ctrl+C.
+    ///
+    /// Nothing is applied until the read lands, and both apply sites are
+    /// gated on `pending_resume` still naming it — so clearing that *is*
+    /// the cancellation. Without it the app sits `Idle` while the load is
+    /// outstanding, so Ctrl+C only armed quit and the session arrived
+    /// whenever the filesystem got round to it.
+    #[test]
+    fn a_pending_resume_is_dropped_once_cancelled() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("other-session".into());
+
+        // What the cancel path does.
+        let id = app.pending_resume.take().unwrap_or_default();
+        app.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
+
+        assert_eq!(id, "other-session");
+        assert!(app.pending_resume.is_none(), "the gate still names it");
+        // The apply sites ask exactly this question before restoring.
+        assert_ne!(
+            app.pending_resume.as_deref(),
+            Some("other-session"),
+            "a load landing now would still be applied"
+        );
+    }
+
     /// The saved directory is a *precondition* of the restore. If it
     /// cannot be entered the resume must be refused outright — adopting
     /// the conversation anyway would leave a project-A session running
@@ -4329,6 +4904,424 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "already being there should be a no-op, not a move"
+        );
+    }
+
+    /// The command line is a layer above the files and belongs to the
+    /// process, not to a directory. A cross-project resume reloads the
+    /// file layers from the destination, so without reapplying it a
+    /// project whose own config says `allow` silently discards the
+    /// operator's `--permission-mode deny`.
+    #[test]
+    fn the_operators_command_line_survives_a_project_reload() {
+        let _guard = crate::ui::test_locks::env();
+        use agent_code_lib::config::{PermissionMode, PermissionRule};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"allow\"\n",
+        )
+        .unwrap();
+
+        // Without the operator's layer, the destination decides.
+        let plain = load_project_config(
+            &dir.path().display().to_string(),
+            &CliPermissionOverride::default(),
+        )
+        .expect("settings parse");
+        assert_eq!(plain.permissions.default_mode, PermissionMode::Allow);
+
+        // Mode-only: the operator's default must outlive the reload.
+        let deny_mode = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            ..Default::default()
+        };
+        let guarded = load_project_config(&dir.path().display().to_string(), &deny_mode)
+            .expect("settings parse");
+        assert_eq!(
+            guarded.permissions.default_mode,
+            PermissionMode::Deny,
+            "the destination project overrode --permission-mode deny"
+        );
+
+        // With an overlay, startup composes it *over* the mode, so the
+        // overlay's own default governs — mirrored here deliberately
+        // rather than improved, so the resumed session and a freshly
+        // started one answer identically.
+        let with_overlay = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            no_sandbox: false,
+            overlay: Some(agent_code_lib::config::PermissionsConfig {
+                default_mode: PermissionMode::Deny,
+                rules: vec![PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: Some("rm *".into()),
+                    action: PermissionMode::Deny,
+                }],
+                ..Default::default()
+            }),
+        };
+        let guarded = load_project_config(&dir.path().display().to_string(), &with_overlay)
+            .expect("settings parse");
+        assert_eq!(guarded.permissions.default_mode, PermissionMode::Deny);
+        assert!(
+            guarded
+                .permissions
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Deny),
+            "the operator's deny rule did not survive the reload"
+        );
+    }
+
+    /// A project that locks bypassing cannot be loosened by an overlay
+    /// the process happened to start with. Startup ignores the overlay
+    /// in such a project; resuming *into* one was a way around that gate.
+    #[test]
+    fn a_locked_destination_ignores_a_carried_overlay() {
+        let _guard = crate::ui::test_locks::env();
+        use agent_code_lib::config::{PermissionMode, PermissionRule};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"ask\"\n\n\
+             [security]\ndisable_bypass_permissions = true\n\n\
+             [sandbox]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let permissive = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: false,
+            overlay: Some(agent_code_lib::config::PermissionsConfig {
+                default_mode: PermissionMode::Allow,
+                rules: vec![PermissionRule {
+                    tool: "Bash".into(),
+                    pattern: None,
+                    action: PermissionMode::Allow,
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let cfg = load_project_config(&dir.path().display().to_string(), &permissive)
+            .expect("settings parse");
+        assert!(
+            cfg.security.disable_bypass_permissions,
+            "precondition: the destination's lock must have been read"
+        );
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Ask,
+            "a carried overlay loosened a project that forbids bypassing"
+        );
+        assert!(
+            !cfg.permissions
+                .rules
+                .iter()
+                .any(|r| r.tool == "Bash" && r.action == PermissionMode::Allow),
+            "the overlay's allow-all rule was applied in a locked project"
+        );
+
+        // The same lock also refuses a carried `Allow` — the mode is not
+        // a lesser bypass than the overlay, and checking it after the
+        // assignment blocked only half.
+        let skip_all = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Allow),
+            no_sandbox: true,
+            overlay: None,
+        };
+        let cfg = load_project_config(&dir.path().display().to_string(), &skip_all)
+            .expect("settings parse");
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Ask,
+            "--dangerously-skip-permissions was carried into a locked project"
+        );
+        assert!(
+            cfg.sandbox.enabled,
+            "--no-sandbox was carried into a locked project that enables the sandbox"
+        );
+    }
+
+    /// The preflight must not run the destination's `api_key_helper`: it
+    /// may still refuse the resume, and the helper is a shell command
+    /// executed on the event-loop thread.
+    #[test]
+    fn the_preflight_does_not_run_the_destination_key_helper() {
+        let _guard = crate::ui::test_locks::env();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let marker = dir.path().join("helper-ran");
+        std::fs::write(
+            agent.join("settings.toml"),
+            // A TOML *literal* string and forward slashes: a basic string
+            // processes backslash escapes, so a Windows temp path made
+            // the file unparseable (`\U...` reads as a unicode escape).
+            format!(
+                "[api]\napi_key_helper = 'touch {}'\n",
+                marker.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let _ = load_project_config(
+            &dir.path().display().to_string(),
+            &CliPermissionOverride::default(),
+        )
+        .expect("settings parse");
+
+        assert!(
+            !marker.exists(),
+            "the destination's key helper was executed during preflight"
+        );
+    }
+
+    /// A locked project refuses overrides that loosen it, but must keep
+    /// ones that tighten it. Returning early on the lock discarded
+    /// `--permission-mode deny` as well, leaving the destination's own
+    /// `allow` live — the lock making the session *more* permissive than
+    /// the operator asked for.
+    #[test]
+    fn a_locked_destination_keeps_a_stricter_command_line() {
+        use agent_code_lib::config::PermissionMode;
+
+        let _guard = crate::ui::test_locks::env();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"allow\"\n\n\
+             [security]\ndisable_bypass_permissions = true\n",
+        )
+        .unwrap();
+
+        let stricter = CliPermissionOverride {
+            default_mode: Some(PermissionMode::Deny),
+            ..Default::default()
+        };
+        let cfg = load_project_config(&dir.path().display().to_string(), &stricter)
+            .expect("settings parse");
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            PermissionMode::Deny,
+            "the lock discarded a restrictive command line and left the project's allow"
+        );
+    }
+
+    /// Two directories in one repository can resolve *different* MCP
+    /// configuration, because config discovery takes the nearest
+    /// `.agent/settings.toml` rather than the git root. Deciding by root
+    /// therefore left the source project's proxies live and callable.
+    #[test]
+    fn mcp_is_kept_only_when_the_destination_asks_for_the_same_servers() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let entry = |cmd: &str| {
+            serde_json::from_value::<McpServerEntry>(serde_json::json!({
+                "command": cmd,
+                "args": [],
+            }))
+            .expect("entry")
+        };
+
+        let mut a: HashMap<String, McpServerEntry> = HashMap::new();
+        a.insert("docs".into(), entry("docs-server"));
+        let mut same: HashMap<String, McpServerEntry> = HashMap::new();
+        same.insert("docs".into(), entry("docs-server"));
+        let mut different: HashMap<String, McpServerEntry> = HashMap::new();
+        different.insert("docs".into(), entry("other-server"));
+
+        assert_eq!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&same),
+            "identical configuration must compare equal, or a routine resume drops its servers"
+        );
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&different),
+            "a different server must compare unequal, or the old project's proxies stay callable"
+        );
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&HashMap::new()),
+            "a destination configuring no servers must not keep the source's"
+        );
+    }
+
+    /// A destination whose policy forbids nothing.
+    fn open_policy() -> agent_code_lib::config::SecurityConfig {
+        agent_code_lib::config::SecurityConfig::default()
+    }
+
+    /// A destination can define exactly the same servers and still forbid
+    /// them. Nothing consults these lists when a tool is dispatched, so a
+    /// proxy the destination excludes has to lose its connection here or
+    /// it stays callable in a project that says it must not be.
+    #[test]
+    fn a_destination_that_forbids_a_server_drops_its_proxy() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let servers = || {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "url": "https://example.invalid/mcp",
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+
+        assert!(
+            !mcp_needs_reconnect(&servers(), &servers(), &open_policy()),
+            "precondition: an identical remote server is reusable"
+        );
+
+        let mut denied = open_policy();
+        denied.mcp_server_denylist = vec!["docs".to_string()];
+        assert!(
+            mcp_needs_reconnect(&servers(), &servers(), &denied),
+            "a denied server kept its connection"
+        );
+
+        let mut allow_other = open_policy();
+        allow_other.mcp_server_allowlist = vec!["something-else".to_string()];
+        assert!(
+            mcp_needs_reconnect(&servers(), &servers(), &allow_other),
+            "a server outside the allowlist kept its connection"
+        );
+    }
+
+    /// A stdio server is spawned without `current_dir`, so it inherited
+    /// the directory the process started in and a bare command resolved
+    /// there. Identical config files therefore do *not* mean the
+    /// connection is reusable after a move — the subprocess is still
+    /// rooted in the project being left.
+    #[test]
+    fn stdio_servers_always_reconnect_after_a_move() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let stdio = |cmd: &str| {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "command": cmd, "args": [],
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+        let remote = || {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "url": "https://example.invalid/mcp",
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+
+        assert!(
+            mcp_needs_reconnect(&stdio("docs-server"), &stdio("docs-server"), &open_policy()),
+            "an identical stdio config still points at a subprocess launched elsewhere"
+        );
+        assert!(
+            !mcp_needs_reconnect(&remote(), &remote(), &open_policy()),
+            "a networked server does not care which directory we stand in"
+        );
+        assert!(
+            mcp_needs_reconnect(&remote(), &HashMap::new(), &open_policy()),
+            "a destination configuring no servers must not inherit these"
+        );
+    }
+    /// An entry's `env` is its own map and serializes in iteration order,
+    /// so identical settings could fingerprint differently and disconnect
+    /// proxies that were working — a restart to recover, for nothing.
+    #[test]
+    fn the_mcp_fingerprint_is_stable_across_nested_map_order() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let with_env = |pairs: &[(&str, &str)]| {
+            let env: serde_json::Map<String, serde_json::Value> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_string(),
+                        serde_json::Value::String((*v).to_string()),
+                    )
+                })
+                .collect();
+            let entry: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "command": "docs-server",
+                "args": [],
+                "env": env,
+            }))
+            .expect("entry");
+            let mut m: HashMap<String, McpServerEntry> = HashMap::new();
+            m.insert("docs".into(), entry);
+            m
+        };
+
+        let forward = with_env(&[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")]);
+        let reverse = with_env(&[("D", "4"), ("C", "3"), ("B", "2"), ("A", "1")]);
+
+        assert_eq!(
+            mcp_fingerprint(&forward),
+            mcp_fingerprint(&reverse),
+            "the same environment written in another order must compare equal"
+        );
+
+        let changed = with_env(&[("A", "1"), ("B", "changed"), ("C", "3"), ("D", "4")]);
+        assert_ne!(
+            mcp_fingerprint(&forward),
+            mcp_fingerprint(&changed),
+            "a changed environment value must still compare unequal"
+        );
+    }
+
+    /// A subdirectory can hold an `.agent` that carries no settings — a
+    /// skills folder, say. Config loading walks past it to the settings
+    /// that actually govern, so the policy scope has to walk past it too:
+    /// stopping at the nearest `.agent` directory scoped grants and the
+    /// canonical team-memory check to a directory whose policy was never
+    /// adopted.
+    #[test]
+    fn the_policy_root_follows_the_settings_that_govern() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".agent")).unwrap();
+        std::fs::write(
+            root.path().join(".agent").join("settings.toml"),
+            "[permissions]\ndefault_mode = \"ask\"\n",
+        )
+        .unwrap();
+
+        // A nearer `.agent` holding no settings at all.
+        let sub = root.path().join("subdir");
+        std::fs::create_dir_all(sub.join(".agent").join("skills")).unwrap();
+
+        let resolved = policy_root_from_config(&sub).expect("settings govern this directory");
+
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            root.path().canonicalize().unwrap(),
+            "the scope stopped at an .agent that defines no policy"
+        );
+        assert!(
+            policy_root_from_config(std::path::Path::new("/")).is_none(),
+            "no governing settings should fall back, not invent a root"
         );
     }
 }

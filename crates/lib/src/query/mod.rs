@@ -370,6 +370,24 @@ impl QueryEngine {
         let _ = dropped_dirs;
     }
 
+    /// Tell watchers the `/add-dir` working set is back.
+    ///
+    /// Pairs with [`Self::notify_working_set_dropped`] when the swap it
+    /// announced does not happen: the drop was announced before the move
+    /// so watchers would stop indexing a project being left, and a move
+    /// that then fails leaves those directories still in use with every
+    /// watcher told to ignore them.
+    pub async fn notify_working_set_restored(&mut self) {
+        if self.state.additional_dirs.is_empty() {
+            return;
+        }
+        let cwd = self.state.cwd.clone();
+        let dirs = self.state.additional_dirs.clone();
+        let swap_cancel = CancellationToken::new();
+        self.run_cwd_changed_hooks_with(&cwd, "session-swap-aborted", &dirs, Some(&swap_cancel))
+            .await;
+    }
+
     /// Tell watchers the `/add-dir` working set is going away.
     ///
     /// Separate from [`Self::reset_for_session_swap`] because the two
@@ -390,7 +408,11 @@ impl QueryEngine {
         // reject every hook before it started, so watchers would silently
         // never hear about the dropped directories.
         let swap_cancel = CancellationToken::new();
-        self.run_cwd_changed_hooks(&cwd, "session-swap", Some(&swap_cancel))
+        // Empty, because that is what the working set *becomes*. The
+        // directories are still in state so a failed move can keep the
+        // session intact, but a watcher told to keep tracking them would
+        // hold indexes open on a project this session is leaving.
+        self.run_cwd_changed_hooks_with(&cwd, "session-swap", &[], Some(&swap_cancel))
             .await;
     }
 
@@ -480,7 +502,16 @@ impl QueryEngine {
     /// Only policy is taken from that config: the model, modes and the
     /// rest of the runtime state belong to the session being restored,
     /// not to the directory it lives in.
-    pub fn adopt_project(&mut self, project_root: &std::path::Path, cfg: crate::config::Config) {
+    /// Returns how many MCP proxy tools were dropped, so the caller can
+    /// tell the user why a server they were using has gone.
+    /// `drop_mcp` is false when the project root has not actually
+    /// changed — a resume within the same repository keeps its servers.
+    pub fn adopt_project(
+        &mut self,
+        project_root: &std::path::Path,
+        cfg: crate::config::Config,
+        drop_mcp: bool,
+    ) -> usize {
         self.rescope_persistent_grants(project_root);
         self.permissions
             .set_project_root(project_root.to_path_buf());
@@ -504,6 +535,20 @@ impl QueryEngine {
         self.state.config.permissions.allowed_tools = cfg.permissions.allowed_tools;
         self.state.config.permissions.disallowed_tools = cfg.permissions.disallowed_tools;
         self.state.config.hooks = cfg.hooks;
+        // The prompt describes the servers from config, so dropping the
+        // proxies without this told the model to call tools that no
+        // longer exist. The destination's own list takes its place —
+        // empty unless it configures servers, and its proxies are not
+        // connected either, so it stays empty until a restart.
+        if !drop_mcp {
+            return 0;
+        }
+        self.state.config.mcp_servers.clear();
+        // MCP proxies belong to the project that configured them. A
+        // visibility filter would only hide them; they would still be
+        // callable, so a model in the destination could reach servers the
+        // session just left.
+        self.tools.remove_mcp_tools()
     }
 
     /// Re-scope persistent grants to a new project root. Must be called
@@ -590,10 +635,30 @@ impl QueryEngine {
         cause: &str,
         cancel: Option<&CancellationToken>,
     ) -> Vec<crate::hooks::HookResult> {
+        self.run_cwd_changed_hooks_with(previous_cwd, cause, &self.state.additional_dirs, cancel)
+            .await
+    }
+
+    /// As [`Self::run_cwd_changed_hooks`], but stating the working set the
+    /// event should report rather than reading it from state.
+    ///
+    /// `additional_dirs` is documented as the working set *after* the
+    /// change, and a swap has to announce the drop while the state still
+    /// holds those directories — clearing first would leave nothing to
+    /// restore if the move then failed. Passing the set explicitly keeps
+    /// both true: state is untouched, and watchers are told the truth
+    /// about what they should be tracking afterwards.
+    async fn run_cwd_changed_hooks_with(
+        &self,
+        previous_cwd: &str,
+        cause: &str,
+        additional_dirs: &[String],
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<crate::hooks::HookResult> {
         let ctx = serde_json::json!({
             "previous_cwd": previous_cwd,
             "new_cwd": self.state.cwd,
-            "additional_dirs": self.state.additional_dirs,
+            "additional_dirs": additional_dirs,
             "cause": cause,
         });
         self.hooks

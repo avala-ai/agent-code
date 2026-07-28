@@ -31,7 +31,7 @@ pub mod theme_picker;
 mod toolcard;
 mod vi;
 
-pub use run::run_modern_tui;
+pub use run::{CliPermissionOverride, run_modern_tui};
 
 /// Why the interactive TUI cannot start, or `None` when it can.
 ///

@@ -23,22 +23,87 @@ pub use schema::*;
 use crate::error::ConfigError;
 use std::path::{Path, PathBuf};
 
-/// Re-entrancy guard to prevent Config::load → log → Config::load cycles.
-static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Serializes configuration loads across threads.
+///
+/// A load is filesystem work with layered merges; two at once are not a
+/// correctness problem, but the *guard* used to be a process-wide flag
+/// that answered `Config::default()` to whoever arrived second. That is
+/// a silent, permissive answer — no deny rules, no bypass lock — handed
+/// to a caller that asked for a project's real policy. Blocking is the
+/// right response to a concurrent load; only genuine re-entrancy needs
+/// the escape hatch below.
+static LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Set while *this* thread is inside a load.
+    ///
+    /// The original guard existed because loading logs, and logging can
+    /// load: that cycle is same-thread, so it is the only case that must
+    /// short-circuit rather than block — waiting on a lock this thread
+    /// already holds would deadlock instead of recursing.
+    static LOADING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` under the load lock, short-circuiting only on same-thread
+/// re-entrancy.
+fn with_load_guard<F>(f: F) -> Result<Config, ConfigError>
+where
+    F: FnOnce() -> Result<Config, ConfigError>,
+{
+    if LOADING_HERE.with(std::cell::Cell::get) {
+        return Ok(Config::default());
+    }
+    // Poison is ignored: a panicking loader says nothing about whether
+    // the files are readable, and refusing every later load would turn
+    // one failure into a permanently defaulted process.
+    let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    LOADING_HERE.with(|f| f.set(true));
+    let result = f();
+    LOADING_HERE.with(|f| f.set(false));
+    result
+}
 
 impl Config {
     /// Load configuration from all sources, merging by priority.
     pub fn load() -> Result<Config, ConfigError> {
-        // Re-entrancy guard.
-        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Config::default());
-        }
-        let result = Self::load_inner();
-        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
-        result
+        with_load_guard(|| Self::load_inner(None, true))
     }
 
-    fn load_inner() -> Result<Config, ConfigError> {
+    /// Load configuration as it would be seen *from* `dir`, without
+    /// entering it.
+    ///
+    /// The project and project-local layers are discovered by walking up
+    /// from the working directory, so reading another project's settings
+    /// otherwise meant chdir-ing into it and back — which mutates global
+    /// state for every thread and leaves the process in the wrong place
+    /// if the return trip fails. Resuming a session saved elsewhere needs
+    /// to answer "would this project's settings parse" before committing
+    /// to it, so it needs this.
+    ///
+    /// User-level and environment layers are unchanged: they are not
+    /// per-project.
+    pub fn load_from(dir: &Path) -> Result<Config, ConfigError> {
+        with_load_guard(|| Self::load_inner(Some(dir), true))
+    }
+
+    /// Load another project's *policy* without resolving its API key.
+    ///
+    /// [`Self::load_from`] runs the destination's `api_key_helper`
+    /// through `bash -c`. A resume preflight only reads policy and may
+    /// still refuse the resume, so running it there would execute a
+    /// command from a project the session never enters — and block the
+    /// caller (the TUI event loop, Ctrl+C included) while it does.
+    ///
+    /// The returned `api.api_key` is therefore whatever the files and
+    /// environment gave, with no helper invocation. Callers that need a
+    /// usable key must use [`Self::load_from`].
+    pub fn load_policy_from(dir: &Path) -> Result<Config, ConfigError> {
+        with_load_guard(|| Self::load_inner(Some(dir), false))
+    }
+
+    /// `start` is the directory the project layers are discovered from;
+    /// `None` means the process working directory.
+    fn load_inner(start: Option<&Path>, resolve_api_key: bool) -> Result<Config, ConfigError> {
         let mut layers: Vec<String> = Vec::new();
 
         // Layer 1: User-level config (lowest priority file).
@@ -49,7 +114,11 @@ impl Config {
         }
 
         // Layer 2: Project-level config (overrides user config).
-        if let Some(path) = find_project_config() {
+        let project = match start {
+            Some(dir) => find_project_config_from(dir),
+            None => find_project_config(),
+        };
+        if let Some(path) = project {
             layers.push(read_layer_through_migrations(&path)?);
         }
 
@@ -58,7 +127,11 @@ impl Config {
         // `settings.local.toml` in the same `.agent/` directory; only
         // the one closest to cwd is used, matching the project-config
         // walk so sub-packages inherit the repo-root settings.local.
-        if let Some(path) = find_project_local_config() {
+        let project_local = match start {
+            Some(dir) => find_local_config_in_ancestors(dir),
+            None => find_project_local_config(),
+        };
+        if let Some(path) = project_local {
             layers.push(read_layer_through_migrations(&path)?);
         }
 
@@ -109,7 +182,8 @@ impl Config {
         // user-configured `api_key_helper` command (via `bash -c`) and
         // use its trimmed stdout as the key. Allows fetching short-lived
         // tokens from a secrets manager without pinning them to disk.
-        if config.api.api_key.is_none()
+        if resolve_api_key
+            && config.api.api_key.is_none()
             && let Some(cmd) = &config.api.api_key_helper
         {
             match resolve_api_key_from_helper(cmd) {
@@ -1267,5 +1341,74 @@ action = "ask"
         // some encoded tokens) must be preserved.
         let key = resolve_api_key_from_helper("printf '  part1\\npart2  '").unwrap();
         assert_eq!(key, "part1\npart2");
+    }
+
+    /// Reading another project's settings must not move the process.
+    ///
+    /// The resume path answers "would this project's config parse" before
+    /// committing to it. Entering the directory to find out mutates
+    /// global state for every thread, and a failed return trip leaves the
+    /// process somewhere the caller does not believe it is.
+    #[test]
+    fn load_from_reads_a_project_without_entering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"deny\"\n",
+        )
+        .unwrap();
+
+        let before = std::env::current_dir().unwrap();
+        let cfg = Config::load_from(dir.path()).expect("the project's settings should parse");
+        let after = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            cfg.permissions.default_mode,
+            crate::config::PermissionMode::Deny,
+            "the target project's layer was not read"
+        );
+        assert_eq!(before, after, "loading moved the process");
+    }
+
+    /// A load that arrives while another is in flight used to be handed
+    /// `Config::default()` and no indication of it — which for the resume
+    /// preflight means adopting *no* deny rules and `bypass` unlocked
+    /// instead of the destination's real policy. Concurrent loads block
+    /// and then read the files; only same-thread re-entrancy short
+    /// circuits, because that is the cycle the guard exists for.
+    #[test]
+    fn concurrent_loads_read_the_project_rather_than_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"deny\"\n",
+        )
+        .unwrap();
+
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    Config::load_policy_from(&p)
+                        .expect("settings parse")
+                        .permissions
+                        .default_mode
+                })
+            })
+            .collect();
+
+        for t in threads {
+            let mode = t.join().expect("thread");
+            assert_eq!(
+                mode,
+                crate::config::PermissionMode::Deny,
+                "a concurrent load was answered with defaults instead of the project's policy"
+            );
+        }
     }
 }

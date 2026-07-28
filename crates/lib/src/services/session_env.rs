@@ -59,6 +59,18 @@ impl SessionEnvironment {
 }
 
 /// Walk up from cwd to find the project root (git root or first dir with config).
+/// The project root that owns `cwd`.
+///
+/// Public because a resume adopts another project and has to scope
+/// per-project policy — persistent grants and the canonical
+/// protected-path checks — to that project's *root*, not to whichever
+/// subdirectory the session happened to be saved in. Pinning them to
+/// `/repo/crate` leaves `/repo/.agent/team-memory` outside the root and
+/// therefore unprotected.
+pub async fn project_root_for(cwd: &Path) -> PathBuf {
+    detect_project_root(cwd).await
+}
+
 async fn detect_project_root(cwd: &Path) -> PathBuf {
     // Try git root first.
     if let Some(root) = crate::services::git::repo_root(cwd).await {

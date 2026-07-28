@@ -419,6 +419,7 @@ pub(super) async fn run_beats(mut h: Harness, beats: Vec<Beat>, seen: Seen) -> (
         h.eng_tx.clone(),
         h.eng_rx,
         h.base_mode,
+        &super::run::CliPermissionOverride::default(),
         // Test-mode service: records instead of shelling out to the OS.
         &agent_code_lib::services::notifier::NotifierService::new_for_test(
             agent_code_lib::config::NotifierConfig::default(),

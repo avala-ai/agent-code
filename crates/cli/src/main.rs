@@ -534,6 +534,11 @@ async fn async_main() -> anyhow::Result<()> {
         config.api.auth_mode = auth_mode;
     }
 
+    // Captured as its own layer, not just folded into `config`: a
+    // cross-project resume reloads the file and environment layers from
+    // the destination, and the operator's command line has to be applied
+    // on top of those too.
+    let mut cli_permissions = ui::modern::CliPermissionOverride::default();
     // Apply --no-sandbox before permission-mode handling so the bypass
     // gate applies uniformly.
     if cli.no_sandbox {
@@ -543,6 +548,7 @@ async fn async_main() -> anyhow::Result<()> {
                 "--no-sandbox ignored: security.disable_bypass_permissions is set in config",
             );
         } else {
+            cli_permissions.no_sandbox = true;
             config.sandbox.enabled = false;
             tracing::warn!("Process-level sandbox disabled for this session (--no-sandbox)");
             agent_code_lib::services::warnings::warn(
@@ -554,6 +560,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Apply permission mode from CLI.
     if cli.dangerously_skip_permissions {
+        cli_permissions.default_mode = Some(agent_code_lib::config::PermissionMode::Allow);
         config.permissions.default_mode = agent_code_lib::config::PermissionMode::Allow;
         tracing::warn!("All permission checks disabled (--dangerously-skip-permissions)");
         agent_code_lib::services::warnings::warn(
@@ -563,7 +570,9 @@ async fn async_main() -> anyhow::Result<()> {
     } else if let Some(ref mode) = cli.permission_mode {
         // An unrecognised value used to fall through to `Ask`, so a typo
         // (`--permission-mode alow`) looked like it had been honoured.
-        config.permissions.default_mode = parse_permission_mode(mode)?;
+        let parsed = parse_permission_mode(mode)?;
+        cli_permissions.default_mode = Some(parsed);
+        config.permissions.default_mode = parsed;
     }
 
     // Apply --permissions-overlay. Parsed as a TOML document whose
@@ -585,6 +594,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 .try_into::<agent_code_lib::config::PermissionsConfig>()
                             {
                                 Ok(perms) => {
+                                    cli_permissions.overlay = Some(perms.clone());
                                     // Compose with host permissions so project
                                     // rules survive typed-subagent visibility
                                     // overlays (do not wholesale replace).
@@ -1118,7 +1128,7 @@ async fn async_main() -> anyhow::Result<()> {
 
             // Modern TUI takes ownership of the engine via Session and
             // fires SessionStop itself on clean exit.
-            ui::modern::run_modern_tui(engine).await?;
+            ui::modern::run_modern_tui(engine, cli_permissions.clone()).await?;
 
             // Show update notification after session ends.
             if let Ok(Some(check)) = update_handle.await {

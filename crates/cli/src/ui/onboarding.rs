@@ -558,7 +558,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
             let prev_home = std::env::var("HOME").ok();
-            // SAFETY: sandbox-using tests hold ENV_LOCK while mutating process
+            // SAFETY: sandbox-using tests hold the shared env lock while mutating process
             // env, so no other test in this module observes a partial update.
             unsafe {
                 std::env::set_var("XDG_CONFIG_HOME", tmp.path());
@@ -574,7 +574,7 @@ mod tests {
 
     impl Drop for ConfigSandbox {
         fn drop(&mut self) {
-            // SAFETY: the owning test still holds ENV_LOCK while this Drop
+            // SAFETY: the owning test still holds the shared env lock while this Drop
             // restores process-wide environment values.
             unsafe {
                 match &self.prev_xdg {
@@ -591,11 +591,10 @@ mod tests {
 
     // Serialise tests that mutate process-wide env vars. Without this
     // they race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn sentinel_absent_then_present_after_mark() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::ui::test_locks::env();
         let _sandbox = ConfigSandbox::new();
         assert!(
             !already_onboarded(),
@@ -609,7 +608,7 @@ mod tests {
 
     #[test]
     fn mark_onboarded_creates_parent_dir() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::ui::test_locks::env();
         let _sandbox = ConfigSandbox::new();
         // Sanity: parent dir does not exist yet.
         let dir = config_dir().unwrap();
@@ -621,7 +620,7 @@ mod tests {
 
     #[test]
     fn persist_theme_writes_ui_table_and_preserves_other_keys() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::ui::test_locks::env();
         let _sandbox = ConfigSandbox::new();
         let dir = config_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -650,7 +649,7 @@ mod tests {
 
     #[test]
     fn persist_theme_creates_file_when_absent() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::ui::test_locks::env();
         let _sandbox = ConfigSandbox::new();
         persist_theme("light-ansi").unwrap();
         let raw = std::fs::read_to_string(config_dir().unwrap().join("config.toml")).unwrap();
