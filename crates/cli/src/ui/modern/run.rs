@@ -1231,6 +1231,14 @@ pub(super) async fn event_loop(
                         let user_mode =
                             (app.mode_chosen || app.mode != last_mode).then_some(app.mode);
                         let turns = data.turn_count;
+                        // The conversation being left, counted while the
+                        // engine still holds it. Read here rather than
+                        // mirrored on `App`: a mirror has to be refreshed
+                        // at every seam that rewrites history — `/clear`,
+                        // `/rewind`, `/snip`, a completed turn — and the
+                        // one that gets forgotten stamps a cached view
+                        // with a count the conversation no longer has.
+                        let outgoing_len = eng.state().messages.len();
                         {
                             let st = eng.state_mut();
                             // Identity moves with the conversation. Left alone,
@@ -1282,7 +1290,13 @@ pub(super) async fn event_loop(
                         // or the pane keeps showing the old session's
                         // work.
                         app.adopt_restored_todos(&eng.state().messages);
-                        app.restore_transcript(items, &id, turns, eng.state().messages.len());
+                        app.restore_transcript(
+                            items,
+                            &id,
+                            turns,
+                            eng.state().messages.len(),
+                            outgoing_len,
+                        );
                         let stored_mode = app.adopt_restored_session(&restored);
                         let mode = user_mode.unwrap_or(stored_mode);
                         app.mode = mode;
@@ -1729,7 +1743,6 @@ pub(super) async fn event_loop(
                         app.tokens_in = eng.state().total_usage.input_tokens;
                         app.tokens_out = eng.state().total_usage.output_tokens;
                         app.turn_count = eng.state().turn_count;
-                        app.conversation_len = eng.state().messages.len();
                         app.model = eng.state().config.api.model.clone();
 
                         // The model can toggle plan mode itself

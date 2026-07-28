@@ -412,10 +412,6 @@ pub struct App {
     /// written for. The fields are private for that reason; see
     /// [`super::session_work`].
     pub work: super::session_work::SessionWork,
-    /// Messages in the conversation currently in front, mirrored from
-    /// the engine. Stamps the view cache so a session rewritten while it
-    /// sat in the background is rebuilt rather than replayed.
-    pub conversation_len: usize,
     /// Whether a turn task currently exists (set by the run loop). Lets
     /// modal resolution decide between returning to Streaming (turn still
     /// running) and Idle (modal outlived its turn).
@@ -685,7 +681,6 @@ impl App {
             status_message: String::new(),
             should_quit: false,
             work: super::session_work::SessionWork::default(),
-            conversation_len: 0,
             turn_live: false,
             transcript_bottom_row: 0,
             queue: std::collections::VecDeque::new(),
