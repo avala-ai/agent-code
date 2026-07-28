@@ -283,6 +283,17 @@ pub struct CliPermissionOverride {
     /// `state.config`, so a project reload that restored the file value
     /// silently re-enabled the sandbox the operator turned off.
     pub no_sandbox: bool,
+    /// From `--api-base-url`, when given. Captured for the same reason
+    /// as the rest of this struct: the command line is a layer above the
+    /// files and outlives the directory the process started in.
+    ///
+    /// A pinned field cannot mismatch across a resume — it wins in the
+    /// destination exactly as it wins here — so [`provider_mismatch`]
+    /// skips it rather than comparing the operator's value against a
+    /// project file value it has already overridden.
+    pub api_base_url: Option<String>,
+    /// From `--auth-mode`, when given. Same reasoning.
+    pub auth_mode: Option<agent_code_lib::config::ApiAuthMode>,
 }
 
 impl CliPermissionOverride {
@@ -539,18 +550,30 @@ fn check_session_cwd(
 fn provider_mismatch(
     current: &agent_code_lib::config::ApiConfig,
     destination: &agent_code_lib::config::ApiConfig,
+    cli: &CliPermissionOverride,
 ) -> Option<String> {
-    if current.base_url != destination.base_url {
+    if cli.api_base_url.is_none() && current.base_url != destination.base_url {
         return Some(format!(
             "it is configured for a different API endpoint ({})",
             destination.base_url
         ));
     }
-    if current.auth_mode != destination.auth_mode {
+    if cli.auth_mode.is_none() && current.auth_mode != destination.auth_mode {
         return Some(format!(
             "it is configured for a different authentication mode ({:?})",
             destination.auth_mode
         ));
+    }
+    // Same endpoint and mode still means a different account when the
+    // credential comes from somewhere else: the provider holds the key
+    // resolved at startup, and the destination's helper is deliberately
+    // never executed, so its turns would be billed to the source's
+    // account under a project that named its own.
+    if current.api_key_helper != destination.api_key_helper {
+        return Some("it resolves its API key from a different helper".to_string());
+    }
+    if current.codex_home != destination.codex_home {
+        return Some("it authenticates from a different Codex home".to_string());
     }
     None
 }
@@ -1063,7 +1086,8 @@ pub(super) async fn event_loop(
                         // than silently answered over the source's
                         // connection.
                         if let Some(cfg) = destination_cfg.as_ref()
-                            && let Some(why) = provider_mismatch(&current_api, &cfg.api)
+                            && let Some(why) =
+                                provider_mismatch(&current_api, &cfg.api, cli_permissions)
                         {
                             app.status_message.clear();
                             app.transcript
@@ -5140,6 +5164,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let guarded = load_project_config(&dir.path().display().to_string(), &with_overlay)
             .expect("settings parse");
@@ -5185,6 +5210,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         let cfg = load_project_config(&dir.path().display().to_string(), &permissive)
@@ -5214,6 +5240,7 @@ mod tests {
             default_mode: Some(PermissionMode::Allow),
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
         let cfg = load_project_config(&dir.path().display().to_string(), &skip_all)
             .expect("settings parse");
@@ -5245,8 +5272,8 @@ mod tests {
             ..ApiConfig::default()
         };
 
-        let why =
-            provider_mismatch(&current, &destination).expect("a different endpoint was accepted");
+        let why = provider_mismatch(&current, &destination, &CliPermissionOverride::default())
+            .expect("a different endpoint was accepted");
         assert!(
             why.contains("internal.corp.example"),
             "the refusal did not name the endpoint it refused: {why}"
@@ -5266,7 +5293,9 @@ mod tests {
             auth_mode: ApiAuthMode::CodexChatgpt,
             ..ApiConfig::default()
         };
-        assert!(provider_mismatch(&current, &destination).is_some());
+        assert!(
+            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_some()
+        );
     }
 
     /// A project that shares the endpoint and credentials is fine, and
@@ -5287,9 +5316,97 @@ mod tests {
             ..ApiConfig::default()
         };
         assert!(
-            provider_mismatch(&current, &destination).is_none(),
+            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_none(),
             "a differing model alone blocked a resume that shares the provider"
         );
+    }
+
+    /// Same endpoint and mode still means a different account when the
+    /// key comes from somewhere else. The provider holds the credential
+    /// resolved at startup and the destination's helper is deliberately
+    /// never executed, so its turns would be billed to the source's
+    /// account under a project that named its own.
+    #[test]
+    fn a_destination_resolving_credentials_elsewhere_is_refused() {
+        use agent_code_lib::config::ApiConfig;
+        let current = ApiConfig {
+            api_key_helper: Some("op read op://team/key".into()),
+            ..ApiConfig::default()
+        };
+        let destination = ApiConfig {
+            api_key_helper: Some("vault kv get -field=key secret/other".into()),
+            ..ApiConfig::default()
+        };
+        assert!(
+            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_some(),
+            "a resume would have billed the destination's turns to the source's account"
+        );
+
+        let elsewhere = ApiConfig {
+            codex_home: Some("/home/other/.codex".into()),
+            ..ApiConfig::default()
+        };
+        assert!(
+            provider_mismatch(
+                &current.clone(),
+                &elsewhere,
+                &CliPermissionOverride::default()
+            )
+            .is_some()
+                || provider_mismatch(
+                    &ApiConfig::default(),
+                    &elsewhere,
+                    &CliPermissionOverride::default()
+                )
+                .is_some(),
+            "a different Codex home was accepted"
+        );
+    }
+
+    /// A field pinned on the command line wins in *both* projects, so it
+    /// cannot mismatch. Comparing the operator's value against a project
+    /// file value it has already overridden refused resumes that were
+    /// perfectly compatible.
+    #[test]
+    fn a_field_pinned_on_the_command_line_cannot_mismatch() {
+        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
+        let current = ApiConfig {
+            base_url: "https://pinned.example".into(),
+            ..ApiConfig::default()
+        };
+        let destination = ApiConfig {
+            base_url: "https://whatever-the-project-file-says".into(),
+            ..ApiConfig::default()
+        };
+
+        assert!(
+            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_some(),
+            "precondition: without the pin these differ"
+        );
+
+        let pinned = CliPermissionOverride {
+            api_base_url: Some("https://pinned.example".into()),
+            ..CliPermissionOverride::default()
+        };
+        assert!(
+            provider_mismatch(&current, &destination, &pinned).is_none(),
+            "--api-base-url applies to the destination too, so this was not a mismatch"
+        );
+
+        // Same for the authentication mode.
+        let current_mode = ApiConfig {
+            auth_mode: ApiAuthMode::CodexChatgpt,
+            ..ApiConfig::default()
+        };
+        let dest_mode = ApiConfig {
+            auth_mode: ApiAuthMode::ApiKey,
+            ..ApiConfig::default()
+        };
+        let pinned_mode = CliPermissionOverride {
+            auth_mode: Some(ApiAuthMode::CodexChatgpt),
+            ..CliPermissionOverride::default()
+        };
+        assert!(provider_mismatch(&current_mode, &dest_mode, &pinned_mode).is_none());
     }
 
     /// Starting in a locked project emits "--no-sandbox ignored". If
@@ -5309,6 +5426,7 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
         // A destination that permits bypasses and wants the sandbox on.
         let mut cfg = agent_code_lib::config::Config::default();
@@ -5332,6 +5450,7 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = false;
@@ -5351,6 +5470,7 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = true;
@@ -5384,6 +5504,7 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = false;
@@ -5427,6 +5548,7 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
+            ..Default::default()
         };
 
         let cfg = load_project_config(&dir.path().display().to_string(), &requested)

@@ -538,7 +538,13 @@ async fn async_main() -> anyhow::Result<()> {
     // cross-project resume reloads the file and environment layers from
     // the destination, and the operator's command line has to be applied
     // on top of those too.
-    let mut cli_permissions = ui::modern::CliPermissionOverride::default();
+    let mut cli_permissions = ui::modern::CliPermissionOverride {
+        // Pinned on the command line, so they win in every project the
+        // session visits — including one it resumes into.
+        api_base_url: cli.api_base_url.clone(),
+        auth_mode: cli_auth_mode,
+        ..Default::default()
+    };
     // Apply --no-sandbox before permission-mode handling so the bypass
     // gate applies uniformly.
     if cli.no_sandbox {
