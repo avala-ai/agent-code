@@ -23,19 +23,50 @@ pub use schema::*;
 use crate::error::ConfigError;
 use std::path::{Path, PathBuf};
 
-/// Re-entrancy guard to prevent Config::load → log → Config::load cycles.
-static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Serializes configuration loads across threads.
+///
+/// A load is filesystem work with layered merges; two at once are not a
+/// correctness problem, but the *guard* used to be a process-wide flag
+/// that answered `Config::default()` to whoever arrived second. That is
+/// a silent, permissive answer — no deny rules, no bypass lock — handed
+/// to a caller that asked for a project's real policy. Blocking is the
+/// right response to a concurrent load; only genuine re-entrancy needs
+/// the escape hatch below.
+static LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Set while *this* thread is inside a load.
+    ///
+    /// The original guard existed because loading logs, and logging can
+    /// load: that cycle is same-thread, so it is the only case that must
+    /// short-circuit rather than block — waiting on a lock this thread
+    /// already holds would deadlock instead of recursing.
+    static LOADING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` under the load lock, short-circuiting only on same-thread
+/// re-entrancy.
+fn with_load_guard<F>(f: F) -> Result<Config, ConfigError>
+where
+    F: FnOnce() -> Result<Config, ConfigError>,
+{
+    if LOADING_HERE.with(std::cell::Cell::get) {
+        return Ok(Config::default());
+    }
+    // Poison is ignored: a panicking loader says nothing about whether
+    // the files are readable, and refusing every later load would turn
+    // one failure into a permanently defaulted process.
+    let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    LOADING_HERE.with(|f| f.set(true));
+    let result = f();
+    LOADING_HERE.with(|f| f.set(false));
+    result
+}
 
 impl Config {
     /// Load configuration from all sources, merging by priority.
     pub fn load() -> Result<Config, ConfigError> {
-        // Re-entrancy guard.
-        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Config::default());
-        }
-        let result = Self::load_inner(None, true);
-        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
-        result
+        with_load_guard(|| Self::load_inner(None, true))
     }
 
     /// Load configuration as it would be seen *from* `dir`, without
@@ -52,12 +83,7 @@ impl Config {
     /// User-level and environment layers are unchanged: they are not
     /// per-project.
     pub fn load_from(dir: &Path) -> Result<Config, ConfigError> {
-        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Config::default());
-        }
-        let result = Self::load_inner(Some(dir), true);
-        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
-        result
+        with_load_guard(|| Self::load_inner(Some(dir), true))
     }
 
     /// Load another project's *policy* without resolving its API key.
@@ -72,12 +98,7 @@ impl Config {
     /// environment gave, with no helper invocation. Callers that need a
     /// usable key must use [`Self::load_from`].
     pub fn load_policy_from(dir: &Path) -> Result<Config, ConfigError> {
-        if LOADING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Config::default());
-        }
-        let result = Self::load_inner(Some(dir), false);
-        LOADING.store(false, std::sync::atomic::Ordering::SeqCst);
-        result
+        with_load_guard(|| Self::load_inner(Some(dir), false))
     }
 
     /// `start` is the directory the project layers are discovered from;
@@ -1349,5 +1370,45 @@ action = "ask"
             "the target project's layer was not read"
         );
         assert_eq!(before, after, "loading moved the process");
+    }
+
+    /// A load that arrives while another is in flight used to be handed
+    /// `Config::default()` and no indication of it — which for the resume
+    /// preflight means adopting *no* deny rules and `bypass` unlocked
+    /// instead of the destination's real policy. Concurrent loads block
+    /// and then read the files; only same-thread re-entrancy short
+    /// circuits, because that is the cycle the guard exists for.
+    #[test]
+    fn concurrent_loads_read_the_project_rather_than_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("settings.toml"),
+            "[permissions]\ndefault_mode = \"deny\"\n",
+        )
+        .unwrap();
+
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    Config::load_policy_from(&p)
+                        .expect("settings parse")
+                        .permissions
+                        .default_mode
+                })
+            })
+            .collect();
+
+        for t in threads {
+            let mode = t.join().expect("thread");
+            assert_eq!(
+                mode,
+                crate::config::PermissionMode::Deny,
+                "a concurrent load was answered with defaults instead of the project's policy"
+            );
+        }
     }
 }
