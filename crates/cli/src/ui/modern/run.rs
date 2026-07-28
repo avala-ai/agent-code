@@ -283,17 +283,6 @@ pub struct CliPermissionOverride {
     /// `state.config`, so a project reload that restored the file value
     /// silently re-enabled the sandbox the operator turned off.
     pub no_sandbox: bool,
-    /// From `--api-base-url`, when given. Captured for the same reason
-    /// as the rest of this struct: the command line is a layer above the
-    /// files and outlives the directory the process started in.
-    ///
-    /// A pinned field cannot mismatch across a resume — it wins in the
-    /// destination exactly as it wins here — so [`provider_mismatch`]
-    /// skips it rather than comparing the operator's value against a
-    /// project file value it has already overridden.
-    pub api_base_url: Option<String>,
-    /// From `--auth-mode`, when given. Same reasoning.
-    pub auth_mode: Option<agent_code_lib::config::ApiAuthMode>,
 }
 
 impl CliPermissionOverride {
@@ -526,58 +515,6 @@ fn check_session_cwd(
         ));
     }
     Ok(Some(dir))
-}
-
-/// Why the destination project's provider cannot be adopted, if it
-/// cannot.
-///
-/// The provider is built once, at startup, from the project the process
-/// launched in. Adoption moves *policy* — permissions, sandbox, hooks,
-/// features — but not the transport, so a destination naming a different
-/// endpoint or authentication mode would receive the restored
-/// conversation over the source's connection: sent to an endpoint the
-/// user did not choose, or billed to an account they had switched away
-/// from. A wire format that does not know the restored model merely
-/// fails, which is the harmless case.
-///
-/// Refusing is the conservative half. Rebuilding the provider for the
-/// destination is the complete fix and needs an auth and credential
-/// story of its own — tracked in #537.
-///
-/// The model is deliberately not compared: two projects sharing an
-/// endpoint may legitimately prefer different models, and the restore
-/// already carries the session's own.
-fn provider_mismatch(
-    current: &agent_code_lib::config::ApiConfig,
-    destination: &agent_code_lib::config::ApiConfig,
-    cli: &CliPermissionOverride,
-) -> Option<String> {
-    if cli.api_base_url.is_none() && current.base_url != destination.base_url {
-        return Some(format!(
-            "it is configured for a different API endpoint ({})",
-            destination.base_url
-        ));
-    }
-    if cli.auth_mode.is_none() && current.auth_mode != destination.auth_mode {
-        return Some(format!(
-            "it is configured for a different authentication mode ({:?})",
-            destination.auth_mode
-        ));
-    }
-    // Credentials are deliberately not compared. Startup resolves an
-    // `api_key_helper` into `api_key`; the resume preflight uses
-    // `load_policy_from`, which leaves it unresolved on purpose rather
-    // than run a command from a project the session may never enter. So
-    // the two sides are not comparable: two projects sharing one helper
-    // present a resolved key against `None` and would be refused every
-    // time.
-    //
-    // Establishing credential identity needs the destination's helper
-    // executed, which is the same work rebuilding the provider needs —
-    // see #537. Until then the account-level check does not exist, and a
-    // refusal that fires on every helper-based project is worse than
-    // none: it blocks work that was always compatible.
-    None
 }
 
 /// Finish moving into a directory the process has already entered:
@@ -1049,12 +986,7 @@ pub(super) async fn event_loop(
                         // project-A session running against project-B's
                         // cwd — the wrong-tree hazard this restore exists
                         // to prevent. Refuse the whole resume instead.
-                        let (previous_cwd, current_api) = {
-                            let engine_arc = session.engine();
-                            let eng = engine_arc.lock().await;
-                            let st = eng.state();
-                            (st.cwd.clone(), st.config.api.clone())
-                        };
+                        let previous_cwd = session.engine().lock().await.state().cwd.clone();
                         // Phase A — everything that can fail, before
                         // anything is touched. A directory that cannot be
                         // entered and settings that will not parse are
@@ -1082,29 +1014,6 @@ pub(super) async fn event_loop(
                                 continue;
                             }
                         };
-                        // Still Phase A: the transport cannot be moved
-                        // with the policy, so a destination that would
-                        // need a different one is refused here rather
-                        // than silently answered over the source's
-                        // connection.
-                        if let Some(cfg) = destination_cfg.as_ref()
-                            && let Some(why) =
-                                provider_mismatch(&current_api, &cfg.api, cli_permissions)
-                        {
-                            app.status_message.clear();
-                            app.transcript
-                                .push(super::app::TranscriptItem::Error(format!(
-                                    "could not resume {id}: {why} — restart in {} to use it, \
-                                     staying in {previous_cwd}",
-                                    data.cwd
-                                )));
-                            app.cancel_deferred_resume_work(
-                                "cancelled — held for a session that needs a different provider:",
-                            );
-                            app.resume.settle();
-                            app.dirty = true;
-                            continue;
-                        }
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
                             Ok(dir) => dir,
                             Err(e) => {
@@ -5166,7 +5075,6 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            ..Default::default()
         };
         let guarded = load_project_config(&dir.path().display().to_string(), &with_overlay)
             .expect("settings parse");
@@ -5212,7 +5120,6 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            ..Default::default()
         };
 
         let cfg = load_project_config(&dir.path().display().to_string(), &permissive)
@@ -5242,7 +5149,6 @@ mod tests {
             default_mode: Some(PermissionMode::Allow),
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
         let cfg = load_project_config(&dir.path().display().to_string(), &skip_all)
             .expect("settings parse");
@@ -5255,154 +5161,6 @@ mod tests {
             cfg.sandbox.enabled,
             "--no-sandbox was carried into a locked project that enables the sandbox"
         );
-    }
-
-    /// The provider is built once at startup. Adoption moves policy but
-    /// not the transport, so a destination naming another endpoint would
-    /// receive the restored conversation over the source's connection —
-    /// sent somewhere the user did not choose, or billed to an account
-    /// they had switched away from.
-    #[test]
-    fn a_destination_on_another_endpoint_is_refused() {
-        use agent_code_lib::config::ApiConfig;
-        let current = ApiConfig {
-            base_url: "https://api.example.com".into(),
-            ..ApiConfig::default()
-        };
-        let destination = ApiConfig {
-            base_url: "https://internal.corp.example".into(),
-            ..ApiConfig::default()
-        };
-
-        let why = provider_mismatch(&current, &destination, &CliPermissionOverride::default())
-            .expect("a different endpoint was accepted");
-        assert!(
-            why.contains("internal.corp.example"),
-            "the refusal did not name the endpoint it refused: {why}"
-        );
-    }
-
-    /// Same endpoint, different credentials: the conversation would be
-    /// billed to an account the user had moved away from.
-    #[test]
-    fn a_destination_using_another_auth_mode_is_refused() {
-        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        let current = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            ..ApiConfig::default()
-        };
-        let destination = ApiConfig {
-            auth_mode: ApiAuthMode::CodexChatgpt,
-            ..ApiConfig::default()
-        };
-        assert!(
-            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_some()
-        );
-    }
-
-    /// A project that shares the endpoint and credentials is fine, and
-    /// preferring a different model is not a reason to refuse: two
-    /// projects on one endpoint may legitimately differ there, and the
-    /// restore already carries the session's own.
-    #[test]
-    fn a_destination_sharing_the_provider_is_accepted_whatever_model_it_prefers() {
-        use agent_code_lib::config::ApiConfig;
-        let current = ApiConfig {
-            base_url: "https://api.example.com".into(),
-            model: "fast-1".into(),
-            ..ApiConfig::default()
-        };
-        let destination = ApiConfig {
-            base_url: "https://api.example.com".into(),
-            model: "thorough-9".into(),
-            ..ApiConfig::default()
-        };
-        assert!(
-            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_none(),
-            "a differing model alone blocked a resume that shares the provider"
-        );
-    }
-
-    /// Two projects sharing one `api_key_helper` are compatible, and
-    /// must not be refused.
-    ///
-    /// They do not *look* compatible from here. Startup resolves the
-    /// helper into `api_key`, while the resume preflight uses
-    /// `load_policy_from`, which leaves it unresolved on purpose rather
-    /// than run a command from a project the session may never enter.
-    /// So the running config presents a resolved key and the
-    /// destination presents `None` — comparing them refused every
-    /// helper-based project, which is why credentials are not compared
-    /// at all. Establishing that identity needs the helper executed,
-    /// which is #537's work.
-    #[test]
-    fn two_projects_sharing_a_key_helper_are_not_refused() {
-        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        // As startup sees it: the helper has been run.
-        let running = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            api_key: Some("resolved-at-startup".into()),
-            api_key_helper: Some("op read op://team/key".into()),
-            ..ApiConfig::default()
-        };
-        // As the preflight sees the same project: helper unresolved.
-        let destination = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            api_key: None,
-            api_key_helper: Some("op read op://team/key".into()),
-            ..ApiConfig::default()
-        };
-
-        assert!(
-            provider_mismatch(&running, &destination, &CliPermissionOverride::default()).is_none(),
-            "a project was refused for using the very same key helper"
-        );
-    }
-
-    /// A field pinned on the command line wins in *both* projects, so it
-    /// cannot mismatch. Comparing the operator's value against a project
-    /// file value it has already overridden refused resumes that were
-    /// perfectly compatible.
-    #[test]
-    fn a_field_pinned_on_the_command_line_cannot_mismatch() {
-        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        let current = ApiConfig {
-            base_url: "https://pinned.example".into(),
-            ..ApiConfig::default()
-        };
-        let destination = ApiConfig {
-            base_url: "https://whatever-the-project-file-says".into(),
-            ..ApiConfig::default()
-        };
-
-        assert!(
-            provider_mismatch(&current, &destination, &CliPermissionOverride::default()).is_some(),
-            "precondition: without the pin these differ"
-        );
-
-        let pinned = CliPermissionOverride {
-            api_base_url: Some("https://pinned.example".into()),
-            ..CliPermissionOverride::default()
-        };
-        assert!(
-            provider_mismatch(&current, &destination, &pinned).is_none(),
-            "--api-base-url applies to the destination too, so this was not a mismatch"
-        );
-
-        // Same for the authentication mode.
-        let current_mode = ApiConfig {
-            auth_mode: ApiAuthMode::CodexChatgpt,
-            ..ApiConfig::default()
-        };
-        let dest_mode = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            ..ApiConfig::default()
-        };
-        let pinned_mode = CliPermissionOverride {
-            auth_mode: Some(ApiAuthMode::CodexChatgpt),
-            ..CliPermissionOverride::default()
-        };
-        assert!(provider_mismatch(&current_mode, &dest_mode, &pinned_mode).is_none());
     }
 
     /// Starting in a locked project emits "--no-sandbox ignored". If
@@ -5422,7 +5180,6 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
         // A destination that permits bypasses and wants the sandbox on.
         let mut cfg = agent_code_lib::config::Config::default();
@@ -5446,7 +5203,6 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = false;
@@ -5466,7 +5222,6 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = true;
@@ -5500,7 +5255,6 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
         let mut cfg = agent_code_lib::config::Config::default();
         cfg.security.disable_bypass_permissions = false;
@@ -5544,7 +5298,6 @@ mod tests {
             default_mode: None,
             no_sandbox: true,
             overlay: None,
-            ..Default::default()
         };
 
         let cfg = load_project_config(&dir.path().display().to_string(), &requested)
