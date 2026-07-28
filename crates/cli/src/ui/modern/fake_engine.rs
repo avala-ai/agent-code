@@ -413,6 +413,12 @@ pub(super) async fn run_beats(mut h: Harness, beats: Vec<Beat>, seen: Seen) -> (
         Ok(())
     };
     let mut term_events = ScriptedTerm::play_beats(beats);
+    // Bound rather than passed inline: adoption reconfigures the service
+    // for the destination project, so it is taken by `&mut` and a
+    // temporary cannot be borrowed that way.
+    let mut test_notifier = agent_code_lib::services::notifier::NotifierService::new_for_test(
+        agent_code_lib::config::NotifierConfig::default(),
+    );
     super::run::event_loop(
         &h.session,
         &mut h.app,
@@ -421,9 +427,7 @@ pub(super) async fn run_beats(mut h: Harness, beats: Vec<Beat>, seen: Seen) -> (
         h.base_mode,
         &super::run::CliPermissionOverride::default(),
         // Test-mode service: records instead of shelling out to the OS.
-        &agent_code_lib::services::notifier::NotifierService::new_for_test(
-            agent_code_lib::config::NotifierConfig::default(),
-        ),
+        &mut test_notifier,
         &mut term_events,
         &mut draw,
     )

@@ -411,7 +411,7 @@ pub async fn run_modern_tui(
     app.effort = initial_effort;
     app.notifier_enabled = notifier_config.enabled;
     // Construction performs no I/O; the first `notify` is what spawns.
-    let notifier = NotifierService::new(notifier_config);
+    let mut notifier = NotifierService::new(notifier_config);
 
     // Restore the terminal even if the draw path panics.
     install_panic_restore_hook();
@@ -432,7 +432,7 @@ pub async fn run_modern_tui(
         eng_rx,
         base_permission_mode,
         &cli_permissions,
-        &notifier,
+        &mut notifier,
         &mut term_events,
         &mut draw,
     )
@@ -524,6 +524,7 @@ fn check_session_cwd(
 async fn finish_cwd_adoption(
     app: &mut App,
     eng: &mut agent_code_lib::query::QueryEngine,
+    notifier: &mut NotifierService,
     dir: &std::path::Path,
     cfg: agent_code_lib::config::Config,
 ) {
@@ -575,10 +576,17 @@ async fn finish_cwd_adoption(
                 "{lost} — restart in this directory to connect its own MCP servers"
             )));
     }
-    // The TUI keeps its own copy of one policy bit, consulted on every
-    // submit: left at the value the process started with, a project that
-    // forbids shell-executing skills inherits one that allows it.
+    // The TUI keeps its own copies of a few policy bits, consulted
+    // without going back to the engine: left at the values the process
+    // started with, a project that forbids shell-executing skills
+    // inherits one that allows it, and one that wants no notifications
+    // keeps receiving them.
     app.disable_skill_shell = cfg.security.disable_skill_shell_execution;
+    app.notifier_enabled = cfg.notifier.enabled;
+    // The gate above only silences what the TUI asks for. The service
+    // holds the rest of the policy — which kinds, and how long a turn
+    // must run to be worth announcing — and it is built once at startup.
+    notifier.reconfigure(cfg.notifier.clone());
     app.cwd = cwd;
 }
 
@@ -757,7 +765,7 @@ pub(super) async fn event_loop(
     mut eng_rx: mpsc::UnboundedReceiver<EngineEvent>,
     mut base_permission_mode: PermissionMode,
     cli_permissions: &CliPermissionOverride,
-    notifier: &NotifierService,
+    notifier: &mut NotifierService,
     term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
     draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -1369,7 +1377,7 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
-                            finish_cwd_adoption(app, &mut eng, dir, cfg).await;
+                            finish_cwd_adoption(app, &mut eng, notifier, dir, cfg).await;
                             // Fired here rather than inside, so the loop
                             // can keep painting through a slow watcher
                             // hook. A cancel during it is noted and

@@ -151,6 +151,22 @@ impl NotifierService {
         }
     }
 
+    /// Point the service at the notifier settings of another project.
+    ///
+    /// A resume can cross into a project that disables notifications, or
+    /// changes which kinds it wants and how long a turn must run before
+    /// one is worth sending. The service is built once at startup, so
+    /// without this the destination keeps receiving notifications under
+    /// the departing project's rules — including completion bodies
+    /// carrying the destination's own cwd.
+    ///
+    /// The backend and focus probe are left alone: they describe the
+    /// terminal the process is attached to, which a change of directory
+    /// does not alter.
+    pub fn reconfigure(&mut self, config: NotifierConfig) {
+        self.config = Arc::new(config);
+    }
+
     /// Fire-and-forget notification. Returns immediately. The call is
     /// dropped (without error) when:
     ///
@@ -641,5 +657,34 @@ mod tests {
         let s = format!("{svc:?}");
         assert!(s.contains("NotifierService"));
         assert!(s.contains("test"));
+    }
+
+    /// A resume can cross into a project that wants no notifications, or
+    /// different ones. The service is built once at startup, so without
+    /// reconfiguration the destination keeps being notified under the
+    /// departing project's rules — including completion bodies carrying
+    /// its own cwd.
+    #[test]
+    fn reconfiguring_adopts_the_destination_projects_settings() {
+        let loud = NotifierConfig {
+            enabled: true,
+            ..NotifierConfig::default()
+        };
+        let mut svc = NotifierService::new_for_test(loud);
+        svc.notify(NotificationKind::TaskComplete, "before", "body");
+        assert_eq!(svc.recorded().len(), 1, "precondition: notifying");
+
+        let quiet = NotifierConfig {
+            enabled: false,
+            ..NotifierConfig::default()
+        };
+        svc.reconfigure(quiet);
+
+        svc.notify(NotificationKind::TaskComplete, "after", "body");
+        assert_eq!(
+            svc.recorded().len(),
+            1,
+            "a project that disables notifications was still notified"
+        );
     }
 }
