@@ -20,6 +20,7 @@ mod run;
 mod scroll;
 mod search;
 mod session_picker;
+mod session_views;
 mod sink;
 #[cfg(test)]
 mod snapshot;

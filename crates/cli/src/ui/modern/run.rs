@@ -945,7 +945,9 @@ pub(super) async fn event_loop(
                                         "could not resume {id}: its project settings could \
                                              not be read ({e}) — staying in {previous_cwd}"
                                     )));
-                                app.cancel_deferred_resume_work();
+                                app.cancel_deferred_resume_work(
+                                    "cancelled — held for a session whose settings could not be read:",
+                                );
                                 app.pending_resume = None;
                                 app.dirty = true;
                                 continue;
@@ -965,7 +967,7 @@ pub(super) async fn event_loop(
                                 // work held for a swap that is not going to
                                 // happen before the gate opens, or it lands
                                 // on the conversation being kept.
-                                app.cancel_deferred_resume_work();
+                                app.cancel_deferred_resume_work("cancelled — held for a session whose directory could not be entered:");
                                 app.pending_resume = None;
                                 app.dirty = true;
                                 continue;
@@ -1097,7 +1099,9 @@ pub(super) async fn event_loop(
                                     },
                                 )
                                 .await;
-                                app.cancel_deferred_resume_work();
+                                app.cancel_deferred_resume_work(
+                                    "cancelled — held for a resume that could not be applied:",
+                                );
                                 app.pending_resume = None;
                                 app.dirty = true;
                                 continue;
@@ -1176,7 +1180,7 @@ pub(super) async fn event_loop(
                             {
                                 app.cancel_requested = true;
                             }
-                            app.cancel_deferred_resume_work();
+                            app.cancel_deferred_resume_work("cancelled — held for a session whose directory became unavailable:");
                             app.pending_resume = None;
                             app.dirty = true;
                             continue;
@@ -1840,7 +1844,9 @@ pub(super) async fn event_loop(
                         // restored whenever the filesystem got round to
                         // it. Their only escape was leaving the TUI.
                         let id = app.pending_resume.take().unwrap_or_default();
-                        app.cancel_deferred_resume_work();
+                        app.cancel_deferred_resume_work(
+                            "cancelled — held for the resume you cancelled:",
+                        );
                         app.status_message.clear();
                         app.transcript.push(super::app::TranscriptItem::System(format!(
                             "resume of {id} cancelled — staying here"
@@ -2008,7 +2014,9 @@ pub(super) async fn event_loop(
                             // never arrived, and releasing it would run it
                             // against the conversation the user was trying
                             // to leave.
-                            app.cancel_deferred_resume_work();
+                            app.cancel_deferred_resume_work(
+                                "cancelled — held for the session that failed to load:",
+                            );
                             app.pending_resume = None;
                             app.dirty = true;
                         }
@@ -4855,7 +4863,7 @@ mod tests {
 
         // What the cancel path does.
         let id = app.pending_resume.take().unwrap_or_default();
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
 
         assert_eq!(id, "other-session");
         assert!(app.pending_resume.is_none(), "the gate still names it");

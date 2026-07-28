@@ -18,6 +18,10 @@ use super::mode::SessionMode;
 /// Overlay state for the session picker.
 #[derive(Debug, Clone)]
 pub struct SessionPicker {
+    /// The session the user is in right now. Marked in the list so
+    /// "resume" never looks like it might land somewhere else.
+    /// Sessions with a cached view — returning to one of these keeps
+    /// where you were instead of rebuilding from the conversation.
     /// Filter over id, label, cwd and model.
     pub query: String,
     /// Highlighted row into the filtered list.
@@ -356,8 +360,13 @@ impl App {
     /// screen, and skipping this would leave the restored history on
     /// display in front of an empty conversation.
     pub fn clear_transcript_view(&mut self) {
-        self.transcript.clear();
-        self.expanded.clear();
+        // Replaced, not `clear`ed: clearing drops the rows but keeps the
+        // buffer a long transcript grew, and that buffer then travels
+        // into the session-view cache on the next switch. Releasing it
+        // here keeps what `/clear` frees and what the cache is charged
+        // for the same number — see `session_views::view_bytes`.
+        self.transcript = Vec::new();
+        self.expanded = std::collections::HashSet::new();
         self.selected_item = None;
         self.layout.invalidate();
         self.ctx_meter = None;
@@ -368,7 +377,7 @@ impl App {
     /// for never arrived. None of it may run against the conversation the
     /// user was trying to leave — a prompt or `!cmd` would take real tool
     /// and filesystem side effects there — so it is cancelled and shown.
-    pub fn cancel_deferred_resume_work(&mut self) {
+    pub fn cancel_deferred_resume_work(&mut self, header: &str) {
         // Notices carried from the accept are already on the transcript,
         // and the swap they were waiting for is never going to happen.
         // Left here they would surface again — stale and attributed to
@@ -376,10 +385,12 @@ impl App {
         self.resume_notices.clear();
         // Terminal path: no restore follows, so nothing needs to survive
         // a transcript swap that will not happen.
-        self.cancel_pending_session_work(
-            "cancelled — held for the session that failed to load:",
-            false,
-        );
+        //
+        // The header is the caller's, because the *reason* differs and
+        // the user is reading it: a load that failed and a resume the
+        // user chose to abandon both end here, and reporting the second
+        // as the first blames a session that was never unhealthy.
+        self.cancel_pending_session_work(header, false);
     }
 
     /// Session-scoped work staged against a conversation that is being
@@ -575,6 +586,30 @@ impl App {
             return;
         };
         self.close_session_picker();
+        // Selecting the session you are already in is a no-op, not a
+        // reload. Going through the resume path would cancel pending
+        // work and rebuild the transcript to arrive exactly where it
+        // started — the user would lose queued prompts for nothing.
+        if id == self.session_id {
+            // Choosing to stay must also *stop* a resume already in
+            // flight. `/resume` can be reopened while an earlier
+            // selection is still loading, and returning without clearing
+            // it left the run loop free to apply that earlier
+            // destination — while this message claimed nothing happened.
+            self.status_message = if self.pending_resume.take().is_some() {
+                // Taking the gate is not enough: work staged against the
+                // session that was loading is held *because* a resume is
+                // outstanding, so releasing the gate without releasing
+                // that work lets the run loop apply a `/clear` meant for
+                // a session we are no longer going to.
+                self.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
+                "already in this session — cancelled the resume in progress".to_string()
+            } else {
+                "already in this session".to_string()
+            };
+            self.dirty = true;
+            return;
+        }
         // Work already staged against the conversation we are leaving is
         // resolved here, at the moment of the decision. Left alone the
         // resume gates would merely *hold* it, and it would then land on
@@ -603,6 +638,27 @@ impl App {
 
     /// Replace the visible transcript with a restored conversation.
     pub fn restore_transcript(&mut self, items: Vec<TranscriptItem>, id: &str, turns: usize) {
+        // Remember the session being left, so switching back lands where
+        // it was rather than at the bottom of a rebuilt transcript.
+        self.stash_current_view();
+
+        // Returning to a session visited earlier: restore what was on
+        // screen instead of the rebuild. The engine reloaded the
+        // conversation either way; this only decides what is shown.
+        if let Some(view) = self.session_views.take(id) {
+            self.transcript = view.transcript;
+            self.expanded = view.expanded;
+            self.selected_item = view.selected_item;
+            self.layout.invalidate();
+            self.scroll = view.scroll;
+            for note in std::mem::take(&mut self.resume_notices) {
+                self.transcript.push(TranscriptItem::System(note));
+            }
+            self.status_message.clear();
+            self.dirty = true;
+            return;
+        }
+
         self.transcript = items;
         self.expanded.clear();
         self.selected_item = None;
@@ -621,6 +677,30 @@ impl App {
         self.scroll_to_bottom();
         self.status_message.clear();
         self.dirty = true;
+    }
+
+    /// Snapshot the outgoing session's view before switching away,
+    /// *consuming* what is on screen.
+    ///
+    /// Called only from [`Self::restore_transcript`], which overwrites
+    /// the transcript and the expansion set on every path immediately
+    /// afterwards — so the outgoing state is moved, not copied. Copying
+    /// would matter: resume deliberately supports conversations that run
+    /// to megabytes of strings, and duplicating one on the event-loop
+    /// thread stalls input and repaint for as long as the copy takes,
+    /// putting back the pause that loading off-thread removed.
+    ///
+    /// A session with nothing on screen is not stored — see
+    /// [`super::session_views::SessionViews::save`].
+    pub fn stash_current_view(&mut self) {
+        let id = self.session_id.clone();
+        let view = super::session_views::SessionView {
+            transcript: std::mem::take(&mut self.transcript),
+            scroll: self.scroll,
+            expanded: std::mem::take(&mut self.expanded),
+            selected_item: self.selected_item,
+        };
+        self.session_views.save(&id, view);
     }
 
     /// Point every App mirror at the session just restored.
@@ -672,6 +752,105 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    /// Picking the session you are already in must do nothing. Routing
+    /// it through the resume path would cancel queued work and rebuild
+    /// the transcript to land exactly where it started.
+    #[test]
+    fn resuming_the_current_session_is_a_no_op() {
+        let mut app = App::new("m", "/tmp", "sess-a");
+        app.queue.push_back("a queued prompt".into());
+        app.open_session_picker(vec![summary("sess-a", Some("current"), "/a")]);
+        app.session_picker_accept();
+
+        assert!(
+            app.pending_resume.is_none(),
+            "scheduled a resume of the session already in front"
+        );
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "queued work was cancelled for a no-op resume"
+        );
+        assert!(app.status_message.contains("already in this session"));
+    }
+
+    /// Switching away and back must land where you left. Rebuilding is
+    /// correct but loses position and expansions, which makes moving
+    /// between sessions cost more than it saves.
+    #[test]
+    fn returning_to_a_session_restores_where_you_were() {
+        let mut app = App::new("m", "/tmp", "session-a");
+        app.transcript
+            .push(TranscriptItem::User("work in a".into()));
+        app.scroll = crate::ui::modern::scroll::ScrollState::Free { top_line: 7 };
+        app.expanded.insert(0);
+
+        // Switch to B: A's view is stashed, B is rebuilt from messages.
+        app.session_id = "session-a".into();
+        app.restore_transcript(
+            vec![TranscriptItem::User("work in b".into())],
+            "session-b",
+            1,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "work in b")),
+            "did not switch to B"
+        );
+
+        // Back to A: the stashed view wins over the rebuild, so the
+        // rebuilt items passed here must NOT be what is shown.
+        app.session_id = "session-b".into();
+        app.restore_transcript(
+            vec![TranscriptItem::User("rebuilt from disk".into())],
+            "session-a",
+            1,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "work in a")),
+            "A's view was not restored: {:?}",
+            app.transcript
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "rebuilt from disk")),
+            "the rebuild replaced a cached view"
+        );
+        assert_eq!(
+            app.scroll,
+            crate::ui::modern::scroll::ScrollState::Free { top_line: 7 },
+            "scroll position was not restored"
+        );
+        assert!(app.expanded.contains(&0), "expansions were not restored");
+    }
+
+    /// A session never visited has no cached view, so it must be built
+    /// from the conversation rather than showing someone else's.
+    #[test]
+    fn a_first_visit_uses_the_rebuilt_transcript() {
+        let mut app = App::new("m", "/tmp", "session-a");
+        app.transcript.push(TranscriptItem::User("in a".into()));
+        app.restore_transcript(
+            vec![TranscriptItem::User("fresh from disk".into())],
+            "never-seen",
+            2,
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "fresh from disk"))
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "in a"))
+        );
+    }
+
     use super::*;
     use agent_code_lib::llm::message::{AssistantMessage, ContentBlock, Message, UserMessage};
     use agent_code_lib::tools::PermissionResponse;
@@ -1019,6 +1198,34 @@ mod tests {
         assert!(app.ctx_meter.is_none());
     }
 
+    /// `/clear` frees the transcript's memory, not just its rows.
+    ///
+    /// `Vec::clear` would leave the buffer a long conversation grew still
+    /// allocated, and the next session switch moves that buffer into the
+    /// view cache — where it is correctly charged its real size and so
+    /// evicts other sessions' places to pay for rows nobody can see.
+    #[test]
+    fn clearing_the_view_releases_the_transcript_allocation() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript = (0..4096)
+            .map(|i| TranscriptItem::User(format!("row {i}")))
+            .collect();
+        app.expanded = (0..4096).collect();
+
+        app.clear_transcript_view();
+
+        assert_eq!(
+            app.transcript.capacity(),
+            0,
+            "a cleared transcript kept its buffer"
+        );
+        assert_eq!(
+            app.expanded.capacity(),
+            0,
+            "a cleared expansion set kept its buffer"
+        );
+    }
+
     /// A failed resume must not release work that was deferred *for* the
     /// session that never arrived: a prompt or `!cmd` would take real
     /// side effects in the conversation the user was trying to leave.
@@ -1031,7 +1238,7 @@ mod tests {
         app.pending_shell = Some("rm -rf build".into());
         app.pending_submit = Some("keep going".into());
 
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
 
         assert!(!app.pending_clear, "/clear would run on the old session");
         assert!(
@@ -1357,7 +1564,7 @@ mod tests {
         assert!(!app.resume_notices.is_empty(), "nothing was carried");
 
         // The chosen session turns out to be missing or corrupt.
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
         assert!(app.resume_notices.is_empty());
 
         // A later, unrelated resume must not replay it.
@@ -1542,7 +1749,7 @@ mod tests {
         );
 
         // The load fails: the clear is cancelled and the history stands.
-        app.cancel_deferred_resume_work();
+        app.cancel_deferred_resume_work("cancelled — held for the session that failed to load:");
         assert!(!app.pending_clear);
         assert!(
             app.transcript
@@ -1781,6 +1988,76 @@ work",
             app.transcript.last(),
             Some(TranscriptItem::System(t)) if t.contains("abcdef12")
         ));
+    }
+
+    /// `/resume` can be reopened while an earlier selection is still
+    /// loading. Choosing the session you are already in must stop that
+    /// earlier resume too — otherwise the run loop applies it while the
+    /// status line claims nothing happened.
+    #[test]
+    fn staying_put_cancels_a_resume_already_in_flight() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.session_id = "current-session".to_string();
+        app.pending_resume = Some("other-session".to_string());
+        app.open_session_picker(vec![summary("current-session", None, "/a")]);
+
+        app.session_picker_accept();
+
+        assert!(
+            app.pending_resume.is_none(),
+            "the in-flight resume survived the decision to stay"
+        );
+        assert!(
+            app.status_message.contains("already in this session"),
+            "status: {}",
+            app.status_message
+        );
+    }
+
+    /// Work staged against the session that was loading is held
+    /// *because* a resume is outstanding. Releasing the gate without
+    /// releasing that work let the run loop apply a `/clear` meant for a
+    /// session the user just decided not to go to.
+    #[test]
+    fn staying_put_also_releases_work_held_for_the_abandoned_resume() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.session_id = "current-session".to_string();
+        app.pending_resume = Some("other-session".to_string());
+        app.pending_clear = true;
+        app.resume_notices.push("stale notice".into());
+        app.open_session_picker(vec![summary("current-session", None, "/a")]);
+
+        app.session_picker_accept();
+
+        assert!(app.pending_resume.is_none(), "gate not released");
+        assert!(
+            !app.pending_clear,
+            "a /clear staged for the abandoned resume would land on this session"
+        );
+        assert!(
+            app.resume_notices.is_empty(),
+            "notices for a swap that never happens would resurface on the next one"
+        );
+        // The user cancelled; the session they were heading to may be
+        // perfectly healthy. Blaming it for a load failure is a lie
+        // about why their /clear did not run.
+        let reported = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !reported.contains("failed to load"),
+            "a user-cancelled resume was reported as a load failure: {reported}"
+        );
+        assert!(
+            reported.contains("resume you cancelled"),
+            "the cancellation was not attributed to the user: {reported}"
+        );
     }
 
     /// A prompt submitted while the selected session is still loading is
