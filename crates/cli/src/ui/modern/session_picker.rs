@@ -596,7 +596,7 @@ impl App {
             // selection is still loading, and returning without clearing
             // it left the run loop free to apply that earlier
             // destination — while this message claimed nothing happened.
-            self.status_message = if self.pending_resume.take().is_some() {
+            self.status_message = if self.resume.settle().is_some() {
                 // Taking the gate is not enough: work staged against the
                 // session that was loading is held *because* a resume is
                 // outstanding, so releasing the gate without releasing
@@ -619,7 +619,7 @@ impl App {
             "cancelled — issued before you resumed another session:",
             true,
         );
-        self.pending_resume = Some(id.clone());
+        self.resume.begin(id.clone());
         self.status_message = format!("resuming {}…", short_id(&id));
         self.dirty = true;
     }
@@ -752,6 +752,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use crate::ui::modern::resume_state::WorkScope;
     /// Picking the session you are already in must do nothing. Routing
     /// it through the resume path would cancel queued work and rebuild
     /// the transcript to land exactly where it started.
@@ -763,7 +764,7 @@ mod tests {
         app.session_picker_accept();
 
         assert!(
-            app.pending_resume.is_none(),
+            app.resume.allows(WorkScope::Session),
             "scheduled a resume of the session already in front"
         );
         assert_eq!(
@@ -914,7 +915,7 @@ mod tests {
         app.session_picker_move(1);
         app.session_picker_accept();
         assert!(!app.session_picker_open());
-        assert_eq!(app.pending_resume.as_deref(), Some("bbb22222"));
+        assert_eq!(app.resume.loading_id(), Some("bbb22222"));
     }
 
     /// Enter with an empty result set must not resume something the user
@@ -929,7 +930,7 @@ mod tests {
         app.session_picker_accept();
         assert!(!app.session_picker_open());
         assert!(
-            app.pending_resume.is_none(),
+            app.resume.allows(WorkScope::Session),
             "resumed an unselected session"
         );
     }
@@ -1164,7 +1165,10 @@ mod tests {
             !app.session_picker_open(),
             "picker kept the keyboard under a HITL modal"
         );
-        assert!(app.pending_resume.is_none(), "a resume was scheduled");
+        assert!(
+            app.resume.allows(WorkScope::Session),
+            "a resume was scheduled"
+        );
     }
 
     /// A `/clear` held back for a resume lands after the restore has
@@ -1232,7 +1236,7 @@ mod tests {
     #[test]
     fn a_failed_resume_cancels_the_work_it_deferred() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
         app.pending_clear = true;
         app.pending_slash = Some("/cost".into());
         app.pending_shell = Some("rm -rf build".into());
@@ -1496,7 +1500,7 @@ mod tests {
 
         app.session_picker_accept();
 
-        assert_eq!(app.pending_resume.as_deref(), Some("aaa11111"));
+        assert_eq!(app.resume.loading_id(), Some("aaa11111"));
         assert!(
             !app.pending_clear,
             "/clear would have cleared the restored session"
@@ -1708,7 +1712,7 @@ mod tests {
     #[test]
     fn a_second_shell_submission_does_not_discard_the_first() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
 
         app.input = "!one".into();
         app.cursor = app.input.len();
@@ -1736,7 +1740,7 @@ mod tests {
     fn clear_during_a_resume_holds_its_visible_half() {
         let mut app = App::new("m", "/tmp", "s");
         app.transcript.push(TranscriptItem::User("earlier".into()));
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
 
         app.input = "/clear".into();
         app.cursor = app.input.len();
@@ -1765,7 +1769,7 @@ mod tests {
     #[test]
     fn reclaiming_removes_the_row_the_submission_drew() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
         app.input = "check the parser".into();
         app.cursor = app.input.len();
         app.submit();
@@ -1826,7 +1830,7 @@ mod tests {
         // truncate the id.
         let _ = summary_line(&summary(id, None, "/a"));
         app.session_picker_accept();
-        assert_eq!(app.pending_resume.as_deref(), Some(id));
+        assert_eq!(app.resume.loading_id(), Some(id));
         app.restore_transcript(vec![], id, 1);
 
         assert!(
@@ -1887,7 +1891,7 @@ work",
     #[test]
     fn reclaiming_a_load_time_prompt_returns_the_app_to_idle() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
         app.input = "check the parser".into();
         app.cursor = app.input.len();
         app.submit();
@@ -1958,7 +1962,7 @@ work",
         let mut app = App::new("m", "/tmp", "s");
         app.phase = Phase::Streaming;
         app.queue.push_back("old conversation prompt".into());
-        app.pending_resume = Some("abcdef123456".into());
+        app.resume.begin("abcdef123456");
         app.mark_turn_idle();
         app.dispatch_queue_head();
         assert!(
@@ -1998,13 +2002,13 @@ work",
     fn staying_put_cancels_a_resume_already_in_flight() {
         let mut app = App::new("m", "/tmp", "s");
         app.session_id = "current-session".to_string();
-        app.pending_resume = Some("other-session".to_string());
+        app.resume.begin("other-session".to_string());
         app.open_session_picker(vec![summary("current-session", None, "/a")]);
 
         app.session_picker_accept();
 
         assert!(
-            app.pending_resume.is_none(),
+            app.resume.allows(WorkScope::Session),
             "the in-flight resume survived the decision to stay"
         );
         assert!(
@@ -2022,14 +2026,14 @@ work",
     fn staying_put_also_releases_work_held_for_the_abandoned_resume() {
         let mut app = App::new("m", "/tmp", "s");
         app.session_id = "current-session".to_string();
-        app.pending_resume = Some("other-session".to_string());
+        app.resume.begin("other-session".to_string());
         app.pending_clear = true;
         app.resume_notices.push("stale notice".into());
         app.open_session_picker(vec![summary("current-session", None, "/a")]);
 
         app.session_picker_accept();
 
-        assert!(app.pending_resume.is_none(), "gate not released");
+        assert!(app.resume.allows(WorkScope::Session), "gate not released");
         assert!(
             !app.pending_clear,
             "a /clear staged for the abandoned resume would land on this session"

@@ -16,6 +16,7 @@ mod mode;
 mod model_picker;
 mod palette;
 mod render;
+pub mod resume_state;
 mod run;
 mod scroll;
 mod search;

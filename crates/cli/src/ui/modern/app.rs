@@ -9,6 +9,7 @@ use agent_code_lib::services::notifier::NotificationKind;
 
 use super::layout::LayoutCache;
 use super::mode::SessionMode;
+use super::resume_state::WorkScope;
 use super::scroll::ScrollState;
 use super::sink::EngineEvent;
 use super::stream_buffer::StreamBuffer;
@@ -454,7 +455,12 @@ pub struct App {
     /// `/resume` in-TUI session picker.
     pub session_picker: Option<super::session_picker::SessionPicker>,
     /// Session id the run loop should load.
-    pub pending_resume: Option<String>,
+    /// Where the resume lifecycle is. Replaces a bare `Option<String>`:
+    /// the gate on session-scoped deferred work is now asked of the state
+    /// ([`super::resume_state::ResumeState::allows`]) rather than
+    /// re-derived at each consumer, which is where two review findings
+    /// came from.
+    pub resume: super::resume_state::ResumeState,
     /// `/resume` asked for the session list. Enumerating sessions is
     /// filesystem work, so the run loop does it off this thread and
     /// hands the result back through `show_session_picker`.
@@ -701,7 +707,7 @@ impl App {
             command_palette: None,
             model_picker: None,
             session_picker: None,
-            pending_resume: None,
+            resume: Default::default(),
             pending_session_list: false,
             deferred_sessions: None,
             resume_notices: Vec::new(),
@@ -1396,7 +1402,7 @@ impl App {
             // blank screen in front of a conversation that is still
             // there. The deferred handler clears the view when it runs.
             // (`ctx_meter` is cleared by `clear_transcript_view`.)
-            if self.pending_resume.is_none() {
+            if self.resume.allows(WorkScope::Session) {
                 self.clear_transcript_view();
                 // The checklist belongs to the conversation being
                 // discarded; keeping it would hold the pane open on work
@@ -2153,7 +2159,7 @@ impl App {
         // composed against the conversation that is about to be replaced,
         // so sending its head now would run it against a different
         // session than the user wrote it for.
-        if self.pending_resume.is_some() {
+        if self.resume.is_loading() {
             return;
         }
         if let Some(text) = self.queue.pop_front() {
@@ -2614,6 +2620,55 @@ impl App {
         self.dirty = true;
     }
 
+    // ---- Session-scoped deferred work ----
+    //
+    // Each accessor asks the resume state before yielding its value, so
+    // the gate cannot be forgotten: there is no other way to reach the
+    // field. Previously every consumer wrote `pending_resume.is_none()`
+    // by hand, and a deferred action added without that line ran against
+    // the session a restore was about to replace — which is exactly what
+    // two review findings were.
+
+    /// Take a deferred `/model` action, unless a resume holds it.
+    pub fn take_pending_model(&mut self) -> Option<PendingModelAction> {
+        self.take_session_scoped(|a| a.pending_model.take())
+    }
+
+    /// Take a deferred bridged slash command, unless a resume holds it.
+    pub fn take_pending_slash(&mut self) -> Option<String> {
+        self.take_session_scoped(|a| a.pending_slash.take())
+    }
+
+    /// Take a deferred `!cmd`, unless a resume holds it.
+    pub fn take_pending_shell(&mut self) -> Option<String> {
+        self.take_session_scoped(|a| a.pending_shell.take())
+    }
+
+    /// Take a deferred prompt, unless a resume holds it.
+    pub fn take_pending_submit(&mut self) -> Option<String> {
+        self.take_session_scoped(|a| a.pending_submit.take())
+    }
+
+    /// Claim a deferred `/clear`, unless a resume holds it.
+    ///
+    /// Returns whether it was claimed; the flag is cleared only when it
+    /// is, so a held `/clear` stays pending rather than being dropped.
+    pub fn claim_pending_clear(&mut self) -> bool {
+        if !self.pending_clear || !self.resume.allows(WorkScope::Session) {
+            return false;
+        }
+        self.pending_clear = false;
+        true
+    }
+
+    /// The one place the session gate is applied to a take.
+    fn take_session_scoped<T>(&mut self, take: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.resume.allows(WorkScope::Session) {
+            return None;
+        }
+        take(self)
+    }
+
     pub fn toggle_tasks(&mut self) {
         self.show_tasks = !self.show_tasks;
         self.dirty = true;
@@ -3054,6 +3109,59 @@ mod tests {
 
     use super::*;
     use agent_code_lib::tools::PermissionResponse;
+
+    /// The property the refactor exists for: the gate is inside the
+    /// accessor, so a caller cannot reach session-scoped deferred work
+    /// while a resume is loading — with or without remembering to check.
+    #[test]
+    fn session_scoped_work_is_withheld_while_a_resume_loads() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_model = Some(PendingModelAction::Show);
+        app.pending_slash = Some("/status".into());
+        app.pending_shell = Some("ls".into());
+        app.pending_submit = Some("a prompt".into());
+        app.pending_clear = true;
+
+        app.resume.begin("other-session");
+
+        assert!(app.take_pending_model().is_none(), "model action escaped");
+        assert!(app.take_pending_slash().is_none(), "slash command escaped");
+        assert!(app.take_pending_shell().is_none(), "shell command escaped");
+        assert!(app.take_pending_submit().is_none(), "prompt escaped");
+        assert!(!app.claim_pending_clear(), "/clear escaped");
+
+        // Withheld, not consumed: it must still be there afterwards.
+        assert!(app.pending_model.is_some(), "the held action was dropped");
+        assert!(app.pending_clear, "the held /clear was dropped");
+    }
+
+    /// Once the resume settles, the same work is available again.
+    #[test]
+    fn session_scoped_work_is_released_when_the_resume_settles() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_slash = Some("/status".into());
+        app.pending_clear = true;
+        app.resume.begin("other-session");
+        assert!(app.take_pending_slash().is_none());
+
+        app.resume.settle();
+
+        assert_eq!(app.take_pending_slash().as_deref(), Some("/status"));
+        assert!(app.claim_pending_clear());
+        assert!(!app.pending_clear, "claiming must consume the flag");
+    }
+
+    /// Global work is not session state and must not be held — holding it
+    /// would freeze the UI for no safety gain.
+    #[test]
+    fn global_work_runs_during_a_resume() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.resume.begin("other-session");
+        assert!(
+            app.resume.allows(WorkScope::Global),
+            "global work was held behind a resume"
+        );
+    }
 
     // Build a transcript tall enough to scroll, then prime layout metrics as
     // the draw would (one System block = one wrapped line each here).

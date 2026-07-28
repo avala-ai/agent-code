@@ -21,6 +21,7 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 
+use super::resume_state::WorkScope;
 use super::terminal_caps::TerminalCaps;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -775,7 +776,7 @@ pub(super) async fn event_loop(
     let (resume_tx, mut resume_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Result<Box<LoadedSession>, String>)>();
     // Set while a load is in flight so the arm does not respawn it every
-    // pass; `app.pending_resume` stays set until the restore is applied,
+    // pass; `app.resume` stays `Loading` until the restore is applied,
     // which is what suppresses queue auto-dispatch in the meantime.
     let mut resume_loading = false;
     let mut pending_restore: Option<Box<LoadedSession>> = None;
@@ -823,7 +824,7 @@ pub(super) async fn event_loop(
         // onto the conversation being replaced. The choice is not lost —
         // the restore replays it on top of the restored session, since a
         // toggle made after picking is the user's newest instruction.
-        if (app.mode != last_mode || app.mode_chosen) && app.pending_resume.is_none() {
+        if (app.mode != last_mode || app.mode_chosen) && app.resume.allows(WorkScope::Session) {
             apply_mode_to_engine(session, app.mode, base_permission_mode);
             last_mode = app.mode;
             app.mode_chosen = false;
@@ -842,9 +843,7 @@ pub(super) async fn event_loop(
         // handlers is already "apply when possible", so they simply run
         // once the restored session is in place. `/theme` is exempt: it is
         // global UI state, not session state.
-        if app.pending_resume.is_none()
-            && let Some(action) = app.pending_model.take()
-        {
+        if let Some(action) = app.take_pending_model() {
             let engine_arc = session.engine();
             match engine_arc.try_lock() {
                 Ok(mut eng) => {
@@ -908,7 +907,7 @@ pub(super) async fn event_loop(
             let (id, data, items, loaded_cfg) = *loaded;
             // Superseded by a newer selection made while this one was
             // still loading: drop it, the load arm fetches the new one.
-            if app.pending_resume.as_deref() == Some(id.as_str()) {
+            if app.resume.is_awaiting(&id) {
                 match session.engine().try_lock() {
                     Ok(probe) => {
                         // The probe only answers "is the engine free right
@@ -948,7 +947,7 @@ pub(super) async fn event_loop(
                                 app.cancel_deferred_resume_work(
                                     "cancelled — held for a session whose settings could not be read:",
                                 );
-                                app.pending_resume = None;
+                                app.resume.settle();
                                 app.dirty = true;
                                 continue;
                             }
@@ -968,7 +967,7 @@ pub(super) async fn event_loop(
                                 // happen before the gate opens, or it lands
                                 // on the conversation being kept.
                                 app.cancel_deferred_resume_work("cancelled — held for a session whose directory could not be entered:");
-                                app.pending_resume = None;
+                                app.resume.settle();
                                 app.dirty = true;
                                 continue;
                             }
@@ -1102,7 +1101,7 @@ pub(super) async fn event_loop(
                                 app.cancel_deferred_resume_work(
                                     "cancelled — held for a resume that could not be applied:",
                                 );
-                                app.pending_resume = None;
+                                app.resume.settle();
                                 app.dirty = true;
                                 continue;
                             }
@@ -1181,7 +1180,7 @@ pub(super) async fn event_loop(
                                 app.cancel_requested = true;
                             }
                             app.cancel_deferred_resume_work("cancelled — held for a session whose directory became unavailable:");
-                            app.pending_resume = None;
+                            app.resume.settle();
                             app.dirty = true;
                             continue;
                         }
@@ -1323,7 +1322,7 @@ pub(super) async fn event_loop(
                                 app.cancel_requested = true;
                             }
                         }
-                        app.pending_resume = None;
+                        app.resume.settle();
                         drop(eng);
                         // SessionStart for the session just restored, now
                         // that the engine describes it. Paired with the
@@ -1379,7 +1378,7 @@ pub(super) async fn event_loop(
         // parity). try_lock like `/model`: if a turn holds the mutex we
         // retry next iteration (the live atomic state is unaffected).
         if app.pending_clear
-            && app.pending_resume.is_none()
+            && app.resume.allows(WorkScope::Session)
             && let Ok(mut eng) = session.engine().try_lock()
         {
             eng.state_mut().messages.clear();
@@ -1401,9 +1400,7 @@ pub(super) async fn event_loop(
         // Run off the async worker via `block_in_place`: many slash arms call
         // `Handle::block_on` / spawn+join, which panic if invoked directly on
         // a Tokio worker without parking it first.
-        if app.pending_resume.is_none()
-            && let Some(slash) = app.pending_slash.take()
-        {
+        if let Some(slash) = app.take_pending_slash() {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     let interactive = crate::commands::is_interactive_slash(&slash);
@@ -1492,9 +1489,7 @@ pub(super) async fn event_loop(
         }
 
         // `!cmd` shell passthrough (classic parity).
-        if app.pending_resume.is_none()
-            && let Some(cmd) = app.pending_shell.take()
-        {
+        if let Some(cmd) = app.take_pending_shell() {
             match session.engine().try_lock() {
                 Ok(mut eng) => {
                     use agent_code_lib::services::shell_passthrough;
@@ -1575,7 +1570,7 @@ pub(super) async fn event_loop(
         // send now, with the blocks it was already encoded with. Not while
         // a resume is outstanding: it would be staged against the
         // conversation the restore is about to replace.
-        if turn.is_none() && active_encode.is_none() && app.pending_resume.is_none() {
+        if turn.is_none() && active_encode.is_none() && app.resume.allows(WorkScope::Session) {
             app.rearm_deferred_prompt();
         }
 
@@ -1585,12 +1580,12 @@ pub(super) async fn event_loop(
         // prompt, which keeps this loop free to redraw and to take a Ctrl+C
         // while a slow mount is being read.
         //
-        // Gated on `pending_resume` for the same reason the turn start
+        // Gated on the resume state for the same reason the turn start
         // below is: taking the prompt here would encode it for the
         // conversation being thrown away.
         if turn.is_none()
             && active_encode.is_none()
-            && app.pending_resume.is_none()
+            && app.resume.allows(WorkScope::Session)
             && !app.pending_images.is_empty()
             && let Some(prompt) = app.pending_submit.take()
         {
@@ -1626,7 +1621,7 @@ pub(super) async fn event_loop(
         // handed back to the composer when the restore lands.
         if turn.is_none()
             && active_encode.is_none()
-            && app.pending_resume.is_none()
+            && app.resume.allows(WorkScope::Session)
             && let Some(prompt) = app.pending_submit.take()
         {
             app.pending_submit_display = None;
@@ -1768,7 +1763,7 @@ pub(super) async fn event_loop(
                 // through to `select!` would park until an unrelated event
                 // — leaving the user staring at "resuming …" until they
                 // pressed a key.
-                if app.pending_submit.is_some() || app.pending_resume.is_some() {
+                if app.pending_submit.is_some() || app.resume.is_loading() {
                     continue;
                 }
             }
@@ -1829,12 +1824,12 @@ pub(super) async fn event_loop(
             maybe_ev = next_terminal_event(&mut pending_events, term_events) => {
                 match maybe_ev {
                     Some(Ok(Event::Key(key))) if is_cancel_chord(&key)
-                        && app.pending_resume.is_some() =>
+                        && app.resume.is_loading() =>
                     {
                         // A resume whose session or policy is still being
                         // read off a slow mount. Nothing is applied until
                         // it lands, and the apply is gated on
-                        // `pending_resume` still naming it — so clearing
+                        // the state still awaiting it — so settling
                         // that *is* the cancellation: the read finishes
                         // into a result nobody wants and is dropped.
                         //
@@ -1843,7 +1838,7 @@ pub(super) async fn event_loop(
                         // session the user had decided against was
                         // restored whenever the filesystem got round to
                         // it. Their only escape was leaving the TUI.
-                        let id = app.pending_resume.take().unwrap_or_default();
+                        let id = app.resume.settle().unwrap_or_default();
                         app.cancel_deferred_resume_work(
                             "cancelled — held for the resume you cancelled:",
                         );
@@ -1961,11 +1956,11 @@ pub(super) async fn event_loop(
             // this thread froze input and repaint for its duration. Only
             // the (cheap) apply stays on the loop, where it can be
             // ordered against turn teardown.
-            _ = std::future::ready(()), if app.pending_resume.is_some()
+            _ = std::future::ready(()), if app.resume.is_loading()
                 && !resume_loading
                 && pending_restore.is_none()
                 && turn.is_none() => {
-                if let Some(id) = app.pending_resume.clone() {
+                if let Some(id) = app.resume.loading_id().map(str::to_string) {
                     resume_loading = true;
                     let tx = resume_tx.clone();
                     // Read the display setting here: the blocking task
@@ -1996,12 +1991,12 @@ pub(super) async fn event_loop(
             }
             Some((id, loaded)) = resume_rx.recv() => {
                 resume_loading = false;
-                // Dropped unless `pending_resume` still names this one.
+                // Dropped unless the state is still awaiting this one.
                 // Two things clear it: a second `/resume` supersedes the
                 // first, and Ctrl+C cancels it outright — restoring a
                 // session the user has moved on from, or decided against,
                 // is the same mistake either way.
-                if app.pending_resume.as_deref() == Some(id.as_str()) {
+                if app.resume.is_awaiting(&id) {
                     match loaded {
                         Ok(l) => pending_restore = Some(l),
                         Err(e) => {
@@ -2009,7 +2004,7 @@ pub(super) async fn event_loop(
                             app.transcript.push(super::app::TranscriptItem::Error(
                                 format!("could not resume {id}: {e}"),
                             ));
-                            // Cancel *before* clearing `pending_resume`:
+                            // Cancel *before* settling the state:
                             // the work was deferred for a session that
                             // never arrived, and releasing it would run it
                             // against the conversation the user was trying
@@ -2017,7 +2012,7 @@ pub(super) async fn event_loop(
                             app.cancel_deferred_resume_work(
                                 "cancelled — held for the session that failed to load:",
                             );
-                            app.pending_resume = None;
+                            app.resume.settle();
                             app.dirty = true;
                         }
                     }
@@ -4852,24 +4847,27 @@ mod tests {
     /// A resume waiting on a slow filesystem is abandoned by Ctrl+C.
     ///
     /// Nothing is applied until the read lands, and both apply sites are
-    /// gated on `pending_resume` still naming it — so clearing that *is*
+    /// gated on the state still awaiting it — so settling that *is*
     /// the cancellation. Without it the app sits `Idle` while the load is
     /// outstanding, so Ctrl+C only armed quit and the session arrived
     /// whenever the filesystem got round to it.
     #[test]
     fn a_pending_resume_is_dropped_once_cancelled() {
         let mut app = App::new("m", "/tmp", "s");
-        app.pending_resume = Some("other-session".into());
+        app.resume.begin("other-session");
 
         // What the cancel path does.
-        let id = app.pending_resume.take().unwrap_or_default();
+        let id = app.resume.settle().unwrap_or_default();
         app.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
 
         assert_eq!(id, "other-session");
-        assert!(app.pending_resume.is_none(), "the gate still names it");
+        assert!(
+            app.resume.allows(WorkScope::Session),
+            "the gate still names it"
+        );
         // The apply sites ask exactly this question before restoring.
         assert_ne!(
-            app.pending_resume.as_deref(),
+            app.resume.loading_id(),
             Some("other-session"),
             "a load landing now would still be applied"
         );
