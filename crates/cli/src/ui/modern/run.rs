@@ -309,6 +309,22 @@ impl CliPermissionOverride {
         // what it is for.
         let locked = cfg.security.disable_bypass_permissions;
         if self.no_sandbox && !locked {
+            // Warn where the flag takes effect, not only where it was
+            // typed. Starting in a project that forbids bypasses emits
+            // "--no-sandbox ignored"; without this, that stays the only
+            // notice the operator ever sees, and it describes the
+            // opposite of the security state once the session resumes
+            // somewhere the flag does apply.
+            //
+            // Only on the transition: a destination whose own config
+            // already disables the sandbox is not becoming less isolated
+            // by being resumed into.
+            if cfg.sandbox.enabled {
+                agent_code_lib::services::warnings::warn(
+                    "Process-level sandbox disabled for this project (--no-sandbox). Tool \
+                     calls are not isolated.",
+                );
+            }
             cfg.sandbox.enabled = false;
         }
         if let Some(mode) = self.default_mode
@@ -5112,6 +5128,96 @@ mod tests {
         );
     }
 
+    /// Starting in a locked project emits "--no-sandbox ignored". If
+    /// that stayed the only notice, it would describe the opposite of
+    /// the truth the moment the session resumed somewhere the flag does
+    /// apply — the operator would have been told they were sandboxed
+    /// while tool calls ran unisolated.
+    ///
+    /// Drives `apply` directly rather than `load_project_config`: the
+    /// latter reads the user config layer through `XDG_CONFIG_HOME`, so
+    /// what it returns depends on the environment the suite happens to
+    /// run in. Snapshots either side rather than clearing, because the
+    /// warning registry is process-global and shared with every other
+    /// test in this binary.
+    #[test]
+    fn taking_effect_in_a_new_project_warns_again() {
+        let requested = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: true,
+            overlay: None,
+        };
+        // A destination that permits bypasses and wants the sandbox on.
+        let mut cfg = agent_code_lib::config::Config::default();
+        cfg.security.disable_bypass_permissions = false;
+        cfg.sandbox.enabled = true;
+
+        let before = agent_code_lib::services::warnings::snapshot().len();
+        requested.apply(&mut cfg);
+        let after = agent_code_lib::services::warnings::snapshot();
+
+        assert!(!cfg.sandbox.enabled, "precondition: the flag applied here");
+        assert!(
+            after[before..]
+                .iter()
+                .any(|w| w.message.contains("sandbox disabled for this project")),
+            "the sandbox was disabled with no warning at the moment it happened: {:?}",
+            &after[before..]
+        );
+    }
+
+    /// A destination that already disables the sandbox itself is not
+    /// becoming less isolated, so re-announcing it on every resume would
+    /// train the operator to ignore the notice that matters.
+    #[test]
+    fn a_project_that_already_disables_the_sandbox_is_not_re_announced() {
+        let requested = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: true,
+            overlay: None,
+        };
+        let mut cfg = agent_code_lib::config::Config::default();
+        cfg.security.disable_bypass_permissions = false;
+        cfg.sandbox.enabled = false;
+
+        let before = agent_code_lib::services::warnings::snapshot().len();
+        requested.apply(&mut cfg);
+        let after = agent_code_lib::services::warnings::snapshot();
+
+        assert!(
+            !after[before..]
+                .iter()
+                .any(|w| w.message.contains("sandbox disabled for this project")),
+            "warned about a change that did not happen"
+        );
+    }
+
+    /// And a locked destination still refuses the flag outright, so no
+    /// warning is due there either — the sandbox never came down.
+    #[test]
+    fn a_locked_destination_neither_disables_nor_warns() {
+        let requested = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: true,
+            overlay: None,
+        };
+        let mut cfg = agent_code_lib::config::Config::default();
+        cfg.security.disable_bypass_permissions = true;
+        cfg.sandbox.enabled = true;
+
+        let before = agent_code_lib::services::warnings::snapshot().len();
+        requested.apply(&mut cfg);
+        let after = agent_code_lib::services::warnings::snapshot();
+
+        assert!(cfg.sandbox.enabled, "a locked project lost its sandbox");
+        assert!(
+            !after[before..]
+                .iter()
+                .any(|w| w.message.contains("sandbox disabled for this project")),
+            "announced a bypass that the lock refused"
+        );
+    }
+
     /// The complement, and the case that was broken: a `--no-sandbox`
     /// given while the *starting* project locked bypasses must still
     /// apply when the session later resumes into one that permits them.
@@ -5123,14 +5229,16 @@ mod tests {
     /// warning to say so.
     #[test]
     fn no_sandbox_still_applies_after_starting_in_a_locked_project() {
+        let _guard = crate::ui::test_locks::env();
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join(".agent-code")).unwrap();
-        // The destination permits bypasses; only the start was locked.
-        std::fs::write(
-            dir.path().join(".agent-code/settings.json"),
-            r#"{"sandbox": {"enabled": true}}"#,
-        )
-        .unwrap();
+        let agent = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        // The destination permits bypasses and wants the sandbox on;
+        // only the start was locked. Written where the loader actually
+        // looks — a fixture it never reads leaves `enabled` at its
+        // `false` default, and the assertion below passes for the wrong
+        // reason.
+        std::fs::write(agent.join("settings.toml"), "[sandbox]\nenabled = true\n").unwrap();
 
         // What startup records for `--no-sandbox` regardless of the
         // directory it happened to launch in.
