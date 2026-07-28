@@ -275,6 +275,26 @@ fn tool_detail(input: &serde_json::Value) -> String {
 
 impl App {
     /// Open the session picker (`/resume` with no argument).
+    /// Whether an overlay that [`Self::open_session_picker`] would
+    /// displace is in front right now.
+    ///
+    /// The session scan runs off-thread, so its rows can arrive after
+    /// the user has opened Ctrl+F, `/model`, `/theme` or the palette.
+    /// Showing the picker then takes the keyboard away from the thing
+    /// they just opened, to answer a request they have visibly moved on
+    /// from — a second `/resume` is not the only way to supersede one.
+    ///
+    /// Deliberately adjacent to `open_session_picker`, and listing the
+    /// same overlays it closes: these are one list, and keeping them
+    /// apart is how one grows an entry the other forgets.
+    pub fn session_picker_would_displace_an_overlay(&self) -> bool {
+        self.search_open()
+            || self.model_picker.is_some()
+            || self.theme_picker.is_some()
+            || self.command_palette.is_some()
+            || self.show_shortcuts
+    }
+
     pub fn open_session_picker(&mut self, entries: Vec<SessionSummary>) {
         if self.front_modal().is_some() {
             return;
@@ -1748,6 +1768,61 @@ mod tests {
             !app.tasks.iter().any(|t| t.source == TaskSource::Subagent),
             "the previous conversation's subagents stayed in the pane"
         );
+    }
+
+    /// A scan that lands after the user opened something else is
+    /// answering a request they have moved on from. Every overlay the
+    /// picker would close counts, not just a second `/resume`.
+    #[test]
+    fn a_scan_result_yields_to_whatever_the_user_opened_since() {
+        let mut app = App::new("m", "/tmp", "s");
+        assert!(
+            !app.session_picker_would_displace_an_overlay(),
+            "nothing is open, so nothing would be displaced"
+        );
+
+        app.open_search();
+        assert!(
+            app.session_picker_would_displace_an_overlay(),
+            "a scan landing now would take the keyboard from Ctrl+F"
+        );
+        app.cancel_search();
+
+        app.command_palette = Some(Default::default());
+        assert!(app.session_picker_would_displace_an_overlay());
+        app.command_palette = None;
+
+        app.show_shortcuts = true;
+        assert!(app.session_picker_would_displace_an_overlay());
+        app.show_shortcuts = false;
+
+        app.open_model_picker("m", vec![("m".into(), "reason".into())]);
+        assert!(
+            app.session_picker_would_displace_an_overlay(),
+            "the model picker is routed after the session picker, so it \
+             would be left open and unreachable"
+        );
+    }
+
+    /// The list has to match what `open_session_picker` actually closes.
+    /// If it drifts, a scan silently steals focus from the overlay the
+    /// predicate forgot — so this pins them together.
+    #[test]
+    fn every_overlay_the_picker_closes_is_one_it_yields_to() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.open_search();
+        app.command_palette = Some(Default::default());
+        app.show_shortcuts = true;
+
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+
+        // Everything it closed is now shut, which is only consistent if
+        // the predicate above named that same set.
+        assert!(!app.search_open());
+        assert!(app.command_palette.is_none());
+        assert!(!app.show_shortcuts);
+        assert!(app.model_picker.is_none());
+        assert!(app.theme_picker.is_none());
     }
 
     /// Switching away and back is the whole point of the view cache, so
