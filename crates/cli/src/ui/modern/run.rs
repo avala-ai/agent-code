@@ -138,6 +138,25 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// The project root that owns the settings `load_policy_from` will read
+/// from `dir`.
+///
+/// Derived from the settings *file* the loader finds, not from the
+/// nearest `.agent` directory: a subdirectory can hold an `.agent` with
+/// only skills in it, and stopping there scoped grants and the canonical
+/// team-memory check to a directory whose policy was never adopted.
+/// Using the same discovery call the loader uses makes the two agree by
+/// construction rather than by coincidence.
+///
+/// `None` when no project settings file governs `dir` — the caller then
+/// falls back to git/marker detection.
+fn policy_root_from_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // `<root>/.agent/settings.toml` → `<root>`.
+    let settings = agent_code_lib::config::find_project_config_from(dir)?;
+    let agent_dir = settings.parent()?;
+    agent_dir.parent().map(std::path::Path::to_path_buf)
+}
+
 /// Drive `work` to completion while the TUI keeps painting.
 ///
 /// Awaiting a hook directly parks the sole event-loop future, so the
@@ -471,13 +490,7 @@ async fn finish_cwd_adoption(
     // and scoping grants and the canonical team-memory check to the
     // subdirectory leaves `/repo/.agent/team-memory` outside the root —
     // unprotected exactly where a resume crossed into it.
-    // The directory that owns the `.agent` config we just read, first:
-    // `project_root_for` looks for a git root and language markers and
-    // knows nothing about `.agent`, so a non-Git project whose only
-    // marker is its settings file resolved to the saved *subdirectory* —
-    // scoping grants and the canonical team-memory check below the
-    // directory that actually defines them.
-    let project_root = match agent_code_lib::config::find_project_root_from(dir) {
+    let project_root = match policy_root_from_config(dir) {
         Some(root) => root,
         None => agent_code_lib::services::session_env::project_root_for(dir).await,
     };
@@ -5154,6 +5167,39 @@ mod tests {
             mcp_fingerprint(&forward),
             mcp_fingerprint(&changed),
             "a changed environment value must still compare unequal"
+        );
+    }
+
+    /// A subdirectory can hold an `.agent` that carries no settings — a
+    /// skills folder, say. Config loading walks past it to the settings
+    /// that actually govern, so the policy scope has to walk past it too:
+    /// stopping at the nearest `.agent` directory scoped grants and the
+    /// canonical team-memory check to a directory whose policy was never
+    /// adopted.
+    #[test]
+    fn the_policy_root_follows_the_settings_that_govern() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".agent")).unwrap();
+        std::fs::write(
+            root.path().join(".agent").join("settings.toml"),
+            "[permissions]\ndefault_mode = \"ask\"\n",
+        )
+        .unwrap();
+
+        // A nearer `.agent` holding no settings at all.
+        let sub = root.path().join("subdir");
+        std::fs::create_dir_all(sub.join(".agent").join("skills")).unwrap();
+
+        let resolved = policy_root_from_config(&sub).expect("settings govern this directory");
+
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            root.path().canonicalize().unwrap(),
+            "the scope stopped at an .agent that defines no policy"
+        );
+        assert!(
+            policy_root_from_config(std::path::Path::new("/")).is_none(),
+            "no governing settings should fall back, not invent a root"
         );
     }
 }
