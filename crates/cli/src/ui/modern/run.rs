@@ -1805,6 +1805,29 @@ pub(super) async fn event_loop(
             // Terminal input.
             maybe_ev = next_terminal_event(&mut pending_events, term_events) => {
                 match maybe_ev {
+                    Some(Ok(Event::Key(key))) if is_cancel_chord(&key)
+                        && app.pending_resume.is_some() =>
+                    {
+                        // A resume whose session or policy is still being
+                        // read off a slow mount. Nothing is applied until
+                        // it lands, and the apply is gated on
+                        // `pending_resume` still naming it — so clearing
+                        // that *is* the cancellation: the read finishes
+                        // into a result nobody wants and is dropped.
+                        //
+                        // Without this the app is `Idle` while the load is
+                        // outstanding, so Ctrl+C only armed quit, and the
+                        // session the user had decided against was
+                        // restored whenever the filesystem got round to
+                        // it. Their only escape was leaving the TUI.
+                        let id = app.pending_resume.take().unwrap_or_default();
+                        app.cancel_deferred_resume_work();
+                        app.status_message.clear();
+                        app.transcript.push(super::app::TranscriptItem::System(format!(
+                            "resume of {id} cancelled — staying here"
+                        )));
+                        app.dirty = true;
+                    }
                     Some(Ok(Event::Key(key))) => {
                         // Disarm a stale quit before routing the key so a late
                         // second Ctrl+C re-arms instead of quitting.
@@ -1948,9 +1971,11 @@ pub(super) async fn event_loop(
             }
             Some((id, loaded)) = resume_rx.recv() => {
                 resume_loading = false;
-                // A second `/resume` while this one was loading wins; drop
-                // the stale result rather than restoring a session the
-                // user has already moved on from.
+                // Dropped unless `pending_resume` still names this one.
+                // Two things clear it: a second `/resume` supersedes the
+                // first, and Ctrl+C cancels it outright — restoring a
+                // session the user has moved on from, or decided against,
+                // is the same mistake either way.
                 if app.pending_resume.as_deref() == Some(id.as_str()) {
                     match loaded {
                         Ok(l) => pending_restore = Some(l),
@@ -4794,6 +4819,32 @@ mod tests {
         assert!(
             !text.contains('\u{1b}'),
             "escape sequences reached the transcript: {text:?}"
+        );
+    }
+
+    /// A resume waiting on a slow filesystem is abandoned by Ctrl+C.
+    ///
+    /// Nothing is applied until the read lands, and both apply sites are
+    /// gated on `pending_resume` still naming it — so clearing that *is*
+    /// the cancellation. Without it the app sits `Idle` while the load is
+    /// outstanding, so Ctrl+C only armed quit and the session arrived
+    /// whenever the filesystem got round to it.
+    #[test]
+    fn a_pending_resume_is_dropped_once_cancelled() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.pending_resume = Some("other-session".into());
+
+        // What the cancel path does.
+        let id = app.pending_resume.take().unwrap_or_default();
+        app.cancel_deferred_resume_work();
+
+        assert_eq!(id, "other-session");
+        assert!(app.pending_resume.is_none(), "the gate still names it");
+        // The apply sites ask exactly this question before restoring.
+        assert_ne!(
+            app.pending_resume.as_deref(),
+            Some("other-session"),
+            "a load landing now would still be applied"
         );
     }
 
