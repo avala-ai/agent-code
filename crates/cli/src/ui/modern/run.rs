@@ -1831,14 +1831,18 @@ pub(super) async fn event_loop(
                         app.turn_count = eng.state().turn_count;
                         app.model = eng.state().config.api.model.clone();
 
-                        // Checkpoint the conversation now that the turn is
-                        // reaped and the engine's totals are final.
-                        if let Err(e) = persist_session(&eng) {
-                            app.transcript
-                                .push(super::app::TranscriptItem::System(format!(
-                                    "could not save session: {e}"
-                                )));
-                            app.dirty = true;
+                        // Checkpoint now that the turn is reaped and the
+                        // engine's totals are final. Only the copy happens
+                        // under the lock — serializing, masking and writing
+                        // the whole history would stall input and repaint on
+                        // every turn, which is the freeze the off-thread
+                        // session load exists to avoid.
+                        if let Some(snap) = session_snapshot(&eng) {
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = write_session_snapshot(&snap) {
+                                    tracing::warn!("could not save session: {e}");
+                                }
+                            });
                         }
 
                         // The model can toggle plan mode itself
@@ -2252,17 +2256,6 @@ pub(super) async fn event_loop(
         }
     }
 
-    // Persist before tearing down. A turn still running is cancelled
-    // below, so its partial output is deliberately not what gets saved —
-    // the last checkpoint is the last completed turn.
-    {
-        let engine_arc = session.engine();
-        let eng = engine_arc.lock().await;
-        if let Err(e) = persist_session(&eng) {
-            tracing::warn!("could not save session on exit: {e}");
-        }
-    }
-
     // Cancel any in-flight turn on exit. Deny every pending permission
     // first: turn tasks blocked inside the prompter would otherwise
     // deadlock the `join()` below.
@@ -2272,46 +2265,88 @@ pub(super) async fn event_loop(
         let _ = h.join().await;
     }
 
+    // Save last, and only once the turn is joined: a live turn holds the
+    // engine mutex for the whole of `run_turn_spawned`, so locking before
+    // the cancel above deadlocked teardown on any exit during streaming or
+    // at a permission prompt. Written inline rather than off-thread —
+    // there is no UI left to keep responsive, and the write must finish
+    // before the process exits.
+    {
+        let engine_arc = session.engine();
+        let eng = engine_arc.lock().await;
+        if let Some(snap) = session_snapshot(&eng)
+            && let Err(e) = write_session_snapshot(&snap)
+        {
+            tracing::warn!("could not save session on exit: {e}");
+        }
+    }
+
     match loop_err {
         Some(e) => Err(e),
         None => Ok(()),
     }
 }
 
-/// Write the live conversation to the sessions directory.
+/// The parts of a conversation that get written to disk.
+///
+/// Taken under the engine lock and written outside it: `save_session_full`
+/// re-reads the previous JSON, serializes the whole history and masks it
+/// before writing, which is far too much to do on the event-loop thread
+/// once it runs after every turn.
+struct SessionSnapshot {
+    id: String,
+    messages: Vec<agent_code_lib::llm::message::Message>,
+    cwd: String,
+    model: String,
+    turn_count: usize,
+    cost_usd: f64,
+    tokens_in: u64,
+    tokens_out: u64,
+    plan_mode: bool,
+}
+
+/// Copy the live conversation out of the engine, or `None` when there is
+/// nothing worth writing.
+///
+/// An empty conversation is skipped: launching and quitting without
+/// asking anything should not leave a session for the picker to list.
+fn session_snapshot(eng: &agent_code_lib::query::QueryEngine) -> Option<SessionSnapshot> {
+    let st = eng.state();
+    if st.messages.is_empty() {
+        return None;
+    }
+    Some(SessionSnapshot {
+        id: st.session_id.clone(),
+        messages: st.messages.clone(),
+        cwd: st.cwd.clone(),
+        model: st.config.api.model.clone(),
+        turn_count: st.turn_count,
+        cost_usd: st.total_cost_usd,
+        tokens_in: st.total_usage.input_tokens,
+        tokens_out: st.total_usage.output_tokens,
+        plan_mode: st.plan_mode,
+    })
+}
+
+/// Write a snapshot to the sessions directory.
 ///
 /// `/resume` reads that directory, so without this the picker can only
 /// ever list sessions created by `/fork` or a scheduled run — an
 /// interactive session was never persisted at all, and quitting lost it.
 ///
-/// Called after every completed turn and once on exit rather than only
-/// on exit, so a crash or a kill costs at most the turn in progress.
-/// `save_session_full` re-reads the existing file to preserve
-/// `created_at`, `label` and `tags`, so repeated saves are cheap to
-/// reason about and do not clobber metadata set elsewhere.
-///
-/// A conversation with no messages is not written: launching and
-/// quitting without asking anything should not leave a session behind
-/// for the picker to list.
-///
-/// Failures are reported to the transcript and otherwise ignored — a
-/// full disk or an unwritable config dir must not take down the turn
-/// loop or block exit.
-fn persist_session(eng: &agent_code_lib::query::QueryEngine) -> Result<(), String> {
-    let st = eng.state();
-    if st.messages.is_empty() {
-        return Ok(());
-    }
+/// `save_session_full`, not `save_session`: the thin wrapper hardcodes
+/// `plan_mode = false` and zeroes the cost and token totals.
+fn write_session_snapshot(snap: &SessionSnapshot) -> Result<(), String> {
     agent_code_lib::services::session::save_session_full(
-        &st.session_id,
-        &st.messages,
-        &st.cwd,
-        &st.config.api.model,
-        st.turn_count,
-        st.total_cost_usd,
-        st.total_usage.input_tokens,
-        st.total_usage.output_tokens,
-        st.plan_mode,
+        &snap.id,
+        &snap.messages,
+        &snap.cwd,
+        &snap.model,
+        snap.turn_count,
+        snap.cost_usd,
+        snap.tokens_in,
+        snap.tokens_out,
+        snap.plan_mode,
     )
     .map(|_| ())
 }
@@ -5345,7 +5380,8 @@ mod tests {
             },
         );
         let eng = engine_with(vec![msg]);
-        persist_session(&eng).expect("save");
+        let snap = session_snapshot(&eng).expect("non-empty conversation snapshots");
+        write_session_snapshot(&snap).expect("save");
 
         let found = agent_code_lib::services::session::list_session_summaries(10);
         let it = found
@@ -5373,7 +5409,10 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
 
-        persist_session(&engine_with(Vec::new())).expect("no-op save");
+        assert!(
+            session_snapshot(&engine_with(Vec::new())).is_none(),
+            "an empty conversation produced a snapshot to write"
+        );
 
         assert!(
             agent_code_lib::services::session::list_session_summaries(10).is_empty(),
