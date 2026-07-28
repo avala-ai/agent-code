@@ -517,6 +517,44 @@ fn check_session_cwd(
     Ok(Some(dir))
 }
 
+/// Why the destination project's provider cannot be adopted, if it
+/// cannot.
+///
+/// The provider is built once, at startup, from the project the process
+/// launched in. Adoption moves *policy* — permissions, sandbox, hooks,
+/// features — but not the transport, so a destination naming a different
+/// endpoint or authentication mode would receive the restored
+/// conversation over the source's connection: sent to an endpoint the
+/// user did not choose, or billed to an account they had switched away
+/// from. A wire format that does not know the restored model merely
+/// fails, which is the harmless case.
+///
+/// Refusing is the conservative half. Rebuilding the provider for the
+/// destination is the complete fix and needs an auth and credential
+/// story of its own — tracked in #537.
+///
+/// The model is deliberately not compared: two projects sharing an
+/// endpoint may legitimately prefer different models, and the restore
+/// already carries the session's own.
+fn provider_mismatch(
+    current: &agent_code_lib::config::ApiConfig,
+    destination: &agent_code_lib::config::ApiConfig,
+) -> Option<String> {
+    if current.base_url != destination.base_url {
+        return Some(format!(
+            "it is configured for a different API endpoint ({})",
+            destination.base_url
+        ));
+    }
+    if current.auth_mode != destination.auth_mode {
+        return Some(format!(
+            "it is configured for a different authentication mode ({:?})",
+            destination.auth_mode
+        ));
+    }
+    None
+}
+
 /// Finish moving into a directory the process has already entered:
 /// engine state, prompt cache (the cwd is baked into it), persistent
 /// grants (per-project, so approvals from the old one must stop
@@ -986,7 +1024,12 @@ pub(super) async fn event_loop(
                         // project-A session running against project-B's
                         // cwd — the wrong-tree hazard this restore exists
                         // to prevent. Refuse the whole resume instead.
-                        let previous_cwd = session.engine().lock().await.state().cwd.clone();
+                        let (previous_cwd, current_api) = {
+                            let engine_arc = session.engine();
+                            let eng = engine_arc.lock().await;
+                            let st = eng.state();
+                            (st.cwd.clone(), st.config.api.clone())
+                        };
                         // Phase A — everything that can fail, before
                         // anything is touched. A directory that cannot be
                         // entered and settings that will not parse are
@@ -1014,6 +1057,28 @@ pub(super) async fn event_loop(
                                 continue;
                             }
                         };
+                        // Still Phase A: the transport cannot be moved
+                        // with the policy, so a destination that would
+                        // need a different one is refused here rather
+                        // than silently answered over the source's
+                        // connection.
+                        if let Some(cfg) = destination_cfg.as_ref()
+                            && let Some(why) = provider_mismatch(&current_api, &cfg.api)
+                        {
+                            app.status_message.clear();
+                            app.transcript
+                                .push(super::app::TranscriptItem::Error(format!(
+                                    "could not resume {id}: {why} — restart in {} to use it, \
+                                     staying in {previous_cwd}",
+                                    data.cwd
+                                )));
+                            app.cancel_deferred_resume_work(
+                                "cancelled — held for a session that needs a different provider:",
+                            );
+                            app.resume.settle();
+                            app.dirty = true;
+                            continue;
+                        }
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
                             Ok(dir) => dir,
                             Err(e) => {
@@ -5160,6 +5225,70 @@ mod tests {
         assert!(
             cfg.sandbox.enabled,
             "--no-sandbox was carried into a locked project that enables the sandbox"
+        );
+    }
+
+    /// The provider is built once at startup. Adoption moves policy but
+    /// not the transport, so a destination naming another endpoint would
+    /// receive the restored conversation over the source's connection —
+    /// sent somewhere the user did not choose, or billed to an account
+    /// they had switched away from.
+    #[test]
+    fn a_destination_on_another_endpoint_is_refused() {
+        use agent_code_lib::config::ApiConfig;
+        let current = ApiConfig {
+            base_url: "https://api.example.com".into(),
+            ..ApiConfig::default()
+        };
+        let destination = ApiConfig {
+            base_url: "https://internal.corp.example".into(),
+            ..ApiConfig::default()
+        };
+
+        let why =
+            provider_mismatch(&current, &destination).expect("a different endpoint was accepted");
+        assert!(
+            why.contains("internal.corp.example"),
+            "the refusal did not name the endpoint it refused: {why}"
+        );
+    }
+
+    /// Same endpoint, different credentials: the conversation would be
+    /// billed to an account the user had moved away from.
+    #[test]
+    fn a_destination_using_another_auth_mode_is_refused() {
+        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
+        let current = ApiConfig {
+            auth_mode: ApiAuthMode::ApiKey,
+            ..ApiConfig::default()
+        };
+        let destination = ApiConfig {
+            auth_mode: ApiAuthMode::CodexChatgpt,
+            ..ApiConfig::default()
+        };
+        assert!(provider_mismatch(&current, &destination).is_some());
+    }
+
+    /// A project that shares the endpoint and credentials is fine, and
+    /// preferring a different model is not a reason to refuse: two
+    /// projects on one endpoint may legitimately differ there, and the
+    /// restore already carries the session's own.
+    #[test]
+    fn a_destination_sharing_the_provider_is_accepted_whatever_model_it_prefers() {
+        use agent_code_lib::config::ApiConfig;
+        let current = ApiConfig {
+            base_url: "https://api.example.com".into(),
+            model: "fast-1".into(),
+            ..ApiConfig::default()
+        };
+        let destination = ApiConfig {
+            base_url: "https://api.example.com".into(),
+            model: "thorough-9".into(),
+            ..ApiConfig::default()
+        };
+        assert!(
+            provider_mismatch(&current, &destination).is_none(),
+            "a differing model alone blocked a resume that shares the provider"
         );
     }
 
