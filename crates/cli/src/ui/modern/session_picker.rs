@@ -273,6 +273,13 @@ fn tool_detail(input: &serde_json::Value) -> String {
     String::new()
 }
 
+/// What `/resume` shows while its scan runs.
+///
+/// Shared so the code that clears it cannot drift from the code that
+/// sets it: they are one fact, and comparing against a copied literal
+/// is how a later reword leaves the status uncleared.
+pub const SESSION_SCAN_STATUS: &str = "loading sessions…";
+
 impl App {
     /// Open the session picker (`/resume` with no argument).
     /// Take a completed session scan, or drop it and say nothing.
@@ -287,8 +294,16 @@ impl App {
     /// wrote over it, reporting a scan that finished long ago.
     pub fn accept_session_scan(&mut self, rows: Vec<SessionSummary>) {
         if self.session_picker_would_displace_an_overlay() {
-            self.status_message.clear();
-            self.dirty = true;
+            // Only if it is still the scan's own line. Ctrl+F, the model
+            // and theme pickers and the palette each write their own
+            // instructions when they open, and clearing unconditionally
+            // erased the guidance of the overlay that is still in front.
+            // The shortcuts overlay writes nothing, which is the case
+            // that needs clearing.
+            if self.status_message == SESSION_SCAN_STATUS {
+                self.status_message.clear();
+                self.dirty = true;
+            }
             return;
         }
         self.show_session_picker(rows);
@@ -1802,10 +1817,10 @@ mod tests {
     #[test]
     fn a_dropped_scan_does_not_leave_its_status_behind() {
         let mut app = App::new("m", "/tmp", "s");
-        app.status_message = "loading sessions…".into();
+        app.status_message = SESSION_SCAN_STATUS.into();
         app.toggle_shortcuts();
         assert_eq!(
-            app.status_message, "loading sessions…",
+            app.status_message, SESSION_SCAN_STATUS,
             "precondition: this overlay does not write its own status"
         );
 
@@ -1823,12 +1838,37 @@ mod tests {
         assert!(app.show_shortcuts, "the user's overlay was closed anyway");
     }
 
+    /// An overlay that writes its own instructions keeps them. Ctrl+F,
+    /// the model and theme pickers and the palette all replace the
+    /// status line when they open, so the scan's line is already gone —
+    /// clearing regardless erased the guidance for the overlay the user
+    /// is actually looking at.
+    #[test]
+    fn a_dropped_scan_leaves_an_active_overlays_own_status_alone() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.status_message = SESSION_SCAN_STATUS.into();
+        app.open_search();
+        let banner = app.status_message.clone();
+        assert_ne!(
+            banner, SESSION_SCAN_STATUS,
+            "precondition: this overlay writes its own status"
+        );
+
+        app.accept_session_scan(vec![summary("aaa11111", None, "/a")]);
+
+        assert_eq!(
+            app.status_message, banner,
+            "the search overlay lost its instructions to a scan it had already superseded"
+        );
+        assert!(app.search_open());
+    }
+
     /// The ordinary path is unchanged: with nothing in the way the rows
     /// open the picker, and the status goes with it.
     #[test]
     fn an_accepted_scan_opens_the_picker() {
         let mut app = App::new("m", "/tmp", "s");
-        app.status_message = "loading sessions…".into();
+        app.status_message = SESSION_SCAN_STATUS.into();
 
         app.accept_session_scan(vec![summary("aaa11111", None, "/a")]);
 

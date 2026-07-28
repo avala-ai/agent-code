@@ -1519,7 +1519,7 @@ impl App {
             // does the scan on a blocking thread and calls back into
             // `show_session_picker`.
             self.pending_session_list = true;
-            self.status_message = "loading sessions…".into();
+            self.status_message = super::session_picker::SESSION_SCAN_STATUS.into();
             self.input.clear();
             self.cursor = 0;
             self.dirty = true;
