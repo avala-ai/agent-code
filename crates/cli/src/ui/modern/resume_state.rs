@@ -100,9 +100,9 @@ impl ResumeState {
     ///
     /// The superseded read is left to finish and be discarded on
     /// arrival — [`Self::is_awaiting`] already refuses it.
-    pub fn load_to_start<'a>(&'a self, in_flight: Option<&str>) -> Option<&'a str> {
+    pub fn load_to_start<'a>(&'a self, in_flight: &[String]) -> Option<&'a str> {
         match self.loading_id() {
-            Some(id) if in_flight != Some(id) => Some(id),
+            Some(id) if !in_flight.iter().any(|f| f == id) => Some(id),
             _ => None,
         }
     }
@@ -195,15 +195,16 @@ mod tests {
     fn a_superseding_load_starts_while_the_old_one_is_still_running() {
         let mut s = ResumeState::Idle;
         s.begin("first");
-        assert_eq!(s.load_to_start(None), Some("first"));
+        assert_eq!(s.load_to_start(&[]), Some("first"));
 
         // "first" is now off-thread; nothing further to start for it.
-        assert_eq!(s.load_to_start(Some("first")), None);
+        let running = vec!["first".to_string()];
+        assert_eq!(s.load_to_start(&running), None);
 
         // The user picks another session while "first" is still stuck.
         s.begin("second");
         assert_eq!(
-            s.load_to_start(Some("first")),
+            s.load_to_start(&running),
             Some("second"),
             "the superseding load waited for the read it replaced"
         );
@@ -212,8 +213,8 @@ mod tests {
     #[test]
     fn nothing_starts_when_no_resume_is_awaited() {
         let s = ResumeState::Idle;
-        assert_eq!(s.load_to_start(None), None);
-        assert_eq!(s.load_to_start(Some("stale")), None);
+        assert_eq!(s.load_to_start(&[]), None);
+        assert_eq!(s.load_to_start(&["stale".to_string()]), None);
     }
 
     #[test]

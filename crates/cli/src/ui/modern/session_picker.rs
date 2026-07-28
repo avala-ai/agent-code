@@ -446,9 +446,15 @@ impl App {
         // conversation being replaced — so without reclaiming them here
         // they and their attachments vanish with no notice at all, which
         // is the one outcome this function exists to prevent.
-        for (prompt, _blocks) in std::mem::take(&mut self.deferred_prompts) {
-            self.remove_staged_row(&prompt);
-            carried.push(prompt);
+        for (submission, _blocks) in std::mem::take(&mut self.deferred_prompts) {
+            // The typed line, not the engine payload: a prompt naming an
+            // image *and* a text file has that file's contents inlined
+            // into the payload, so reporting it would print the file into
+            // the notice — and `remove_staged_row` would miss, because the
+            // row on screen shows what the user typed.
+            let text = submission.user_text();
+            self.remove_staged_row(&text);
+            carried.push(text);
         }
         // A prompt whose images are still being encoded is inside the
         // blocking task, not in `pending_submit`, so nothing else here
@@ -1644,8 +1650,10 @@ mod tests {
     #[test]
     fn a_held_image_prompt_is_reported_rather_than_vanishing() {
         let mut app = App::new("m", "/tmp", "s");
-        app.deferred_prompts
-            .push_back(("look at @shot.png please".into(), Vec::new()));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("look at @shot.png please"),
+            Vec::new(),
+        ));
 
         app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
         app.session_picker_accept();
@@ -1666,6 +1674,45 @@ mod tests {
         assert!(
             app.deferred_prompts.is_empty(),
             "the held prompt was reported but left staged for the new session"
+        );
+    }
+
+    /// A prompt naming an image *and* a text file has that file's
+    /// contents inlined into its engine payload. Reporting the payload
+    /// would print the file into the cancellation notice, and
+    /// `remove_staged_row` would miss too — the row on screen shows what
+    /// the user typed. The typed line therefore travels with the payload.
+    #[test]
+    fn a_reclaimed_image_prompt_reports_the_typed_line_not_the_inlined_file() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission {
+                payload: "compare @shot.png with @src/main.rs\n                          <file path=\"src/main.rs\">fn main() { secret_helper(); }</file>"
+                    .into(),
+                display: Some("compare @shot.png with @src/main.rs".into()),
+            },
+            Vec::new(),
+        ));
+
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        app.session_picker_accept();
+
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("compare @shot.png with @src/main.rs"),
+            "the typed line was not reported: {said}"
+        );
+        assert!(
+            !said.contains("secret_helper"),
+            "an inlined file body was printed into the cancellation notice"
         );
     }
 

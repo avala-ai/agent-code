@@ -49,6 +49,15 @@ pub struct Submission {
 }
 
 impl Submission {
+    /// A prompt the composer sent unchanged, where the payload *is*
+    /// what the user typed.
+    pub fn verbatim(text: impl Into<String>) -> Self {
+        Submission {
+            payload: text.into(),
+            display: None,
+        }
+    }
+
     /// The user's own words, falling back to the payload when the
     /// composer sent it verbatim.
     ///

@@ -786,7 +786,20 @@ pub(super) async fn event_loop(
     // wanted. `ResumeState` already knows which id is awaited; this says
     // which one is in flight, and the two are compared rather than
     // conflated.
-    let mut loading_now: Option<String> = None;
+    let mut loading_now: Vec<String> = Vec::new();
+    let mut resume_cap_warned = false;
+
+    /// How many session reads may be outstanding at once.
+    ///
+    /// A superseded read cannot be cancelled — `spawn_blocking` owns its
+    /// thread until the filesystem answers — so each supersession over an
+    /// unavailable mount abandons one. Letting the newer choice start is
+    /// the point; letting them accumulate without limit is not, because
+    /// exhausting Tokio's blocking pool stops image encoding, session
+    /// scans and every later resume too. Three is enough for ordinary
+    /// re-picking and small enough that a hung mount cannot drain the
+    /// pool through this path.
+    const MAX_INFLIGHT_RESUME_READS: usize = 3;
     let mut pending_restore: Option<Box<LoadedSession>> = None;
     // Image attachments are read and encoded the same way: detached, with
     // the result landing in a select arm. Awaiting the work inline would
@@ -1963,15 +1976,19 @@ pub(super) async fn event_loop(
             // this thread froze input and repaint for its duration. Only
             // the (cheap) apply stays on the loop, where it can be
             // ordered against turn teardown.
-            _ = std::future::ready(()), if app.resume.load_to_start(loading_now.as_deref()).is_some()
+            _ = std::future::ready(()), if app.resume.load_to_start(&loading_now).is_some()
+                && (loading_now.len() < MAX_INFLIGHT_RESUME_READS || !resume_cap_warned)
                 && pending_restore.is_none()
                 && turn.is_none() => {
-                if let Some(id) = app
-                    .resume
-                    .load_to_start(loading_now.as_deref())
-                    .map(str::to_string)
-                {
-                    loading_now = Some(id.clone());
+                if loading_now.len() >= MAX_INFLIGHT_RESUME_READS {
+                    // Said once, not every iteration: this arm is always
+                    // ready, so an unguarded message here would spin.
+                    resume_cap_warned = true;
+                    app.status_message =
+                        "waiting for an earlier session read to finish".into();
+                    app.dirty = true;
+                } else if let Some(id) = app.resume.load_to_start(&loading_now).map(str::to_string) {
+                    loading_now.push(id.clone());
                     let tx = resume_tx.clone();
                     // Read the display setting here: the blocking task
                     // cannot touch `app`.
@@ -2003,9 +2020,8 @@ pub(super) async fn event_loop(
                 // Only the load still in flight clears the marker. A
                 // superseded read finishing late must not report the
                 // newer one as done, or its result would never arrive.
-                if loading_now.as_deref() == Some(id.as_str()) {
-                    loading_now = None;
-                }
+                loading_now.retain(|f| f != &id);
+                resume_cap_warned = false;
                 // Dropped unless the state is still awaiting this one.
                 // Two things clear it: a second `/resume` supersedes the
                 // first, and Ctrl+C cancels it outright — restoring a
@@ -2052,12 +2068,21 @@ pub(super) async fn event_loop(
                     app.abandon_staged_attachments();
                 } else {
                     active_encode = None;
-                    // It arrived, so nothing needs reclaiming on its behalf.
-                    app.encoding_display = None;
+                    // It arrived, so nothing needs reclaiming on its
+                    // behalf — but the typed line travels on with it, or
+                    // a deferred prompt loses the only text that can be
+                    // shown to the user or matched against its row.
+                    let typed = app.encoding_display.take();
                     for note in notes {
                         app.transcript.push(super::app::TranscriptItem::System(note));
                     }
-                    app.accept_encoded_attachments(prompt, blocks);
+                    app.accept_encoded_attachments(
+                        super::session_work::Submission {
+                            payload: prompt,
+                            display: typed,
+                        },
+                        blocks,
+                    );
                 }
                 app.dirty = true;
             }

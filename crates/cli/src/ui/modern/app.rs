@@ -486,8 +486,10 @@ pub struct App {
     /// while the user is pressing Ctrl+C to stop everything.
     pub cancel_is_interject: bool,
     #[allow(clippy::type_complexity)]
-    pub deferred_prompts:
-        std::collections::VecDeque<(String, Vec<agent_code_lib::llm::message::ContentBlock>)>,
+    pub deferred_prompts: std::collections::VecDeque<(
+        super::session_work::Submission,
+        Vec<agent_code_lib::llm::message::ContentBlock>,
+    )>,
     /// Set when a picker accept abandons a prompt whose images were
     /// still encoding.
     ///
@@ -2986,19 +2988,20 @@ impl App {
     /// second time, sending bytes the staged turn never had.
     pub fn accept_encoded_attachments(
         &mut self,
-        prompt: String,
+        submission: super::session_work::Submission,
         blocks: Vec<agent_code_lib::llm::message::ContentBlock>,
     ) {
         if self.work.submit_staged() {
             self.transcript.push(TranscriptItem::System(
                 "another prompt was sent first — sending this one with its images next".into(),
             ));
-            self.deferred_prompts.push_back((prompt, blocks));
+            self.deferred_prompts.push_back((submission, blocks));
             self.dirty = true;
             return;
         }
         self.pending_attachments = blocks;
-        self.work.stage_submit(prompt, None);
+        self.work
+            .stage_submit(submission.payload, submission.display);
         self.dirty = true;
     }
 
@@ -3025,9 +3028,10 @@ impl App {
         if self.work.submit_staged() || !self.pending_images.is_empty() {
             return;
         }
-        if let Some((prompt, blocks)) = self.deferred_prompts.pop_front() {
+        if let Some((submission, blocks)) = self.deferred_prompts.pop_front() {
             self.pending_attachments = blocks;
-            self.work.stage_submit(prompt, None);
+            self.work
+                .stage_submit(submission.payload, submission.display);
             self.phase = Phase::Streaming;
             self.dirty = true;
         }
@@ -5751,7 +5755,10 @@ mod tests {
     #[test]
     fn encoded_attachments_arm_their_own_prompt() {
         let (_dir, mut app) = app_in_workspace();
-        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments(
+            crate::ui::modern::session_work::Submission::verbatim("look at @shot.png"),
+            vec![png_block()],
+        );
         assert_eq!(app.work.submit_payload(), Some("look at @shot.png"));
         assert_eq!(app.pending_attachments.len(), 1);
     }
@@ -5766,7 +5773,10 @@ mod tests {
         app.enqueue_turn_from_command("show me the diff".into());
         assert_eq!(app.work.submit_payload(), Some("show me the diff"));
 
-        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments(
+            crate::ui::modern::session_work::Submission::verbatim("look at @shot.png"),
+            vec![png_block()],
+        );
 
         assert_eq!(
             app.work.submit_payload(),
@@ -5795,7 +5805,10 @@ mod tests {
     fn a_deferred_prompt_returns_with_its_original_blocks() {
         let (_dir, mut app) = app_in_workspace();
         app.enqueue_turn_from_command("show me the diff".into());
-        app.accept_encoded_attachments("look at @shot.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments(
+            crate::ui::modern::session_work::Submission::verbatim("look at @shot.png"),
+            vec![png_block()],
+        );
 
         // The turn it was waiting behind starts and finishes.
         let _ = app.work.discard_submit();
@@ -5818,8 +5831,10 @@ mod tests {
     #[test]
     fn a_deferred_prompt_waits_for_staged_descriptors_to_clear() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         write_png(&app, "later.png");
         type_input(&mut app, "later @later.png");
         app.submit();
@@ -5839,8 +5854,10 @@ mod tests {
     #[test]
     fn cancelling_a_turn_drops_a_prompt_waiting_behind_it() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         // A bare cancel: nothing staged to send.
         app.cancel_pending_followups();
         assert!(
@@ -5854,8 +5871,10 @@ mod tests {
     #[test]
     fn interjecting_keeps_a_prompt_waiting_behind_it() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         // Interject only cancels when there is a turn to cancel.
         app.phase = Phase::Streaming;
         type_input(&mut app, "do this instead");
@@ -5876,8 +5895,10 @@ mod tests {
     #[test]
     fn a_bare_cancel_drops_held_prompts_even_with_a_command_staged() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         // A slash command stages its prompt directly, without interjecting.
         app.enqueue_turn_from_command("show me the diff".into());
         assert!(app.work.submit_staged(), "precondition");
@@ -5894,8 +5915,10 @@ mod tests {
     #[test]
     fn queue_send_now_keeps_held_prompts() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         app.queue.push_back("queued work".into());
         app.phase = Phase::Streaming;
         app.queue_send_selected();
@@ -5913,8 +5936,10 @@ mod tests {
     #[test]
     fn abandoning_a_read_leaves_held_prompts_alone() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         app.phase = Phase::Streaming;
         type_input(&mut app, "do this instead");
         app.interject();
@@ -5935,8 +5960,14 @@ mod tests {
     fn held_prompts_keep_their_order() {
         let (_dir, mut app) = app_in_workspace();
         app.enqueue_turn_from_command("busy".into());
-        app.accept_encoded_attachments("first @a.png".into(), vec![png_block()]);
-        app.accept_encoded_attachments("second @b.png".into(), vec![png_block()]);
+        app.accept_encoded_attachments(
+            crate::ui::modern::session_work::Submission::verbatim("first @a.png"),
+            vec![png_block()],
+        );
+        app.accept_encoded_attachments(
+            crate::ui::modern::session_work::Submission::verbatim("second @b.png"),
+            vec![png_block()],
+        );
         assert_eq!(app.deferred_prompts.len(), 2, "a held prompt was dropped");
 
         let _ = app.work.discard_submit();
@@ -5953,8 +5984,10 @@ mod tests {
     #[test]
     fn a_replaced_conversation_drops_staged_attachments() {
         let (_dir, mut app) = app_in_workspace();
-        app.deferred_prompts
-            .push_back(("earlier @a.png".into(), vec![png_block()]));
+        app.deferred_prompts.push_back((
+            crate::ui::modern::session_work::Submission::verbatim("earlier @a.png"),
+            vec![png_block()],
+        ));
         app.pending_attachments = vec![png_block()];
         write_png(&app, "shot.png");
         type_input(&mut app, "look at @shot.png");
