@@ -644,7 +644,7 @@ impl App {
         // Returning to a session visited earlier: restore what was on
         // screen instead of the rebuild. The engine reloaded the
         // conversation either way; this only decides what is shown.
-        if let Some(view) = self.session_views.take(id) {
+        if let Some(view) = self.session_views.take(id, turns) {
             self.transcript = view.transcript;
             self.expanded = view.expanded;
             self.selected_item = view.selected_item;
@@ -699,7 +699,7 @@ impl App {
             expanded: std::mem::take(&mut self.expanded),
             selected_item: self.selected_item,
         };
-        self.session_views.save(&id, view);
+        self.session_views.save(&id, view, self.turn_count);
     }
 
     /// Point every App mirror at the session just restored.
@@ -782,6 +782,10 @@ mod tests {
         let mut app = App::new("m", "/tmp", "session-a");
         app.transcript
             .push(TranscriptItem::User("work in a".into()));
+        // A is at the turn count the reload below reports for it. The
+        // cache is only reused while those agree, so leaving this at the
+        // default would read as "the session moved while we were away".
+        app.turn_count = 1;
         app.scroll = crate::ui::modern::scroll::ScrollState::Free { top_line: 7 };
         app.expanded.insert(0);
 
@@ -1588,6 +1592,83 @@ mod tests {
         assert!(
             !said.contains("make clean"),
             "a stale report resurfaced on an unrelated resume: {said}"
+        );
+    }
+
+    /// Switching away and back is the whole point of the view cache, so
+    /// the remembered transcript must come back when nothing moved.
+    ///
+    /// The run loop calls `restore_transcript` first — stashing under the
+    /// id still in front — and only then `adopt_restored_session`, which
+    /// moves the identity. These tests mirror that order; skipping the
+    /// second half stashes the arriving session under the departing id
+    /// and proves nothing.
+    #[test]
+    fn switching_back_to_an_untouched_session_restores_the_remembered_view() {
+        let mut app = App::new("m", "/tmp", "aaa11111");
+        app.turn_count = 4;
+        app.transcript
+            .push(TranscriptItem::User("what I was reading".into()));
+
+        // Away to another session.
+        app.restore_transcript(
+            vec![TranscriptItem::User("elsewhere".into())],
+            "bbb22222",
+            1,
+        );
+        app.session_id = "bbb22222".into();
+        app.turn_count = 1;
+
+        // Back to it, still at the turn count we left it on.
+        app.restore_transcript(vec![TranscriptItem::User("rebuilt".into())], "aaa11111", 4);
+
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "what I was reading")),
+            "the remembered view was discarded for an unchanged session"
+        );
+    }
+
+    /// Another agent process can advance a session while it sits in the
+    /// background here. The resume reloads *its* messages into the
+    /// engine, so replaying the remembered view would leave the user
+    /// reading a transcript the model has already moved past — and the
+    /// gap is silent, because each half looks internally consistent.
+    #[test]
+    fn a_session_advanced_by_another_process_is_rebuilt_not_replayed() {
+        let mut app = App::new("m", "/tmp", "aaa11111");
+        app.turn_count = 4;
+        app.transcript
+            .push(TranscriptItem::User("what I was reading".into()));
+
+        app.restore_transcript(
+            vec![TranscriptItem::User("elsewhere".into())],
+            "bbb22222",
+            1,
+        );
+        app.session_id = "bbb22222".into();
+        app.turn_count = 1;
+
+        // Back to it — but another process has completed turns since, so
+        // the reload carries messages the remembered view never had.
+        app.restore_transcript(
+            vec![TranscriptItem::User("newer history from disk".into())],
+            "aaa11111",
+            9,
+        );
+
+        assert!(
+            app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "newer history from disk")),
+            "the rebuild was replaced by a view from before the session moved on"
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(t) if t == "what I was reading")),
+            "stale history survived alongside the reload"
         );
     }
 
