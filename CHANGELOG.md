@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.29.0] - 2026-07-28
+
+### Added
+
+- **In-TUI session picker for `/resume`** (#518) — `/resume` opens a filterable list of recent sessions instead of requiring an id. The conversation is read and rebuilt off-thread, so a multi-megabyte session no longer freezes input and repaint while it loads, and the picker can be cancelled with Ctrl+C mid-load. Resuming carries the whole project across: permissions, sandbox and bypass policy, hooks, tool visibility, MCP servers, `[features]` and `[notifier]` all move to the destination's settings rather than the ones the process started in. A destination whose directory cannot be entered, or whose settings will not parse, is refused before anything moves. Work staged against the conversation being left — a queued prompt, `/clear`, `/model`, a `!cmd`, a submitted prompt with its images — is reported back verbatim rather than run against the session that arrives, and each session keeps its scroll position and expansions when you switch away and back.
+- **Images mentioned in the prompt are attached** (#521) — `@shot.png` stages the file as an image block, encoded off-thread with the descriptors it was staged with, so the bytes sent are the ones the prompt referred to.
+- **vi editing mode for the composer** (#522) — opt-in modal editing with normal/insert modes and the usual motions and operators.
+- **Persistent permission grants** (#507, #530) — "allow always" survives a restart, scoped per project, and prefix-scoped grants let one approval cover a command and its arguments (`git status`, not `git statusx`).
+- **Inline subagent output in the tasks pane** (#526, #519, #527) — subagent results are captured for drill-in, the model's own checklist appears alongside background work, and groups collapse.
+- **Review targets and a rubric** (#529) — `ReviewTarget` resolution for uncommitted work, a base branch, a commit or custom instructions, with merge-base resolution that prefers the tracked upstream.
+
+### Fixed
+
+- **Quoted destructive commands are no longer missed** (#506) — tokens are unquoted before the destructive-command scan, so `rm -rf "$HOME"` and its quoted variants reach the guard.
+- **Documented theme aliases work** (#523) — `dark` and `light` resolve as advertised instead of falling through.
+- **Chrome colours route through the palette** (#520) — hard-coded ANSI in the frame chrome is replaced by theme slots, so custom and accessibility palettes apply everywhere.
+
+### Changed
+
+- **CI runs on stacked pull requests** (#533) — the `pull_request` trigger no longer filters to `main`, so a PR targeting a feature branch runs the full gate instead of silently reporting no checks.
+- Test-infrastructure hardening: the mention tag's path separator is pinned on every platform (#535), frame snapshots no longer depend on the crate version (#525), and plan-mode tests that share process-wide pointers are serialized (#528).
+
+### Dependencies
+
+- Bumped `anyhow` 1.0.104, `clap` 4.6.4, `glob` 0.3.4, `landlock` 0.4.7, `libc` 0.2.189, `regex` 1.13.1, `tokio-stream` 0.1.19, `tokio-util` 0.7.19, `uuid` 1.24.0 (#540–#548).
+
 ## [0.28.0] - 2026-07-25
 
 ### Added
@@ -609,7 +635,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/avala-ai/agent-code/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/avala-ai/agent-code/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/avala-ai/agent-code/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/avala-ai/agent-code/compare/v0.25.3...v0.26.0
