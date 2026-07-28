@@ -471,7 +471,16 @@ async fn finish_cwd_adoption(
     // and scoping grants and the canonical team-memory check to the
     // subdirectory leaves `/repo/.agent/team-memory` outside the root —
     // unprotected exactly where a resume crossed into it.
-    let project_root = agent_code_lib::services::session_env::project_root_for(dir).await;
+    // The directory that owns the `.agent` config we just read, first:
+    // `project_root_for` looks for a git root and language markers and
+    // knows nothing about `.agent`, so a non-Git project whose only
+    // marker is its settings file resolved to the saved *subdirectory* —
+    // scoping grants and the canonical team-memory check below the
+    // directory that actually defines them.
+    let project_root = match agent_code_lib::config::find_project_root_from(dir) {
+        Some(root) => root,
+        None => agent_code_lib::services::session_env::project_root_for(dir).await,
+    };
     // Keep the connected servers only when the destination asks for the
     // *same* ones. The project root is the wrong question: config
     // discovery walks up from the session directory and takes the nearest
@@ -1028,20 +1037,34 @@ pub(super) async fn event_loop(
                                     .push(super::app::TranscriptItem::System(format!(
                                         "resume of {id} cancelled — staying here"
                                     )));
-                                {
-                                    let engine_arc = session.engine();
-                                    let mut eng = engine_arc.lock().await;
-                                    // The scope Ctrl+C just cancelled is
-                                    // the one these would run under, so
-                                    // without a fresh one `run_hooks`
-                                    // rejects every compensating start
-                                    // before it begins — leaving whatever
-                                    // an already-completed SessionStop
-                                    // tore down still down, for a session
-                                    // the user is keeping.
-                                    eng.renew_cancel_scope();
-                                    let _ = eng.fire_session_start_hooks().await;
-                                }
+                                let engine_arc = session.engine();
+                                // Painted through like the rest: the user
+                                // has just pressed Ctrl+C, and freezing on
+                                // the frame that acknowledges it is the
+                                // worst moment to stop redrawing. A second
+                                // cancel here changes nothing — the resume
+                                // is already being refused.
+                                let _ = drive_while_painting(
+                                    app,
+                                    term_events,
+                                    draw,
+                                    &mut pending_events,
+                                    async {
+                                        let mut eng = engine_arc.lock().await;
+                                        // The scope Ctrl+C just cancelled
+                                        // is the one these would run
+                                        // under, so without a fresh one
+                                        // `run_hooks` rejects every
+                                        // compensating start before it
+                                        // begins — leaving whatever an
+                                        // already-completed SessionStop
+                                        // tore down still down, for a
+                                        // session the user is keeping.
+                                        eng.renew_cancel_scope();
+                                        let _ = eng.fire_session_start_hooks().await;
+                                    },
+                                )
+                                .await;
                                 app.cancel_deferred_resume_work();
                                 app.pending_resume = None;
                                 app.dirty = true;
@@ -1089,22 +1112,37 @@ pub(super) async fn event_loop(
                             // before the move, so every watcher has been
                             // told to stop tracking directories this
                             // session still uses. Announce them back.
+                            // Both painted through, like every other hook
+                            // on this path: these run user shell commands,
+                            // and a slow one here froze the UI on the very
+                            // screen that is reporting a failure. The
+                            // session is being kept either way, so a
+                            // cancel is honoured afterwards.
+                            let engine_arc = session.engine();
+                            if drive_while_painting(
+                                app,
+                                term_events,
+                                draw,
+                                &mut pending_events,
+                                async {
+                                    let mut eng = engine_arc.lock().await;
+                                    // The working set was announced as
+                                    // dropped before the move, so every
+                                    // watcher was told to stop tracking
+                                    // directories this session still uses.
+                                    eng.notify_working_set_restored().await;
+                                    // And the kept session was told it
+                                    // stopped: start it again so the
+                                    // lifecycle stays paired, under a
+                                    // fresh scope in case a cancel during
+                                    // teardown left the old one cancelled.
+                                    eng.renew_cancel_scope();
+                                    let _ = eng.fire_session_start_hooks().await;
+                                },
+                            )
+                            .await
                             {
-                                let engine_arc = session.engine();
-                                let mut eng = engine_arc.lock().await;
-                                eng.notify_working_set_restored().await;
-                            }
-                            // The session being kept has already been
-                            // told it stopped. Start it again so the
-                            // lifecycle stays paired: without this its
-                            // watchers and cleanup hooks stay torn down
-                            // for a session that goes on being used, and
-                            // the eventual exit emits a second stop with
-                            // no start between them.
-                            {
-                                let engine_arc = session.engine();
-                                let eng = engine_arc.lock().await;
-                                let _ = eng.fire_session_start_hooks().await;
+                                app.cancel_requested = true;
                             }
                             app.cancel_deferred_resume_work();
                             app.pending_resume = None;
