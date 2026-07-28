@@ -275,6 +275,25 @@ fn tool_detail(input: &serde_json::Value) -> String {
 
 impl App {
     /// Open the session picker (`/resume` with no argument).
+    /// Take a completed session scan, or drop it and say nothing.
+    ///
+    /// The generation check belongs to the run loop, which owns the
+    /// counter; what to *do* with a result that survives it belongs
+    /// here, next to the overlays the decision is about.
+    ///
+    /// Dropping has to clear the status: `open_session_picker` would
+    /// have replaced "loading sessions…", nothing else does, and no
+    /// retry is coming — so it would sit there until something unrelated
+    /// wrote over it, reporting a scan that finished long ago.
+    pub fn accept_session_scan(&mut self, rows: Vec<SessionSummary>) {
+        if self.session_picker_would_displace_an_overlay() {
+            self.status_message.clear();
+            self.dirty = true;
+            return;
+        }
+        self.show_session_picker(rows);
+    }
+
     /// Whether an overlay that [`Self::open_session_picker`] would
     /// displace is in front right now.
     ///
@@ -1768,6 +1787,56 @@ mod tests {
             !app.tasks.iter().any(|t| t.source == TaskSource::Subagent),
             "the previous conversation's subagents stayed in the pane"
         );
+    }
+
+    /// A dropped scan has to take its status with it. `/resume` sets
+    /// "loading sessions…", and if the result is discarded in favour of
+    /// an overlay the user opened since, nothing else clears it and no
+    /// retry is coming — so the UI would report a scan still running
+    /// long after it finished.
+    ///
+    /// Uses the shortcuts overlay deliberately. `toggle_shortcuts` only
+    /// flips a flag, so the stale status really does survive; Ctrl+F
+    /// would have written its own banner over it and the test would
+    /// have passed for the wrong reason.
+    #[test]
+    fn a_dropped_scan_does_not_leave_its_status_behind() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.status_message = "loading sessions…".into();
+        app.toggle_shortcuts();
+        assert_eq!(
+            app.status_message, "loading sessions…",
+            "precondition: this overlay does not write its own status"
+        );
+
+        app.accept_session_scan(vec![summary("aaa11111", None, "/a")]);
+
+        assert!(
+            app.session_picker.is_none(),
+            "the picker stole focus from the overlay"
+        );
+        assert!(
+            app.status_message.is_empty(),
+            "the UI still claims a finished scan is running: {:?}",
+            app.status_message
+        );
+        assert!(app.show_shortcuts, "the user's overlay was closed anyway");
+    }
+
+    /// The ordinary path is unchanged: with nothing in the way the rows
+    /// open the picker, and the status goes with it.
+    #[test]
+    fn an_accepted_scan_opens_the_picker() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.status_message = "loading sessions…".into();
+
+        app.accept_session_scan(vec![summary("aaa11111", None, "/a")]);
+
+        assert!(
+            app.session_picker.is_some(),
+            "the rows never reached the picker"
+        );
+        assert!(!app.status_message.contains("loading sessions"));
     }
 
     /// A scan that lands after the user opened something else is

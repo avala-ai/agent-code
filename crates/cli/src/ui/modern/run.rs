@@ -2035,11 +2035,8 @@ pub(super) async fn event_loop(
                 // scan has not been spawned yet — both arms can be ready
                 // at once and `select!` may take this one first, so the
                 // generation alone would still compare equal.
-                if generation == session_scan_generation
-                    && !app.pending_session_list
-                    && !app.session_picker_would_displace_an_overlay()
-                {
-                    app.show_session_picker(rows);
+                if generation == session_scan_generation && !app.pending_session_list {
+                    app.accept_session_scan(rows);
                 }
             }
             // Read and rebuild the selected session off-thread: a long
