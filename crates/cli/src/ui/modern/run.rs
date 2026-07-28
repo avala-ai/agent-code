@@ -778,7 +778,15 @@ pub(super) async fn event_loop(
     // Set while a load is in flight so the arm does not respawn it every
     // pass; `app.resume` stays `Loading` until the restore is applied,
     // which is what suppresses queue auto-dispatch in the meantime.
-    let mut resume_loading = false;
+    // The id currently being read off-thread, not merely "a read is
+    // running". A second `/resume` supersedes the first, and with a bare
+    // flag the superseding load could not start until the one it
+    // replaced returned — so selecting another session while the first
+    // sat on an unavailable mount hung the picker behind a result nobody
+    // wanted. `ResumeState` already knows which id is awaited; this says
+    // which one is in flight, and the two are compared rather than
+    // conflated.
+    let mut loading_now: Option<String> = None;
     let mut pending_restore: Option<Box<LoadedSession>> = None;
     // Image attachments are read and encoded the same way: detached, with
     // the result landing in a select arm. Awaiting the work inline would
@@ -1955,12 +1963,15 @@ pub(super) async fn event_loop(
             // this thread froze input and repaint for its duration. Only
             // the (cheap) apply stays on the loop, where it can be
             // ordered against turn teardown.
-            _ = std::future::ready(()), if app.resume.is_loading()
-                && !resume_loading
+            _ = std::future::ready(()), if app.resume.load_to_start(loading_now.as_deref()).is_some()
                 && pending_restore.is_none()
                 && turn.is_none() => {
-                if let Some(id) = app.resume.loading_id().map(str::to_string) {
-                    resume_loading = true;
+                if let Some(id) = app
+                    .resume
+                    .load_to_start(loading_now.as_deref())
+                    .map(str::to_string)
+                {
+                    loading_now = Some(id.clone());
                     let tx = resume_tx.clone();
                     // Read the display setting here: the blocking task
                     // cannot touch `app`.
@@ -1989,7 +2000,12 @@ pub(super) async fn event_loop(
                 }
             }
             Some((id, loaded)) = resume_rx.recv() => {
-                resume_loading = false;
+                // Only the load still in flight clears the marker. A
+                // superseded read finishing late must not report the
+                // newer one as done, or its result would never arrive.
+                if loading_now.as_deref() == Some(id.as_str()) {
+                    loading_now = None;
+                }
                 // Dropped unless the state is still awaiting this one.
                 // Two things clear it: a second `/resume` supersedes the
                 // first, and Ctrl+C cancels it outright — restoring a

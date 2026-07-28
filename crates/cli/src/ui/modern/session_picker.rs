@@ -440,6 +440,16 @@ impl App {
     fn reclaim_staged_prompts(&mut self, header: &str, spill: &mut Vec<String>) {
         let mut carried: Vec<String> = self.queue.drain(..).collect();
         self.queue_selected = 0;
+        // Prompts whose images finished encoding while another
+        // submission held the work slot. `new_conversation` clears them
+        // on a successful restore — correctly, they belong to the
+        // conversation being replaced — so without reclaiming them here
+        // they and their attachments vanish with no notice at all, which
+        // is the one outcome this function exists to prevent.
+        for (prompt, _blocks) in std::mem::take(&mut self.deferred_prompts) {
+            self.remove_staged_row(&prompt);
+            carried.push(prompt);
+        }
         // A prompt whose images are still being encoded is inside the
         // blocking task, not in `pending_submit`, so nothing else here
         // can reach it — and the restore bumps the epoch, which makes
@@ -633,6 +643,17 @@ impl App {
     pub fn adopt_restored_todos(&mut self, messages: &[agent_code_lib::llm::message::Message]) {
         self.new_conversation();
         self.todos = super::tasks::todos_from_messages(messages);
+        // Subagent rows and their captured output are conversation
+        // state, and `sync_background_tasks` deliberately carries every
+        // one of them across a refresh — the event stream is their only
+        // source, so a row dropped there is gone. That is right within a
+        // conversation and wrong across a swap: left alone, the restored
+        // session's pane keeps listing agents from the session it
+        // replaced, and drill-in still opens their results. The captured
+        // bodies live on the rows, so dropping the rows drops those too.
+        self.tasks
+            .retain(|t| t.source != super::tasks::TaskSource::Subagent);
+        self.tasks_selected = 0;
     }
 
     /// Replace the visible transcript with a restored conversation.
@@ -1610,6 +1631,71 @@ mod tests {
         assert!(
             !said.contains("make clean"),
             "a stale report resurfaced on an unrelated resume: {said}"
+        );
+    }
+
+    /// A prompt whose images finished encoding while another submission
+    /// held the work slot waits in `deferred_prompts`. A successful
+    /// restore calls `new_conversation`, which clears them — correctly,
+    /// they belong to the conversation being replaced — so if the
+    /// reclamation misses them they disappear with no notice at all.
+    /// Silent loss of the user's own words is the one outcome this path
+    /// exists to prevent.
+    #[test]
+    fn a_held_image_prompt_is_reported_rather_than_vanishing() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.deferred_prompts
+            .push_back(("look at @shot.png please".into(), Vec::new()));
+
+        app.open_session_picker(vec![summary("aaa11111", None, "/a")]);
+        app.session_picker_accept();
+
+        let said = app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::System(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("look at @shot.png please"),
+            "a held image prompt was dropped without a word: {said}"
+        );
+        assert!(
+            app.deferred_prompts.is_empty(),
+            "the held prompt was reported but left staged for the new session"
+        );
+    }
+
+    /// Subagent rows are conversation state, and `sync_background_tasks`
+    /// carries every one of them across a refresh because the event
+    /// stream is their only source. Right within a conversation, wrong
+    /// across a swap: the restored session would keep listing agents
+    /// from the session it replaced, with their captured output still
+    /// open to drill-in.
+    #[test]
+    fn subagent_rows_do_not_survive_into_a_restored_session() {
+        use super::super::tasks::{CapturedOutput, TaskEntry, TaskSource, TaskState};
+        let mut app = App::new("m", "/tmp", "s");
+        app.tasks.push(TaskEntry {
+            agent_id: "agent-1".into(),
+            state: TaskState::Done,
+            headline: "explored the parser".into(),
+            source: TaskSource::Subagent,
+            task_id: None,
+            outputs: vec![CapturedOutput {
+                call_id: "call-1".into(),
+                body: "findings from the old session".into(),
+            }],
+        });
+
+        app.adopt_restored_todos(&[]);
+
+        assert!(
+            !app.tasks.iter().any(|t| t.source == TaskSource::Subagent),
+            "the previous conversation's subagents stayed in the pane"
         );
     }
 

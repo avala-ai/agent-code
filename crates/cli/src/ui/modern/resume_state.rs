@@ -88,6 +88,25 @@ impl ResumeState {
         self.loading_id() == Some(id)
     }
 
+    /// The load that should be started, given what is already running.
+    ///
+    /// `None` when nothing is awaited, or when the awaited load is the
+    /// one already in flight. The comparison is by id and not by a bare
+    /// "a read is running" flag, because those two are not the same
+    /// question: a second `/resume` supersedes the first, and with a
+    /// flag the superseding load could not start until the one it
+    /// replaced returned. A session sitting on an unavailable mount then
+    /// held the picker behind a result nobody wanted.
+    ///
+    /// The superseded read is left to finish and be discarded on
+    /// arrival — [`Self::is_awaiting`] already refuses it.
+    pub fn load_to_start<'a>(&'a self, in_flight: Option<&str>) -> Option<&'a str> {
+        match self.loading_id() {
+            Some(id) if in_flight != Some(id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Begin a load, replacing any outstanding one.
     ///
     /// Replacing is deliberate: a second `/resume` supersedes the first,
@@ -167,6 +186,34 @@ mod tests {
         assert!(!s.is_awaiting("abc"));
         // Settling again is harmless and yields nothing.
         assert_eq!(s.settle(), None);
+    }
+
+    /// A `/resume` that supersedes another must start immediately. The
+    /// read it replaced may be blocked on an unavailable mount, and
+    /// waiting for it means the user's newer choice never loads.
+    #[test]
+    fn a_superseding_load_starts_while_the_old_one_is_still_running() {
+        let mut s = ResumeState::Idle;
+        s.begin("first");
+        assert_eq!(s.load_to_start(None), Some("first"));
+
+        // "first" is now off-thread; nothing further to start for it.
+        assert_eq!(s.load_to_start(Some("first")), None);
+
+        // The user picks another session while "first" is still stuck.
+        s.begin("second");
+        assert_eq!(
+            s.load_to_start(Some("first")),
+            Some("second"),
+            "the superseding load waited for the read it replaced"
+        );
+    }
+
+    #[test]
+    fn nothing_starts_when_no_resume_is_awaited() {
+        let s = ResumeState::Idle;
+        assert_eq!(s.load_to_start(None), None);
+        assert_eq!(s.load_to_start(Some("stale")), None);
     }
 
     #[test]
