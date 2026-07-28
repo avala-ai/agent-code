@@ -44,6 +44,11 @@ const SESSION_PICKER_LIMIT: usize = 50;
 /// work off a worker but still suspends the single future that drives
 /// redraws and Ctrl+C, so the freeze it was meant to fix remained.
 type LoadedSession = (
+    // The resume attempt this answers. Selecting A, then B, then A again
+    // is three attempts, and only the third may be applied — the first
+    // A's result may carry an error, or a snapshot taken before another
+    // process wrote the session.
+    u64,
     String,
     agent_code_lib::services::session::SessionData,
     Vec<super::app::TranscriptItem>,
@@ -774,7 +779,7 @@ pub(super) async fn event_loop(
     // around by value in a select arm.
     #[allow(clippy::type_complexity)]
     let (resume_tx, mut resume_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<Box<LoadedSession>, String>)>();
+        tokio::sync::mpsc::unbounded_channel::<(u64, String, Result<Box<LoadedSession>, String>)>();
     // Set while a load is in flight so the arm does not respawn it every
     // pass; `app.resume` stays `Loading` until the restore is applied,
     // which is what suppresses queue auto-dispatch in the meantime.
@@ -786,7 +791,7 @@ pub(super) async fn event_loop(
     // wanted. `ResumeState` already knows which id is awaited; this says
     // which one is in flight, and the two are compared rather than
     // conflated.
-    let mut loading_now: Vec<String> = Vec::new();
+    let mut loading_now: Vec<u64> = Vec::new();
     let mut resume_cap_warned = false;
 
     /// How many session reads may be outstanding at once.
@@ -925,10 +930,10 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(loaded) = pending_restore.take()
         {
-            let (id, data, items, loaded_cfg) = *loaded;
+            let (generation, id, data, items, loaded_cfg) = *loaded;
             // Superseded by a newer selection made while this one was
             // still loading: drop it, the load arm fetches the new one.
-            if app.resume.is_awaiting(&id) {
+            if app.resume.is_awaiting(generation) {
                 match session.engine().try_lock() {
                     Ok(probe) => {
                         // The probe only answers "is the engine free right
@@ -1379,7 +1384,9 @@ pub(super) async fn event_loop(
                     }
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
-                    Err(_) => pending_restore = Some(Box::new((id, data, items, loaded_cfg))),
+                    Err(_) => {
+                        pending_restore = Some(Box::new((generation, id, data, items, loaded_cfg)))
+                    }
                 }
             }
         }
@@ -1987,8 +1994,10 @@ pub(super) async fn event_loop(
                     app.status_message =
                         "waiting for an earlier session read to finish".into();
                     app.dirty = true;
-                } else if let Some(id) = app.resume.load_to_start(&loading_now).map(str::to_string) {
-                    loading_now.push(id.clone());
+                } else if let Some((id, generation)) =
+                    app.resume.load_to_start(&loading_now).map(|(i, g)| (i.to_string(), g))
+                {
+                    loading_now.push(generation);
                     let tx = resume_tx.clone();
                     // Read the display setting here: the blocking task
                     // cannot touch `app`.
@@ -2010,24 +2019,25 @@ pub(super) async fn event_loop(
                                 } else {
                                     Some(load_project_config(&data.cwd, &cli_for_cfg))
                                 };
-                                Box::new((id.clone(), data, items, cfg))
+                                Box::new((generation, id.clone(), data, items, cfg))
                             });
-                        let _ = tx.send((id, loaded));
+                        let _ = tx.send((generation, id, loaded));
                     });
                 }
             }
-            Some((id, loaded)) = resume_rx.recv() => {
+            Some((generation, id, loaded)) = resume_rx.recv() => {
                 // Only the load still in flight clears the marker. A
                 // superseded read finishing late must not report the
                 // newer one as done, or its result would never arrive.
-                loading_now.retain(|f| f != &id);
+                let _ = &id;
+                loading_now.retain(|f| f != &generation);
                 resume_cap_warned = false;
                 // Dropped unless the state is still awaiting this one.
                 // Two things clear it: a second `/resume` supersedes the
                 // first, and Ctrl+C cancels it outright — restoring a
                 // session the user has moved on from, or decided against,
                 // is the same mistake either way.
-                if app.resume.is_awaiting(&id) {
+                if app.resume.is_awaiting(generation) {
                     match loaded {
                         Ok(l) => pending_restore = Some(l),
                         Err(e) => {
