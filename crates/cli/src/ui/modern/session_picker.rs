@@ -636,7 +636,13 @@ impl App {
     }
 
     /// Replace the visible transcript with a restored conversation.
-    pub fn restore_transcript(&mut self, items: Vec<TranscriptItem>, id: &str, turns: usize) {
+    pub fn restore_transcript(
+        &mut self,
+        items: Vec<TranscriptItem>,
+        id: &str,
+        turns: usize,
+        messages: usize,
+    ) {
         // Remember the session being left, so switching back lands where
         // it was rather than at the bottom of a rebuilt transcript.
         self.stash_current_view();
@@ -644,7 +650,7 @@ impl App {
         // Returning to a session visited earlier: restore what was on
         // screen instead of the rebuild. The engine reloaded the
         // conversation either way; this only decides what is shown.
-        if let Some(view) = self.session_views.take(id, turns) {
+        if let Some(view) = self.session_views.take(id, messages) {
             self.transcript = view.transcript;
             self.expanded = view.expanded;
             self.selected_item = view.selected_item;
@@ -655,6 +661,7 @@ impl App {
             }
             self.status_message.clear();
             self.dirty = true;
+            self.conversation_len = messages;
             return;
         }
 
@@ -676,6 +683,7 @@ impl App {
         self.scroll_to_bottom();
         self.status_message.clear();
         self.dirty = true;
+        self.conversation_len = messages;
     }
 
     /// Snapshot the outgoing session's view before switching away,
@@ -699,7 +707,7 @@ impl App {
             expanded: std::mem::take(&mut self.expanded),
             selected_item: self.selected_item,
         };
-        self.session_views.save(&id, view, self.turn_count);
+        self.session_views.save(&id, view, self.conversation_len);
     }
 
     /// Point every App mirror at the session just restored.
@@ -782,10 +790,10 @@ mod tests {
         let mut app = App::new("m", "/tmp", "session-a");
         app.transcript
             .push(TranscriptItem::User("work in a".into()));
-        // A is at the turn count the reload below reports for it. The
+        // A holds the conversation the reload below reports for it. The
         // cache is only reused while those agree, so leaving this at the
         // default would read as "the session moved while we were away".
-        app.turn_count = 1;
+        app.conversation_len = 1;
         app.scroll = crate::ui::modern::scroll::ScrollState::Free { top_line: 7 };
         app.expanded.insert(0);
 
@@ -794,6 +802,7 @@ mod tests {
         app.restore_transcript(
             vec![TranscriptItem::User("work in b".into())],
             "session-b",
+            1,
             1,
         );
         assert!(
@@ -809,6 +818,7 @@ mod tests {
         app.restore_transcript(
             vec![TranscriptItem::User("rebuilt from disk".into())],
             "session-a",
+            1,
             1,
         );
         assert!(
@@ -841,6 +851,7 @@ mod tests {
         app.restore_transcript(
             vec![TranscriptItem::User("fresh from disk".into())],
             "never-seen",
+            2,
             2,
         );
         assert!(
@@ -1192,6 +1203,7 @@ mod tests {
             vec![TranscriptItem::User("restored".into())],
             "abcdef123456",
             2,
+            2,
         );
         assert!(!app.transcript.is_empty());
 
@@ -1538,7 +1550,12 @@ mod tests {
         app.session_picker_accept();
 
         // The restore replaces everything that was on screen.
-        app.restore_transcript(vec![TranscriptItem::User("restored".into())], "aaa11111", 2);
+        app.restore_transcript(
+            vec![TranscriptItem::User("restored".into())],
+            "aaa11111",
+            2,
+            2,
+        );
 
         let said = app
             .transcript
@@ -1579,6 +1596,7 @@ mod tests {
             vec![TranscriptItem::User("a different session".into())],
             "bbb22222",
             1,
+            1,
         );
         let said = app
             .transcript
@@ -1606,7 +1624,7 @@ mod tests {
     #[test]
     fn switching_back_to_an_untouched_session_restores_the_remembered_view() {
         let mut app = App::new("m", "/tmp", "aaa11111");
-        app.turn_count = 4;
+        app.conversation_len = 8;
         app.transcript
             .push(TranscriptItem::User("what I was reading".into()));
 
@@ -1615,12 +1633,17 @@ mod tests {
             vec![TranscriptItem::User("elsewhere".into())],
             "bbb22222",
             1,
+            1,
         );
         app.session_id = "bbb22222".into();
-        app.turn_count = 1;
 
-        // Back to it, still at the turn count we left it on.
-        app.restore_transcript(vec![TranscriptItem::User("rebuilt".into())], "aaa11111", 4);
+        // Back to it, holding the conversation we left it on.
+        app.restore_transcript(
+            vec![TranscriptItem::User("rebuilt".into())],
+            "aaa11111",
+            4,
+            8,
+        );
 
         assert!(
             app.transcript
@@ -1638,7 +1661,7 @@ mod tests {
     #[test]
     fn a_session_advanced_by_another_process_is_rebuilt_not_replayed() {
         let mut app = App::new("m", "/tmp", "aaa11111");
-        app.turn_count = 4;
+        app.conversation_len = 8;
         app.transcript
             .push(TranscriptItem::User("what I was reading".into()));
 
@@ -1646,16 +1669,16 @@ mod tests {
             vec![TranscriptItem::User("elsewhere".into())],
             "bbb22222",
             1,
+            1,
         );
         app.session_id = "bbb22222".into();
-        app.turn_count = 1;
 
-        // Back to it — but another process has completed turns since, so
-        // the reload carries messages the remembered view never had.
+        // Back to it — but the conversation has grown since.
         app.restore_transcript(
             vec![TranscriptItem::User("newer history from disk".into())],
             "aaa11111",
             9,
+            14,
         );
 
         assert!(
@@ -1669,6 +1692,44 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, TranscriptItem::User(t) if t == "what I was reading")),
             "stale history survived alongside the reload"
+        );
+    }
+
+    /// `/rewind` and `/snip` rewrite `messages` without touching
+    /// `turn_count`, so a session can come back reporting the very same
+    /// turns while holding a shorter conversation. Stamping on turns
+    /// would call that unchanged and replay a transcript containing the
+    /// messages the rewind removed.
+    #[test]
+    fn a_session_rewound_elsewhere_is_rebuilt_though_its_turn_count_is_unchanged() {
+        let mut app = App::new("m", "/tmp", "aaa11111");
+        app.turn_count = 4;
+        app.conversation_len = 8;
+        app.transcript
+            .push(TranscriptItem::User("a message since rewound away".into()));
+
+        app.restore_transcript(
+            vec![TranscriptItem::User("elsewhere".into())],
+            "bbb22222",
+            1,
+            1,
+        );
+        app.session_id = "bbb22222".into();
+
+        // Same turn count, shorter conversation: a rewind happened while
+        // this session sat in the background.
+        app.restore_transcript(
+            vec![TranscriptItem::User("history after the rewind".into())],
+            "aaa11111",
+            4,
+            5,
+        );
+
+        assert!(
+            !app.transcript.iter().any(
+                |i| matches!(i, TranscriptItem::User(t) if t == "a message since rewound away")
+            ),
+            "a rewound-away message was replayed because the turn count matched"
         );
     }
 
@@ -1909,7 +1970,7 @@ mod tests {
         let _ = summary_line(&summary(id, None, "/a"));
         app.session_picker_accept();
         assert_eq!(app.resume.loading_id(), Some(id));
-        app.restore_transcript(vec![], id, 1);
+        app.restore_transcript(vec![], id, 1, 1);
 
         assert!(
             app.transcript
@@ -2054,6 +2115,7 @@ work",
         app.restore_transcript(
             vec![TranscriptItem::User("fresh".into())],
             "abcdef123456",
+            4,
             4,
         );
         assert!(

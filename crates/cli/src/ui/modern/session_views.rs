@@ -51,16 +51,26 @@ pub struct SessionView {
 #[derive(Debug, Clone)]
 struct Entry {
     view: SessionView,
-    /// Turns completed in the conversation this view was built from.
+    /// Messages in the conversation this view was built from.
     ///
-    /// The cache is only valid while the session on disk still says what
-    /// it said when we left. Another agent process can advance a session
+    /// The cache is only valid while the conversation still says what it
+    /// said when we left. Another agent process can advance a session
     /// that is not in front here, and the resume path reloads those
     /// messages into the engine — so restoring the remembered view
     /// unconditionally shows history the model is no longer reasoning
-    /// from. Comparing the turn count catches that: the reload knows
-    /// what disk says, and this records what we last saw.
-    turns: usize,
+    /// from.
+    ///
+    /// Message count rather than turn count: `/rewind` and `/snip`
+    /// rewrite `messages` without touching `turn_count`, so a rewound
+    /// session can report the same turns as the view we cached while
+    /// holding a different conversation. Counting messages catches
+    /// growth *and* truncation.
+    ///
+    /// It is a witness, not a hash — a conversation rewound and regrown
+    /// to exactly the same length while we were away still matches. That
+    /// needs a revision counter on the conversation itself, which the
+    /// engine does not carry today.
+    messages: usize,
     /// Charged against [`MAX_BYTES`]; recorded at insert so eviction
     /// never has to re-walk a transcript to know what it frees.
     bytes: usize,
@@ -93,7 +103,7 @@ impl SessionViews {
     /// one would mean flushing every other session's place *and* still
     /// blowing the bound, which is the failure this cap exists to
     /// prevent; that session falls back to the engine's rebuild.
-    pub fn save(&mut self, session_id: &str, view: SessionView, turns: usize) {
+    pub fn save(&mut self, session_id: &str, view: SessionView, messages: usize) {
         if session_id.is_empty() || view.transcript.is_empty() {
             return;
         }
@@ -112,8 +122,14 @@ impl SessionViews {
         }
         self.order.push(session_id.to_string());
         self.bytes += bytes;
-        self.views
-            .insert(session_id.to_string(), Entry { view, bytes, turns });
+        self.views.insert(
+            session_id.to_string(),
+            Entry {
+                view,
+                bytes,
+                messages,
+            },
+        );
     }
 
     /// Take back a remembered view, if it still matches the session.
@@ -122,14 +138,18 @@ impl SessionViews {
     /// live view, and a stale copy left behind would be restored over
     /// newer content the next time round.
     ///
-    /// `turns` is what the conversation just loaded from disk reports. A
-    /// view remembered at a different turn count describes a session
+    /// `messages` is what the conversation just loaded into the engine
+    /// holds. A view remembered at a different count describes a session
     /// that has since moved on — under another agent process, say — so
     /// it is dropped and the caller falls back to the rebuild. Erring
     /// this way costs the reader their scroll position; erring the other
     /// way shows them a transcript the model has already left behind.
-    pub fn take(&mut self, session_id: &str, turns: usize) -> Option<SessionView> {
-        if self.views.get(session_id).is_some_and(|e| e.turns != turns) {
+    pub fn take(&mut self, session_id: &str, messages: usize) -> Option<SessionView> {
+        if self
+            .views
+            .get(session_id)
+            .is_some_and(|e| e.messages != messages)
+        {
             self.remove(session_id);
             return None;
         }
@@ -282,7 +302,7 @@ mod tests {
 
         assert!(
             views.take("a", 5).is_none(),
-            "a view from turn 3 was restored over a session now at turn 5"
+            "a view from a 3-message conversation was restored over a 5-message one"
         );
         // And it is gone, not merely refused: keeping it would hand the
         // same stale transcript back on the next switch.
@@ -292,6 +312,8 @@ mod tests {
     /// The common case is our own process advancing the session, where
     /// the remembered view is exactly right — invalidating there would
     /// cost the reader their place on every switch and defeat the cache.
+    /// App's mirror is kept in step with the engine each iteration, so
+    /// our own growth is already reflected in what we stashed.
     #[test]
     fn a_view_survives_when_the_session_is_unchanged() {
         let mut views = SessionViews::default();
