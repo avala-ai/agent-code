@@ -5099,6 +5099,42 @@ mod tests {
         );
     }
 
+    /// The complement, and the case that was broken: a `--no-sandbox`
+    /// given while the *starting* project locked bypasses must still
+    /// apply when the session later resumes into one that permits them.
+    ///
+    /// Startup used to record the flag only on the branch where the
+    /// starting project allowed it, so one locked directory disarmed the
+    /// command line for every project visited afterwards — the sandbox
+    /// stayed on where the operator had asked for it off, with no second
+    /// warning to say so.
+    #[test]
+    fn no_sandbox_still_applies_after_starting_in_a_locked_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".agent-code")).unwrap();
+        // The destination permits bypasses; only the start was locked.
+        std::fs::write(
+            dir.path().join(".agent-code/settings.json"),
+            r#"{"sandbox": {"enabled": true}}"#,
+        )
+        .unwrap();
+
+        // What startup records for `--no-sandbox` regardless of the
+        // directory it happened to launch in.
+        let requested = CliPermissionOverride {
+            default_mode: None,
+            no_sandbox: true,
+            overlay: None,
+        };
+
+        let cfg = load_project_config(&dir.path().display().to_string(), &requested)
+            .expect("settings parse");
+        assert!(
+            !cfg.sandbox.enabled,
+            "--no-sandbox was forgotten because the session started in a locked project"
+        );
+    }
+
     /// The preflight must not run the destination's `api_key_helper`: it
     /// may still refuse the resume, and the helper is a shell command
     /// executed on the event-loop thread.
