@@ -1030,7 +1030,16 @@ pub(super) async fn event_loop(
                                     )));
                                 {
                                     let engine_arc = session.engine();
-                                    let eng = engine_arc.lock().await;
+                                    let mut eng = engine_arc.lock().await;
+                                    // The scope Ctrl+C just cancelled is
+                                    // the one these would run under, so
+                                    // without a fresh one `run_hooks`
+                                    // rejects every compensating start
+                                    // before it begins — leaving whatever
+                                    // an already-completed SessionStop
+                                    // tore down still down, for a session
+                                    // the user is keeping.
+                                    eng.renew_cancel_scope();
                                     let _ = eng.fire_session_start_hooks().await;
                                 }
                                 app.cancel_deferred_resume_work();
