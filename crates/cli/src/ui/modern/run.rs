@@ -138,6 +138,54 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// Drive `work` to completion while the TUI keeps painting.
+///
+/// Awaiting a hook directly parks the sole event-loop future, so the
+/// screen stops repainting and raw-mode Ctrl+C never reaches the code
+/// that would act on it — the same freeze whichever hook it is. Terminal
+/// events that arrive meanwhile are buffered and replayed on exactly the
+/// path live events take.
+///
+/// Returns `true` if the user pressed the cancel chord while waiting.
+/// Acting on that is the caller's decision: what a cancel *means* differs
+/// between tearing the old session down and finishing the new one.
+async fn drive_while_painting<F>(
+    app: &mut App,
+    term_events: &mut (impl futures::Stream<Item = std::io::Result<Event>> + Unpin),
+    draw: &mut dyn FnMut(&mut App) -> anyhow::Result<()>,
+    buffered: &mut std::collections::VecDeque<Event>,
+    work: F,
+) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(work);
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            () = &mut work => break,
+            maybe_ev = term_events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(key))) if is_cancel_chord(&key) => {
+                        cancelled = true;
+                        app.dirty = true;
+                    }
+                    Some(Ok(ev)) => buffered.push_back(ev),
+                    Some(Err(_)) | None => break,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(80)) => {
+                app.dirty = true;
+            }
+        }
+        if app.dirty {
+            let _ = draw(app);
+            app.dirty = false;
+        }
+    }
+    cancelled
+}
+
 /// The next terminal event, taking anything buffered during work the
 /// loop could not interrupt before reading the stream again.
 ///
@@ -409,7 +457,6 @@ async fn finish_cwd_adoption(
     app: &mut App,
     eng: &mut agent_code_lib::query::QueryEngine,
     dir: &std::path::Path,
-    previous_cwd: &str,
     cfg: agent_code_lib::config::Config,
 ) {
     let cwd = dir.display().to_string();
@@ -438,11 +485,19 @@ async fn finish_cwd_adoption(
     // wrong ones leaves another project's servers reachable.
     let drop_mcp = mcp_needs_reconnect(&eng.state().config.mcp_servers, &cfg.mcp_servers);
     let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
-    if dropped_mcp > 0 {
+    // Keyed on whether this project's servers are connected, not on how
+    // many were removed: a destination that *introduces* MCP servers drops
+    // nothing and still has none connected, and suppressing the notice
+    // there left the user wondering why its tools were missing.
+    if drop_mcp {
+        let lost = if dropped_mcp > 0 {
+            format!("{dropped_mcp} MCP tool(s) from the previous project are no longer available")
+        } else {
+            "this project's MCP servers are not connected".to_string()
+        };
         app.transcript
             .push(super::app::TranscriptItem::System(format!(
-                "{dropped_mcp} MCP tool(s) from the previous project are no longer available — \
-             restart in this directory to connect its own MCP servers"
+                "{lost} — restart in this directory to connect its own MCP servers"
             )));
     }
     // The TUI keeps its own copy of one policy bit, consulted on every
@@ -450,7 +505,6 @@ async fn finish_cwd_adoption(
     // forbids shell-executing skills inherits one that allows it.
     app.disable_skill_shell = cfg.security.disable_skill_shell_execution;
     app.cwd = cwd;
-    let _ = eng.fire_cwd_changed_hooks(previous_cwd, "resume").await;
 }
 
 fn probe_caps() -> TerminalCaps {
@@ -1165,7 +1219,26 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
-                            finish_cwd_adoption(app, &mut eng, dir, &previous_cwd, cfg).await;
+                            finish_cwd_adoption(app, &mut eng, dir, cfg).await;
+                            // Fired here rather than inside, so the loop
+                            // can keep painting through a slow watcher
+                            // hook. A cancel during it is noted and
+                            // honoured after: the move has already
+                            // happened, so there is nothing to refuse.
+                            if drive_while_painting(
+                                app,
+                                term_events,
+                                draw,
+                                &mut pending_events,
+                                async {
+                                    let _ =
+                                        eng.fire_cwd_changed_hooks(&previous_cwd, "resume").await;
+                                },
+                            )
+                            .await
+                            {
+                                app.cancel_requested = true;
+                            }
                         }
                         app.pending_resume = None;
                         drop(eng);
@@ -1174,9 +1247,24 @@ pub(super) async fn event_loop(
                         // SessionStop above, a resume reads as one session
                         // ending and another beginning — which is what
                         // per-session setup (watchers, audit) keys off.
+                        // Painted through for the same reason the teardown
+                        // is: a slow setup hook here froze the restored
+                        // session's first frame and its Ctrl+C with it.
+                        // A cancel is honoured after — the session is
+                        // already installed, so there is nothing to undo.
+                        if drive_while_painting(
+                            app,
+                            term_events,
+                            draw,
+                            &mut pending_events,
+                            async {
+                                let eng = engine_arc.lock().await;
+                                let _ = eng.fire_session_start_hooks().await;
+                            },
+                        )
+                        .await
                         {
-                            let eng = engine_arc.lock().await;
-                            let _ = eng.fire_session_start_hooks().await;
+                            app.cancel_requested = true;
                         }
                         // Restart the loop so the handlers *above* this one
                         // get their turn now that the resume gate is open.
