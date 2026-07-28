@@ -294,12 +294,6 @@ pub struct CliPermissionOverride {
     pub api_base_url: Option<String>,
     /// From `--auth-mode`, when given. Same reasoning.
     pub auth_mode: Option<agent_code_lib::config::ApiAuthMode>,
-    /// Whether `--api-key` pinned the credential. The value is not kept
-    /// here — nothing in this layer needs to read it, and a secret that
-    /// is never stored cannot be logged by accident. Startup applies the
-    /// key over every configured source, so a pinned credential is the
-    /// same in every project and cannot mismatch.
-    pub api_key_pinned: bool,
 }
 
 impl CliPermissionOverride {
@@ -570,55 +564,19 @@ fn provider_mismatch(
             destination.auth_mode
         ));
     }
-    credential_mismatch(current, destination, cli)
-}
-
-/// Whether the destination resolves its credential from somewhere else,
-/// under the authentication mode actually in force.
-///
-/// Same endpoint and mode still means a different *account* when the
-/// key comes from elsewhere: the provider holds what was resolved at
-/// startup, and the destination's `api_key_helper` is deliberately never
-/// executed, so its turns would be billed to the source's account under
-/// a project that named its own.
-///
-/// Gated on the effective mode because each mode reads only its own
-/// fields. Two `api_key` projects may name different `codex_home`
-/// values and be perfectly compatible; comparing everything refused
-/// resumes over settings that nothing would have read.
-///
-/// Values are compared, never reported. The messages name *where* a
-/// credential comes from, so a refusal never puts a key on screen or in
-/// a transcript.
-fn credential_mismatch(
-    current: &agent_code_lib::config::ApiConfig,
-    destination: &agent_code_lib::config::ApiConfig,
-    cli: &CliPermissionOverride,
-) -> Option<String> {
-    use agent_code_lib::config::ApiAuthMode;
-    // `--api-key` is applied over every configured source, so the
-    // credential is the operator's in both projects.
-    if cli.api_key_pinned {
-        return None;
-    }
-    match cli.auth_mode.unwrap_or(current.auth_mode) {
-        ApiAuthMode::ApiKey => {
-            if current.api_key != destination.api_key {
-                return Some("it is configured with a different API key".to_string());
-            }
-            if current.api_key_helper != destination.api_key_helper {
-                return Some("it resolves its API key from a different helper".to_string());
-            }
-        }
-        ApiAuthMode::CodexChatgpt => {
-            if current.codex_home != destination.codex_home {
-                return Some("it authenticates from a different Codex home".to_string());
-            }
-        }
-        // Its credential lives in the user's own auth file, not in
-        // project config, so no project setting distinguishes accounts.
-        ApiAuthMode::XaiOauth => {}
-    }
+    // Credentials are deliberately not compared. Startup resolves an
+    // `api_key_helper` into `api_key`; the resume preflight uses
+    // `load_policy_from`, which leaves it unresolved on purpose rather
+    // than run a command from a project the session may never enter. So
+    // the two sides are not comparable: two projects sharing one helper
+    // present a resolved key against `None` and would be refused every
+    // time.
+    //
+    // Establishing credential identity needs the destination's helper
+    // executed, which is the same work rebuilding the provider needs —
+    // see #537. Until then the account-level check does not exist, and a
+    // refusal that fires on every helper-based project is worse than
+    // none: it blocks work that was always compatible.
     None
 }
 
@@ -5365,118 +5323,39 @@ mod tests {
         );
     }
 
-    /// Same endpoint and mode still means a different account when the
-    /// key comes from elsewhere — the provider holds what was resolved
-    /// at startup and the destination's helper is never executed.
+    /// Two projects sharing one `api_key_helper` are compatible, and
+    /// must not be refused.
+    ///
+    /// They do not *look* compatible from here. Startup resolves the
+    /// helper into `api_key`, while the resume preflight uses
+    /// `load_policy_from`, which leaves it unresolved on purpose rather
+    /// than run a command from a project the session may never enter.
+    /// So the running config presents a resolved key and the
+    /// destination presents `None` — comparing them refused every
+    /// helper-based project, which is why credentials are not compared
+    /// at all. Establishing that identity needs the helper executed,
+    /// which is #537's work.
     #[test]
-    fn a_destination_resolving_credentials_elsewhere_is_refused() {
+    fn two_projects_sharing_a_key_helper_are_not_refused() {
         use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        let plain = CliPermissionOverride::default();
-
-        let by_helper = |h: &str| ApiConfig {
+        // As startup sees it: the helper has been run.
+        let running = ApiConfig {
             auth_mode: ApiAuthMode::ApiKey,
-            api_key_helper: Some(h.to_string()),
+            api_key: Some("resolved-at-startup".into()),
+            api_key_helper: Some("op read op://team/key".into()),
             ..ApiConfig::default()
         };
-        let why = provider_mismatch(
-            &by_helper("op read op://team/key"),
-            &by_helper("vault kv get -field=key secret/other"),
-            &plain,
-        )
-        .expect("a different helper was accepted");
-        assert!(
-            !why.contains("op://") && !why.contains("vault"),
-            "the refusal quoted the credential source itself: {why}"
-        );
-
-        // A literal key is a supported configuration too.
-        let by_key = |k: &str| ApiConfig {
+        // As the preflight sees the same project: helper unresolved.
+        let destination = ApiConfig {
             auth_mode: ApiAuthMode::ApiKey,
-            api_key: Some(k.to_string()),
+            api_key: None,
+            api_key_helper: Some("op read op://team/key".into()),
             ..ApiConfig::default()
         };
-        let why = provider_mismatch(&by_key("sk-source"), &by_key("sk-destination"), &plain)
-            .expect("a different API key was accepted");
-        assert!(
-            !why.contains("sk-"),
-            "the refusal put a key on screen: {why}"
-        );
-
-        // And the Codex home, under the mode that reads it.
-        let by_home = |h: &str| ApiConfig {
-            auth_mode: ApiAuthMode::CodexChatgpt,
-            codex_home: Some(h.to_string()),
-            ..ApiConfig::default()
-        };
-        assert!(provider_mismatch(&by_home("/a/.codex"), &by_home("/b/.codex"), &plain).is_some());
-    }
-
-    /// Each mode reads only its own credential fields. Comparing the
-    /// others refuses projects over settings nothing would have read.
-    #[test]
-    fn credentials_belonging_to_another_auth_mode_do_not_block_a_resume() {
-        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        let plain = CliPermissionOverride::default();
-
-        // Two api_key projects that merely name different Codex homes.
-        let a = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            codex_home: Some("/home/a/.codex".into()),
-            ..ApiConfig::default()
-        };
-        let b = ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            codex_home: Some("/home/b/.codex".into()),
-            ..ApiConfig::default()
-        };
-        assert!(
-            provider_mismatch(&a, &b, &plain).is_none(),
-            "an inactive codex_home blocked a compatible api_key resume"
-        );
-
-        // Two codex_chatgpt projects with different helpers.
-        let c = ApiConfig {
-            auth_mode: ApiAuthMode::CodexChatgpt,
-            api_key_helper: Some("op read op://a/key".into()),
-            ..ApiConfig::default()
-        };
-        let d = ApiConfig {
-            auth_mode: ApiAuthMode::CodexChatgpt,
-            api_key_helper: Some("op read op://b/key".into()),
-            ..ApiConfig::default()
-        };
-        assert!(
-            provider_mismatch(&c, &d, &plain).is_none(),
-            "an inactive api_key_helper blocked a compatible codex resume"
-        );
-    }
-
-    /// `--api-key` is applied over every configured source, so the
-    /// credential is the operator's in both projects — the same
-    /// exemption the endpoint and mode pins already get.
-    #[test]
-    fn a_credential_pinned_on_the_command_line_cannot_mismatch() {
-        use agent_code_lib::config::{ApiAuthMode, ApiConfig};
-        let by_helper = |h: &str| ApiConfig {
-            auth_mode: ApiAuthMode::ApiKey,
-            api_key_helper: Some(h.to_string()),
-            ..ApiConfig::default()
-        };
-        let a = by_helper("op read op://a/key");
-        let b = by_helper("op read op://b/key");
 
         assert!(
-            provider_mismatch(&a, &b, &CliPermissionOverride::default()).is_some(),
-            "precondition: without the pin these differ"
-        );
-
-        let pinned = CliPermissionOverride {
-            api_key_pinned: true,
-            ..CliPermissionOverride::default()
-        };
-        assert!(
-            provider_mismatch(&a, &b, &pinned).is_none(),
-            "--api-key applies to the destination too, so this was not a mismatch"
+            provider_mismatch(&running, &destination, &CliPermissionOverride::default()).is_none(),
+            "a project was refused for using the very same key helper"
         );
     }
 
