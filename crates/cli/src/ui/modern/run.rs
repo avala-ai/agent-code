@@ -81,7 +81,22 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn mcp_needs_reconnect(
     before: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
     after: &std::collections::HashMap<String, agent_code_lib::config::McpServerEntry>,
+    after_policy: &agent_code_lib::config::SecurityConfig,
 ) -> bool {
+    // A destination can define the same servers and still forbid them.
+    // Copying its `security` into state does not stop a connected proxy
+    // being dispatched — nothing consults these lists at call time — so
+    // a server this project excludes has to lose its connection here or
+    // it stays callable.
+    let excluded = |name: &String| {
+        let denied = after_policy.mcp_server_denylist.iter().any(|d| d == name);
+        let not_allowed = !after_policy.mcp_server_allowlist.is_empty()
+            && !after_policy.mcp_server_allowlist.iter().any(|a| a == name);
+        denied || not_allowed
+    };
+    if before.keys().any(excluded) {
+        return true;
+    }
     // `command` is what makes an entry stdio; a `url` server is reached
     // over the network and does not care where we stand.
     if before.values().any(|e| e.command.is_some()) {
@@ -505,7 +520,11 @@ async fn finish_cwd_adoption(
     // `PartialEq`, and fail-closed if either side will not serialize:
     // dropping proxies costs a restart to get them back, keeping the
     // wrong ones leaves another project's servers reachable.
-    let drop_mcp = mcp_needs_reconnect(&eng.state().config.mcp_servers, &cfg.mcp_servers);
+    let drop_mcp = mcp_needs_reconnect(
+        &eng.state().config.mcp_servers,
+        &cfg.mcp_servers,
+        &cfg.security,
+    );
     let dropped_mcp = eng.adopt_project(&project_root, cfg.clone(), drop_mcp);
     // Keyed on whether this project's servers are connected, not on how
     // many were removed: a destination that *introduces* MCP servers drops
@@ -5133,6 +5152,50 @@ mod tests {
         );
     }
 
+    /// A destination whose policy forbids nothing.
+    fn open_policy() -> agent_code_lib::config::SecurityConfig {
+        agent_code_lib::config::SecurityConfig::default()
+    }
+
+    /// A destination can define exactly the same servers and still forbid
+    /// them. Nothing consults these lists when a tool is dispatched, so a
+    /// proxy the destination excludes has to lose its connection here or
+    /// it stays callable in a project that says it must not be.
+    #[test]
+    fn a_destination_that_forbids_a_server_drops_its_proxy() {
+        use agent_code_lib::config::McpServerEntry;
+        use std::collections::HashMap;
+
+        let servers = || {
+            let e: McpServerEntry = serde_json::from_value(serde_json::json!({
+                "url": "https://example.invalid/mcp",
+            }))
+            .expect("entry");
+            let mut m = HashMap::new();
+            m.insert("docs".to_string(), e);
+            m
+        };
+
+        assert!(
+            !mcp_needs_reconnect(&servers(), &servers(), &open_policy()),
+            "precondition: an identical remote server is reusable"
+        );
+
+        let mut denied = open_policy();
+        denied.mcp_server_denylist = vec!["docs".to_string()];
+        assert!(
+            mcp_needs_reconnect(&servers(), &servers(), &denied),
+            "a denied server kept its connection"
+        );
+
+        let mut allow_other = open_policy();
+        allow_other.mcp_server_allowlist = vec!["something-else".to_string()];
+        assert!(
+            mcp_needs_reconnect(&servers(), &servers(), &allow_other),
+            "a server outside the allowlist kept its connection"
+        );
+    }
+
     /// A stdio server is spawned without `current_dir`, so it inherited
     /// the directory the process started in and a bare command resolved
     /// there. Identical config files therefore do *not* mean the
@@ -5163,15 +5226,15 @@ mod tests {
         };
 
         assert!(
-            mcp_needs_reconnect(&stdio("docs-server"), &stdio("docs-server")),
+            mcp_needs_reconnect(&stdio("docs-server"), &stdio("docs-server"), &open_policy()),
             "an identical stdio config still points at a subprocess launched elsewhere"
         );
         assert!(
-            !mcp_needs_reconnect(&remote(), &remote()),
+            !mcp_needs_reconnect(&remote(), &remote(), &open_policy()),
             "a networked server does not care which directory we stand in"
         );
         assert!(
-            mcp_needs_reconnect(&remote(), &HashMap::new()),
+            mcp_needs_reconnect(&remote(), &HashMap::new(), &open_policy()),
             "a destination configuring no servers must not inherit these"
         );
     }
