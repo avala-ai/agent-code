@@ -452,20 +452,38 @@ fn decision_is_widening(decision: &PermissionDecision) -> bool {
     matches!(decision, PermissionDecision::Allow)
 }
 
-/// Top-level string fields permission patterns are written against.
+/// Subject fields a permission pattern may compare against for a tool.
 ///
-/// Order does not matter for matching: a rule matches when **any** of
-/// these that are present matches the pattern. Tools whose subject is
-/// not in this list (and that do not carry `command`) hit the fail-closed
-/// branch below rather than a silent empty-string match.
-const PATTERN_INPUT_FIELDS: &[&str] = &[
-    "file_path", // FileRead / FileWrite / FileEdit / MultiEdit / NotebookEdit
-    "url",       // WebFetch
-    "path",      // Grep / Glob
-    "pattern",   // Grep / Glob (search pattern)
-    "query",     // WebSearch / ToolSearch
-    "prompt",    // Agent / CronCreate
-];
+/// Patterns are tool-scoped: a WebFetch allow rule must only look at
+/// `url`, never at an optional `prompt` the model stuffed with a
+/// matching string. Grep/Glob may target either `path` or `pattern`.
+/// Unknown tools with none of these fields fail closed below.
+fn pattern_subject_fields(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        t if t.eq_ignore_ascii_case("WebFetch") => &["url"],
+        t if t.eq_ignore_ascii_case("WebSearch") || t.eq_ignore_ascii_case("ToolSearch") => {
+            &["query"]
+        }
+        t if t.eq_ignore_ascii_case("Agent") || t.eq_ignore_ascii_case("CronCreate") => {
+            &["prompt"]
+        }
+        t if t.eq_ignore_ascii_case("Grep") || t.eq_ignore_ascii_case("Glob") => {
+            &["path", "pattern"]
+        }
+        t if t.eq_ignore_ascii_case("FileRead")
+            || t.eq_ignore_ascii_case("FileWrite")
+            || t.eq_ignore_ascii_case("FileEdit")
+            || t.eq_ignore_ascii_case("MultiEdit")
+            || t.eq_ignore_ascii_case("NotebookEdit") =>
+        {
+            &["file_path", "path"]
+        }
+        // PowerShell (and any other non-Bash tool that carries `command`)
+        // is handled before this list is consulted. Default empty so an
+        // unrecognised tool cannot smuggle a match via an unrelated field.
+        _ => &[],
+    }
+}
 
 fn matches_input_pattern(
     pattern: &str,
@@ -494,12 +512,12 @@ fn matches_input_pattern(
         return true;
     }
 
-    // Match against every known subject field that is present. Any hit
-    // counts: a deny on `url` must not be defeated by a missing
-    // `file_path`, and a Grep rule may target either `path` or the
-    // search `pattern`.
+    // Match only this tool's subject field(s). Any hit among those
+    // fields counts (Grep may target path or search pattern); fields
+    // that belong to other tools are ignored so a crafted secondary
+    // argument cannot satisfy an allow rule.
     let mut saw_comparable = false;
-    for key in PATTERN_INPUT_FIELDS {
+    for key in pattern_subject_fields(tool_name) {
         if let Some(value) = input.get(*key).and_then(|v| v.as_str()) {
             saw_comparable = true;
             if glob_match(pattern, value) {
@@ -511,7 +529,7 @@ fn matches_input_pattern(
         return false;
     }
 
-    // No comparable field at all. The old code fell through to
+    // No comparable field for this tool. The old code fell through to
     // `glob_match(pattern, "")`, which can never match a pattern with a
     // literal character — so a deny rule on `url` (or any other key we
     // had not listed) loaded, evaluated, and silently did nothing.
@@ -1673,6 +1691,40 @@ mod tests {
                 PermissionDecision::Deny(_)
             ),
             "allow must not grant a url the pattern does not describe"
+        );
+    }
+
+    /// WebFetch allow rules must only compare `url`. Matching any known
+    /// field would let a call with an evil `url` and a crafted `prompt`
+    /// (or other secondary string) satisfy a docs-site allow rule.
+    #[test]
+    fn webfetch_allow_ignores_prompt_field() {
+        let c = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![rule(
+                "WebFetch",
+                "https://docs.example.com/*",
+                PermissionMode::Allow,
+            )],
+            ..Default::default()
+        });
+        let input = serde_json::json!({
+            "url": "https://evil.example",
+            "prompt": "https://docs.example.com/guide"
+        });
+        assert!(
+            matches!(c.check("WebFetch", &input), PermissionDecision::Deny(_)),
+            "allow on docs URL must not match when only prompt carries that URL"
+        );
+        // Direct pattern check: widening allow must not match.
+        assert!(
+            !matches_input_pattern(
+                "https://docs.example.com/*",
+                &input,
+                true,
+                "WebFetch"
+            ),
+            "WebFetch subject is url only; prompt must not satisfy the pattern"
         );
     }
 
