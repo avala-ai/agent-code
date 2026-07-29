@@ -222,6 +222,66 @@ jobs:
       # npm (Publisher: GitHub Actions, repo avala-ai/agent-code,
       # workflow file release.yml) for this to succeed. `--provenance`
       # publishes a signed build-provenance attestation.
+      #
+      # Do not reintroduce a long-lived NPM_TOKEN repo secret — it is
+      # unused (OIDC only) and is a live publish credential if present.
+      # Delete any residual `NPM_TOKEN` secret from the repository settings.
       - name: Publish
         working-directory: npm
         run: npm publish --access public --provenance
+
+  # Surfaces a failed publish so a green binary/GitHub-release job cannot
+  # hide a stale Homebrew formula or a crates.io/npm miss (see #562).
+  report-failures:
+    name: Report release failures
+    if: always()
+    needs: [build, release, publish-crate, update-homebrew, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open an issue when any publish job failed
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY=$(cat <<MD
+          ## Release workflow failure for \`${TAG}\`
+
+          One or more publish jobs did not succeed. The GitHub Release or
+          binary matrix may still look green — check every job below.
+
+          | Job | Result |
+          |---|---|
+          | build | \`${{ needs.build.result }}\` |
+          | release | \`${{ needs.release.result }}\` |
+          | publish-crate | \`${{ needs.publish-crate.result }}\` |
+          | update-homebrew | \`${{ needs.update-homebrew.result }}\` |
+          | publish-npm | \`${{ needs.publish-npm.result }}\` |
+
+          Run: ${RUN_URL}
+
+          ---
+          Opened automatically by \`release.yml\` / report-failures (see #562).
+          MD
+          )
+          # Dedup: if an open issue already tracks this tag, comment instead.
+          EXISTING=$(gh issue list --state open --label release-failure \
+            --search "Release workflow failure for ${TAG} in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Still failing on re-run: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Release workflow failure for ${TAG}" \
+              --label "release-failure" \
+              --body "$BODY" || \
+            gh issue create \
+              --title "Release workflow failure for ${TAG}" \
+              --body "$BODY"
+          fi

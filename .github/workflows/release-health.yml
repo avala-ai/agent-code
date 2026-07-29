@@ -1,0 +1,61 @@
+name: Release health
+
+# Catches a publish job that failed or silently no-op'd: the newest tag
+# must match crates.io, npm, and the Homebrew formula. See #562.
+on:
+  schedule:
+    - cron: "0 14 * * *" # daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Compare published versions to latest tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)
+          WANT="${TAG#v}"
+          echo "latest tag: $TAG ($WANT)"
+
+          CRATES=$(curl -fsSL "https://crates.io/api/v1/crates/agent-code" | jq -r .crate.max_version)
+          NPM=$(curl -fsSL "https://registry.npmjs.org/@avala-ai/agent-code/latest" | jq -r .version)
+          # Homebrew formula from the tap (raw main).
+          FORMULA=$(curl -fsSL "https://raw.githubusercontent.com/avala-ai/homebrew-tap/main/Formula/agent-code.rb" \
+            | grep -E '^\s*version\s+"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+
+          echo "crates.io: $CRATES"
+          echo "npm:       $NPM"
+          echo "homebrew:  $FORMULA"
+
+          FAIL=0
+          MSG=""
+          for pair in "crates.io=$CRATES" "npm=$NPM" "homebrew=$FORMULA"; do
+            name=${pair%%=*}
+            got=${pair#*=}
+            if [ "$got" != "$WANT" ]; then
+              FAIL=1
+              MSG="${MSG}- ${name} is \`${got}\` (want \`${WANT}\`)\n"
+            fi
+          done
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "all publish targets match $WANT"
+            exit 0
+          fi
+
+          BODY=$(printf "Latest tag is \`%s\`, but:\n\n%s\nOpened by \`release-health.yml\` (see #562)." "$TAG" "$(printf "$MSG")")
+          EXISTING=$(gh issue list --state open --search "Release version drift for ${TAG} in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Still drifting: ${BODY}"
+          else
+            gh issue create --title "Release version drift for ${TAG}" --body "$BODY" || true
+          fi
+          exit 1
