@@ -3652,13 +3652,32 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     handle_scrollbar_press(app, m.row, kind);
                     return;
                 }
+                Some(super::hit_rect::HitTarget::StatusChip { id }) => {
+                    handle_status_chip_click(app, id);
+                    return;
+                }
                 _ => {}
             }
             app.scrollbar_drag = None;
             if let Some(abs) = mouse_abs_line(app, m.row) {
-                app.selection = Some(super::app::TextSelection {
-                    start_line: abs,
-                    end_line: abs,
+                let col = mouse_abs_col(app, m.column);
+                let n = app.click_tracker.register(abs, col);
+                app.selection = Some(match n {
+                    // Double-click: word under the cursor (#558 D5-34).
+                    2 => {
+                        let plain = app.layout.plain_range(abs, abs).unwrap_or_default();
+                        match super::app::word_range_at(&plain, col) {
+                            Some((a, b)) => super::app::TextSelection::word(abs, a, b),
+                            None => super::app::TextSelection::lines(abs, abs),
+                        }
+                    }
+                    // Triple-click: full soft-wrap group (logical line).
+                    3 => {
+                        let (lo, hi) = app.layout.soft_wrap_span(abs).unwrap_or((abs, abs));
+                        super::app::TextSelection::lines(lo, hi)
+                    }
+                    // Single click: one display line.
+                    _ => super::app::TextSelection::lines(abs, abs),
                 });
                 app.dirty = true;
             }
@@ -3670,12 +3689,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 if let Some(sel) = app.selection.as_mut() {
+                    // Drag expands to full lines (drops word-column range).
                     sel.end_line = abs;
+                    sel.cols = None;
                 } else {
-                    app.selection = Some(super::app::TextSelection {
-                        start_line: abs,
-                        end_line: abs,
-                    });
+                    app.selection = Some(super::app::TextSelection::lines(abs, abs));
                 }
                 app.dirty = true;
             }
@@ -3686,10 +3704,12 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 return;
             }
             // Keep selection for y / Ctrl+Shift+C; toast if non-empty.
-            if let Some(sel) = app.selection
-                && sel.start_line != sel.end_line
-            {
-                app.push_toast("selection ready · Ctrl+Shift+C or y to copy");
+            if let Some(sel) = app.selection {
+                let multi_line = sel.start_line != sel.end_line;
+                let word = sel.cols.is_some();
+                if multi_line || word {
+                    app.push_toast("selection ready · Ctrl+Shift+C or y to copy");
+                }
             }
         }
         // Middle-click: no OS PRIMARY read without extra deps; hint paste path.
@@ -3714,6 +3734,57 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Status-bar chip clicks (#558 D6-23 / D4-18). Mode cycles; others toast
+/// a detail line so the bar stays dense but inspectable.
+fn handle_status_chip_click(app: &mut App, id: &str) {
+    match id {
+        "mode" => {
+            app.cycle_mode_forward();
+        }
+        "turn" => {
+            app.push_toast(format!("turn {}", app.turn_count));
+        }
+        "tokens" => {
+            app.push_toast(format!(
+                "tokens in {} · out {} · total {}",
+                app.tokens_in,
+                app.tokens_out,
+                app.tokens_in + app.tokens_out
+            ));
+        }
+        "cost" => {
+            app.push_toast(format!("session cost ${:.4}", app.cost_usd));
+        }
+        "ctx" => {
+            if let Some((used, max)) = app.ctx_meter {
+                let pct = if max > 0 {
+                    ((used as f64 / max as f64) * 100.0).round() as u32
+                } else {
+                    0
+                };
+                app.push_toast(format!("context {used}/{max} ({pct}%)"));
+            } else {
+                app.push_toast("context meter unavailable");
+            }
+        }
+        "queue" => {
+            app.show_queue_pane = !app.show_queue_pane;
+            app.dirty = true;
+        }
+        "selection" => {
+            app.copy_selection_or_last();
+        }
+        "session" => {
+            app.push_toast(format!("session {}", app.session_id));
+        }
+        "phase" | "status" if !app.status_message.is_empty() => {
+            app.push_toast(app.status_message.clone());
+        }
+        _ => {}
+    }
+    app.dirty = true;
 }
 
 /// Begin a scrollbar interaction: thumb drag, or track click-to-jump.
@@ -3875,6 +3946,11 @@ fn mouse_abs_line(app: &App, row: u16) -> Option<usize> {
     let total = app.layout.total_lines();
     let top = app.scroll.top(total, app.viewport_h);
     app.layout.abs_line_at(top, row_in_view)
+}
+
+/// Map a screen column to a display column inside the transcript body.
+fn mouse_abs_col(app: &App, column: u16) -> u16 {
+    column.saturating_sub(app.transcript_left_x)
 }
 
 /// Strip C0/C1 control bytes (and DEL) so untrusted title components
@@ -5394,6 +5470,82 @@ mod tests {
             mouse_at(MouseEventKind::Down(MouseButton::Left), 65, 22),
         );
         assert!(app.scroll.is_following(), "click on jump pill follows");
+    }
+
+    #[test]
+    fn status_chip_click_toasts_token_detail() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.tokens_in = 10;
+        app.tokens_out = 5;
+        app.hit_registry.register(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 12,
+                height: 1,
+            },
+            super::super::hit_rect::HitTarget::StatusChip { id: "tokens" },
+        );
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 2, 0),
+        );
+        let toast = app.toast.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        assert!(
+            toast.contains("tokens") && toast.contains('1') && toast.contains('5'),
+            "expected token toast, got {toast:?}"
+        );
+    }
+
+    #[test]
+    fn multi_click_selects_line_word_then_soft_wrap() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        // Wide content so soft-wrap produces multiple display rows.
+        app.transcript
+            .push(crate::ui::modern::app::TranscriptItem::System(
+                "hello world_path/file.rs and more text that wraps".into(),
+            ));
+        app.layout
+            .sync(&app.transcript, 20, &std::collections::HashSet::new(), None);
+        app.viewport_h = 10;
+        app.transcript_bottom_row = 10;
+        app.transcript_left_x = 0;
+        // Line 0 is visible at screen row = bottom - (h-1) + 0.
+        let top_row = app
+            .transcript_bottom_row
+            .saturating_sub(app.viewport_h as u16 - 1);
+
+        // 1st click → single display line.
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 6, top_row),
+        );
+        let s1 = app.selection.expect("line select");
+        assert_eq!(s1.start_line, s1.end_line);
+        assert!(s1.cols.is_none(), "single click is full line: {s1:?}");
+
+        // 2nd click same cell → word under column 6 ("world_path/file.rs").
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 6, top_row),
+        );
+        let s2 = app.selection.expect("word select");
+        assert!(s2.cols.is_some(), "double click is word: {s2:?}");
+        let text = app.selection_plain_text(s2).unwrap_or_default();
+        assert!(
+            text.contains("world") || text.contains("hello"),
+            "word text should be non-empty: {text:?}"
+        );
+
+        // 3rd click → soft-wrap span (may be multi-line at width 20).
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 6, top_row),
+        );
+        let s3 = app.selection.expect("soft-wrap select");
+        assert!(s3.cols.is_none(), "triple click is lines: {s3:?}");
+        assert!(s3.end_line >= s3.start_line, "soft-wrap span: {s3:?}");
     }
 
     #[test]

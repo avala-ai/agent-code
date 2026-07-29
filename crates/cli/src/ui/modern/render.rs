@@ -9,6 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::anim::{blink_visible, pulse_style, spinner_glyph, toast_style};
 use super::app::{App, PendingPermission, Phase};
@@ -111,10 +112,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_transcript(frame, chunks[1], app);
     }
     draw_status(frame, chunks[2], app);
-    app.hit_registry.register(
-        chunks[2],
-        super::hit_rect::HitTarget::StatusChip { id: "status" },
-    );
     if chips_h > 0 {
         draw_queue_chips(frame, chunks[3], app);
         app.hit_registry.register(
@@ -1358,8 +1355,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     {
         app.recompute_search(false);
     }
-    // Record the bottom screen row for mouse hit-testing (jump pill).
+    // Record the body origin for mouse hit-testing (jump pill / multi-click).
     app.transcript_bottom_row = inner.y + inner.height.saturating_sub(1);
+    app.transcript_left_x = inner.x;
     let total = app.layout.total_lines();
     let top = app.scroll.top(total, height);
     let view = app.layout.viewport(top, height);
@@ -1643,20 +1641,58 @@ fn apply_selection_highlight(
     let lo = sel.start_line.min(sel.end_line);
     let hi = sel.start_line.max(sel.end_line);
     let accent = palette().accent;
+    let fill = Style::default()
+        .fg(super::colors::on_fill(accent))
+        .bg(accent)
+        .add_modifier(Modifier::BOLD);
     for (i, line) in view.iter_mut().enumerate() {
         let abs = top + i;
-        if abs >= lo && abs <= hi {
-            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            *line = Line::from(Span::styled(
-                plain,
-                Style::default()
-                    .fg(super::colors::on_fill(accent))
-                    .bg(accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        if abs < lo || abs > hi {
+            continue;
+        }
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if let Some((cs, ce)) = sel.cols.filter(|_| lo == hi) {
+            // Partial (word) selection: only paint the column range.
+            *line = paint_col_range(&plain, cs, ce, fill, line.style);
+        } else {
+            *line = Line::from(Span::styled(plain, fill));
         }
     }
     view
+}
+
+/// Paint display columns `[start, end)` of `plain` with `fill`, leaving
+/// the rest unstyled (using `base` as the surrounding style).
+fn paint_col_range(plain: &str, start: u16, end: u16, fill: Style, base: Style) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_fill = false;
+    let mut col = 0u16;
+    let flush = |spans: &mut Vec<Span<'static>>, buf: &mut String, filled: bool| {
+        if buf.is_empty() {
+            return;
+        }
+        let style = if filled { fill } else { base };
+        spans.push(Span::styled(std::mem::take(buf), style));
+    };
+    for g in plain.graphemes(true) {
+        let w = UnicodeWidthStr::width(g).max(1) as u16;
+        let in_sel = col < end && col.saturating_add(w) > start;
+        if !buf.is_empty() && in_sel != buf_fill {
+            flush(&mut spans, &mut buf, buf_fill);
+        }
+        buf_fill = in_sel;
+        buf.push_str(g);
+        col = col.saturating_add(w);
+    }
+    flush(&mut spans, &mut buf, buf_fill);
+    if spans.is_empty() {
+        Line::from(Span::styled(plain.to_string(), base))
+    } else {
+        Line::from(spans)
+    }
 }
 
 /// Paint the row the `2/3` counter points at, so stepping through
@@ -1689,7 +1725,7 @@ fn apply_search_highlight(
     view
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if !app.statusline_enabled {
         return;
     }
@@ -1713,37 +1749,53 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(palette().muted),
         ));
         frame.render_widget(Paragraph::new(line), area);
+        // Whole bar is one chip under a custom template.
+        app.hit_registry.register(
+            area,
+            super::hit_rect::HitTarget::StatusChip { id: "status" },
+        );
         return;
     }
-    let mut spans = Vec::new();
+    // (span, optional chip id for hit testing — #558 D6-23).
+    let mut chips: Vec<(Span<'static>, Option<&'static str>)> = Vec::new();
     // The mode badge must be visible in EVERY state (product bar). The
     // minimal skin hides the header that normally carries it, so show it
     // in the status bar there — permission behavior differs radically
     // between Manual/AcceptEdits/Plan and must never be invisible.
     if matches!(app.skin, super::app::Skin::Minimal) {
-        spans.push(Span::styled(
-            format!(" {} ", app.mode.short_badge()),
-            mode_style(app.mode),
+        chips.push((
+            Span::styled(
+                format!(" {} ", app.mode.short_badge()),
+                mode_style(app.mode),
+            ),
+            Some("mode"),
         ));
-        spans.push(Span::raw("│"));
+        chips.push((Span::raw("│"), None));
     }
-    spans.extend([
+    chips.push((
         Span::styled(
             format!(" turn {} ", app.turn_count),
             Style::default().fg(palette().muted),
         ),
-        Span::raw("│"),
+        Some("turn"),
+    ));
+    chips.push((Span::raw("│"), None));
+    chips.push((
         Span::styled(
             format!(" {tokens} tok "),
             Style::default().fg(palette().muted),
         ),
-        Span::raw("│"),
+        Some("tokens"),
+    ));
+    chips.push((Span::raw("│"), None));
+    chips.push((
         Span::styled(
             format!(" ${:.4} ", app.cost_usd),
             Style::default().fg(palette().muted),
         ),
-        Span::raw("│"),
-    ]);
+        Some("cost"),
+    ));
+    chips.push((Span::raw("│"), None));
 
     // Context meter: yellow ≥70%, red ≥90% (plan §M1/§6).
     if let Some((used, max)) = app.ctx_meter
@@ -1758,11 +1810,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             palette().muted
         };
-        spans.push(Span::styled(
-            format!(" ctx {pct}% "),
-            Style::default().fg(color),
+        chips.push((
+            Span::styled(format!(" ctx {pct}% "), Style::default().fg(color)),
+            Some("ctx"),
         ));
-        spans.push(Span::raw("│"));
+        chips.push((Span::raw("│"), None));
     }
 
     // Live spinner / blinking action-required / toast / idle message.
@@ -1775,74 +1827,124 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 super::app::WaitingOn::UserInput => (warning, warning),
                 _ => (accent, palette().inactive),
             };
-            spans.push(Span::styled(
-                format!(" {glyph} "),
-                pulse_style(app.tick, glyph_color),
+            chips.push((
+                Span::styled(format!(" {glyph} "), pulse_style(app.tick, glyph_color)),
+                Some("phase"),
             ));
-            spans.push(Span::styled(
-                format!(
-                    "{} ",
-                    app.waiting_on.label_with_elapsed(app.thinking_started_at)
+            chips.push((
+                Span::styled(
+                    format!(
+                        "{} ",
+                        app.waiting_on.label_with_elapsed(app.thinking_started_at)
+                    ),
+                    Style::default().fg(text_color),
                 ),
-                Style::default().fg(text_color),
+                Some("phase"),
             ));
         }
         Phase::Permission => {
             let show = blink_visible(app.tick, app.terminal_focused);
             if show {
-                spans.push(Span::styled(
-                    format!(" {} ", spinner_glyph(app.tick)),
-                    Style::default().fg(warning).add_modifier(Modifier::BOLD),
+                chips.push((
+                    Span::styled(
+                        format!(" {} ", spinner_glyph(app.tick)),
+                        Style::default().fg(warning).add_modifier(Modifier::BOLD),
+                    ),
+                    Some("phase"),
                 ));
-                spans.push(Span::styled(
-                    " action required ",
-                    Style::default()
-                        .fg(super::colors::on_fill(warning))
-                        .bg(warning)
-                        .add_modifier(Modifier::BOLD),
+                chips.push((
+                    Span::styled(
+                        " action required ",
+                        Style::default()
+                            .fg(super::colors::on_fill(warning))
+                            .bg(warning)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Some("phase"),
                 ));
             } else {
-                spans.push(Span::styled(
-                    "  · waiting for you ·  ",
-                    Style::default().fg(warning).add_modifier(Modifier::DIM),
+                chips.push((
+                    Span::styled(
+                        "  · waiting for you ·  ",
+                        Style::default().fg(warning).add_modifier(Modifier::DIM),
+                    ),
+                    Some("phase"),
                 ));
             }
         }
         _ => {
             if let Some((ref msg, left)) = app.toast {
-                spans.push(Span::styled(format!(" {msg} "), toast_style(left)));
+                chips.push((
+                    Span::styled(format!(" {msg} "), toast_style(left)),
+                    Some("status"),
+                ));
             } else {
-                spans.push(Span::styled(
-                    format!(" {} ", app.status_message),
-                    Style::default().fg(palette().inactive),
+                chips.push((
+                    Span::styled(
+                        format!(" {} ", app.status_message),
+                        Style::default().fg(palette().inactive),
+                    ),
+                    Some("status"),
                 ));
             }
         }
     }
     if !app.queue.is_empty() {
-        spans.push(Span::raw("│"));
+        chips.push((Span::raw("│"), None));
         let q_style = if app.phase == Phase::Streaming {
             pulse_style(app.tick, accent)
         } else {
             Style::default().fg(accent)
         };
-        spans.push(Span::styled(
-            format!(" ⧉ {} queued ", app.queue.len()),
-            q_style,
+        chips.push((
+            Span::styled(format!(" ⧉ {} queued ", app.queue.len()), q_style),
+            Some("queue"),
         ));
     }
     if app.selection.is_some() {
-        spans.push(Span::raw("│"));
-        spans.push(Span::styled(
-            " sel · Ctrl+Shift+C copy ",
-            Style::default().fg(accent).add_modifier(Modifier::DIM),
+        chips.push((Span::raw("│"), None));
+        chips.push((
+            Span::styled(
+                " sel · Ctrl+Shift+C copy ",
+                Style::default().fg(accent).add_modifier(Modifier::DIM),
+            ),
+            Some("selection"),
         ));
     }
-    spans.push(Span::raw("│"));
-    spans.push(Span::styled(
-        format!(" sid {} ", truncate_mid(&app.session_id, 12)),
-        Style::default().fg(palette().muted),
+    chips.push((Span::raw("│"), None));
+    chips.push((
+        Span::styled(
+            format!(" sid {} ", truncate_mid(&app.session_id, 12)),
+            Style::default().fg(palette().muted),
+        ),
+        Some("session"),
     ));
+
+    // Register hit rects left-to-right before paint (topmost = last chip).
+    let mut x = area.x;
+    for (span, id) in &chips {
+        let w = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        if let Some(id) = id
+            && w > 0
+            && area.height > 0
+        {
+            let max_w = area.width.saturating_sub(x.saturating_sub(area.x)).min(w);
+            if max_w > 0 {
+                app.hit_registry.register(
+                    Rect {
+                        x,
+                        y: area.y,
+                        width: max_w,
+                        height: area.height.max(1),
+                    },
+                    super::hit_rect::HitTarget::StatusChip { id },
+                );
+            }
+        }
+        x = x.saturating_add(w);
+    }
+
+    let spans: Vec<Span<'static>> = chips.into_iter().map(|(s, _)| s).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -2902,10 +3004,7 @@ mod tests {
         let _g = crate::ui::theme::test_lock();
 
         let view = vec![Line::from("match here")];
-        let sel = super::super::app::TextSelection {
-            start_line: 0,
-            end_line: 0,
-        };
+        let sel = super::super::app::TextSelection::lines(0, 0);
 
         for theme in ["one-dark", "solarized-light", "dark-ansi", "light-ansi"] {
             crate::ui::theme::init(theme);

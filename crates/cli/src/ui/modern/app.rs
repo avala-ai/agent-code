@@ -610,6 +610,11 @@ pub struct App {
     /// In-app mouse drag selection over absolute transcript line indices
     /// (layout coordinates). `None` when no selection.
     pub selection: Option<TextSelection>,
+    /// Multi-click sequence tracker for 1/2/3-click selection (#558 D5-34).
+    pub click_tracker: ClickTracker,
+    /// Left edge of the transcript body (screen column), recorded on draw
+    /// so mouse X can be mapped to a display column.
+    pub transcript_left_x: u16,
     /// Whether the keyboard-shortcuts overlay is open (Ctrl+. / Ctrl+X).
     pub show_shortcuts: bool,
     /// When HITL answer keys (y/a/n, plan a/k, question digits) become
@@ -665,10 +670,145 @@ pub fn should_notify(notifier_enabled: bool, terminal_focused: bool) -> bool {
 }
 
 /// Absolute-line selection in the virtualized transcript.
+///
+/// Full-line ranges leave [`Self::cols`] as `None`. Double-click word
+/// selection sets `cols` to a half-open display-column range on a single
+/// line (`start_line == end_line`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextSelection {
     pub start_line: usize,
     pub end_line: usize,
+    /// Half-open display columns on a single-line selection.
+    pub cols: Option<(u16, u16)>,
+}
+
+impl TextSelection {
+    pub fn lines(start_line: usize, end_line: usize) -> Self {
+        Self {
+            start_line,
+            end_line,
+            cols: None,
+        }
+    }
+
+    pub fn word(line: usize, start_col: u16, end_col: u16) -> Self {
+        let (a, b) = if start_col <= end_col {
+            (start_col, end_col)
+        } else {
+            (end_col, start_col)
+        };
+        Self {
+            start_line: line,
+            end_line: line,
+            cols: Some((a, b.max(a.saturating_add(1)))),
+        }
+    }
+}
+
+/// Multi-click timing for transcript selection (1 = line, 2 = word, 3 = soft-wrap).
+#[derive(Debug, Clone, Default)]
+pub struct ClickTracker {
+    count: u8,
+    last: Option<(Instant, usize, u16)>,
+}
+
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+impl ClickTracker {
+    /// Register a click at `(line, col)` and return the multi-click count
+    /// (1, 2, or 3). Same cell within [`MULTI_CLICK_WINDOW`] advances the
+    /// sequence; otherwise it resets to 1.
+    pub fn register(&mut self, line: usize, col: u16) -> u8 {
+        let now = Instant::now();
+        let next = match self.last {
+            Some((t, l, c))
+                if now.duration_since(t) <= MULTI_CLICK_WINDOW
+                    && l == line
+                    && c.abs_diff(col) <= 2 =>
+            {
+                match self.count {
+                    1 => 2,
+                    2 => 3,
+                    _ => 1,
+                }
+            }
+            _ => 1,
+        };
+        self.count = next;
+        self.last = Some((now, line, col));
+        next
+    }
+
+    #[cfg(test)]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Slice `text` to the half-open display-column range `[start, end)`.
+pub fn slice_display_cols(text: &str, start: u16, end: u16) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut out = String::new();
+    let mut col = 0u16;
+    for g in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(g).max(1) as u16;
+        let next = col.saturating_add(w);
+        if next > start && col < end {
+            out.push_str(g);
+        }
+        col = next;
+        if col >= end {
+            break;
+        }
+    }
+    out
+}
+
+/// Half-open display-column range of the word under `col` in `text`.
+///
+/// Word characters: alphanumeric, `_`, `-`, `/`, `.`, `:`. Returns `None`
+/// when the line is empty or `col` is past the end (falls back to the last
+/// word when past the last character).
+pub fn word_range_at(text: &str, col: u16) -> Option<(u16, u16)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    if text.is_empty() {
+        return None;
+    }
+    // (start_col, end_col, is_word)
+    let mut units: Vec<(u16, u16, bool)> = Vec::new();
+    let mut c = 0u16;
+    for g in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(g).max(1) as u16;
+        let ch = g.chars().next().unwrap_or(' ');
+        let is_word = ch.is_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.' | ':');
+        units.push((c, c.saturating_add(w), is_word));
+        c = c.saturating_add(w);
+    }
+    if units.is_empty() {
+        return None;
+    }
+    // Find the unit containing `col`, or the last unit if past the end.
+    let idx = units
+        .iter()
+        .position(|(s, e, _)| col >= *s && col < *e)
+        .unwrap_or(units.len().saturating_sub(1));
+    if !units[idx].2 {
+        // Punctuation / whitespace under the cursor — single-cell "word".
+        let (s, e, _) = units[idx];
+        return Some((s, e));
+    }
+    let mut lo = idx;
+    while lo > 0 && units[lo - 1].2 {
+        lo -= 1;
+    }
+    let mut hi = idx;
+    while hi + 1 < units.len() && units[hi + 1].2 {
+        hi += 1;
+    }
+    Some((units[lo].0, units[hi].1))
 }
 
 impl App {
@@ -776,6 +916,8 @@ impl App {
             terminal_focused: true,
             toast: None,
             selection: None,
+            click_tracker: ClickTracker::default(),
+            transcript_left_x: 0,
             show_shortcuts: false,
             hitl_answers_eligible_at: None,
             stream_buf: StreamBuffer::new(),
@@ -3031,13 +3173,22 @@ impl App {
     /// Copy current mouse/keyboard selection, else last assistant, else fail.
     pub fn copy_selection_or_last(&mut self) {
         if let Some(sel) = self.selection
-            && let Some(text) = self.layout.plain_range(sel.start_line, sel.end_line)
+            && let Some(text) = self.selection_plain_text(sel)
             && !text.trim().is_empty()
         {
             self.copy_text_report(&text, "selection");
             return;
         }
         self.copy_last_assistant();
+    }
+
+    /// Plain text covered by `sel`, honouring column ranges for word picks.
+    pub fn selection_plain_text(&self, sel: TextSelection) -> Option<String> {
+        if let Some((cs, ce)) = sel.cols {
+            let line = self.layout.plain_range(sel.start_line, sel.start_line)?;
+            return Some(slice_display_cols(&line, cs, ce));
+        }
+        self.layout.plain_range(sel.start_line, sel.end_line)
     }
 
     pub fn clear_selection(&mut self) {
@@ -3613,10 +3764,7 @@ mod tests {
     fn needs_anim_tick_ignores_static_selection() {
         let mut app = App::new("m", "/tmp", "s");
         assert!(!app.needs_anim_tick(), "idle must not tick");
-        app.selection = Some(TextSelection {
-            start_line: 0,
-            end_line: 1,
-        });
+        app.selection = Some(TextSelection::lines(0, 1));
         assert!(
             !app.needs_anim_tick(),
             "static mouse selection must not keep anim timer alive"
@@ -6453,5 +6601,24 @@ mod tests {
         app.mode_chosen = false;
         app.cycle_mode_forward();
         assert!(app.mode_chosen, "cycling is an explicit choice");
+    }
+
+    #[test]
+    fn word_range_at_finds_path_like_tokens() {
+        let text = "see src/main.rs now";
+        // "src/main.rs" starts at col 4.
+        let (a, b) = word_range_at(text, 6).expect("word");
+        assert_eq!(&slice_display_cols(text, a, b), "src/main.rs");
+        // Space under cursor is a single-cell pick.
+        let (a, b) = word_range_at(text, 3).expect("space");
+        assert_eq!(b - a, 1);
+    }
+
+    #[test]
+    fn slice_display_cols_respects_wide_glyphs() {
+        let text = "ab界cd";
+        // 界 is 2 cells at col 2..4.
+        assert_eq!(slice_display_cols(text, 2, 4), "界");
+        assert_eq!(slice_display_cols(text, 0, 2), "ab");
     }
 }

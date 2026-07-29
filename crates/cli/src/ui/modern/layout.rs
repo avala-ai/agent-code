@@ -288,6 +288,37 @@ impl LayoutCache {
         if abs < self.total { Some(abs) } else { None }
     }
 
+    /// Inclusive display-line span of the soft-wrap group containing `abs`.
+    ///
+    /// A triple-click selects this span so a wrapped logical line is
+    /// captured as one unit (#558 D5-34).
+    pub fn soft_wrap_span(&self, abs: usize) -> Option<(usize, usize)> {
+        if abs >= self.total {
+            return None;
+        }
+        let mut base = 0usize;
+        for b in &self.blocks {
+            let block_end = base + b.lines.len();
+            if abs < block_end {
+                let li = abs - base;
+                // Walk back over continuation rows.
+                let mut start_li = li;
+                while start_li > 0 && b.cont.get(start_li).copied().unwrap_or(false) {
+                    start_li -= 1;
+                }
+                // Walk forward over following continuations.
+                let mut end_li = li;
+                while end_li + 1 < b.lines.len() && b.cont.get(end_li + 1).copied().unwrap_or(false)
+                {
+                    end_li += 1;
+                }
+                return Some((base + start_li, base + end_li));
+            }
+            base = block_end;
+        }
+        None
+    }
+
     /// Plain text grouped by logical line: each inner vec is the display
     /// rows `(absolute index, text)` one pre-wrap line occupies. Search
     /// scans these so a query can match across a display-wrap boundary.
@@ -1040,6 +1071,23 @@ mod tests {
             links.iter().any(|l| l.url == "https://example.com/a"),
             "expected assistant link in layout cache, got {links:?}"
         );
+    }
+
+    #[test]
+    fn soft_wrap_span_covers_continuation_rows() {
+        let mut c = LayoutCache::default();
+        // Width 10 forces "abcdefghijklmnopqrstuvwxyz" into several rows.
+        c.sync(
+            &[TranscriptItem::System("abcdefghijklmnopqrstuvwxyz".into())],
+            10,
+            &HashSet::new(),
+            None,
+        );
+        let total = c.total_lines();
+        assert!(total > 1, "expected soft wraps, got {total}");
+        let (lo, hi) = c.soft_wrap_span(1).expect("span");
+        assert_eq!(lo, 0, "group starts at first display row");
+        assert_eq!(hi, total - 1, "group covers all wrapped rows of the item");
     }
 
     #[test]
