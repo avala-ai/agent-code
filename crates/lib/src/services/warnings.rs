@@ -97,17 +97,23 @@ pub fn len() -> usize {
     registry().lock().unwrap().len()
 }
 
+/// Process-wide lock for tests that push/clear the warning registry.
+///
+/// The registry is a process singleton; any unit test (in this crate or
+/// dependents) that calls [`clear`] or asserts on [`snapshot`] must hold
+/// this guard for the whole assertion window so parallel tests cannot
+/// interleave. Not for production use.
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Serialize tests against the global registry. Tests in this
-    // module share a singleton so they can't run in parallel without
-    // clobbering each other's state.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = test_lock();
         clear();
         guard
     }

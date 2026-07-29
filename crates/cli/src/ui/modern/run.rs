@@ -410,6 +410,15 @@ pub async fn run_modern_tui(
     app.show_thinking_blocks = show_thinking_blocks;
     app.effort = initial_effort;
     app.notifier_enabled = notifier_config.enabled;
+    // Surface process-level startup warnings (e.g. unknown theme id) in the
+    // status bar — tracing is redirected to agent.log in the interactive
+    // path, so a registry-only push would otherwise never be seen.
+    if let Some(w) = agent_code_lib::services::warnings::snapshot()
+        .into_iter()
+        .next()
+    {
+        app.status_message = format!("{}: {}", w.level.label(), w.message);
+    }
     // Construction performs no I/O; the first `notify` is what spawns.
     let mut notifier = NotifierService::new(notifier_config);
 

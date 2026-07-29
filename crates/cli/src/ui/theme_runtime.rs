@@ -550,6 +550,8 @@ mod tests {
     fn unknown_theme_id_is_flagged_but_still_resolves() {
         // resolve_theme must not panic or rewrite the id — from_name falls
         // back to one-dark — but warn_if_unknown_theme must fire.
+        // Hold the registry lock so parallel tests cannot clear mid-assert.
+        let _lock = agent_code_lib::services::warnings::test_lock();
         agent_code_lib::services::warnings::clear();
         let resolved = resolve_theme("this-theme-does-not-exist-xyz");
         assert_eq!(resolved, "this-theme-does-not-exist-xyz");
