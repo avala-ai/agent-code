@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.30.0] - 2026-07-29
+
+### Added
+
+- **First-run and launch experience** (#557 epic) — first-time setup asks which provider instead of silently pinning xAI (#577). Interactive sessions open a launch surface with branding, `repo:branch · version`, auth/mode, a single startup-warning slot (from local `/doctor` checks), recent sessions, and type-to-start (#579). Resume a recent session with ↑/↓ + Enter or a click (#580, #582). Brand shimmer is gated by `[ui] reduced_motion` (#582). Empty conversations show three concrete next steps (#578).
+- **Interactive sessions persist for `/resume`** (#556) — modern TUI sessions are written so the picker and launch recent list are not empty after a chat.
+- **Completion dropdown** (#576) — slash and `@path` completions show a dropdown menu above the composer (fuzzy ranking via #573).
+- **Per-frame mouse hit-rect registry** (#574) — renderers register hit targets; hover/click resolve centrally (#558 foundation).
+- **Mouse capture toggle** (#570) — `/mouse` and `Ctrl+Alt+M` release capture for native terminal selection without clobbering the composer draft; `Ctrl+Shift+M` only when kitty enhancement is safe.
+- **Statusline template wiring** (#571) — `[ui.statusline]` template is rendered into the modern status bar.
+- **Fuzzy command palette ranking** (#573) — subsequence matcher for Ctrl+P; canonical names rank above aliases.
+
+### Fixed
+
+- **Session write atomicity** (#564) — all session writers take a per-session lock and write via temp+rename; prune removes lock sidecars.
+- **Provider identity on resume** (#566) — sessions stamp provider fingerprint and refuse a mismatched resume so a transcript is not sent to the wrong endpoint/account.
+- **Resume project root off the event loop** (#565) — cross-project resume no longer blocks TUI redraw while resolving the destination root.
+- **WebFetch permission patterns match `url` only** (#563) — tool-subject fields are selected per tool so a prompt field cannot satisfy a URL allow rule under default-deny.
+- **Conversation-scoped state reset seam** (#572) — a single path clears epoch-scoped tasks/todos/pending output when the conversation is swapped.
+- **Unknown theme id warns in the TUI** (#569) — misspelled `[ui].theme` surfaces on the status bar (not only in `agent.log`).
+- **Streaming highlight cache resets on theme polarity change** (#575) and is freed on `/clear`.
+
+### Changed
+
+- **Oversized diffs short-circuit rich highlight** (#567) — collapsed large diffs no longer pay full materialization cost before the line cap.
+- **crates.io publish via OIDC trusted publishing** (#555); release health workflow opens issues on publish drift and pin `GH_REPO` for `gh issue` (#568).
+
 ## [0.29.0] - 2026-07-28
 
 ### Added
@@ -635,7 +662,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/avala-ai/agent-code/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/avala-ai/agent-code/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/avala-ai/agent-code/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/avala-ai/agent-code/compare/v0.26.0...v0.27.0
