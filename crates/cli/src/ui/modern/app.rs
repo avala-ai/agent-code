@@ -398,6 +398,9 @@ pub struct App {
     pub composer_clicks: u8,
     pub composer_click_at: Option<std::time::Instant>,
     pub composer_click_pos: Option<(usize, usize)>, // (line, col)
+    /// Byte range selected inside the composer (`start..end`), from a
+    /// double/triple-click. Cleared on single click and typing.
+    pub composer_sel: Option<(usize, usize)>,
     /// When true: Enter inserts newline; Alt/Shift+Enter submit.
     /// When false (default): Enter submits; Alt/Shift+Enter insert newline.
     /// Toggle with Ctrl+M (prompt-focused).
@@ -819,21 +822,40 @@ pub fn word_range_at(text: &str, col: u16) -> Option<(u16, u16)> {
 }
 
 /// Char-column just past the word under `col` on a single composer line.
+fn is_composer_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | ':')
+}
+
 fn word_end_col(line: &str, col: usize) -> usize {
     let chars: Vec<char> = line.chars().collect();
     if chars.is_empty() {
         return 0;
     }
     let idx = col.min(chars.len().saturating_sub(1));
-    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | ':');
-    if !is_word(chars[idx]) {
+    if !is_composer_word_char(chars[idx]) {
         return idx + 1;
     }
     let mut end = idx + 1;
-    while end < chars.len() && is_word(chars[end]) {
+    while end < chars.len() && is_composer_word_char(chars[end]) {
         end += 1;
     }
     end
+}
+
+fn word_start_col(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return 0;
+    }
+    let idx = col.min(chars.len().saturating_sub(1));
+    if !is_composer_word_char(chars[idx]) {
+        return idx;
+    }
+    let mut start = idx;
+    while start > 0 && is_composer_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    start
 }
 
 impl App {
@@ -880,6 +902,7 @@ impl App {
             composer_clicks: 0,
             composer_click_at: None,
             composer_click_pos: None,
+            composer_sel: None,
             multiline_mode: false,
             prompt_history: Vec::new(),
             history_browse: None,
@@ -1409,6 +1432,7 @@ impl App {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.composer_sel = None;
         if self.phase != Phase::Idle && self.phase != Phase::Streaming {
             return;
         }
@@ -1445,6 +1469,7 @@ impl App {
     /// Same phase gate as [`insert_char`]. Preserves newlines so multi-line
     /// pastes (code, logs) survive into the next submit.
     pub fn insert_str(&mut self, text: &str) {
+        self.composer_sel = None;
         if text.is_empty() {
             return;
         }
@@ -1637,17 +1662,25 @@ impl App {
 
         match n {
             2 => {
-                // End of the word under `col`.
+                // Select the word under `col` and park the caret at its end.
                 let line_text = self.input.split('\n').nth(line).unwrap_or("");
+                let start_col = word_start_col(line_text, col);
                 let end_col = word_end_col(line_text, col);
-                self.cursor = self.byte_at_line_col(line, end_col);
+                let a = self.byte_at_line_col(line, start_col);
+                let b = self.byte_at_line_col(line, end_col);
+                self.composer_sel = Some((a.min(b), a.max(b)));
+                self.cursor = a.max(b);
             }
             3 => {
-                // End of the line.
+                // Select the whole line.
                 let len = self.line_char_len(line);
-                self.cursor = self.byte_at_line_col(line, len);
+                let a = self.byte_at_line_col(line, 0);
+                let b = self.byte_at_line_col(line, len);
+                self.composer_sel = Some((a, b));
+                self.cursor = b;
             }
             _ => {
+                self.composer_sel = None;
                 self.cursor = self.byte_at_line_col(line, col);
             }
         }
@@ -3266,6 +3299,17 @@ impl App {
 
     /// Copy current mouse/keyboard selection, else last assistant, else fail.
     pub fn copy_selection_or_last(&mut self) {
+        if let Some((a, b)) = self.composer_sel {
+            let lo = a.min(b).min(self.input.len());
+            let hi = a.max(b).min(self.input.len());
+            if lo < hi {
+                let text = self.input[lo..hi].to_string();
+                if !text.trim().is_empty() {
+                    self.copy_text_report(&text, "composer selection");
+                    return;
+                }
+            }
+        }
         if let Some(sel) = self.selection
             && let Some(text) = self.selection_plain_text(sel)
             && !text.trim().is_empty()
@@ -3870,14 +3914,17 @@ mod tests {
         let n = app.place_composer_caret(1 + 2 + 5, 10);
         assert_eq!(n, 1);
         assert_eq!(app.cursor, 5, "caret after 'hello'");
-        // Same cell again → double-click jumps to end of "world".
+        assert!(app.composer_sel.is_none());
+        // Same cell again → double-click selects "world".
         let n = app.place_composer_caret(1 + 2 + 6, 10);
         assert_eq!(n, 2);
         assert_eq!(app.cursor, "hello world".len());
-        // Triple → end of line (same).
+        assert_eq!(app.composer_sel, Some((6, 11)));
+        // Triple → whole line selected.
         let n = app.place_composer_caret(1 + 2 + 6, 10);
         assert_eq!(n, 3);
         assert_eq!(app.cursor, "hello world".len());
+        assert_eq!(app.composer_sel, Some((0, 11)));
     }
 
     #[test]

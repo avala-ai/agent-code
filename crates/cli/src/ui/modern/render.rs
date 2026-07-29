@@ -2060,7 +2060,13 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         v
     };
 
+    let sel = app.composer_sel;
+    let fill = Style::default()
+        .fg(super::colors::on_fill(border))
+        .bg(border)
+        .add_modifier(Modifier::BOLD);
     let mut display_lines: Vec<Line<'static>> = Vec::with_capacity(input_lines.len());
+    let mut byte_at = 0usize;
     for (i, segment) in input_lines.iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
@@ -2068,8 +2074,36 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         } else {
             spans.push(Span::raw("  ".to_string())); // indent continuation
         }
-        spans.push(Span::styled((*segment).to_string(), body_style));
+        // Highlight composer_sel when it overlaps this line's bytes.
+        if let Some((a, b)) = sel {
+            let lo = a.min(b);
+            let hi = a.max(b);
+            let line_start = byte_at;
+            let line_end = byte_at + segment.len();
+            if hi > line_start && lo < line_end {
+                let s0 = lo.saturating_sub(line_start).min(segment.len());
+                let s1 = hi.saturating_sub(line_start).min(segment.len());
+                if s0 > 0 {
+                    spans.push(Span::styled(segment[..s0].to_string(), body_style));
+                }
+                if s1 > s0 {
+                    spans.push(Span::styled(segment[s0..s1].to_string(), fill));
+                }
+                if s1 < segment.len() {
+                    spans.push(Span::styled(segment[s1..].to_string(), body_style));
+                }
+            } else {
+                spans.push(Span::styled((*segment).to_string(), body_style));
+            }
+        } else {
+            spans.push(Span::styled((*segment).to_string(), body_style));
+        }
         display_lines.push(Line::from(spans));
+        byte_at += segment.len();
+        if i + 1 < input_lines.len() || app.input.ends_with('\n') {
+            // Account for the newline separator between lines.
+            byte_at = byte_at.saturating_add(1);
+        }
     }
 
     if app.skin == crate::ui::modern::app::Skin::Minimal {
