@@ -3648,6 +3648,21 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     app.dirty = true;
                     return;
                 }
+                Some(super::hit_rect::HitTarget::Control { id }) if id == "guide_focus" => {
+                    // Step 1: just focus the composer (toast a nudge).
+                    app.push_toast("type a task in the composer below");
+                    app.dirty = true;
+                    return;
+                }
+                Some(super::hit_rect::HitTarget::Control { id }) if id == "guide_palette" => {
+                    app.open_command_palette();
+                    app.dirty = true;
+                    return;
+                }
+                Some(super::hit_rect::HitTarget::Control { id }) if id == "guide_mode" => {
+                    app.cycle_mode_forward();
+                    return;
+                }
                 Some(super::hit_rect::HitTarget::Scrollbar { kind }) => {
                     handle_scrollbar_press(app, m.row, kind);
                     return;

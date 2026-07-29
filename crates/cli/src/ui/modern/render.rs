@@ -1472,7 +1472,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // instead of a blank pane (#557 Phase 4). Only when idle — never
     // over a live stream or permission modal.
     if app.phase == Phase::Idle && transcript_is_empty_guidance(&app.transcript) {
-        draw_empty_conversation_guidance(frame, inner);
+        draw_empty_conversation_guidance(frame, inner, app);
     }
 
     // Overlay scrollbar on the right edge when content overflows (#558 D5-21).
@@ -1563,7 +1563,7 @@ fn transcript_is_empty_guidance(items: &[super::app::TranscriptItem]) -> bool {
     })
 }
 
-fn draw_empty_conversation_guidance(frame: &mut Frame<'_>, area: Rect) {
+fn draw_empty_conversation_guidance(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.height < 6 || area.width < 40 {
         return;
     }
@@ -1620,6 +1620,27 @@ fn draw_empty_conversation_guidance(frame: &mut Frame<'_>, area: Rect) {
         height: h.min(area.height),
     };
     frame.render_widget(Paragraph::new(lines), rect);
+
+    // Clickable rows for the three next steps (#558 D4-24).
+    // Line indices within `lines`: 3 = type, 4 = palette/resume, 5 = mode.
+    for (row_off, id) in [
+        (3u16, "guide_focus"),
+        (4, "guide_palette"),
+        (5, "guide_mode"),
+    ] {
+        let ry = y.saturating_add(row_off);
+        if ry < area.y.saturating_add(area.height) {
+            app.hit_registry.register(
+                Rect {
+                    x: area.x,
+                    y: ry,
+                    width: area.width,
+                    height: 1,
+                },
+                super::hit_rect::HitTarget::Control { id: id.into() },
+            );
+        }
+    }
 }
 
 /// Floating "↓ N new" pill anchored bottom-right of the transcript area.
