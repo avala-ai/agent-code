@@ -120,7 +120,7 @@ mod tests {
         let ranked = fuzzy_rank("sess", items, |s| s);
         assert_eq!(ranked[0], "session");
         assert!(ranked.contains(&"sessions"));
-        assert!(!ranked.iter().any(|s| *s == "help"));
+        assert!(!ranked.contains(&"help"));
     }
 
     #[test]
