@@ -1480,12 +1480,7 @@ impl App {
                 "/mouse off" => false,
                 _ => !self.mouse_capture,
             };
-            self.mouse_capture = want;
-            self.status_message = if want {
-                "mouse capture on — line selection active · /mouse off for native copy".into()
-            } else {
-                "mouse capture off — terminal native selection · /mouse on to restore".into()
-            };
+            self.set_mouse_capture(want);
             self.transcript
                 .push(TranscriptItem::System(self.status_message.clone()));
             self.input.clear();
@@ -3036,6 +3031,25 @@ impl App {
         self.dirty = true;
     }
 
+    /// Set mouse capture without touching the composer draft.
+    ///
+    /// The run loop watches `mouse_capture` and emits Enable/Disable on
+    /// the live backend when it drifts from `MOUSE_CAPTURE_WANTED`.
+    pub fn set_mouse_capture(&mut self, want: bool) {
+        self.mouse_capture = want;
+        self.status_message = if want {
+            "mouse capture on — line selection active · /mouse off for native copy".into()
+        } else {
+            "mouse capture off — terminal native selection · /mouse on to restore".into()
+        };
+        self.dirty = true;
+    }
+
+    /// Toggle mouse capture without clobbering an unsent draft (Ctrl+Alt+M).
+    pub fn toggle_mouse_capture(&mut self) {
+        self.set_mouse_capture(!self.mouse_capture);
+    }
+
     /// True while micro-animations should keep the event loop awake.
     ///
     /// Static mouse selection must **not** keep the timer running — that
@@ -3435,6 +3449,24 @@ mod tests {
         app.input = "/mouse off".into();
         app.submit();
         assert!(!app.mouse_capture);
+    }
+
+    #[test]
+    fn toggle_mouse_capture_preserves_draft() {
+        let mut app = app_with_lines(10, 20);
+        app.input = "unsent draft".into();
+        app.cursor = app.input.len();
+        assert!(app.mouse_capture);
+        app.toggle_mouse_capture();
+        assert!(!app.mouse_capture);
+        assert_eq!(
+            app.input, "unsent draft",
+            "keyboard toggle must not clobber draft"
+        );
+        assert_eq!(app.cursor, "unsent draft".len());
+        app.toggle_mouse_capture();
+        assert!(app.mouse_capture);
+        assert_eq!(app.input, "unsent draft");
     }
 
     #[test]

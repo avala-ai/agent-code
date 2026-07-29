@@ -183,12 +183,19 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     if app.show_shortcuts && app.phase != Phase::Permission {
-        draw_shortcuts_overlay(frame, area);
+        draw_shortcuts_overlay(frame, area, app);
     }
 }
 
-fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
+fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let accent = palette().accent;
+    // Only advertise Ctrl+Shift+M when the host can actually deliver it
+    // (kitty keyboard enhancement enabled and not denylisted).
+    let mouse_toggle = if app.caps.kitty_keyboard_safe {
+        "  Ctrl+Alt+M / Ctrl+Shift+M  toggle mouse capture (/mouse)"
+    } else {
+        "  Ctrl+Alt+M    toggle mouse capture (same as /mouse)"
+    };
     let lines = vec![
         Line::from(Span::styled(
             " keyboard shortcuts ",
@@ -211,7 +218,7 @@ fn draw_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  y / Y           copy block body / metadata"),
         Line::from("  Ctrl+Shift+C    copy selection or last reply"),
         Line::from("  drag mouse      select transcript text · /mouse off for native copy"),
-        Line::from("  Ctrl+Shift+M    toggle mouse capture (same as /mouse)"),
+        Line::from(mouse_toggle),
         Line::from("  @path           mention a file · Tab completes · contents inlined"),
         Line::from("  !cmd            shell passthrough"),
         Line::from("  Ctrl+. / Ctrl+X this help"),

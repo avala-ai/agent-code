@@ -19,6 +19,8 @@ Interactive sessions use the fullscreen TUI.
 | `Ctrl+P` / `?` | **Command palette** — filter slash commands, Enter fills `/cmd ` |
 | `Ctrl+.` / `Ctrl+X` | **Keyboard shortcuts** overlay |
 | `Ctrl+Shift+C` | Copy mouse selection, else last assistant reply |
+| `Ctrl+Alt+M` | Toggle **mouse capture** (same as `/mouse`) without clearing the composer draft. Prefer this on legacy terminals. |
+| `Ctrl+Shift+M` | Same toggle, only when kitty keyboard enhancement is enabled (not advertised on denylisted hosts) |
 | `Ctrl+;` / `Ctrl+'` | Toggle **queue pane** (full list) |
 | `Ctrl+L` | Force full redraw |
 | `/resume` | Open the session picker (filter, `↑↓`, Enter resumes) |
