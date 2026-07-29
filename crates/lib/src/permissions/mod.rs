@@ -464,9 +464,7 @@ fn pattern_subject_fields(tool_name: &str) -> &'static [&'static str] {
         t if t.eq_ignore_ascii_case("WebSearch") || t.eq_ignore_ascii_case("ToolSearch") => {
             &["query"]
         }
-        t if t.eq_ignore_ascii_case("Agent") || t.eq_ignore_ascii_case("CronCreate") => {
-            &["prompt"]
-        }
+        t if t.eq_ignore_ascii_case("Agent") || t.eq_ignore_ascii_case("CronCreate") => &["prompt"],
         t if t.eq_ignore_ascii_case("Grep") || t.eq_ignore_ascii_case("Glob") => {
             &["path", "pattern"]
         }
@@ -1718,12 +1716,7 @@ mod tests {
         );
         // Direct pattern check: widening allow must not match.
         assert!(
-            !matches_input_pattern(
-                "https://docs.example.com/*",
-                &input,
-                true,
-                "WebFetch"
-            ),
+            !matches_input_pattern("https://docs.example.com/*", &input, true, "WebFetch"),
             "WebFetch subject is url only; prompt must not satisfy the pattern"
         );
     }
