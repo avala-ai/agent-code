@@ -5,6 +5,7 @@
 mod anim;
 mod app;
 mod colors;
+mod completion;
 mod diffview;
 #[cfg(test)]
 mod fake_engine;

@@ -2716,6 +2716,47 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Completion dropdown captures navigation / accept / dismiss.
+    if app.completion.is_some() && app.phase != super::app::Phase::Permission {
+        match key.code {
+            KeyCode::Esc => {
+                app.dismiss_completion();
+                return;
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                app.accept_completion();
+                return;
+            }
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.complete_tab();
+                return;
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(m) = app.completion.as_mut() {
+                    m.move_sel(-1);
+                    app.status_message = m.current().label.clone();
+                    app.dirty = true;
+                }
+                return;
+            }
+            KeyCode::Down => {
+                if let Some(m) = app.completion.as_mut() {
+                    m.move_sel(1);
+                    app.status_message = m.current().label.clone();
+                    app.dirty = true;
+                }
+                return;
+            }
+            // Typing rebuilds the menu from the new input on next Tab;
+            // dismiss so characters land in the composer.
+            KeyCode::Char(_) | KeyCode::Backspace if key.modifiers.is_empty() => {
+                app.dismiss_completion();
+                // fall through
+            }
+            _ => {}
+        }
+    }
+
     // Search captures input when open (and no HITL modal is up).
     if app.search_open() {
         handle_search_key(app, key);

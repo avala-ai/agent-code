@@ -140,6 +140,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_input(frame, chunks[6], app);
     app.hit_registry
         .register(chunks[6], super::hit_rect::HitTarget::Composer);
+    if let Some(menu) = app.completion.as_ref() {
+        // Float above the composer within the full frame.
+        super::completion::draw(frame, chunks[6], menu);
+    }
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()

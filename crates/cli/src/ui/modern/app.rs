@@ -416,6 +416,8 @@ pub struct App {
     pub statusline_enabled: bool,
     /// Optional custom template for the status bar (`[ui.statusline].template`).
     pub statusline_template: Option<String>,
+    /// Open Tab-completion dropdown (slash or `@path`).
+    pub completion: Option<super::completion::CompletionMenu>,
 
     pub should_quit: bool,
     /// Work staged against the conversation currently in front: a
@@ -711,6 +713,7 @@ impl App {
             hit_registry: Default::default(),
             statusline_enabled: true,
             statusline_template: None,
+            completion: None,
             should_quit: false,
             work: super::session_work::SessionWork::default(),
             exit_save_error: None,
@@ -1690,11 +1693,51 @@ impl App {
 
     /// Tab-complete the token under the cursor: an `@path` file mention when
     /// the cursor sits in one, otherwise a partial slash command.
+    ///
+    /// Multiple matches open the completion dropdown (#560) instead of
+    /// dumping names into the transcript.
     pub fn complete_tab(&mut self) {
+        // Tab while the menu is open cycles the selection.
+        if let Some(menu) = self.completion.as_mut() {
+            menu.move_sel(1);
+            self.status_message = menu.current().label.clone();
+            self.dirty = true;
+            return;
+        }
         if self.complete_at_tab() {
             return;
         }
         self.complete_slash_tab();
+    }
+
+    /// Accept the highlighted dropdown row into the composer.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(menu) = self.completion.take() else {
+            return false;
+        };
+        let item = menu.current().clone();
+        let start = menu.replace_start.min(self.input.len());
+        let end = menu.replace_end.min(self.input.len()).max(start);
+        let mut insert = item.insert.clone();
+        if menu.kind == super::completion::CompletionKind::Path {
+            let is_dir = insert.ends_with('/');
+            let already_spaced = self.input[end..].starts_with(char::is_whitespace);
+            if !is_dir && !already_spaced {
+                insert.push(' ');
+            }
+        }
+        self.input.replace_range(start..end, &insert);
+        self.cursor = start + insert.len();
+        self.history_browse = None;
+        self.status_message = item.label;
+        self.dirty = true;
+        true
+    }
+
+    pub fn dismiss_completion(&mut self) {
+        if self.completion.take().is_some() {
+            self.dirty = true;
+        }
     }
 
     /// Complete an `@path` mention against the session cwd. Returns `false`
@@ -1704,40 +1747,33 @@ impl App {
         let Some(tok) = super::mentions::at_token_at_cursor(&self.input, self.cursor) else {
             return false;
         };
-        let cands =
-            super::mentions::complete_at_path(std::path::Path::new(&self.cwd), &tok.partial);
-        match cands.as_slice() {
+        let items = super::completion::path_items(std::path::Path::new(&self.cwd), &tok.partial);
+        match items.as_slice() {
             [] => {
                 self.status_message = "no matching paths".into();
+                self.completion = None;
             }
             [only] => {
-                let text = super::mentions::mention_text(only);
-                // A directory keeps the cursor tight against the `/` so the
-                // next Tab drills in; a file gets a separating space unless
-                // the line already has one after the token.
                 let already_spaced = self.input[tok.end..].starts_with(char::is_whitespace);
-                let trailing = if text.ends_with('/') || already_spaced {
+                let trailing = if only.insert.ends_with('/') || already_spaced {
                     ""
                 } else {
                     " "
                 };
-                self.replace_at_token(&tok, &format!("@{text}{trailing}"));
-                self.status_message = format!("@{text}");
+                self.replace_at_token(&tok, &format!("{}{trailing}", only.insert));
+                self.status_message = only.label.clone();
+                self.completion = None;
             }
-            many => {
-                let prefix = super::mentions::longest_common_prefix(many);
-                if prefix.len() > tok.partial.len() {
-                    self.replace_at_token(&tok, &format!("@{prefix}"));
+            _ => {
+                self.completion = super::completion::CompletionMenu::new(
+                    super::completion::CompletionKind::Path,
+                    items,
+                    tok.start,
+                    tok.end,
+                );
+                if let Some(m) = &self.completion {
+                    self.status_message = format!("{} matches · Tab cycle · Enter accept", m.len());
                 }
-                let list = many.iter().take(12).cloned().collect::<Vec<_>>().join(" ");
-                let more = if many.len() > 12 {
-                    format!(" …+{}", many.len() - 12)
-                } else {
-                    String::new()
-                };
-                self.transcript
-                    .push(TranscriptItem::System(format!("paths: {list}{more}")));
-                self.status_message = format!("{} matches", many.len());
             }
         }
         self.dirty = true;
@@ -1761,41 +1797,69 @@ impl App {
             return;
         }
         let partial = trimmed.trim_start_matches('/');
-        let cands = crate::commands::complete_slash(partial);
-        match cands.as_slice() {
+        // Whole input is the slash token when there is no space.
+        let replace_end = self.input.len();
+        // Unique *name-prefix* match still completes inline (Tab on `/hel`
+        // → `/help `). Fuzzy multi-matches open the dropdown.
+        let prefix_hits = crate::commands::complete_slash(partial);
+        if let [only] = prefix_hits.as_slice() {
+            self.input = format!("/{only} ");
+            self.cursor = self.input.len();
+            let hint = try_expand_skill_slash_full(
+                &format!("/{only}"),
+                &self.cwd,
+                self.disable_skill_shell,
+            )
+            .and_then(|e| e.argument_hint);
+            self.status_message = match hint {
+                Some(h) => format!("/{only} ‹{h}›"),
+                None => format!("/{only}"),
+            };
+            self.completion = None;
+            self.dirty = true;
+            return;
+        }
+        let items = if prefix_hits.is_empty() {
+            super::completion::slash_items(partial)
+        } else {
+            // Prefer prefix hits for the menu so Tab ranking stays predictable.
+            prefix_hits
+                .into_iter()
+                .map(|name| {
+                    let desc = crate::commands::list_slash_for_palette(name)
+                        .into_iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, d)| d.to_string())
+                        .unwrap_or_default();
+                    super::completion::CompletionItem {
+                        label: format!("/{name}"),
+                        description: desc,
+                        insert: format!("/{name} "),
+                    }
+                })
+                .collect()
+        };
+        match items.as_slice() {
             [] => {
                 self.status_message = "no matching commands".into();
+                self.completion = None;
             }
             [only] => {
-                self.input = format!("/{only} ");
+                self.input = only.insert.clone();
                 self.cursor = self.input.len();
-                // Surface skill argument hints when available.
-                let hint = try_expand_skill_slash_full(
-                    &format!("/{only}"),
-                    &self.cwd,
-                    self.disable_skill_shell,
-                )
-                .and_then(|e| e.argument_hint);
-                self.status_message = match hint {
-                    Some(h) => format!("/{only} ‹{h}›"),
-                    None => format!("/{only}"),
-                };
+                self.status_message = only.label.clone();
+                self.completion = None;
             }
-            many => {
-                let prefix = super::mentions::longest_common_prefix(many);
-                if prefix.len() > partial.len() {
-                    self.input = format!("/{prefix}");
-                    self.cursor = self.input.len();
+            _ => {
+                self.completion = super::completion::CompletionMenu::new(
+                    super::completion::CompletionKind::Slash,
+                    items,
+                    0,
+                    replace_end,
+                );
+                if let Some(m) = &self.completion {
+                    self.status_message = format!("{} matches · Tab cycle · Enter accept", m.len());
                 }
-                let list = many.iter().take(12).copied().collect::<Vec<_>>().join(" ");
-                let more = if many.len() > 12 {
-                    format!(" …+{}", many.len() - 12)
-                } else {
-                    String::new()
-                };
-                self.transcript
-                    .push(TranscriptItem::System(format!("commands: {list}{more}")));
-                self.status_message = format!("{} matches", many.len());
             }
         }
         self.dirty = true;
@@ -5698,14 +5762,18 @@ mod tests {
             app.input, "@src/",
             "directory keeps the cursor on the slash"
         );
-        // Drilling in again lists the directory's contents.
+        // Drilling in again opens the completion dropdown for the contents.
         app.complete_tab();
         assert!(app.input.starts_with("@src/"));
         assert!(
-            app.transcript
-                .iter()
-                .any(|i| matches!(i, TranscriptItem::System(s) if s.starts_with("paths: "))),
-            "candidate list should be shown like slash completion"
+            app.completion.is_some(),
+            "candidate dropdown should open for directory contents"
+        );
+        let menu = app.completion.as_ref().unwrap();
+        assert!(
+            menu.items.iter().any(|i| i.label.contains("main.rs")),
+            "expected main.rs in dropdown: {:?}",
+            menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
     }
 
@@ -5735,6 +5803,22 @@ mod tests {
         assert!(
             app.input.starts_with("/help"),
             "slash completion regressed: {}",
+            app.input
+        );
+    }
+
+    #[test]
+    fn tab_opens_slash_dropdown_for_ambiguous_prefix() {
+        let (_dir, mut app) = app_in_workspace();
+        // "se" matches sessions, session, etc. — not unique.
+        type_input(&mut app, "/se");
+        app.complete_tab();
+        let menu = app.completion.as_ref().expect("dropdown should open");
+        assert!(menu.len() >= 2, "expected multiple slash hits");
+        app.accept_completion();
+        assert!(
+            app.input.starts_with('/') && app.completion.is_none(),
+            "accept should insert and close: {}",
             app.input
         );
     }
