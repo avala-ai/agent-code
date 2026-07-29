@@ -605,12 +605,17 @@ fn highlight_code_body(lang: &str, content: &str, num_w: usize) -> Vec<Line<'sta
     })
 }
 
-/// Test-only: drop the stream cache so cases don't leak into each other.
-#[cfg(test)]
-fn clear_code_hl_stream() {
+/// Drop the stream highlight cache so fenced-block memory is released
+/// (e.g. on `/clear`) and tests do not leak state into each other.
+pub(super) fn reset_code_hl_stream() {
     CODE_HL_STREAM.with(|cell| {
         cell.borrow_mut().reset("", 2, true);
     });
+}
+
+#[cfg(test)]
+fn clear_code_hl_stream() {
+    reset_code_hl_stream();
 }
 
 #[cfg(test)]
@@ -722,6 +727,40 @@ mod tests {
             }
             assert!(checked > 0, "{name}: no highlighted runs were checked");
         }
+        crate::ui::theme::init("one-dark");
+    }
+
+    /// one-dark → solarized-light must invalidate the stream cache: cached
+    /// spans bake in the dark `code_bg` / syntect theme and would paint
+    /// unreadable light-on-light if reused after a polarity flip.
+    #[test]
+    fn theme_polarity_change_resets_stream_cache() {
+        let _g = crate::ui::theme::test_lock();
+        clear_code_hl_stream();
+        crate::ui::theme::init("one-dark");
+        let dark_bg = palette().code_bg;
+        let a = highlight_code_body("rust", "fn main() {}\n", 2);
+        assert!(
+            a.iter()
+                .any(|l| l.spans.iter().any(|s| s.style.bg == Some(dark_bg))),
+            "dark theme should paint against dark code_bg"
+        );
+
+        crate::ui::theme::init("solarized-light");
+        let light_bg = palette().code_bg;
+        assert_ne!(dark_bg, light_bg, "fixture themes must differ in code_bg");
+        let b = highlight_code_body("rust", "fn main() {}\n", 2);
+        assert!(
+            b.iter()
+                .any(|l| l.spans.iter().any(|s| s.style.bg == Some(light_bg))),
+            "polarity flip must re-highlight against light code_bg"
+        );
+        assert!(
+            !b.iter()
+                .any(|l| l.spans.iter().any(|s| s.style.bg == Some(dark_bg))),
+            "must not reuse dark-theme cached spans after light theme"
+        );
+        clear_code_hl_stream();
         crate::ui::theme::init("one-dark");
     }
 

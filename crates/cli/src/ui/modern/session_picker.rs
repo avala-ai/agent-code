@@ -424,6 +424,9 @@ impl App {
         self.selected_item = None;
         self.layout.invalidate();
         self.ctx_meter = None;
+        // Streaming fenced-block highlight state is thread-local and not
+        // held by the layout cache — free it with the transcript.
+        super::markdown::reset_code_hl_stream();
         self.dirty = true;
     }
 
