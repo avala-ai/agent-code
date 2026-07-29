@@ -4,6 +4,7 @@
 //! Headless (`-p`), HTTP (`--serve`), and ACP remain separate entry points.
 
 pub mod color_emit;
+pub mod fuzzy;
 pub mod keybindings;
 pub mod modern;
 pub mod onboarding;

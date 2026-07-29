@@ -788,29 +788,47 @@ fn slash_needs_stdin_prompt(cmd: &str) -> bool {
 
 /// Slash-command entries for the Ctrl+P palette.
 ///
-/// Matches on command name (prefix), alias (prefix), or description
-/// (substring). Hidden commands are omitted. Sorted by name.
+/// Fuzzy-matches command name, aliases, and description (see
+/// [`crate::ui::fuzzy`]). Hidden commands are omitted. Ranked best-first.
 ///
 /// Description matching is **palette-only** — Tab complete uses
 /// [`complete_slash`] so `/hel` still resolves to `/help`.
 pub fn list_slash_for_palette(query: &str) -> Vec<(&'static str, &'static str)> {
-    let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
-    let mut out: Vec<(&'static str, &'static str)> = COMMANDS
+    let q = query.trim().trim_start_matches('/');
+    let candidates: Vec<(&'static str, &'static str)> = COMMANDS
         .iter()
         .filter(|c| !c.hidden)
-        .filter(|c| {
-            if q.is_empty() {
-                return true;
-            }
-            c.name.starts_with(&q)
-                || c.aliases.iter().any(|a| a.starts_with(q.as_str()))
-                || c.description.to_ascii_lowercase().contains(&q)
-        })
         .map(|c| (c.name, c.description))
         .collect();
-    out.sort_unstable_by_key(|(name, _)| *name);
-    out.dedup_by_key(|(name, _)| *name);
-    out
+    if q.is_empty() {
+        let mut out = candidates;
+        out.sort_unstable_by_key(|(name, _)| *name);
+        out.dedup_by_key(|(name, _)| *name);
+        return out;
+    }
+    // Score against name, best alias, and description; keep the max.
+    let mut scored: Vec<(i64, &'static str, &'static str)> = Vec::new();
+    for c in COMMANDS.iter().filter(|c| !c.hidden) {
+        let mut best = crate::ui::fuzzy::fuzzy_score(q, c.name);
+        for a in c.aliases {
+            if let Some(s) = crate::ui::fuzzy::fuzzy_score(q, a) {
+                best = Some(best.map_or(s, |b| b.max(s)));
+            }
+        }
+        if let Some(s) = crate::ui::fuzzy::fuzzy_score(q, c.description) {
+            // Description hits rank below name hits.
+            best = Some(best.map_or(s / 2, |b| b.max(s / 2)));
+        }
+        if let Some(s) = best {
+            scored.push((s, c.name, c.description));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    scored.dedup_by_key(|(_, name, _)| *name);
+    scored
+        .into_iter()
+        .map(|(_, name, desc)| (name, desc))
+        .collect()
 }
 
 #[cfg(test)]
