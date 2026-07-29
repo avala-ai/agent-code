@@ -522,6 +522,10 @@ pub struct UiConfig {
     /// are not written into the transcript.
     #[serde(default = "default_true")]
     pub show_thinking_blocks: bool,
+    /// Prefer static chrome over micro-animations (launch shimmer, etc.).
+    /// Off by default; set `[ui] reduced_motion = true` for accessibility.
+    #[serde(default)]
+    pub reduced_motion: bool,
     /// Between-turn status line customization.
     pub statusline: StatusLineConfig,
 }
@@ -539,6 +543,7 @@ impl Default for UiConfig {
             inherit_fg: false,
             edit_mode: "emacs".to_string(),
             show_thinking_blocks: true,
+            reduced_motion: false,
             statusline: StatusLineConfig::default(),
         }
     }

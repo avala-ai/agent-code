@@ -573,6 +573,8 @@ pub struct App {
     /// Desired mouse-capture state. The run loop applies
     /// `Enable`/`DisableMouseCapture` when this flips. Default true.
     pub mouse_capture: bool,
+    /// From `[ui] reduced_motion` — freezes launch shimmer and similar.
+    pub reduced_motion: bool,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -754,6 +756,7 @@ impl App {
             inherit_fg: false,
             pending_theme: None,
             mouse_capture: true,
+            reduced_motion: false,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),

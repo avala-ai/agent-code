@@ -18,6 +18,8 @@ pub enum HitTarget {
     TaskRow { index: usize },
     /// Queue pane row.
     QueueRow { index: usize },
+    /// Launch-surface recent session row (#557 Phase 3).
+    LaunchRecent { index: usize },
     /// Status-bar chip (future: model, mode, cwd).
     StatusChip { id: &'static str },
     /// Composer input area.

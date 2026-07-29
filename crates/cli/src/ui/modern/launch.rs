@@ -2,8 +2,8 @@
 //!
 //! Phases 2–3 of the first-run / launch epic (#557): branding, `repo:branch ·
 //! version`, auth + permission mode, a single startup-warning slot, recent
-//! sessions with ↑/↓ + Enter to resume, and a type-to-start prompt.
-//! Remaining: mouse hit-testing on rows, shimmer / reduced_motion.
+//! sessions with ↑/↓ + Enter (or click) to resume, brand shimmer gated by
+//! `[ui] reduced_motion`, and a type-to-start prompt.
 
 use agent_code_lib::services::session::SessionSummary;
 use agent_code_lib::services::startup::{self, StartupWarning, WarningSeverity};
@@ -13,8 +13,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::anim::shimmer_style;
 use super::app::{App, Phase, TranscriptItem};
 use super::colors::palette;
+use super::hit_rect::HitTarget;
 
 /// How many recent sessions to list on the launch screen.
 pub const RECENT_LIMIT: usize = 5;
@@ -145,19 +147,23 @@ pub fn repo_branch_label(cwd: &str, repo_root: Option<&str>, branch: Option<&str
 }
 
 /// Paint the launch surface into `area` (the transcript body).
-pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+///
+/// Registers [`HitTarget::LaunchRecent`] rows so clicks resume a session.
+pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let launch = &app.launch;
     if area.height < 4 || area.width < 20 {
         return;
     }
     let p = palette();
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Absolute line index within `lines` for each recent row (for hit rects).
+    let mut recent_line_idxs: Vec<(usize, usize)> = Vec::new(); // (line_idx, recent_i)
 
-    // Brand
+    // Brand (shimmer when motion is allowed)
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  agent-code",
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        shimmer_style(app.tick, app.reduced_motion, p.accent),
     )));
 
     // repo:branch · version
@@ -244,10 +250,11 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 Style::default().fg(p.inactive)
             };
+            recent_line_idxs.push((lines.len(), i));
             lines.push(Line::from(Span::styled(row, style)));
         }
         lines.push(Line::from(Span::styled(
-            "    ↑/↓ select · Enter resume · or type to start",
+            "    ↑/↓ or click · Enter resume · type to start",
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         )));
     }
@@ -276,6 +283,22 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         width: area.width,
         height: h.min(area.height),
     };
+    // Hit-test each recent row (absolute screen y = origin + line index).
+    for (line_idx, recent_i) in recent_line_idxs {
+        let row_y = y.saturating_add(line_idx as u16);
+        if row_y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        app.hit_registry.register(
+            Rect {
+                x: area.x,
+                y: row_y,
+                width: area.width,
+                height: 1,
+            },
+            HitTarget::LaunchRecent { index: recent_i },
+        );
+    }
     frame.render_widget(Paragraph::new(lines), rect);
 }
 
@@ -500,5 +523,50 @@ mod tests {
         app.launch_accept();
         assert!(app.status_message.contains("already in this session"));
         assert!(app.resume.settle().is_none());
+    }
+
+    #[test]
+    fn draw_registers_launch_recent_hit_targets() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/w", "s");
+        app.launch = LaunchSurface::ready(
+            "r:b",
+            "API key",
+            "normal",
+            &[],
+            vec![
+                summary("sess-aaa", Some("one")),
+                summary("sess-bbb", Some("two")),
+            ],
+        );
+        term.draw(|f| {
+            let area = Rect {
+                x: 0,
+                y: 3,
+                width: 80,
+                height: 14,
+            };
+            draw(f, area, &mut app);
+        })
+        .unwrap();
+        let hits: Vec<_> = (0..24u16)
+            .filter_map(|y| {
+                app.hit_registry.hit_test(10, y).and_then(|t| match t {
+                    HitTarget::LaunchRecent { index } => Some(*index),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            hits.contains(&0) && hits.contains(&1),
+            "expected LaunchRecent hit targets for both rows, got {hits:?}"
+        );
     }
 }

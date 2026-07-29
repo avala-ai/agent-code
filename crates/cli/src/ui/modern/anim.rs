@@ -52,6 +52,26 @@ pub fn toast_style(remaining: u8) -> Style {
     }
 }
 
+/// Soft brand shimmer for the launch surface title.
+///
+/// When `reduced_motion` is set (or motion would be distracting), returns a
+/// static bold accent. Otherwise cycles accent intensity on a calm period
+/// driven by `tick` (~12 fps while idle chrome is live).
+pub fn shimmer_style(tick: u64, reduced_motion: bool, base: Color) -> Style {
+    if reduced_motion {
+        return Style::default().fg(base).add_modifier(Modifier::BOLD);
+    }
+    // ~400ms per step at 80ms ticks.
+    match (tick / 5) % 4 {
+        0 => Style::default().fg(base).add_modifier(Modifier::BOLD),
+        1 => Style::default().fg(base),
+        2 => Style::default()
+            .fg(palette().inactive)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(base),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +95,23 @@ mod tests {
         let a = blink_visible(0, false);
         let b = blink_visible(BLINK_DIVISOR, false);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn shimmer_is_static_when_reduced_motion() {
+        let a = shimmer_style(0, true, Color::Cyan);
+        let b = shimmer_style(17, true, Color::Cyan);
+        assert_eq!(a, b, "reduced_motion must freeze the brand shimmer");
+    }
+
+    #[test]
+    fn shimmer_varies_when_motion_allowed() {
+        let styles: Vec<_> = (0..20)
+            .map(|t| shimmer_style(t, false, Color::Cyan))
+            .collect();
+        assert!(
+            styles.windows(2).any(|w| w[0] != w[1]),
+            "shimmer should change across ticks when motion is allowed"
+        );
     }
 }

@@ -392,6 +392,7 @@ pub async fn run_modern_tui(
     let base_permission_mode = engine.state().config.permissions.default_mode;
     let disable_skill_shell = engine.state().config.security.disable_skill_shell_execution;
     let show_thinking_blocks = engine.state().config.ui.show_thinking_blocks;
+    let reduced_motion = engine.state().config.ui.reduced_motion;
     let initial_effort = engine.state().config.api.effort.clone();
     let notifier_config = engine.state().config.notifier.clone();
     let statusline_cfg = engine.state().config.ui.statusline.clone();
@@ -433,6 +434,7 @@ pub async fn run_modern_tui(
     app.theme_name = configured.clone();
     app.inherit_fg = inherit_fg;
     app.show_thinking_blocks = show_thinking_blocks;
+    app.reduced_motion = reduced_motion;
     app.effort = initial_effort;
     app.notifier_enabled = notifier_config.enabled;
     // Surface process-level startup warnings (e.g. unknown theme id) in the
@@ -3630,6 +3632,17 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             app.clear_selection();
         }
         MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
+            // Launch recent row: click resumes (same path as Enter).
+            if let Some(super::hit_rect::HitTarget::LaunchRecent { index }) =
+                app.hit_registry.hit_test(m.column, m.row).cloned()
+                && app.launch.should_draw(app)
+                && index < app.launch.recent.len()
+            {
+                app.launch.selected = index;
+                app.launch_accept();
+                app.dirty = true;
+                return;
+            }
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 app.selection = Some(super::app::TextSelection {
                     start_line: abs,
@@ -3664,8 +3677,16 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             app.push_toast("use Ctrl+Shift+V / terminal paste for clipboard");
         }
         // Hover: resolve against the per-frame hit registry (#558).
+        // Launch rows also update the keyboard highlight under the cursor.
         MouseEventKind::Moved => {
             let target = app.hit_registry.hit_test(m.column, m.row).cloned();
+            if let Some(super::hit_rect::HitTarget::LaunchRecent { index }) = &target
+                && app.launch.should_draw(app)
+                && app.launch.selected != *index
+            {
+                app.launch.selected = *index;
+                app.dirty = true;
+            }
             let (enter, leave) = app.hit_registry.set_hover(target);
             if enter.is_some() || leave.is_some() {
                 app.dirty = true;
