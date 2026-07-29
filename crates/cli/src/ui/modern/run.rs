@@ -3784,6 +3784,11 @@ fn handle_status_chip_click(app: &mut App, id: &str) {
         "selection" => {
             app.copy_selection_or_last();
         }
+        "cwd" => {
+            // D6-15: click the status cwd chip to copy the project path.
+            let path = app.cwd.clone();
+            app.copy_text_report(&path, "cwd");
+        }
         "session" => {
             app.push_toast(format!("session {}", app.session_id));
         }

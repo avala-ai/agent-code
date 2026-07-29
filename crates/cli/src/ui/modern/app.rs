@@ -3266,7 +3266,7 @@ impl App {
         }
     }
 
-    fn copy_text_report(&mut self, text: &str, label: &str) {
+    pub(crate) fn copy_text_report(&mut self, text: &str, label: &str) {
         match crate::clipboard::copy_text(text) {
             Ok(result) => {
                 let msg = format!(

@@ -18,7 +18,7 @@ er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
 
 
 
- turn 0 │ 0 tok │ $0.0000 │  │ sid sess1234
+ turn 0 │ 0 tok │ $0.0000 │  │ /w │ sid sess1234
 ╭ composer ────────────────────────────────────────────────────────────────────╮
 │❯                                                                             │
 │Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
@@ -44,7 +44,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-ccccccccbcccccccbcccccccccbddbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbddbccccbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 gaaaaaaaaaaggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
 gaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbg
 gccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccg

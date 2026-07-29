@@ -18,7 +18,7 @@ agent-code 0.0.0-test  test-model   NORMAL   /w
   Type to start a conversation
   Shift+Tab mode · Ctrl+P commands · ? shortcuts
 
- turn 0 │ 0 tok │ $0.0000 │  │ sid sess1234
+ turn 0 │ 0 tok │ $0.0000 │  │ /w │ sid sess1234
 ╭ composer ────────────────────────────────────────────────────────────────────╮
 │❯                                                                             │
 │Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
@@ -44,7 +44,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-ccccccccbcccccccbcccccccccbddbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbddbccccbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 kaaaaaaaaaakkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
 kaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbk
 kcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccck

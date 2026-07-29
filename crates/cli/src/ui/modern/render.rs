@@ -1963,6 +1963,14 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     chips.push((Span::raw("│"), None));
     chips.push((
         Span::styled(
+            format!(" {} ", truncate_path(&app.cwd, 24)),
+            Style::default().fg(palette().muted),
+        ),
+        Some("cwd"),
+    ));
+    chips.push((Span::raw("│"), None));
+    chips.push((
+        Span::styled(
             format!(" sid {} ", truncate_mid(&app.session_id, 12)),
             Style::default().fg(palette().muted),
         ),
