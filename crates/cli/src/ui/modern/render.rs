@@ -1969,7 +1969,7 @@ fn header_and_chrome_reserve(minimal: bool) -> u16 {
     if minimal { 1 + 1 + 8 } else { 3 + 1 + 8 }
 }
 
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let p = palette();
     let border = if app.phase == Phase::Streaming {
         p.warning
@@ -2010,6 +2010,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if app.skin == crate::ui::modern::app::Skin::Minimal {
+        app.composer_body = Some(area);
         frame.render_widget(Paragraph::new(display_lines), area);
         set_prompt_cursor(frame, area, app, /*bordered*/ false);
         return;
@@ -2041,6 +2042,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Body + one-row hint footer inside the box.
     if inner.height == 0 || inner.width == 0 {
+        app.composer_body = None;
         return;
     }
     let body_h = inner.height.saturating_sub(1).max(1);
@@ -2050,6 +2052,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         width: inner.width,
         height: body_h,
     };
+    app.composer_body = Some(body_area);
     let hint_area = Rect {
         x: inner.x,
         y: inner.y + body_h,

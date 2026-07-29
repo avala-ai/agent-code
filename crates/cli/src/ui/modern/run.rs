@@ -3656,6 +3656,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     handle_status_chip_click(app, id);
                     return;
                 }
+                Some(super::hit_rect::HitTarget::Composer) => {
+                    // Click places the caret; 2nd click → word end; 3rd → EOL
+                    // (#558 D2-21).
+                    app.place_composer_caret(m.column, m.row);
+                    app.clear_selection();
+                    app.dirty = true;
+                    return;
+                }
                 _ => {}
             }
             app.scrollbar_drag = None;

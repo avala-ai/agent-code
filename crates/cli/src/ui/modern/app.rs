@@ -391,6 +391,13 @@ pub struct App {
     pub input: String,
     /// Byte index into `input` (must land on a char boundary).
     pub cursor: usize,
+    /// Last-drawn composer text body (inner, after border). Used to map
+    /// mouse clicks onto a caret position (#558 D2-21).
+    pub composer_body: Option<ratatui::layout::Rect>,
+    /// Multi-click tracker for the composer (1 = caret, 2 = word, 3 = line).
+    pub composer_clicks: u8,
+    pub composer_click_at: Option<std::time::Instant>,
+    pub composer_click_pos: Option<(usize, usize)>, // (line, col)
     /// When true: Enter inserts newline; Alt/Shift+Enter submit.
     /// When false (default): Enter submits; Alt/Shift+Enter insert newline.
     /// Toggle with Ctrl+M (prompt-focused).
@@ -811,6 +818,24 @@ pub fn word_range_at(text: &str, col: u16) -> Option<(u16, u16)> {
     Some((units[lo].0, units[hi].1))
 }
 
+/// Char-column just past the word under `col` on a single composer line.
+fn word_end_col(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return 0;
+    }
+    let idx = col.min(chars.len().saturating_sub(1));
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | ':');
+    if !is_word(chars[idx]) {
+        return idx + 1;
+    }
+    let mut end = idx + 1;
+    while end < chars.len() && is_word(chars[end]) {
+        end += 1;
+    }
+    end
+}
+
 impl App {
     pub fn new(
         model: impl Into<String>,
@@ -851,6 +876,10 @@ impl App {
             scrollbar_geom: None,
             input: String::new(),
             cursor: 0,
+            composer_body: None,
+            composer_clicks: 0,
+            composer_click_at: None,
+            composer_click_pos: None,
             multiline_mode: false,
             prompt_history: Vec::new(),
             history_browse: None,
@@ -1559,6 +1588,71 @@ impl App {
             return self.input.len();
         }
         self.input.len()
+    }
+
+    /// Place the composer caret from a click inside the body rect (#558 D2-21).
+    ///
+    /// Returns the multi-click count (1–3). Double-click lands on the end of
+    /// the word under the pointer; triple-click lands on the end of the line.
+    pub fn place_composer_caret(&mut self, screen_col: u16, screen_row: u16) -> u8 {
+        let Some(body) = self.composer_body else {
+            return 0;
+        };
+        if body.width == 0 || body.height == 0 {
+            return 0;
+        }
+        if screen_row < body.y
+            || screen_row >= body.y.saturating_add(body.height)
+            || screen_col < body.x
+            || screen_col >= body.x.saturating_add(body.width)
+        {
+            return 0;
+        }
+        // "❯ " / "  " prefix is two columns on every row.
+        let prefix_cols = 2u16;
+        let rel_x = screen_col.saturating_sub(body.x);
+        let rel_y = screen_row.saturating_sub(body.y) as usize;
+        let col = rel_x.saturating_sub(prefix_cols) as usize;
+        let line = rel_y.min(self.input_line_count().saturating_sub(1));
+
+        let now = Instant::now();
+        let same = self
+            .composer_click_pos
+            .is_some_and(|(l, c)| l == line && c.abs_diff(col) <= 1)
+            && self
+                .composer_click_at
+                .is_some_and(|t| now.duration_since(t) <= Duration::from_millis(500));
+        let n = if same {
+            match self.composer_clicks {
+                1 => 2,
+                2 => 3,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        self.composer_clicks = n;
+        self.composer_click_at = Some(now);
+        self.composer_click_pos = Some((line, col));
+
+        match n {
+            2 => {
+                // End of the word under `col`.
+                let line_text = self.input.split('\n').nth(line).unwrap_or("");
+                let end_col = word_end_col(line_text, col);
+                self.cursor = self.byte_at_line_col(line, end_col);
+            }
+            3 => {
+                // End of the line.
+                let len = self.line_char_len(line);
+                self.cursor = self.byte_at_line_col(line, len);
+            }
+            _ => {
+                self.cursor = self.byte_at_line_col(line, col);
+            }
+        }
+        self.dirty = true;
+        n
     }
 
     /// True when the composer holds more than one line (or trailing newline).
@@ -3758,6 +3852,32 @@ mod tests {
         app.phase = Phase::Streaming;
         app.insert_str("queued paste");
         assert_eq!(app.input, "queued paste");
+    }
+
+    #[test]
+    fn place_composer_caret_maps_click_to_byte_index() {
+        use ratatui::layout::Rect;
+        let mut app = App::new("m", "/tmp", "s");
+        app.input = "hello world".into();
+        app.cursor = 0;
+        app.composer_body = Some(Rect {
+            x: 1,
+            y: 10,
+            width: 40,
+            height: 3,
+        });
+        // Prefix "❯ " is 2 cols → screen col 1+2+5 = 8 lands on 'w' of world.
+        let n = app.place_composer_caret(1 + 2 + 5, 10);
+        assert_eq!(n, 1);
+        assert_eq!(app.cursor, 5, "caret after 'hello'");
+        // Same cell again → double-click jumps to end of "world".
+        let n = app.place_composer_caret(1 + 2 + 6, 10);
+        assert_eq!(n, 2);
+        assert_eq!(app.cursor, "hello world".len());
+        // Triple → end of line (same).
+        let n = app.place_composer_caret(1 + 2 + 6, 10);
+        assert_eq!(n, 3);
+        assert_eq!(app.cursor, "hello world".len());
     }
 
     #[test]
