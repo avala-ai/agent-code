@@ -18,6 +18,9 @@ use crate::ui::text_safety::escape_deceptive;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.frame_count = app.frame_count.wrapping_add(1);
+    // Fresh hit map every frame — rects from the previous layout must
+    // not survive a resize or a widget that disappeared (#558).
+    app.hit_registry.clear();
     let area = frame.area();
     // Minimal skin (plan §M10) drops the header and the framed prompt for a
     // compact look — same block model, render config only.
@@ -112,6 +115,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_search_bar(frame, chunks[5], app);
     }
     draw_input(frame, chunks[6], app);
+    app.hit_registry
+        .register(chunks[6], super::hit_rect::HitTarget::Composer);
 
     if app.phase == Phase::Permission
         && let Some(modal) = app.front_modal().cloned()

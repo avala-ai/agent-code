@@ -402,6 +402,9 @@ pub struct App {
     /// Engine-provided context-window meter (used, max) — plan §3.4.4.
     pub ctx_meter: Option<(u64, u64)>,
     pub status_message: String,
+    /// Per-frame mouse hit targets. Cleared at the start of each draw;
+    /// widgets register rects; mouse handlers resolve against it (#558).
+    pub hit_registry: super::hit_rect::HitRegistry,
 
     pub should_quit: bool,
     /// Work staged against the conversation currently in front: a
@@ -689,6 +692,7 @@ impl App {
             cost_usd: 0.0,
             ctx_meter: None,
             status_message: String::new(),
+            hit_registry: Default::default(),
             should_quit: false,
             work: super::session_work::SessionWork::default(),
             turn_live: false,

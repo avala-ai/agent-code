@@ -3276,6 +3276,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::Down(MouseButton::Middle) if app.phase != super::app::Phase::Permission => {
             app.push_toast("use Ctrl+Shift+V / terminal paste for clipboard");
         }
+        // Hover: resolve against the per-frame hit registry (#558).
+        MouseEventKind::Moved => {
+            let target = app.hit_registry.hit_test(m.column, m.row).cloned();
+            let (enter, leave) = app.hit_registry.set_hover(target);
+            if enter.is_some() || leave.is_some() {
+                app.dirty = true;
+            }
+        }
         _ => {}
     }
 }
