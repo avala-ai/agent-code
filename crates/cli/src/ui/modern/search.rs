@@ -362,10 +362,20 @@ mod tests {
         // Setup guard: the match must actually span two display rows,
         // or this test proves nothing.
         let total = app.layout.total_lines();
-        let rows = app.layout.plain_range(0, total - 1).unwrap();
+        // Setup guard: no *display* row alone contains the full needle
+        // (soft-wrap split). plain_range joins soft wraps for copy, so we
+        // inspect the viewport rows directly.
+        let display: Vec<String> = app
+            .layout
+            .viewport(0, total)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
         assert!(
-            !rows.lines().any(|l| l.to_lowercase().contains("needle")),
-            "needle fits one row; adjust the padding: {rows:?}"
+            !display
+                .iter()
+                .any(|l| l.to_lowercase().contains("needle")),
+            "needle fits one row; adjust the padding: {display:?}"
         );
         app.open_search();
         for c in "needle".chars() {
@@ -374,7 +384,7 @@ mod tests {
         assert_eq!(
             app.search.as_ref().unwrap().position(),
             (1, 1),
-            "wrapped match not found: {rows:?}"
+            "wrapped match not found: {display:?}"
         );
     }
 
