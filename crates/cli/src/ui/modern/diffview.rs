@@ -214,15 +214,96 @@ fn flush_run(
     }
 }
 
+/// Skip syntect + word-diff when a unified diff is this large or larger.
+/// The display cap is applied *after* highlighting; without this, a
+/// multi-megabyte edit is fully highlighted on every layout cache miss.
+const MAX_DIFF_BYTES: usize = 256 * 1024;
+/// Line count above which we fall back to plain tinted lines.
+const MAX_DIFF_LINES: usize = 2_000;
+/// Single-line char count above which we avoid word-diff / highlight.
+const MAX_LINE_CHARS: usize = 512;
+
+/// True when rich highlighting would cost more than it is worth.
+fn too_large_for_rich_diff(diff: &str) -> bool {
+    if diff.len() > MAX_DIFF_BYTES {
+        return true;
+    }
+    let mut lines = 0usize;
+    for line in diff.lines() {
+        lines += 1;
+        if lines > MAX_DIFF_LINES {
+            return true;
+        }
+        if line.chars().count() > MAX_LINE_CHARS {
+            return true;
+        }
+    }
+    false
+}
+
+/// Plain +/- tinted lines — no syntect, no word-diff. Used when
+/// [`too_large_for_rich_diff`] trips so the layout path stays O(display).
+fn render_plain_unified_diff(diff: &str, expanded: bool, cap: usize) -> Vec<Line<'static>> {
+    let p = palette();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut seen_hunk = false;
+    for raw in diff.lines() {
+        if raw.starts_with("--- ") || raw.starts_with("+++ ") {
+            continue;
+        }
+        if !seen_hunk && !raw.starts_with("@@") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            seen_hunk = true;
+            out.push(Line::from(Span::styled(
+                format!("   {raw}"),
+                Style::default()
+                    .fg(p.accent)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            )));
+            continue;
+        }
+        let (marker, fg, content) = match raw.chars().next() {
+            Some('-') => ('-', p.diff_remove, &raw[1..]),
+            Some('+') => ('+', p.diff_add, &raw[1..]),
+            _ => (' ', p.muted, raw.strip_prefix(' ').unwrap_or(raw)),
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(fg)),
+            Span::styled(content.to_string(), Style::default().fg(fg)),
+        ]));
+    }
+    if !expanded && out.len() > cap {
+        let hidden = out.len() - cap;
+        out.truncate(cap);
+        out.push(Line::from(Span::styled(
+            format!("   … +{hidden} more diff lines · e expand  (plain: large diff)"),
+            Style::default()
+                .fg(p.muted)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+    }
+    out
+}
+
 /// Render a unified-diff string as rich diff `Line`s. `file_path` drives syntax
 /// detection. When `!expanded` and the diff exceeds `cap` lines, it is
 /// truncated with a "… +N more" hint.
+///
+/// Large diffs skip syntect and word-level highlighting and use plain
+/// tinted lines so layout never pays quadratic highlight cost on a
+/// multi-megabyte edit result.
 pub fn render_unified_diff(
     diff: &str,
     file_path: &str,
     expanded: bool,
     cap: usize,
 ) -> Vec<Line<'static>> {
+    if too_large_for_rich_diff(diff) {
+        return render_plain_unified_diff(diff, expanded, cap);
+    }
+
     let p = palette();
     let ss = syntax_set();
     let syntax = std::path::Path::new(file_path)
@@ -388,6 +469,25 @@ mod tests {
         assert_eq!(collapsed.len(), 7); // 6 + hint
         let expanded = render_unified_diff(&big, "x.txt", true, 6);
         assert_eq!(expanded.len(), 21); // header + 20 lines, no hint
+    }
+
+    #[test]
+    fn oversized_diff_uses_plain_path() {
+        // A single huge line trips the per-line guard without allocating
+        // multi-megabyte fixtures.
+        let huge_line = format!("+{}", "x".repeat(MAX_LINE_CHARS + 1));
+        let diff = format!("@@ -1,1 +1,1 @@\n{huge_line}\n");
+        assert!(too_large_for_rich_diff(&diff));
+        let lines = render_unified_diff(&diff, "big.rs", true, 100);
+        assert!(!lines.is_empty(), "plain path must still produce output");
+        // Marker is present without requiring syntect.
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with('+') || text.contains("@@"), "{text}");
+    }
+
+    #[test]
+    fn modest_diff_is_not_considered_oversized() {
+        assert!(!too_large_for_rich_diff(SAMPLE));
     }
 
     #[test]
