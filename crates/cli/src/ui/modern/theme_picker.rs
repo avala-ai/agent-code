@@ -56,6 +56,7 @@ impl App {
         if self.front_modal().is_some() {
             return;
         }
+        self.dismiss_completion();
         self.command_palette = None;
         self.show_shortcuts = false;
         let entries = theme::Theme::all_options();

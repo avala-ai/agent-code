@@ -20,6 +20,7 @@ impl App {
         if self.front_modal().is_some() {
             return;
         }
+        self.dismiss_completion();
         // Seed from a partial slash already in the composer.
         let seed = if self.input.starts_with('/') {
             self.input.trim_start_matches('/').to_string()

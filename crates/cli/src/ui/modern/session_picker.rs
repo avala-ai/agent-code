@@ -339,6 +339,7 @@ impl App {
         // silently ignored every keystroke; the model and theme pickers
         // are routed after, so they would instead be left open and
         // unreachable. These are mutually exclusive overlays.
+        self.dismiss_completion();
         self.cancel_search();
         self.model_picker = None;
         // Cancel, not drop: the theme picker previews live, so discarding

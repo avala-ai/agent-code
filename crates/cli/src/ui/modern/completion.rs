@@ -144,16 +144,20 @@ pub fn path_items(cwd: &std::path::Path, partial: &str) -> Vec<CompletionItem> {
     items
 }
 
-/// Paint the dropdown above `composer` (or clipped to `area`).
+/// Paint the dropdown at the bottom of `area`.
+///
+/// Callers pass the region *above* the composer (full width, from the
+/// frame top to the composer top) so the menu anchors to the composer
+/// without overwriting the input row.
 pub fn draw(frame: &mut Frame<'_>, area: Rect, menu: &CompletionMenu) {
     let (start, end) = menu.window();
     let rows = end - start;
-    if rows == 0 {
+    if rows == 0 || area.height == 0 {
         return;
     }
     let height = (rows as u16).saturating_add(2).min(area.height);
     let width = area.width.clamp(24, 72);
-    // Sit just above the bottom of `area` (composer row).
+    // Sit at the bottom of `area` (just above the composer).
     let y = area.y.saturating_add(area.height.saturating_sub(height));
     let x = area.x;
     let rect = Rect {

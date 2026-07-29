@@ -1268,6 +1268,9 @@ impl App {
         if self.launch.visible {
             self.launch.dismiss();
         }
+        // Paste invalidates the completion replace range; dismiss so Enter
+        // cannot apply a stale menu against the new buffer (#576).
+        self.dismiss_completion();
         // Normalize CRLF → LF so Windows pastes don't leave bare `\r`s.
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let idx = self.cursor.min(self.input.len());
@@ -1920,6 +1923,7 @@ impl App {
         if self.front_modal().is_some() {
             return;
         }
+        self.dismiss_completion();
         self.command_palette = None;
         self.show_shortcuts = false;
         let selected = entries
@@ -3001,6 +3005,9 @@ impl App {
 
     pub fn toggle_shortcuts(&mut self) {
         self.show_shortcuts = !self.show_shortcuts;
+        if self.show_shortcuts {
+            self.dismiss_completion();
+        }
         self.dirty = true;
     }
 
@@ -5821,6 +5828,31 @@ mod tests {
             "accept should insert and close: {}",
             app.input
         );
+    }
+
+    #[test]
+    fn paste_dismisses_open_completion() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "/se");
+        app.complete_tab();
+        assert!(app.completion.is_some());
+        app.insert_str("ssions ");
+        assert!(
+            app.completion.is_none(),
+            "paste must dismiss so Enter cannot apply a stale range"
+        );
+        assert!(app.input.contains("ssions"));
+    }
+
+    #[test]
+    fn opening_palette_dismisses_completion() {
+        let (_dir, mut app) = app_in_workspace();
+        type_input(&mut app, "/se");
+        app.complete_tab();
+        assert!(app.completion.is_some());
+        app.open_command_palette();
+        assert!(app.completion.is_none());
+        assert!(app.command_palette_open());
     }
 
     #[test]
