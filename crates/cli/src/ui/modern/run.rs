@@ -3730,9 +3730,10 @@ fn handle_scrollbar_press(app: &mut App, row: u16, kind: super::hit_rect::Scroll
             app.scrollbar_drag = Some(grab.min(geom.thumb.height.saturating_sub(1)));
         }
         super::hit_rect::ScrollbarKind::Track => {
-            // Jump so the thumb top lands under the click, then start a drag
-            // so a press-and-move continues smoothly.
-            let new_top = super::scroll::top_from_track_row(row, geom, total, height, 0);
+            // Full-track proportional jump (not travel-range), so a tall
+            // thumb still leaves every track row reachable. Then start a
+            // drag so a press-and-move continues smoothly.
+            let new_top = super::scroll::top_from_track_click(row, geom, total, height);
             app.scroll_to_top_line(new_top);
             // Grab relative to where the thumb will sit after the jump.
             let top2 = app.scroll.top(total, height);

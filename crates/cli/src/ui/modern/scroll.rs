@@ -144,8 +144,10 @@ pub fn scrollbar_geom(
     })
 }
 
-/// Map an absolute screen row on the track to a `top_line`, placing the
-/// thumb so its top sits at the clamped click (drag with offset 0).
+/// Map an absolute screen row during a **thumb drag** to a `top_line`.
+///
+/// Uses the thumb's travel range (track height minus thumb height) so the
+/// pointer keeps its grab offset relative to the thumb top.
 pub fn top_from_track_row(
     mouse_row: u16,
     geom: ScrollbarGeom,
@@ -166,6 +168,29 @@ pub fn top_from_track_row(
         .saturating_sub(grab_offset);
     let thumb_top = (raw as usize).min(travel);
     (thumb_top.saturating_mul(max_top) + travel / 2) / travel
+}
+
+/// Map a **track click** (not a drag) to a `top_line` using the full track
+/// height, so every row of the track is reachable even when the thumb is
+/// tall (travel ≪ track height).
+pub fn top_from_track_click(
+    mouse_row: u16,
+    geom: ScrollbarGeom,
+    total: usize,
+    height: usize,
+) -> usize {
+    let max_top = total.saturating_sub(height);
+    if max_top == 0 {
+        return 0;
+    }
+    let track_h = geom.track.height as usize;
+    if track_h <= 1 {
+        return 0;
+    }
+    let rel = mouse_row
+        .saturating_sub(geom.track.y)
+        .min(geom.track.height.saturating_sub(1)) as usize;
+    (rel.saturating_mul(max_top) + (track_h - 1) / 2) / (track_h - 1)
 }
 
 #[cfg(test)]
@@ -273,10 +298,30 @@ mod tests {
             height: 10,
         };
         let geom = scrollbar_geom(area, 100, 10, 0).unwrap();
-        // Click bottom of track (thumb height 1) → near max top.
+        // Drag bottom of track (thumb height 1) → near max top.
         let top = top_from_track_row(area.y + 9, geom, 100, 10, 0);
         assert_eq!(top, 90);
         let top0 = top_from_track_row(area.y, geom, 100, 10, 0);
         assert_eq!(top0, 0);
+    }
+
+    #[test]
+    fn track_click_uses_full_track_not_just_travel() {
+        // Tall thumb: 30 lines, 20 visible → thumb 13, travel only 7.
+        // A click near the bottom of the track must still reach max top,
+        // not clamp at the last travel row.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let geom = scrollbar_geom(area, 30, 20, 0).unwrap();
+        assert!(geom.thumb.height > 10, "expected a tall thumb: {geom:?}");
+        let bottom = top_from_track_click(19, geom, 30, 20);
+        assert_eq!(bottom, 10, "full-track click reaches Follow/max top");
+        // Mid-track click should land mid-document, not max.
+        let mid = top_from_track_click(10, geom, 30, 20);
+        assert!(mid > 0 && mid < 10, "mid click → mid top, got {mid}");
     }
 }
