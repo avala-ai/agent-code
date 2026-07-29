@@ -1409,7 +1409,17 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(view).block(title_block), area);
 
     // Markdown hyperlinks: register hit rects so a click opens the URL
-    // (#558 D3-10). Columns are relative to the transcript body.
+    // (#558 D3-10). Columns are relative to the transcript body. Hover
+    // paints a filled accent bar over the active link (#558 D5-22).
+    let hover_url = match &app.hit_registry.hover {
+        Some(super::hit_rect::HitTarget::Hyperlink { url }) => Some(url.as_str()),
+        _ => None,
+    };
+    let accent = palette().accent;
+    let hover_style = Style::default()
+        .fg(super::colors::on_fill(accent))
+        .bg(accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     for link in app.layout.links_in_range(top, height) {
         let row_in_view = link.line.saturating_sub(top);
         if row_in_view >= height {
@@ -1422,13 +1432,36 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .saturating_sub(link.cols.start)
             .min(inner.width.saturating_sub(link.cols.start))
             .max(1);
+        let rect = Rect {
+            x,
+            y: inner.y.saturating_add(row_in_view as u16),
+            width: w,
+            height: 1,
+        };
+        if hover_url == Some(link.url.as_str()) {
+            // Re-paint the label so hover is visible even without OSC 8.
+            let label: String = app
+                .layout
+                .viewport(link.line, 1)
+                .into_iter()
+                .next()
+                .map(|l| {
+                    let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                    super::app::slice_display_cols(&plain, link.cols.start, link.cols.end)
+                })
+                .unwrap_or_default();
+            let text = if label.is_empty() {
+                " ".repeat(w as usize)
+            } else {
+                label
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, hover_style))),
+                rect,
+            );
+        }
         app.hit_registry.register(
-            Rect {
-                x,
-                y: inner.y.saturating_add(row_in_view as u16),
-                width: w,
-                height: 1,
-            },
+            rect,
             super::hit_rect::HitTarget::Hyperlink {
                 url: link.url.clone(),
             },
