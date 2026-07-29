@@ -103,6 +103,11 @@ impl App {
             self.close_command_palette();
             return;
         };
+        // Palette fills the composer without `insert_char`, so dismiss
+        // the launch surface here (type-to-start path does not run).
+        if self.launch.visible {
+            self.launch.dismiss();
+        }
         self.input = format!("/{name} ");
         self.cursor = self.input.len();
         self.history_browse = None;

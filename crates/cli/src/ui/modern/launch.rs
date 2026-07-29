@@ -380,4 +380,35 @@ mod tests {
         assert!(!app.launch.visible);
         assert_eq!(app.input, "hello");
     }
+
+    #[test]
+    fn palette_accept_dismisses_launch_surface() {
+        let mut app = App::new("m", "/w", "s");
+        app.launch = LaunchSurface::ready("r:b", "API key", "normal", &[], vec![]);
+        app.open_command_palette();
+        for c in "help".chars() {
+            app.palette_insert_char(c);
+        }
+        app.palette_accept();
+        assert!(
+            !app.launch.visible,
+            "palette fill must dismiss launch (no insert_char)"
+        );
+        assert!(app.input.starts_with("/help"));
+    }
+
+    #[test]
+    fn slash_submit_dismisses_launch_surface() {
+        let mut app = App::new("m", "/w", "s");
+        app.launch = LaunchSurface::ready("r:b", "API key", "normal", &[], vec![]);
+        // Simulate palette-filled input without going through insert_char.
+        app.input = "/help".into();
+        app.cursor = app.input.len();
+        assert!(app.launch.visible);
+        app.submit();
+        assert!(
+            !app.launch.visible,
+            "slash submit must dismiss launch so System output is visible"
+        );
+    }
 }

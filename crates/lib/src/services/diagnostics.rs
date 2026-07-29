@@ -78,14 +78,7 @@ async fn run_with_options(cwd: &Path, config: &crate::config::Config, network: b
         ("rg", "content search (ripgrep)"),
         ("bash", "shell execution"),
     ] {
-        let available = tokio::process::Command::new("which")
-            .arg(tool)
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if available {
+        if tool_on_path(tool) {
             checks.push(Check::pass(
                 &format!("tool:{tool}"),
                 &format!("{tool} found ({purpose})"),
@@ -104,14 +97,7 @@ async fn run_with_options(cwd: &Path, config: &crate::config::Config, network: b
         ("python3", "Python execution"),
         ("cargo", "Rust toolchain"),
     ] {
-        let available = tokio::process::Command::new("which")
-            .arg(tool)
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if available {
+        if tool_on_path(tool) {
             checks.push(Check::pass(
                 &format!("tool:{tool}"),
                 &format!("{tool} available ({purpose})"),
@@ -463,22 +449,16 @@ async fn run_with_options(cwd: &Path, config: &crate::config::Config, network: b
         if let Some(ref cmd) = entry.command {
             // Check if the command binary exists.
             let binary = cmd.split_whitespace().next().unwrap_or(cmd);
-            if let Ok(output) = tokio::process::Command::new("which")
-                .arg(binary)
-                .output()
-                .await
-            {
-                if output.status.success() {
-                    checks.push(Check::pass(
-                        &format!("mcp:{name}"),
-                        &format!("MCP server '{name}' binary found: {binary}"),
-                    ));
-                } else {
-                    checks.push(Check::fail(
-                        &format!("mcp:{name}"),
-                        &format!("MCP server '{name}' binary not found: {binary}"),
-                    ));
-                }
+            if tool_on_path(binary) {
+                checks.push(Check::pass(
+                    &format!("mcp:{name}"),
+                    &format!("MCP server '{name}' binary found: {binary}"),
+                ));
+            } else {
+                checks.push(Check::fail(
+                    &format!("mcp:{name}"),
+                    &format!("MCP server '{name}' binary not found: {binary}"),
+                ));
             }
         } else if let Some(ref url) = entry.url {
             if !network {
@@ -599,6 +579,56 @@ async fn run_with_options(cwd: &Path, config: &crate::config::Config, network: b
     checks
 }
 
+/// True when `name` resolves on `$PATH`.
+///
+/// Walks `$PATH` directly instead of shelling out to Unix `which`, which
+/// is missing on Windows and previously produced false "git missing"
+/// failures on the launch-surface probe path. On Windows, also tries
+/// each `PATHEXT` suffix (`.EXE`, `.CMD`, …).
+fn tool_on_path(name: &str) -> bool {
+    // Absolute / relative path: honor as-is (MCP commands may be full paths).
+    let as_path = Path::new(name);
+    if as_path.components().count() > 1 || as_path.is_absolute() {
+        return as_path.is_file();
+    }
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    #[cfg(windows)]
+    let extensions: Vec<std::ffi::OsString> = {
+        let mut exts = vec![std::ffi::OsString::new()];
+        let pathext = std::env::var_os("PATHEXT")
+            .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+        for part in pathext.to_string_lossy().split(';') {
+            let part = part.trim();
+            if !part.is_empty() {
+                exts.push(std::ffi::OsString::from(part));
+            }
+        }
+        exts
+    };
+    #[cfg(not(windows))]
+    let extensions: Vec<std::ffi::OsString> = vec![std::ffi::OsString::new()];
+
+    for dir in std::env::split_paths(&path_var) {
+        for ext in &extensions {
+            let candidate = if ext.is_empty() {
+                dir.join(name)
+            } else {
+                let mut file = std::ffi::OsString::from(name);
+                file.push(ext);
+                dir.join(file)
+            };
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True when the given string is one of the HTTP verbs the hook
 /// dispatcher actually recognizes. Anything else gets treated as POST
 /// at runtime, which is almost certainly wrong — warn early.
@@ -658,6 +688,19 @@ mod tests {
         let f = Check::fail("test", "failed");
         assert_eq!(f.status, CheckStatus::Fail);
         assert_eq!(f.symbol(), "xx");
+    }
+
+    #[test]
+    fn tool_on_path_finds_a_known_binary() {
+        // `cargo` is on PATH in every environment that builds this crate.
+        assert!(
+            tool_on_path("cargo"),
+            "cargo should resolve via PATH walk (not Unix `which`)"
+        );
+        assert!(
+            !tool_on_path("definitely-not-a-real-tool-xyzzy"),
+            "missing binary must not report as present"
+        );
     }
 
     #[test]

@@ -1409,6 +1409,12 @@ impl App {
             }
             return;
         }
+        // Slash commands (and any other submit) that never went through
+        // `insert_char` — e.g. palette-filled `/help` — must still clear
+        // the launch surface so System output is not overdrawn.
+        if self.launch.visible {
+            self.launch.dismiss();
+        }
         if text == "/exit" || text == "/quit" {
             self.should_quit = true;
             self.input.clear();
