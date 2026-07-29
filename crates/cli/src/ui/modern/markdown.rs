@@ -433,24 +433,29 @@ impl Builder {
 /// Layout re-renders the streaming assistant block on every flush; without
 /// this, every previously highlighted line is paid for again. When the
 /// fence content grows by pure append, only the new lines run through
-/// `highlight_line`. A language change, non-prefix edit, or gutter-width
-/// change resets.
+/// `highlight_line`. A language change, non-prefix edit, gutter-width
+/// change, or theme polarity change resets (cached spans bake in the
+/// code-theme and `code_bg` of the paint that produced them).
 struct CodeHlStream {
     lang: String,
     /// Content already fed to `hl` (and covered by `body`).
     content: String,
     body: Vec<Line<'static>>,
     num_w: usize,
+    /// Theme polarity at last paint — light and dark ship different
+    /// syntect themes, and `code_bg` moves with the product theme.
+    dark: bool,
     /// `None` after a reset; recreated on the next append.
     hl: Option<HighlightLines<'static>>,
 }
 
 impl CodeHlStream {
-    fn reset(&mut self, lang: &str, num_w: usize) {
+    fn reset(&mut self, lang: &str, num_w: usize, dark: bool) {
         self.lang = lang.to_string();
         self.content.clear();
         self.body.clear();
         self.num_w = num_w;
+        self.dark = dark;
         self.hl = None;
     }
 
@@ -475,6 +480,7 @@ thread_local! {
             content: String::new(),
             body: Vec::new(),
             num_w: 2,
+            dark: true,
             hl: None,
         })
     };
@@ -550,16 +556,18 @@ fn highlight_one_line(
 /// complete lines are fed into the persistent `HighlightLines`.
 fn highlight_code_body(lang: &str, content: &str, num_w: usize) -> Vec<Line<'static>> {
     let (complete, tail) = complete_and_tail(content);
+    let dark = crate::ui::theme::current().is_dark;
 
     CODE_HL_STREAM.with(|cell| {
         let mut cache = cell.borrow_mut();
         let can_extend = cache.lang == lang
             && cache.num_w == num_w
+            && cache.dark == dark
             && complete.starts_with(&cache.content)
             && (cache.hl.is_some() || cache.content.is_empty());
 
         if !can_extend {
-            cache.reset(lang, num_w);
+            cache.reset(lang, num_w, dark);
         }
 
         if complete.len() > cache.content.len() {
@@ -601,7 +609,7 @@ fn highlight_code_body(lang: &str, content: &str, num_w: usize) -> Vec<Line<'sta
 #[cfg(test)]
 fn clear_code_hl_stream() {
     CODE_HL_STREAM.with(|cell| {
-        cell.borrow_mut().reset("", 2);
+        cell.borrow_mut().reset("", 2, true);
     });
 }
 
@@ -689,6 +697,7 @@ mod tests {
         use super::super::colors::{contrast, luminance};
         let _g = crate::ui::theme::test_lock();
         for name in ["one-dark", "solarized-light"] {
+            clear_code_hl_stream();
             crate::ui::theme::init(name);
             let bg = palette().code_bg;
             let bg_l = luminance(bg).expect("code_bg is rgb on these themes");
