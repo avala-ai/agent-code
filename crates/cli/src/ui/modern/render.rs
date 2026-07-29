@@ -1969,9 +1969,20 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Some("session"),
     ));
 
+    // Hover target for D5-22 status-chip chrome.
+    let hover_chip = match &app.hit_registry.hover {
+        Some(super::hit_rect::HitTarget::StatusChip { id }) => Some(*id),
+        _ => None,
+    };
+    let hover_fill = Style::default()
+        .fg(super::colors::on_fill(accent))
+        .bg(accent)
+        .add_modifier(Modifier::BOLD);
+
     // Register hit rects left-to-right before paint (topmost = last chip).
     let mut x = area.x;
-    for (span, id) in &chips {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chips.len());
+    for (mut span, id) in chips {
         let w = UnicodeWidthStr::width(span.content.as_ref()) as u16;
         if let Some(id) = id
             && w > 0
@@ -1989,11 +2000,14 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     super::hit_rect::HitTarget::StatusChip { id },
                 );
             }
+            if hover_chip == Some(id) {
+                span.style = hover_fill;
+            }
         }
+        spans.push(span);
         x = x.saturating_add(w);
     }
 
-    let spans: Vec<Span<'static>> = chips.into_iter().map(|(s, _)| s).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
