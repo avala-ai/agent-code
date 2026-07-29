@@ -2004,9 +2004,9 @@ pub(super) async fn event_loop(
                 // resume can land while it is still in flight, and the
                 // transcript it would print into is not the one that
                 // asked.
-                if epoch == app.conversation_epoch {
-                    app.show_task_output(&id, out);
-                }
+                // Epoch-gated inside so a late race that slips past this
+                // check still cannot land on a swapped conversation.
+                app.show_task_output_for_epoch(&id, out, epoch);
             }
             // `/resume`: enumerating sessions stats and parses every file
             // in the sessions directory. Done inline in the key handler it

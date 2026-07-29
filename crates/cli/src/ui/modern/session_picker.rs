@@ -701,18 +701,12 @@ impl App {
     /// from the messages actually restored. Skipping it leaves the pane
     /// showing the discarded session's work.
     pub fn adopt_restored_todos(&mut self, messages: &[agent_code_lib::llm::message::Message]) {
+        // `new_conversation` is the single conversation-scoped reset seam
+        // (#539): epoch, todos, staged media, subagent rows, pending
+        // task-output reads. Partial clears here used to leave rows and
+        // in-flight drill-ins attached to the restored session.
         self.new_conversation();
         self.todos = super::tasks::todos_from_messages(messages);
-        // Subagent rows and their captured output are conversation
-        // state, and `sync_background_tasks` deliberately carries every
-        // one of them across a refresh — the event stream is their only
-        // source, so a row dropped there is gone. That is right within a
-        // conversation and wrong across a swap: left alone, the restored
-        // session's pane keeps listing agents from the session it
-        // replaced, and drill-in still opens their results. The captured
-        // bodies live on the rows, so dropping the rows drops those too.
-        self.tasks
-            .retain(|t| t.source != super::tasks::TaskSource::Subagent);
         self.tasks_selected = 0;
     }
 

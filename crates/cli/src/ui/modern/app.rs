@@ -2582,7 +2582,25 @@ impl App {
     }
 
     /// Show a task's output in the transcript.
+    ///
+    /// `epoch` is the conversation that requested the read. A resume that
+    /// landed while the blocking read was in flight must not paste the
+    /// old agent's output into the restored transcript (#539).
     pub fn show_task_output(&mut self, id: &str, output: Result<String, String>) {
+        self.show_task_output_for_epoch(id, output, self.conversation_epoch);
+    }
+
+    /// Like [`Self::show_task_output`], but only applies when `epoch`
+    /// still matches the live conversation.
+    pub fn show_task_output_for_epoch(
+        &mut self,
+        id: &str,
+        output: Result<String, String>,
+        epoch: u64,
+    ) {
+        if epoch != self.conversation_epoch {
+            return;
+        }
         // A task can produce arbitrarily much output; the transcript
         // card shows the tail, like watching the job finish.
         const TAIL_LINES: usize = 200;
@@ -2676,14 +2694,31 @@ impl App {
     /// friends, which can read it back out of the restored messages)
     /// assign `todos` afterwards.
     pub fn new_conversation(&mut self) {
+        self.reset_conversation_scoped_state();
+    }
+
+    /// Single seam for everything that belongs to one conversation and
+    /// must not leak into the next (`/clear`, `/resume`, session swap).
+    ///
+    /// Every site that used to clear a partial subset of this list should
+    /// call here instead: incomplete enumerations are how subagent rows
+    /// and in-flight task-output reads reappeared after a swap (#539).
+    pub fn reset_conversation_scoped_state(&mut self) {
         self.conversation_epoch = self.conversation_epoch.wrapping_add(1);
         self.todos.clear();
         // Anything staged belonged to the conversation being replaced.
-        // Sending it into the new one would attach a file to a thread the
-        // user never attached it to.
         self.deferred_prompts.clear();
         self.pending_images.clear();
         self.pending_attachments.clear();
+        self.encoding_display = None;
+        // Manager-backed LocalAgent rows re-enter via `sync_background_tasks`
+        // from the process-wide TaskManager. Drop every subagent row so the
+        // restored conversation does not inherit the previous one's agents.
+        self.tasks
+            .retain(|t| t.source != super::tasks::TaskSource::Subagent);
+        // Invalidate an in-flight drill-in: the read cannot be cancelled,
+        // but `show_task_output` / the run-loop arm refuse a mismatched epoch.
+        self.pending_task_output = None;
         self.dirty = true;
     }
 
@@ -3217,6 +3252,43 @@ mod tests {
         app.cursor = 2;
         app.submit();
         assert!(app.scroll.is_following(), "sending jumps back to the tail");
+    }
+
+    #[test]
+    fn reset_conversation_scoped_state_drops_subagent_rows_and_pending_output() {
+        use crate::ui::modern::tasks::{TaskEntry, TaskSource, TaskState, TodoItem, TodoStatus};
+        let mut app = App::new("m", "/tmp", "s");
+        let epoch0 = app.conversation_epoch;
+        app.tasks.push(TaskEntry {
+            agent_id: "a1".into(),
+            state: TaskState::Working,
+            headline: "work".into(),
+            source: TaskSource::Subagent,
+            task_id: Some("t1".into()),
+            outputs: Vec::new(),
+        });
+        app.pending_task_output = Some(("t1".into(), epoch0));
+        app.todos.push(TodoItem {
+            id: "1".into(),
+            content: "x".into(),
+            status: TodoStatus::Pending,
+        });
+        app.reset_conversation_scoped_state();
+        assert_ne!(app.conversation_epoch, epoch0);
+        assert!(
+            app.tasks.is_empty(),
+            "subagent rows must not survive a swap"
+        );
+        assert!(app.pending_task_output.is_none());
+        assert!(app.todos.is_empty());
+        app.show_task_output_for_epoch("t1", Ok("leak".into()), epoch0);
+        assert!(
+            !app.transcript.iter().any(|t| matches!(
+                t,
+                TranscriptItem::Tool { call_id, .. } if call_id == "task-t1"
+            )),
+            "old-epoch task output must not land"
+        );
     }
 
     #[test]
