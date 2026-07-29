@@ -254,6 +254,9 @@ impl LayoutCache {
     }
 
     /// Plain (unstyled) text for absolute lines in `[start, end]` inclusive.
+    ///
+    /// Soft-wrap continuation rows are concatenated without a hard newline so
+    /// a triple-click of a wrapped logical line copies as one line.
     pub fn plain_range(&self, start: usize, end: usize) -> Option<String> {
         let lo = start.min(end);
         let hi = start.max(end);
@@ -261,25 +264,31 @@ impl LayoutCache {
             return None;
         }
         let hi = hi.min(self.total.saturating_sub(1));
-        let mut parts = Vec::new();
+        let mut out = String::new();
         let mut idx = 0usize;
+        let mut any = false;
         for b in &self.blocks {
-            for line in &b.lines {
+            for (li, line) in b.lines.iter().enumerate() {
                 if idx >= lo && idx <= hi {
                     let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    parts.push(plain);
+                    let cont = b.cont.get(li).copied().unwrap_or(false);
+                    if any {
+                        // Only insert a hard break when this row starts a
+                        // new logical line (not a soft-wrap continuation).
+                        if !(cont && idx > lo) {
+                            out.push('\n');
+                        }
+                    }
+                    out.push_str(&plain);
+                    any = true;
                 }
                 idx += 1;
                 if idx > hi {
-                    return Some(parts.join("\n"));
+                    return if any { Some(out) } else { None };
                 }
             }
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        }
+        if any { Some(out) } else { None }
     }
 
     /// Absolute layout line index under a viewport-relative row.
@@ -1088,6 +1097,13 @@ mod tests {
         let (lo, hi) = c.soft_wrap_span(1).expect("span");
         assert_eq!(lo, 0, "group starts at first display row");
         assert_eq!(hi, total - 1, "group covers all wrapped rows of the item");
+        // Copy must not inject hard newlines for soft wraps.
+        let plain = c.plain_range(lo, hi).expect("plain");
+        assert!(
+            !plain.contains('\n'),
+            "soft-wrap copy should be one logical line: {plain:?}"
+        );
+        assert!(plain.contains("abcdefghijklmnopqrstuvwxyz") || plain.contains("abcdefghij"));
     }
 
     #[test]
