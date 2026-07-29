@@ -323,4 +323,77 @@ mod frames {
         });
         assert_ne!(dark, light, "the theme did not reach the rendered frame");
     }
+
+    /// Launch surface: branding, repo:branch · version, auth/mode, one
+    /// warning slot, recent sessions, type-to-start (#557 Phase 2).
+    #[test]
+    fn launch_surface_idle() {
+        use agent_code_lib::services::session::SessionSummary;
+        use agent_code_lib::services::startup::{StartupWarning, WarningSeverity};
+
+        let snap = render("one-dark", |app| {
+            app.version = "0.0.0-test".into();
+            app.launch = super::super::launch::LaunchSurface::ready(
+                "agent-code:main",
+                "API key",
+                "normal",
+                &[StartupWarning {
+                    severity: WarningSeverity::Warning,
+                    message: "No API key set (AGENT_CODE_API_KEY)".into(),
+                    action: Some("Run /doctor for details and fixes.".into()),
+                }],
+                vec![SessionSummary {
+                    id: "abcd1234-ffff".into(),
+                    cwd: "/w/proj".into(),
+                    model: "test-model".into(),
+                    turn_count: 3,
+                    message_count: 6,
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    label: Some("fix permissions".into()),
+                    tags: vec![],
+                }],
+            );
+        });
+        assert_snapshot("launch_surface", &snap);
+        assert!(
+            snap.contains("agent-code") && snap.contains("Type to start"),
+            "launch chrome missing:\n{snap}"
+        );
+        assert!(
+            snap.contains("agent-code:main") || snap.contains("main"),
+            "repo:branch missing:\n{snap}"
+        );
+        assert!(
+            snap.contains("Run /doctor") || snap.contains("No API key"),
+            "warning slot missing:\n{snap}"
+        );
+        assert!(
+            snap.contains("abcd1234") || snap.contains("fix permissions"),
+            "recent sessions missing:\n{snap}"
+        );
+    }
+
+    /// Narrow width must not panic and still shows the brand (#557 D11-02).
+    #[test]
+    fn launch_surface_narrow() {
+        let _g = crate::ui::theme::test_lock();
+        crate::ui::theme::init("one-dark");
+        let backend = TestBackend::new(40, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model", "/w", "sess1234");
+        app.version = "0.0.0-test".into();
+        app.launch = super::super::launch::LaunchSurface::ready(
+            "repo:main",
+            "API key",
+            "normal",
+            &[],
+            vec![],
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let snap = buffer_snapshot(term.backend().buffer());
+        assert!(
+            snap.contains("agent-code") || snap.contains("Type to start") || snap.contains("auth:"),
+            "narrow launch should still paint something:\n{snap}"
+        );
+    }
 }

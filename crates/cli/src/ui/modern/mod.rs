@@ -9,6 +9,7 @@ mod diffview;
 #[cfg(test)]
 mod fake_engine;
 mod hit_rect;
+mod launch;
 mod layout;
 mod markdown;
 mod mentions;

@@ -351,6 +351,9 @@ pub struct App {
     /// a rebuilt transcript.
     pub session_views: super::session_views::SessionViews,
     pub version: String,
+    /// Front-door launch surface (branding, recent sessions, startup
+    /// warning). Hidden permanently once the user types or resumes.
+    pub launch: super::launch::LaunchSurface,
     /// Mirror of `security.disable_skill_shell_execution` for skill slash
     /// expansion (must not bypass the policy that strips fenced shell).
     pub disable_skill_shell: bool,
@@ -674,6 +677,7 @@ impl App {
             session_id: session_id.into(),
             session_views: Default::default(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            launch: super::launch::LaunchSurface::default(),
             disable_skill_shell,
             mode: SessionMode::Normal,
             phase: Phase::Idle,
@@ -1213,6 +1217,11 @@ impl App {
         if self.phase != Phase::Idle && self.phase != Phase::Streaming {
             return;
         }
+        // Typing dismisses the launch surface for the rest of the process
+        // (#557 Phase 2: "type to start").
+        if self.launch.visible {
+            self.launch.dismiss();
+        }
         // Allow typing while streaming (buffer for next turn).
         let idx = self.cursor.min(self.input.len());
         self.input.insert(idx, c);
@@ -1246,6 +1255,9 @@ impl App {
         }
         if self.phase != Phase::Idle && self.phase != Phase::Streaming {
             return;
+        }
+        if self.launch.visible {
+            self.launch.dismiss();
         }
         // Normalize CRLF → LF so Windows pastes don't leave bare `\r`s.
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");

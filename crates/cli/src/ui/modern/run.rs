@@ -443,6 +443,30 @@ pub async fn run_modern_tui(
     {
         app.status_message = format!("{}: {}", w.level.label(), w.message);
     }
+    // Launch surface: local doctor checks + recent sessions. Network
+    // probes stay out so a slow endpoint cannot stall the first frame
+    // (#557 Phase 2).
+    {
+        let cwd_path = std::path::Path::new(&app.cwd);
+        let cfg_snapshot = session.engine().lock().await.state().config.clone();
+        let checks =
+            agent_code_lib::services::diagnostics::run_local(cwd_path, &cfg_snapshot).await;
+        let warnings = agent_code_lib::services::startup::from_checks(&checks);
+        let repo = agent_code_lib::services::git::repo_root(cwd_path).await;
+        let branch = agent_code_lib::services::git::current_branch(cwd_path).await;
+        let repo_branch =
+            super::launch::repo_branch_label(&app.cwd, repo.as_deref(), branch.as_deref());
+        let auth = super::launch::auth_label(&cfg_snapshot);
+        let recent =
+            agent_code_lib::services::session::list_session_summaries(super::launch::RECENT_LIMIT);
+        app.launch = super::launch::LaunchSurface::ready(
+            repo_branch,
+            auth,
+            app.mode.label(),
+            &warnings,
+            recent,
+        );
+    }
     // Construction performs no I/O; the first `notify` is what spawns.
     let mut notifier = NotifierService::new(notifier_config);
 

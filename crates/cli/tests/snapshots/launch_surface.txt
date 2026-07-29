@@ -1,0 +1,64 @@
+== glyphs ==
+agent-code 0.0.0-test  test-model   NORMAL   /w
+
+────────────────────────────────────────────────────────────────────────────────
+ transcript
+
+  agent-code
+  agent-code:main · v0.0.0-test
+  auth: API key · mode: normal
+
+  ! No API key set (AGENT_CODE_API_KEY)
+    Run /doctor for details and fixes.
+
+  Recent
+    abcd1234  3 turns  fix permissions
+    /resume or Ctrl+P to open a past session
+
+  Type to start a conversation
+  Shift+Tab mode · Ctrl+P commands · ? shortcuts
+
+ turn 0 │ 0 tok │ $0.0000 │  │ sid sess1234
+╭ composer ────────────────────────────────────────────────────────────────────╮
+│❯                                                                             │
+│Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+== styles ==
+aaaaaaaaaabccccccccccbbddddddddddbbeeeeeeeebbccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+ccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+aaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ffffgggggggggggggggggggggggggggggggggggbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+iiiiiiiibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ddddddddddddddddddddddddddddddddddddddbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbddbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+kaaaaaaaaaakkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
+kaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbk
+kcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccck
+kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
+
+== legend ==
+a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
+b fg=Reset bg=Reset mods=NONE
+c fg=Rgb(92, 99, 112) bg=Reset mods=NONE
+d fg=Rgb(124, 131, 144) bg=Reset mods=NONE
+e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
+f fg=Rgb(229, 192, 123) bg=Reset mods=BOLD
+g fg=Rgb(229, 192, 123) bg=Reset mods=NONE
+h fg=Rgb(92, 99, 112) bg=Reset mods=DIM
+i fg=Rgb(171, 178, 191) bg=Reset mods=BOLD
+j fg=Rgb(171, 178, 191) bg=Reset mods=NONE
+k fg=Rgb(97, 175, 239) bg=Reset mods=NONE

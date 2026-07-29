@@ -53,7 +53,23 @@ impl Check {
 }
 
 /// Run all diagnostic checks and return results.
+///
+/// Includes network probes (API connectivity, remote MCP URLs). Prefer
+/// [`run_local`] on the launch path so the first frame is not blocked on
+/// a multi-second HTTP timeout.
 pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
+    run_with_options(cwd, config, true).await
+}
+
+/// Same checks as [`run_all`], minus network round-trips.
+///
+/// Used by the launch surface so a flaky or slow endpoint cannot stall
+/// the first paint. `/doctor` still runs the full set.
+pub async fn run_local(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
+    run_with_options(cwd, config, false).await
+}
+
+async fn run_with_options(cwd: &Path, config: &crate::config::Config, network: bool) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // 1. Required CLI tools.
@@ -359,82 +375,85 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
         }
     }
 
-    // 8. API connectivity test (provider-aware auth).
-    if matches!(
-        config.api.auth_mode,
-        crate::config::ApiAuthMode::CodexChatgpt | crate::config::ApiAuthMode::XaiOauth
-    ) {
-        checks.push(Check::warn(
-            "api:connectivity",
-            "Skipping /models connectivity check for subscription OAuth auth",
-        ));
-    } else if config.api.api_key.is_some() {
-        let api_key = config.api.api_key.as_deref().unwrap_or("");
-        let url = format!("{}/models", config.api.base_url);
+    // 8. API connectivity test (provider-aware auth). Skipped on the
+    // launch path so a hanging endpoint cannot stall the first frame.
+    if network {
+        if matches!(
+            config.api.auth_mode,
+            crate::config::ApiAuthMode::CodexChatgpt | crate::config::ApiAuthMode::XaiOauth
+        ) {
+            checks.push(Check::warn(
+                "api:connectivity",
+                "Skipping /models connectivity check for subscription OAuth auth",
+            ));
+        } else if config.api.api_key.is_some() {
+            let api_key = config.api.api_key.as_deref().unwrap_or("");
+            let url = format!("{}/models", config.api.base_url);
 
-        let client = reqwest::Client::new();
-        let mut request = client.get(&url).timeout(std::time::Duration::from_secs(5));
+            let client = reqwest::Client::new();
+            let mut request = client.get(&url).timeout(std::time::Duration::from_secs(5));
 
-        // Use provider-specific auth headers.
-        match provider_kind {
-            crate::llm::provider::ProviderKind::AzureOpenAi => {
-                request = request.header("api-key", api_key);
-            }
-            crate::llm::provider::ProviderKind::Anthropic
-            | crate::llm::provider::ProviderKind::Bedrock
-            | crate::llm::provider::ProviderKind::Vertex => {
-                request = request
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01");
-            }
-            _ => {
-                request = request.header("Authorization", format!("Bearer {api_key}"));
-            }
-        }
-
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() || status.as_u16() == 200 {
-                    checks.push(Check::pass(
-                        "api:connectivity",
-                        &format!(
-                            "API reachable ({:?} at {})",
-                            provider_kind, config.api.base_url
-                        ),
-                    ));
-                } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                    checks.push(Check::fail(
-                        "api:connectivity",
-                        &format!(
-                            "API key rejected by {:?} (HTTP {})",
-                            provider_kind,
-                            status.as_u16()
-                        ),
-                    ));
-                } else {
-                    checks.push(Check::warn(
-                        "api:connectivity",
-                        &format!(
-                            "{:?} responded with HTTP {}",
-                            provider_kind,
-                            status.as_u16()
-                        ),
-                    ));
+            // Use provider-specific auth headers.
+            match provider_kind {
+                crate::llm::provider::ProviderKind::AzureOpenAi => {
+                    request = request.header("api-key", api_key);
+                }
+                crate::llm::provider::ProviderKind::Anthropic
+                | crate::llm::provider::ProviderKind::Bedrock
+                | crate::llm::provider::ProviderKind::Vertex => {
+                    request = request
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01");
+                }
+                _ => {
+                    request = request.header("Authorization", format!("Bearer {api_key}"));
                 }
             }
-            Err(e) => {
-                let msg = if e.is_timeout() {
-                    format!("{:?} unreachable (timeout after 5s)", provider_kind)
-                } else if e.is_connect() {
-                    format!(
-                        "Cannot connect to {:?} at {}",
-                        provider_kind, config.api.base_url
-                    )
-                } else {
-                    format!("{:?} error: {e}", provider_kind)
-                };
-                checks.push(Check::fail("api:connectivity", &msg));
+
+            match request.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() || status.as_u16() == 200 {
+                        checks.push(Check::pass(
+                            "api:connectivity",
+                            &format!(
+                                "API reachable ({:?} at {})",
+                                provider_kind, config.api.base_url
+                            ),
+                        ));
+                    } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                        checks.push(Check::fail(
+                            "api:connectivity",
+                            &format!(
+                                "API key rejected by {:?} (HTTP {})",
+                                provider_kind,
+                                status.as_u16()
+                            ),
+                        ));
+                    } else {
+                        checks.push(Check::warn(
+                            "api:connectivity",
+                            &format!(
+                                "{:?} responded with HTTP {}",
+                                provider_kind,
+                                status.as_u16()
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let msg = if e.is_timeout() {
+                        format!("{:?} unreachable (timeout after 5s)", provider_kind)
+                    } else if e.is_connect() {
+                        format!(
+                            "Cannot connect to {:?} at {}",
+                            provider_kind, config.api.base_url
+                        )
+                    } else {
+                        format!("{:?} error: {e}", provider_kind)
+                    };
+                    checks.push(Check::fail("api:connectivity", &msg));
+                }
             }
         }
     }
@@ -462,6 +481,14 @@ pub async fn run_all(cwd: &Path, config: &crate::config::Config) -> Vec<Check> {
                 }
             }
         } else if let Some(ref url) = entry.url {
+            if !network {
+                // Local launch path: only note that a remote MCP is configured.
+                checks.push(Check::pass(
+                    &format!("mcp:{name}"),
+                    &format!("MCP server '{name}' configured at {url}"),
+                ));
+                continue;
+            }
             // Check if the SSE endpoint is reachable.
             match reqwest::Client::new()
                 .get(url)

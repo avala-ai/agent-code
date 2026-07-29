@@ -1369,6 +1369,19 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let title_block = Block::default()
         .borders(Borders::NONE)
         .title(Span::styled(title, title_style));
+    // Launch surface owns the empty transcript body until the user types
+    // or resumes (#557 Phase 2). Paint chrome only, clear the body so
+    // the system welcome line does not ghost under the brand.
+    if app.launch.should_draw(app) {
+        frame.render_widget(
+            Paragraph::new(Vec::<ratatui::text::Line<'_>>::new()).block(title_block),
+            area,
+        );
+        frame.render_widget(Clear, inner);
+        super::launch::draw(frame, inner, app);
+        return;
+    }
+
     // Lines are pre-wrapped by the layout cache; no widget wrapping.
     frame.render_widget(Paragraph::new(view).block(title_block), area);
 
