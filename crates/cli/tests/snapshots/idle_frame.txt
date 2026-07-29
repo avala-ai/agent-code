@@ -7,13 +7,13 @@ agent-code x.y.z   test-model   NORMAL   /w
 er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
 
 
+  Start a conversation
 
+  1. Type a task  — ask to explain, edit, or run something
+  2. Ctrl+P  — open commands · /resume for a past session
+  3. Shift+Tab  — pick a mode (plan / accept edits / …) before you start
 
-
-
-
-
-
+  Tip: @path mentions a file · !cmd runs a shell command
 
 
 
@@ -33,22 +33,22 @@ bccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ffffffffffffffffffffffbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ggggghhhhhhhhhhhccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbb
+gggggffffffcccccccccccccccccccchhhhhhhcccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbb
+gggggfffffffffccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiibbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 ccccccccbcccccccbcccccccccbddbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-faaaaaaaaaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-faabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbf
-fccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccf
-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+gaaaaaaaaaaggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
+gaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbg
+gccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccg
+gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg
 
 == legend ==
 a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
@@ -56,4 +56,7 @@ b fg=Reset bg=Reset mods=NONE
 c fg=Rgb(92, 99, 112) bg=Reset mods=NONE
 d fg=Rgb(124, 131, 144) bg=Reset mods=NONE
 e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
-f fg=Rgb(97, 175, 239) bg=Reset mods=NONE
+f fg=Rgb(171, 178, 191) bg=Reset mods=BOLD
+g fg=Rgb(97, 175, 239) bg=Reset mods=NONE
+h fg=Rgb(171, 178, 191) bg=Reset mods=NONE
+i fg=Rgb(92, 99, 112) bg=Reset mods=DIM
