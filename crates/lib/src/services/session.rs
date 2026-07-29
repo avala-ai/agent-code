@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::config::atomic::atomic_write_secret;
 use crate::config::ApiAuthMode;
+use crate::config::atomic::atomic_write_secret;
 use crate::llm::message::Message;
 use crate::services::secret_masker;
 
