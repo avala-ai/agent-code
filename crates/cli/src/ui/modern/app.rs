@@ -412,6 +412,10 @@ pub struct App {
     /// Per-frame mouse hit targets. Cleared at the start of each draw;
     /// widgets register rects; mouse handlers resolve against it (#558).
     pub hit_registry: super::hit_rect::HitRegistry,
+    /// When false, the status bar is not drawn (`[ui.statusline].enabled`).
+    pub statusline_enabled: bool,
+    /// Optional custom template for the status bar (`[ui.statusline].template`).
+    pub statusline_template: Option<String>,
 
     pub should_quit: bool,
     /// Work staged against the conversation currently in front: a
@@ -705,6 +709,8 @@ impl App {
             ctx_meter: None,
             status_message: String::new(),
             hit_registry: Default::default(),
+            statusline_enabled: true,
+            statusline_template: None,
             should_quit: false,
             work: super::session_work::SessionWork::default(),
             exit_save_error: None,

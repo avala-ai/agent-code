@@ -394,6 +394,7 @@ pub async fn run_modern_tui(
     let show_thinking_blocks = engine.state().config.ui.show_thinking_blocks;
     let initial_effort = engine.state().config.api.effort.clone();
     let notifier_config = engine.state().config.notifier.clone();
+    let statusline_cfg = engine.state().config.ui.statusline.clone();
 
     // Apply theme so any shared color helpers still resolve.
     let engine_edit_mode = engine.state().config.ui.edit_mode.clone();
@@ -467,6 +468,8 @@ pub async fn run_modern_tui(
             recent,
         );
     }
+    app.statusline_enabled = statusline_cfg.enabled;
+    app.statusline_template = statusline_cfg.template;
     // Construction performs no I/O; the first `notify` is what spawns.
     let mut notifier = NotifierService::new(notifier_config);
 

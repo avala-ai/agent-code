@@ -1556,7 +1556,31 @@ fn apply_search_highlight(
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.statusline_enabled {
+        return;
+    }
     let tokens = app.tokens_in + app.tokens_out;
+    // Custom template from `[ui.statusline].template` replaces the
+    // built-in turn/tokens/cost strip when set.
+    if let Some(ref template) = app.statusline_template {
+        let rendered = agent_code_lib::config::render_statusline_template(
+            template,
+            &agent_code_lib::config::StatusLineVars {
+                model: &app.model,
+                turn: app.turn_count as u64,
+                tokens,
+                cost_usd: app.cost_usd,
+                cwd: &app.cwd,
+                session_id: &app.session_id,
+            },
+        );
+        let line = Line::from(Span::styled(
+            format!(" {rendered} "),
+            Style::default().fg(palette().muted),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let mut spans = Vec::new();
     // The mode badge must be visible in EVERY state (product bar). The
     // minimal skin hides the header that normally carries it, so show it
@@ -3599,5 +3623,24 @@ mod tests {
             TranscriptItem::System(WELCOME_SYSTEM_LINE.into()),
             TranscriptItem::Assistant("y".into()),
         ]));
+    }
+    #[test]
+    fn statusline_template_is_honoured() {
+        let mut app = App::new("gpt", "/work", "sid");
+        app.statusline_template = Some("{model} · turn {turn}".into());
+        app.turn_count = 3;
+        // Smoke: the formatter produces the expected string for the template.
+        let s = agent_code_lib::config::render_statusline_template(
+            app.statusline_template.as_deref().unwrap(),
+            &agent_code_lib::config::StatusLineVars {
+                model: &app.model,
+                turn: app.turn_count as u64,
+                tokens: 0,
+                cost_usd: 0.0,
+                cwd: &app.cwd,
+                session_id: &app.session_id,
+            },
+        );
+        assert_eq!(s, "gpt · turn 3");
     }
 }
