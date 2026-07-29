@@ -264,8 +264,8 @@ enum ScheduleAction {
     },
 }
 
-fn run_setup_wizard() {
-    if let Some(result) = ui::setup::run_setup() {
+fn run_setup_wizard(cli_provider: &str) {
+    if let Some(result) = ui::setup::run_setup(cli_provider) {
         // Subscription auth has no API key; only seed the env for key mode.
         if result.auth_mode == "api_key" && !result.api_key.is_empty() {
             // SAFETY: single-threaded, before async runtime work.
@@ -658,8 +658,8 @@ async fn async_main() -> anyhow::Result<()> {
         && !cli.acp
         && !is_headless_subcommand
     {
-        // Sign-in only (env key or xAI OAuth) — no Appearance/Permissions wizard.
-        run_setup_wizard();
+        // Env key or one-screen provider choice — never silent xAI pin.
+        run_setup_wizard(&cli.provider);
         config = Config::load()?;
     }
 

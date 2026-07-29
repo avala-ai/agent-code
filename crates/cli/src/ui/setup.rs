@@ -1,22 +1,15 @@
 //! First-run bootstrap and credentials.
 //!
-//! Interactive launch mirrors Grok Build: **no multi-step wizard**. Missing
-//! config is written with calm defaults; if credentials are still missing we
-//! only run sign-in (device/browser OAuth or env API keys), then drop into the
-//! modern TUI.
-//!
-//! The legacy multi-step Appearance → Sign-in → Permissions → Safety flow is
-//! kept as [`run_setup_wizard_legacy`] for callers that opt in explicitly.
-
-use std::io::Write;
+//! Interactive launch is a **single provider-choice screen** when no
+//! credentials exist — not a silent pin to one vendor, and not a four-step
+//! wizard. Env API keys win when present; `--provider` / `AGENT_CODE_PROVIDER`
+//! pins the choice for scripts. Then OAuth or an env-key hint finishes
+//! sign-in and the modern TUI starts.
 
 use agent_code_lib::config::atomic::atomic_write_secret;
 use crossterm::style::Stylize;
 
 use super::selector::{SelectOption, select};
-
-/// Total interactive steps shown in the progress rail (legacy wizard only).
-const TOTAL_STEPS: u8 = 4;
 
 /// Check if a default config.toml should be created.
 pub fn needs_setup() -> bool {
@@ -27,34 +20,38 @@ pub fn needs_setup() -> bool {
     }
 }
 
-/// Default first-run config: calm midnight theme, accept-edits, xAI endpoint.
+/// Theme + permission defaults shared by every first-run path.
 ///
-/// Auth is left empty until env keys or OAuth fill it in.
+/// Endpoint and provider are **not** filled here — silent bootstrap used
+/// to pin xAI, which configured users with no key for one vendor and
+/// dropped them into its OAuth. Callers must set provider fields after
+/// env detection or an explicit choice.
 pub fn default_setup_result() -> SetupResult {
     SetupResult {
         api_key: String::new(),
         auth_mode: "api_key".into(),
-        provider: "xai".into(),
-        base_url: Some("https://api.x.ai/v1".into()),
-        model: Some("grok-build-0.1".into()),
+        provider: String::new(),
+        base_url: None,
+        model: None,
         theme: "auto".into(),
         permission_mode: "accept_edits".into(),
     }
 }
 
-/// Write calm defaults when no config exists. Silent — no hero UI.
+/// Write provider defaults when no config exists **and** an env API key
+/// already names the provider. Silent — no UI.
 ///
-/// Credentials already present in the environment pick the provider
-/// section: `Config::load` lets env keys replace only `api.api_key`
-/// while `base_url`/`model` keep the file values, so pinning the xAI
-/// endpoint while e.g. `OPENAI_API_KEY` is exported would send that
-/// key to api.x.ai. The key itself is never persisted here — the
-/// loader re-resolves it from the environment on every launch.
+/// Without a key we write nothing: the interactive path asks which
+/// provider to use instead of inventing one. The key itself is never
+/// persisted — the loader re-resolves it from the environment on every
+/// launch.
 pub fn ensure_default_config() {
     if !needs_setup() || env_selects_undescribable_endpoint() {
         return;
     }
-    let mut result = try_env_credentials().unwrap_or_else(default_setup_result);
+    let Some(mut result) = try_env_credentials() else {
+        return;
+    };
     result.api_key = String::new();
     write_config_quiet(&result);
 }
@@ -195,45 +192,328 @@ fn try_env_credentials() -> Option<SetupResult> {
     None
 }
 
-/// Grok-style first-run: defaults on disk + sign-in only (no multi-step wizard).
+/// First-run when interactive launch has no usable credentials.
 ///
-/// Called when interactive launch has no usable credentials. If config is
-/// missing it is bootstrapped first. Then env API keys are preferred; otherwise
-/// xAI device/browser OAuth runs (same product motion as Grok Build).
-pub fn run_setup() -> Option<SetupResult> {
+/// 1. Env API keys (if any) pick the provider and write config.
+/// 2. Else `cli_provider` when not `"auto"` pins the provider for scripts.
+/// 3. Else one interactive screen asks which provider.
+/// 4. Then OAuth or a clear env-key hint for that provider.
+///
+/// `cli_provider` is the value of `--provider` (and may also be read from
+/// `AGENT_CODE_PROVIDER` by clap). Passing `"auto"` means "ask".
+pub fn run_setup(cli_provider: &str) -> Option<SetupResult> {
     ensure_default_config();
 
     if let Some(from_env) = try_env_credentials() {
         write_config(&from_env);
         println!(
-            "  {} Using {} from the environment.",
+            "  {} Using credentials from the environment ({}).",
             "✓".green(),
-            if from_env.provider == "xai" {
-                "XAI_API_KEY"
-            } else {
-                "API key"
-            }
+            from_env.provider
         );
         println!();
         return Some(from_env);
     }
 
-    // Single-step sign-in — no Appearance / Permissions / Safety screens.
+    let choice = resolve_provider_choice(cli_provider)?;
+    finish_provider_setup(&choice)
+}
+
+/// Map CLI / interactive choice to a concrete provider id.
+fn resolve_provider_choice(cli_provider: &str) -> Option<String> {
+    let pinned = cli_provider.trim();
+    if !pinned.is_empty() && !pinned.eq_ignore_ascii_case("auto") {
+        let mapped = map_cli_provider(pinned);
+        println!();
+        println!(
+            "  {} Using provider `{}` from --provider / AGENT_CODE_PROVIDER.",
+            "→".dark_cyan().bold(),
+            mapped
+        );
+        println!();
+        return Some(mapped);
+    }
+    interactive_provider_choice()
+}
+
+fn map_cli_provider(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => "anthropic".into(),
+        "openai" | "gpt" => "openai".into(),
+        "xai" | "grok" => "xai".into(),
+        "google" | "gemini" => "google".into(),
+        "deepseek" => "deepseek".into(),
+        "groq" => "groq".into(),
+        "mistral" => "mistral".into(),
+        "together" => "together".into(),
+        "zhipu" | "glm" | "z.ai" => "zhipu".into(),
+        "ollama" | "local" => "ollama".into(),
+        "codex" | "chatgpt" | "codex_subscription" => "codex_subscription".into(),
+        "xai_subscription" | "grok_oauth" | "supergrok" => "xai_subscription".into(),
+        other => other.to_string(),
+    }
+}
+
+fn interactive_provider_choice() -> Option<String> {
     println!();
     println!(
-        "  {} Signing in with xAI (browser / device code)…",
+        "  {} Choose a provider for this machine.",
         "→".dark_cyan().bold()
     );
     println!(
         "  {}",
-        "Complete the flow in your browser. Credentials persist for later launches.".dark_grey()
-    );
-    println!(
-        "  {}",
-        "Skip: export XAI_API_KEY / OPENAI_API_KEY, or run `agent login codex`.".dark_grey()
+        "No API key was found in the environment. Pick one — you can change later with /config."
+            .dark_grey()
     );
     println!();
+    let choice = select(&provider_select_options());
+    if choice.is_empty() {
+        None
+    } else {
+        Some(choice)
+    }
+}
 
+fn provider_select_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption {
+            label: "ChatGPT / Codex subscription".into(),
+            description: "Sign in with OpenAI account in browser (no API key)".into(),
+            value: "codex_subscription".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "SuperGrok / X Premium subscription".into(),
+            description: "xAI Grok OAuth device sign-in (no XAI_API_KEY)".into(),
+            value: "xai_subscription".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "OpenAI API key".into(),
+            description: "GPT models — export OPENAI_API_KEY".into(),
+            value: "openai".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Anthropic (Claude)".into(),
+            description: "Opus, Sonnet, Haiku — export ANTHROPIC_API_KEY".into(),
+            value: "anthropic".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "xAI (Grok) API key".into(),
+            description: "Grok models — export XAI_API_KEY".into(),
+            value: "xai".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Google (Gemini)".into(),
+            description: "Gemini — export GOOGLE_API_KEY".into(),
+            value: "google".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "DeepSeek".into(),
+            description: "export DEEPSEEK_API_KEY".into(),
+            value: "deepseek".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Groq".into(),
+            description: "export GROQ_API_KEY".into(),
+            value: "groq".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Mistral".into(),
+            description: "export MISTRAL_API_KEY".into(),
+            value: "mistral".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Together".into(),
+            description: "export TOGETHER_API_KEY".into(),
+            value: "together".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Zhipu (z.ai)".into(),
+            description: "export ZHIPU_API_KEY".into(),
+            value: "zhipu".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Ollama (local)".into(),
+            description: "Local models, no API key".into(),
+            value: "ollama".into(),
+            preview: None,
+        },
+        SelectOption {
+            label: "Other OpenAI-compatible".into(),
+            description: "Set base_url later in config".into(),
+            value: "custom".into(),
+            preview: None,
+        },
+    ]
+}
+
+fn finish_provider_setup(choice: &str) -> Option<SetupResult> {
+    match choice {
+        "codex_subscription" => finish_codex_oauth(),
+        "xai_subscription" => finish_xai_oauth(),
+        "ollama" => {
+            let result = SetupResult {
+                api_key: String::new(),
+                auth_mode: "api_key".into(),
+                provider: "ollama".into(),
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+                model: Some("llama3.2".into()),
+                theme: "auto".into(),
+                permission_mode: "accept_edits".into(),
+            };
+            write_config(&result);
+            print_ready_tips(&result);
+            Some(result)
+        }
+        other => {
+            let (provider, env_var, url, model) = api_key_provider_defaults(other);
+            let result = SetupResult {
+                api_key: String::new(),
+                auth_mode: "api_key".into(),
+                provider: provider.into(),
+                base_url: Some(url.into()),
+                model: Some(model.into()),
+                theme: "auto".into(),
+                permission_mode: "accept_edits".into(),
+            };
+            write_config(&result);
+            println!();
+            println!(
+                "  {} Provider `{}` saved. Export a key, then re-run:",
+                "→".dark_cyan().bold(),
+                provider
+            );
+            println!("    {}", format!("export {env_var}=…").white().bold());
+            println!(
+                "  {}",
+                "(Or paste a key into config.toml under [api] — env is preferred.)".dark_grey()
+            );
+            println!();
+            print_ready_tips(&result);
+            // Return Some so the caller reloads config; the next has_key
+            // check may still fail until the user exports the key.
+            Some(result)
+        }
+    }
+}
+
+fn api_key_provider_defaults(
+    choice: &str,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match choice {
+        "anthropic" => (
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-4-20250514",
+        ),
+        "xai" => (
+            "xai",
+            "XAI_API_KEY",
+            "https://api.x.ai/v1",
+            "grok-build-0.1",
+        ),
+        "google" => (
+            "google",
+            "GOOGLE_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.5-flash",
+        ),
+        "deepseek" => (
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+        ),
+        "groq" => (
+            "groq",
+            "GROQ_API_KEY",
+            "https://api.groq.com/openai/v1",
+            "llama-3.3-70b-versatile",
+        ),
+        "mistral" => (
+            "mistral",
+            "MISTRAL_API_KEY",
+            "https://api.mistral.ai/v1",
+            "mistral-large-latest",
+        ),
+        "together" => (
+            "together",
+            "TOGETHER_API_KEY",
+            "https://api.together.xyz/v1",
+            "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+        ),
+        "zhipu" => (
+            "zhipu",
+            "ZHIPU_API_KEY",
+            "https://open.bigmodel.cn/api/paas/v4",
+            "glm-4.7",
+        ),
+        "custom" => (
+            "openai",
+            "OPENAI_API_KEY",
+            "https://api.openai.com/v1",
+            "gpt-5.4",
+        ),
+        _ => (
+            "openai",
+            "OPENAI_API_KEY",
+            "https://api.openai.com/v1",
+            "gpt-5.4",
+        ),
+    }
+}
+
+fn finish_codex_oauth() -> Option<SetupResult> {
+    println!();
+    println!(
+        "  {} Opening browser for ChatGPT / Codex sign-in…",
+        "→".dark_cyan().bold()
+    );
+    match run_codex_browser_login() {
+        Ok(path) => {
+            println!(
+                "  {} Signed in. Session saved to {}",
+                "✓".green(),
+                path.display()
+            );
+            let result = SetupResult {
+                api_key: String::new(),
+                auth_mode: "codex_chatgpt".into(),
+                provider: "openai".into(),
+                base_url: Some("https://chatgpt.com/backend-api/codex".into()),
+                model: Some("gpt-5.5".into()),
+                theme: "auto".into(),
+                permission_mode: "accept_edits".into(),
+            };
+            write_config(&result);
+            print_ready_tips(&result);
+            Some(result)
+        }
+        Err(e) => {
+            println!("  {} Sign-in failed: {e}", "✗".red());
+            println!("  {}", "Retry later with: agent login codex".yellow());
+            None
+        }
+    }
+}
+
+fn finish_xai_oauth() -> Option<SetupResult> {
+    println!();
+    println!(
+        "  {} SuperGrok / X Premium device sign-in…",
+        "→".dark_cyan().bold()
+    );
     match run_xai_device_login() {
         Ok(path) => {
             println!(
@@ -241,7 +521,6 @@ pub fn run_setup() -> Option<SetupResult> {
                 "✓".green(),
                 path.display()
             );
-            println!();
             let result = SetupResult {
                 api_key: String::new(),
                 auth_mode: "xai_oauth".into(),
@@ -252,89 +531,15 @@ pub fn run_setup() -> Option<SetupResult> {
                 permission_mode: "accept_edits".into(),
             };
             write_config(&result);
+            print_ready_tips(&result);
             Some(result)
         }
         Err(e) => {
             println!("  {} Sign-in failed: {e}", "✗".red());
-            println!(
-                "  {}",
-                "Set XAI_API_KEY / OPENAI_API_KEY / AGENT_CODE_API_KEY, or run:".yellow()
-            );
-            println!("    {}", "agent login xai   ·  agent login codex".yellow());
-            println!();
+            println!("  {}", "Retry later with: agent login xai".yellow());
             None
         }
     }
-}
-
-/// Legacy multi-step wizard (Appearance → Sign-in → Permissions → Safety).
-///
-/// Kept for explicit re-runs / tests; interactive first launch uses
-/// [`run_setup`] instead.
-#[allow(dead_code)]
-pub fn run_setup_wizard_legacy() -> Option<SetupResult> {
-    run_setup_wizard_legacy_impl()
-}
-
-fn print_hero() {
-    let version = env!("CARGO_PKG_VERSION");
-    println!();
-    println!(
-        "  {}",
-        "╭──────────────────────────────────────────────────────────╮".dark_cyan()
-    );
-    println!(
-        "  {}  {}{}{}  {}",
-        "│".dark_cyan(),
-        "agent-code".white().bold(),
-        "  v".dark_grey(),
-        version.dark_grey(),
-        "                               │".dark_cyan()
-    );
-    println!(
-        "  {}  {}  {}",
-        "│".dark_cyan(),
-        "Open-source AI coding agent · multi-provider · MIT".dark_grey(),
-        " │".dark_cyan()
-    );
-    println!(
-        "  {}",
-        "╰──────────────────────────────────────────────────────────╯".dark_cyan()
-    );
-    println!();
-    println!(
-        "  {} fullscreen TUI · headless · ACP · no default telemetry",
-        "▸".dark_cyan()
-    );
-    println!();
-    println!(
-        "  {}  {}  {}  {}",
-        "1 Appearance".white().bold(),
-        "→".dark_grey(),
-        "2 Sign-in".dark_grey(),
-        "→ 3 Permissions → 4 Safety".dark_grey()
-    );
-    println!();
-    println!(
-        "  {}  ↑/↓ move · Enter select · Esc keeps highlight",
-        "Keys".dark_grey()
-    );
-    println!();
-}
-
-fn print_step(step: u8, title: &str) {
-    let bar: String = (1..=TOTAL_STEPS)
-        .map(|i| if i <= step { "●" } else { "○" })
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!();
-    println!(
-        "  {}  {}  {}",
-        format!("{step}/{TOTAL_STEPS}").dark_cyan().bold(),
-        bar.dark_cyan(),
-        title.white().bold()
-    );
-    println!();
 }
 
 fn print_ready_tips(result: &SetupResult) {
@@ -413,508 +618,6 @@ fn print_ready_tips(result: &SetupResult) {
 }
 
 /// Legacy multi-step interactive wizard implementation.
-fn run_setup_wizard_legacy_impl() -> Option<SetupResult> {
-    print_hero();
-
-    // Step 1: Theme.
-    print_step(1, "Appearance");
-    let theme = select(&[
-        SelectOption {
-            label: "Midnight".into(),
-            description: "(dark, recommended)".into(),
-            value: "midnight".into(),
-            preview: Some(
-                "\x1b[48;2;24;24;36m\x1b[38;2;86;182;194m  fn \x1b[38;2;198;160;246mmain\x1b[38;2;204;204;204m() {\x1b[0m\n\
-                 \x1b[48;2;24;24;36m\x1b[38;2;204;204;204m      \x1b[38;2;86;182;194mlet\x1b[38;2;204;204;204m msg = \x1b[38;2;152;195;121m\"hello world\"\x1b[38;2;204;204;204m;\x1b[0m\n\
-                 \x1b[48;2;24;24;36m\x1b[38;2;204;204;204m      println!(\x1b[38;2;152;195;121m\"{}\"\x1b[38;2;204;204;204m, msg);\x1b[0m\n\
-                 \x1b[48;2;24;24;36m\x1b[38;2;204;204;204m  }\x1b[0m\n\
-                 \x1b[48;2;24;24;36m\x1b[38;2;86;182;194m  // \x1b[38;2;106;115;125mfast and minimal\x1b[0m".to_string(),
-            ),
-        },
-        SelectOption {
-            label: "Daybreak".into(),
-            description: "(light)".into(),
-            value: "daybreak".into(),
-            preview: Some(
-                "\x1b[48;2;253;246;227m\x1b[38;2;38;139;210m  fn \x1b[38;2;108;113;196mmain\x1b[38;2;55;65;81m() {\x1b[0m\n\
-                 \x1b[48;2;253;246;227m\x1b[38;2;55;65;81m      \x1b[38;2;38;139;210mlet\x1b[38;2;55;65;81m msg = \x1b[38;2;133;153;0m\"hello world\"\x1b[38;2;55;65;81m;\x1b[0m\n\
-                 \x1b[48;2;253;246;227m\x1b[38;2;55;65;81m      println!(\x1b[38;2;133;153;0m\"{}\"\x1b[38;2;55;65;81m, msg);\x1b[0m\n\
-                 \x1b[48;2;253;246;227m\x1b[38;2;55;65;81m  }\x1b[0m\n\
-                 \x1b[48;2;253;246;227m\x1b[38;2;38;139;210m  // \x1b[38;2;147;161;161mclean and bright\x1b[0m".to_string(),
-            ),
-        },
-        SelectOption {
-            label: "Midnight Muted".into(),
-            description: "(dark, softer contrast)".into(),
-            value: "midnight-muted".into(),
-            preview: Some(
-                "\x1b[48;2;40;44;52m\x1b[38;2;97;175;239m  fn \x1b[38;2;198;120;221mmain\x1b[38;2;171;178;191m() {\x1b[0m\n\
-                 \x1b[48;2;40;44;52m\x1b[38;2;171;178;191m      \x1b[38;2;97;175;239mlet\x1b[38;2;171;178;191m msg = \x1b[38;2;152;195;121m\"hello world\"\x1b[38;2;171;178;191m;\x1b[0m\n\
-                 \x1b[48;2;40;44;52m\x1b[38;2;171;178;191m      println!(\x1b[38;2;152;195;121m\"{}\"\x1b[38;2;171;178;191m, msg);\x1b[0m\n\
-                 \x1b[48;2;40;44;52m\x1b[38;2;171;178;191m  }\x1b[0m\n\
-                 \x1b[48;2;40;44;52m\x1b[38;2;97;175;239m  // \x1b[38;2;92;99;112measy on the eyes\x1b[0m".to_string(),
-            ),
-        },
-        SelectOption {
-            label: "Daybreak Muted".into(),
-            description: "(light, softer contrast)".into(),
-            value: "daybreak-muted".into(),
-            preview: Some(
-                "\x1b[48;2;250;244;235m\x1b[38;2;66;133;244m  fn \x1b[38;2;140;100;200mmain\x1b[38;2;80;90;100m() {\x1b[0m\n\
-                 \x1b[48;2;250;244;235m\x1b[38;2;80;90;100m      \x1b[38;2;66;133;244mlet\x1b[38;2;80;90;100m msg = \x1b[38;2;80;160;80m\"hello world\"\x1b[38;2;80;90;100m;\x1b[0m\n\
-                 \x1b[48;2;250;244;235m\x1b[38;2;80;90;100m      println!(\x1b[38;2;80;160;80m\"{}\"\x1b[38;2;80;90;100m, msg);\x1b[0m\n\
-                 \x1b[48;2;250;244;235m\x1b[38;2;80;90;100m  }\x1b[0m\n\
-                 \x1b[48;2;250;244;235m\x1b[38;2;66;133;244m  // \x1b[38;2;160;170;180mgentle warmth\x1b[0m".to_string(),
-            ),
-        },
-        SelectOption {
-            label: "Terminal Native".into(),
-            description: "(uses your terminal colors)".into(),
-            value: "terminal".into(),
-            preview: Some(
-                "\x1b[36m  fn \x1b[35mmain\x1b[0m() {\n\
-                 \x1b[0m      \x1b[36mlet\x1b[0m msg = \x1b[32m\"hello world\"\x1b[0m;\n\
-                 \x1b[0m      println!(\x1b[32m\"{}\"\x1b[0m, msg);\n\
-                 \x1b[0m  }\n\
-                 \x1b[36m  // \x1b[90myour colors, your way\x1b[0m".to_string(),
-            ),
-        },
-        SelectOption {
-            label: "Auto".into(),
-            description: "(follows system dark/light mode)".into(),
-            value: "auto".into(),
-            preview: Some(
-                "\x1b[90m  Detects your system preference\n\
-                 \x1b[90m  and switches between Midnight\n\
-                 \x1b[90m  and Daybreak automatically.\n\
-                 \x1b[0m\n\
-                 ".to_string(),
-            ),
-        },
-    ]);
-    println!();
-
-    // Step 2: Provider / auth method.
-    // Subscription OAuth sits first so new users with a ChatGPT plan
-    // don't have to know about API keys (or `agent login`).
-    print_step(2, "Sign-in / provider");
-    let provider_choice = select(&[
-        SelectOption {
-            label: "ChatGPT / Codex subscription".into(),
-            description: "Sign in with OpenAI account in browser (no API key)".into(),
-            value: "codex_subscription".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "SuperGrok / X Premium subscription".into(),
-            description: "xAI Grok OAuth device sign-in (no XAI_API_KEY)".into(),
-            value: "xai_subscription".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "OpenAI API key".into(),
-            description: "GPT-5.4, GPT-4.1 — paste OPENAI_API_KEY".into(),
-            value: "openai".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Anthropic (Claude)".into(),
-            description: "Opus, Sonnet, Haiku — API key".into(),
-            value: "anthropic".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "xAI (Grok) API key".into(),
-            description: "Grok models — paste XAI_API_KEY".into(),
-            value: "xai".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Google (Gemini)".into(),
-            description: "Gemini 2.5 Flash/Pro".into(),
-            value: "google".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "DeepSeek".into(),
-            description: "DeepSeek-V3".into(),
-            value: "deepseek".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Groq".into(),
-            description: "Llama, Mixtral (fast inference)".into(),
-            value: "groq".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Mistral".into(),
-            description: "Mistral Large, Codestral".into(),
-            value: "mistral".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Together".into(),
-            description: "Llama, Qwen, 100+ open models".into(),
-            value: "together".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Zhipu (z.ai)".into(),
-            description: "GLM-4.7, GLM-4.6, GLM-4.5".into(),
-            value: "zhipu".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Ollama (local)".into(),
-            description: "Run models locally, no API key needed".into(),
-            value: "ollama".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Other".into(),
-            description: "(OpenAI-compatible endpoint)".into(),
-            value: "custom".into(),
-            preview: None,
-        },
-    ]);
-
-    // ---- Subscription OAuth paths (ChatGPT / SuperGrok) ----
-    if provider_choice == "codex_subscription" || provider_choice == "xai_subscription" {
-        print_step(3, "Permission mode");
-        let permission_mode = select_permission_mode();
-        print_step(4, "Safety");
-        print_safety_notes();
-
-        let result = if provider_choice == "codex_subscription" {
-            println!(
-                "  {} Opening browser for ChatGPT / Codex sign-in…\n",
-                "→".dark_cyan().bold()
-            );
-            println!(
-                "    Complete the flow in your browser. This reuses the same session as the Codex CLI.\n"
-            );
-            match run_codex_browser_login() {
-                Ok(path) => {
-                    println!(
-                        "    {} Signed in. Session saved to {}",
-                        "✓".green(),
-                        path.display()
-                    );
-                }
-                Err(e) => {
-                    println!("    {} Browser sign-in failed: {e}", "✗".red());
-                    println!("    {}", "Retry later with: agent login codex".yellow());
-                    println!();
-                    return None;
-                }
-            }
-            SetupResult {
-                api_key: String::new(),
-                auth_mode: "codex_chatgpt".into(),
-                provider: "openai".into(),
-                base_url: Some("https://chatgpt.com/backend-api/codex".into()),
-                model: Some("gpt-5.5".into()),
-                theme: theme.clone(),
-                permission_mode,
-            }
-        } else {
-            println!(
-                "  {} SuperGrok / X Premium device sign-in…\n",
-                "→".dark_cyan().bold()
-            );
-            println!("    A verification URL and code will be printed; approve in your browser.\n");
-            match run_xai_device_login() {
-                Ok(path) => {
-                    println!(
-                        "    {} Signed in. Session saved to {}",
-                        "✓".green(),
-                        path.display()
-                    );
-                }
-                Err(e) => {
-                    println!("    {} Sign-in failed: {e}", "✗".red());
-                    println!("    {}", "Retry later with: agent login xai".yellow());
-                    println!();
-                    return None;
-                }
-            }
-            SetupResult {
-                api_key: String::new(),
-                auth_mode: "xai_oauth".into(),
-                provider: "xai".into(),
-                base_url: Some("https://api.x.ai/v1".into()),
-                model: Some("grok-build-0.1".into()),
-                theme: theme.clone(),
-                permission_mode,
-            }
-        };
-        println!();
-        write_config(&result);
-        print_ready_tips(&result);
-        return Some(result);
-    }
-
-    let (env_var, default_url, default_model) = match provider_choice.as_str() {
-        "anthropic" => (
-            "ANTHROPIC_API_KEY",
-            "https://api.anthropic.com/v1",
-            "claude-sonnet-4-20250514",
-        ),
-        "xai" => ("XAI_API_KEY", "https://api.x.ai/v1", "grok-3"),
-        "google" => (
-            "GOOGLE_API_KEY",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-2.5-flash",
-        ),
-        "deepseek" => (
-            "DEEPSEEK_API_KEY",
-            "https://api.deepseek.com/v1",
-            "deepseek-chat",
-        ),
-        "groq" => (
-            "GROQ_API_KEY",
-            "https://api.groq.com/openai/v1",
-            "llama-3.3-70b-versatile",
-        ),
-        "mistral" => (
-            "MISTRAL_API_KEY",
-            "https://api.mistral.ai/v1",
-            "mistral-large-latest",
-        ),
-        "together" => (
-            "TOGETHER_API_KEY",
-            "https://api.together.xyz/v1",
-            "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
-        ),
-        "zhipu" => (
-            "ZHIPU_API_KEY",
-            "https://open.bigmodel.cn/api/paas/v4",
-            "glm-4.7",
-        ),
-        "ollama" => ("", "http://localhost:11434/v1", "qwen3:latest"),
-        "custom" => ("AGENT_CODE_API_KEY", "", ""),
-        _ => ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-5.4"),
-    };
-    println!();
-
-    // Handle API key based on provider.
-    let api_key = if provider_choice == "ollama" {
-        // Ollama: no key needed, check if running.
-        println!();
-        println!("    {} No API key needed for local Ollama.", "✓".green());
-        // Check if Ollama is running.
-        match std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "http://localhost:11434/api/tags",
-            ])
-            .output()
-        {
-            Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "200" => {
-                println!("    {} Ollama is running at localhost:11434", "✓".green());
-            }
-            _ => {
-                println!(
-                    "    {} Ollama not detected. Start it with: {}",
-                    "!".yellow(),
-                    "ollama serve".bold()
-                );
-            }
-        }
-
-        // Let user pick a model.
-        println!();
-        println!("  {} Ollama model:\n", "  ".dark_cyan().bold());
-        let ollama_model = select(&[
-            SelectOption {
-                label: "qwen3:latest".into(),
-                description: "8B, tool use, recommended".into(),
-                value: "qwen3:latest".into(),
-                preview: None,
-            },
-            SelectOption {
-                label: "mistral:latest".into(),
-                description: "7B, tool use".into(),
-                value: "mistral:latest".into(),
-                preview: None,
-            },
-            SelectOption {
-                label: "mistral-nemo:latest".into(),
-                description: "12B, tool use".into(),
-                value: "mistral-nemo:latest".into(),
-                preview: None,
-            },
-            SelectOption {
-                label: "llama4:latest".into(),
-                description: "109B, tool use".into(),
-                value: "llama4:latest".into(),
-                preview: None,
-            },
-            SelectOption {
-                label: "Other".into(),
-                description: "(type model name)".into(),
-                value: "_other_".into(),
-                preview: None,
-            },
-        ]);
-
-        // Override model if user picked from list.
-        let ollama_model_name = if ollama_model != "_other_" {
-            ollama_model
-        } else {
-            eprint!("  Model name (e.g. qwen3:latest): ");
-            let _ = std::io::stderr().flush();
-            let mut m = String::new();
-            let _ = std::io::stdin().read_line(&mut m);
-            let m = m.trim().to_string();
-            if m.is_empty() {
-                "qwen3:latest".to_string()
-            } else {
-                m
-            }
-        };
-
-        println!();
-        println!("  {} Permission mode:\n", "3.".dark_cyan().bold());
-        let pm = select(&[
-            SelectOption {
-                label: "Ask before changes".into(),
-                description: "(recommended)".into(),
-                value: "ask".into(),
-                preview: None,
-            },
-            SelectOption {
-                label: "Trust fully".into(),
-                description: "everything runs without asking".into(),
-                value: "allow".into(),
-                preview: None,
-            },
-        ]);
-        println!();
-
-        let result = SetupResult {
-            api_key: "ollama".to_string(),
-            auth_mode: "api_key".into(),
-            provider: "ollama".to_string(),
-            base_url: Some(default_url.to_string()),
-            model: Some(ollama_model_name),
-            theme: theme.clone(),
-            permission_mode: pm,
-        };
-        write_config(&result);
-        return Some(result);
-    } else {
-        // Cloud provider: check for existing key.
-        let existing_key = std::env::var(env_var)
-            .ok()
-            .or_else(|| std::env::var("AGENT_CODE_API_KEY").ok());
-
-        if let Some(ref key) = existing_key {
-            let masked = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
-            } else {
-                "****".to_string()
-            };
-            println!("    {} found in env ({masked})", env_var.green());
-        }
-
-        // Always ask for API key — user can press Enter to keep the env key,
-        // or paste a new one to override.
-        let hint = if existing_key.is_some() {
-            "  Paste API key (Enter to keep existing, or paste new): ".to_string()
-        } else {
-            format!("  Paste your {env_var}: ")
-        };
-        eprint!("{hint}");
-        let _ = std::io::stderr().flush();
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        let pasted = input.trim().to_string();
-
-        let key = if pasted.is_empty() {
-            if let Some(env_key) = existing_key {
-                env_key
-            } else {
-                println!(
-                    "    {}",
-                    format!("Set {env_var} before running agent.").yellow()
-                );
-                String::new()
-            }
-        } else {
-            pasted
-        };
-        println!();
-        key
-    };
-
-    // Custom provider: ask for URL and model.
-    let (base_url, model) = if provider_choice == "custom" {
-        eprint!("  Base URL: ");
-        let _ = std::io::stderr().flush();
-        let mut url = String::new();
-        let _ = std::io::stdin().read_line(&mut url);
-        let url = url.trim().to_string();
-
-        eprint!("  Model name: ");
-        let _ = std::io::stderr().flush();
-        let mut m = String::new();
-        let _ = std::io::stdin().read_line(&mut m);
-        let m = m.trim().to_string();
-        println!();
-        (
-            if url.is_empty() {
-                "https://api.openai.com/v1".to_string()
-            } else {
-                url
-            },
-            if m.is_empty() {
-                "gpt-5.4".to_string()
-            } else {
-                m
-            },
-        )
-    } else {
-        (default_url.to_string(), default_model.to_string())
-    };
-
-    // Step 3: Permission mode.
-    print_step(3, "Permission mode");
-    let permission_mode = select_permission_mode();
-
-    // Step 4: Safety notes.
-    print_step(4, "Safety");
-    print_safety_notes();
-
-    let result = SetupResult {
-        api_key,
-        auth_mode: "api_key".into(),
-        provider: provider_choice,
-        base_url: Some(base_url),
-        model: Some(model),
-        theme,
-        permission_mode,
-    };
-    write_config(&result);
-    print_ready_tips(&result);
-
-    Some(result)
-}
-
-/// Render the `config.toml` body for a setup result.
-///
-/// Built through the `toml` serializer rather than string formatting so
-/// every value — most importantly the API key, which can legitimately
-/// contain `\`, `"`, or other TOML metacharacters on OpenAI-compatible
-/// "Other" endpoints — is escaped correctly. Hand-formatting silently
-/// corrupted such keys (`\b` became a backspace, a `"` made the file
-/// unparseable), so the key was effectively forgotten on the next
-/// launch even though setup appeared to succeed (see issue #288).
 fn render_config_toml(result: &SetupResult) -> String {
     let base_url = result
         .base_url
@@ -1016,6 +719,7 @@ fn write_config_impl(result: &SetupResult, announce: bool) {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SetupResult {
     pub api_key: String,
     /// `"api_key"` (default) or `"codex_chatgpt"` for ChatGPT subscription.
@@ -1027,65 +731,6 @@ pub struct SetupResult {
     pub permission_mode: String,
 }
 
-fn select_permission_mode() -> String {
-    select(&[
-        SelectOption {
-            label: "Ask before changes".into(),
-            description: "(recommended) confirms before edits and commands".into(),
-            value: "ask".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Auto-approve edits".into(),
-            description: "file changes automatic, commands still ask".into(),
-            value: "accept_edits".into(),
-            preview: None,
-        },
-        SelectOption {
-            label: "Trust fully".into(),
-            description: "everything runs without asking".into(),
-            value: "allow".into(),
-            preview: None,
-        },
-    ])
-}
-
-fn print_safety_notes() {
-    println!(
-        "    {} Can read, write, and delete project files",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} Can run shell commands on this machine",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} Destructive patterns warn; .git / node_modules writes blocked",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} Shift+Tab → Plan for read-only exploration",
-        "•".dark_grey()
-    );
-    println!(
-        "    {} No product telemetry by default (opt-in only)",
-        "•".dark_grey()
-    );
-    println!();
-    println!("  {}  Press Enter to continue…", "→".dark_cyan());
-    // Brief pause so the user reads the notes (Enter or any key via select of one option).
-    let _ = select(&[SelectOption {
-        label: "I understand — finish setup".into(),
-        description: String::new(),
-        value: "ok".into(),
-        preview: None,
-    }]);
-}
-
-/// Run the ChatGPT/Codex browser OAuth flow on a dedicated runtime thread.
-///
-/// Setup is sync and may already be running under the main Tokio runtime
-/// (`block_on` from a worker would panic), so we always use a fresh thread.
 fn run_codex_browser_login() -> Result<std::path::PathBuf, String> {
     run_async_login(|| async {
         agent_code_lib::llm::codex_auth::browser_login(None)
@@ -1146,6 +791,34 @@ mod tests {
             agent_code_lib::config::API_KEY_ENV_VARS,
             "keep ENV_KEY_CANDIDATES in the same order as API_KEY_ENV_VARS"
         );
+    }
+
+    #[test]
+    fn default_setup_does_not_pin_a_vendor() {
+        let d = default_setup_result();
+        assert!(
+            d.provider.is_empty() && d.base_url.is_none() && d.model.is_none(),
+            "silent defaults must not invent a provider: {d:?}"
+        );
+    }
+
+    #[test]
+    fn map_cli_provider_aliases() {
+        assert_eq!(map_cli_provider("claude"), "anthropic");
+        assert_eq!(map_cli_provider("grok"), "xai");
+        assert_eq!(map_cli_provider("codex"), "codex_subscription");
+        assert_eq!(map_cli_provider("openai"), "openai");
+    }
+
+    #[test]
+    fn api_key_defaults_cover_main_providers() {
+        let (_, env, url, _) = api_key_provider_defaults("anthropic");
+        assert_eq!(env, "ANTHROPIC_API_KEY");
+        assert!(url.contains("anthropic"));
+        let (p, env, _, model) = api_key_provider_defaults("xai");
+        assert_eq!(p, "xai");
+        assert_eq!(env, "XAI_API_KEY");
+        assert!(model.contains("grok"));
     }
 
     #[test]
