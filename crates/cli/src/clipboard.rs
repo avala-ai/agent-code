@@ -345,6 +345,9 @@ fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Process-wide env mutations (PATH/TMUX) must not race other tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn base64_encode_known_vectors() {
         assert_eq!(base64_encode(b""), "");
@@ -409,9 +412,16 @@ mod tests {
         // empty PATH and no TMUX, native fails. OSC 52 may still succeed by
         // writing to stdout — so only assert we get *some* Result that is
         // either Ok(osc52) or Err. Prefer: clear TMUX too.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_path = std::env::var_os("PATH");
         let prev_tmux = std::env::var_os("TMUX");
-        // SAFETY: single-threaded test, restored before exit.
+        let prev_ssh = (
+            std::env::var_os("SSH_CONNECTION"),
+            std::env::var_os("SSH_TTY"),
+            std::env::var_os("SSH_CLIENT"),
+        );
+        let prev_display = std::env::var_os("DISPLAY");
+        // SAFETY: held under ENV_LOCK; restored before unlock.
         unsafe {
             std::env::set_var("PATH", "");
             std::env::remove_var("TMUX");
@@ -431,6 +441,22 @@ mod tests {
             match prev_tmux {
                 Some(v) => std::env::set_var("TMUX", v),
                 None => std::env::remove_var("TMUX"),
+            }
+            match prev_ssh.0 {
+                Some(v) => std::env::set_var("SSH_CONNECTION", v),
+                None => std::env::remove_var("SSH_CONNECTION"),
+            }
+            match prev_ssh.1 {
+                Some(v) => std::env::set_var("SSH_TTY", v),
+                None => std::env::remove_var("SSH_TTY"),
+            }
+            match prev_ssh.2 {
+                Some(v) => std::env::set_var("SSH_CLIENT", v),
+                None => std::env::remove_var("SSH_CLIENT"),
+            }
+            match prev_display {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
             }
         }
         // With empty PATH, native fails; OSC 52 write to stdout should still work.
