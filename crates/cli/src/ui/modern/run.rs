@@ -472,6 +472,13 @@ pub async fn run_modern_tui(
     .await;
     restore_terminal(&mut terminal)?;
 
+    // Louder than a log line: the session is gone and `/resume` will not
+    // show it.
+    if let Some(e) = app.exit_save_error.as_deref() {
+        eprintln!("\nWarning: this session could not be saved ({e}).");
+        eprintln!("It will not appear in /resume.");
+    }
+
     // Don't silently lose prompts queued but never sent (plan §M5).
     if !app.queue.is_empty() {
         println!("\nUnsent queued prompts:");
@@ -863,15 +870,6 @@ pub(super) async fn event_loop(
     // which one is in flight, and the two are compared rather than
     // conflated.
     let mut loading_now: Vec<u64> = Vec::new();
-    // The checkpoint write in flight, if any. `save_session_full` does an
-    // unlocked read-modify-write with `std::fs::write` — it re-reads the
-    // file to preserve `created_at`, `label` and `tags`, and the write is
-    // not atomic. Two overlapping writes can therefore interleave into
-    // invalid JSON, and an older snapshot finishing last silently discards
-    // newer turns or a label just set by `/rename`. One slot, awaited
-    // before the next write starts and drained before exit, keeps them
-    // strictly ordered.
-    let mut pending_save: Option<tokio::task::JoinHandle<()>> = None;
     let mut resume_cap_warned = false;
 
     /// How many session reads may be outstanding at once.
@@ -1840,27 +1838,6 @@ pub(super) async fn event_loop(
                         app.turn_count = eng.state().turn_count;
                         app.model = eng.state().config.api.model.clone();
 
-                        // Checkpoint now that the turn is reaped and the
-                        // engine's totals are final. Only the copy happens
-                        // under the lock — serializing, masking and writing
-                        // the whole history would stall input and repaint on
-                        // every turn, which is the freeze the off-thread
-                        // session load exists to avoid.
-                        if let Some(snap) = session_snapshot(&eng) {
-                            // Await the previous checkpoint rather than
-                            // racing it. Turns finish sequentially, so this
-                            // is normally already complete; when it is not,
-                            // waiting is the point.
-                            if let Some(prev) = pending_save.take() {
-                                let _ = prev.await;
-                            }
-                            pending_save = Some(tokio::task::spawn_blocking(move || {
-                                if let Err(e) = write_session_snapshot(&snap) {
-                                    tracing::warn!("could not save session: {e}");
-                                }
-                            }));
-                        }
-
                         // The model can toggle plan mode itself
                         // (EnterPlanMode/ExitPlanMode tools). Sync the badge
                         // — and the permission override — back from the
@@ -2287,19 +2264,27 @@ pub(super) async fn event_loop(
     // at a permission prompt. Written inline rather than off-thread —
     // there is no UI left to keep responsive, and the write must finish
     // before the process exits.
-    // Drain the outstanding checkpoint first: the final save re-reads the
-    // file, so letting a detached write land afterwards would put an older
-    // snapshot on disk last.
-    if let Some(prev) = pending_save.take() {
-        let _ = prev.await;
-    }
+    // Save last, and only once the turn is joined: a live turn holds the
+    // engine mutex for the whole of `run_turn_spawned`, so locking before
+    // the cancel above deadlocks teardown on any exit during streaming or
+    // at a permission prompt.
+    //
+    // Inline and single: nothing is left to keep responsive, the write
+    // must finish before the process exits, and there is no second writer
+    // in flight to race. Per-turn checkpointing needs the write itself to
+    // be atomic and serialized in the service — cron writes these files
+    // from another process, which no in-process ordering can reach.
     {
         let engine_arc = session.engine();
         let eng = engine_arc.lock().await;
         if let Some(snap) = session_snapshot(&eng)
             && let Err(e) = write_session_snapshot(&snap)
         {
-            tracing::warn!("could not save session on exit: {e}");
+            // Not `tracing`: interactive runs redirect it to
+            // `<config>/logs/agent.log`, so a failed save would be
+            // invisible and the user would believe the work was kept.
+            // The caller prints this once the terminal is restored.
+            app.exit_save_error = Some(e);
         }
     }
 

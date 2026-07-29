@@ -419,6 +419,12 @@ pub struct App {
     /// written for. The fields are private for that reason; see
     /// [`super::session_work`].
     pub work: super::session_work::SessionWork,
+    /// Why the conversation could not be written on exit, if it could
+    /// not. Reported by the caller after the terminal is restored: a
+    /// user who loses their session must be told, and tracing goes to a
+    /// log file in interactive runs.
+    pub exit_save_error: Option<String>,
+
     /// Whether a turn task currently exists (set by the run loop). Lets
     /// modal resolution decide between returning to Streaming (turn still
     /// running) and Idle (modal outlived its turn).
@@ -697,6 +703,7 @@ impl App {
             hit_registry: Default::default(),
             should_quit: false,
             work: super::session_work::SessionWork::default(),
+            exit_save_error: None,
             turn_live: false,
             transcript_bottom_row: 0,
             queue: std::collections::VecDeque::new(),
