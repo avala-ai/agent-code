@@ -863,6 +863,15 @@ pub(super) async fn event_loop(
     // which one is in flight, and the two are compared rather than
     // conflated.
     let mut loading_now: Vec<u64> = Vec::new();
+    // The checkpoint write in flight, if any. `save_session_full` does an
+    // unlocked read-modify-write with `std::fs::write` — it re-reads the
+    // file to preserve `created_at`, `label` and `tags`, and the write is
+    // not atomic. Two overlapping writes can therefore interleave into
+    // invalid JSON, and an older snapshot finishing last silently discards
+    // newer turns or a label just set by `/rename`. One slot, awaited
+    // before the next write starts and drained before exit, keeps them
+    // strictly ordered.
+    let mut pending_save: Option<tokio::task::JoinHandle<()>> = None;
     let mut resume_cap_warned = false;
 
     /// How many session reads may be outstanding at once.
@@ -1838,11 +1847,18 @@ pub(super) async fn event_loop(
                         // every turn, which is the freeze the off-thread
                         // session load exists to avoid.
                         if let Some(snap) = session_snapshot(&eng) {
-                            tokio::task::spawn_blocking(move || {
+                            // Await the previous checkpoint rather than
+                            // racing it. Turns finish sequentially, so this
+                            // is normally already complete; when it is not,
+                            // waiting is the point.
+                            if let Some(prev) = pending_save.take() {
+                                let _ = prev.await;
+                            }
+                            pending_save = Some(tokio::task::spawn_blocking(move || {
                                 if let Err(e) = write_session_snapshot(&snap) {
                                     tracing::warn!("could not save session: {e}");
                                 }
-                            });
+                            }));
                         }
 
                         // The model can toggle plan mode itself
@@ -2271,6 +2287,12 @@ pub(super) async fn event_loop(
     // at a permission prompt. Written inline rather than off-thread —
     // there is no UI left to keep responsive, and the write must finish
     // before the process exits.
+    // Drain the outstanding checkpoint first: the final save re-reads the
+    // file, so letting a detached write land afterwards would put an older
+    // snapshot on disk last.
+    if let Some(prev) = pending_save.take() {
+        let _ = prev.await;
+    }
     {
         let engine_arc = session.engine();
         let eng = engine_arc.lock().await;
