@@ -95,7 +95,18 @@ action = "deny"
 tool = "FileWrite"
 pattern = "/tmp/*"
 action = "allow"
+
+# Deny fetches against an internal host
+[[permissions.rules]]
+tool = "WebFetch"
+pattern = "*internal.example.com*"
+action = "deny"
 ```
+
+For non-shell tools, `pattern` is matched against the tool's subject
+fields (`file_path`, `url`, `path`, `pattern`, `query`, `prompt`). Any
+present field may match. If none of those fields is present, a patterned
+rule fails closed: `allow` does not grant, and `deny`/`ask` still apply.
 
 Rules resolve by **severity, not by position**: `deny` beats `ask`, which beats
 `allow`. If no rule matches, the default mode applies.

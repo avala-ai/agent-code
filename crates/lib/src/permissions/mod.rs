@@ -452,6 +452,21 @@ fn decision_is_widening(decision: &PermissionDecision) -> bool {
     matches!(decision, PermissionDecision::Allow)
 }
 
+/// Top-level string fields permission patterns are written against.
+///
+/// Order does not matter for matching: a rule matches when **any** of
+/// these that are present matches the pattern. Tools whose subject is
+/// not in this list (and that do not carry `command`) hit the fail-closed
+/// branch below rather than a silent empty-string match.
+const PATTERN_INPUT_FIELDS: &[&str] = &[
+    "file_path", // FileRead / FileWrite / FileEdit / MultiEdit / NotebookEdit
+    "url",       // WebFetch
+    "path",      // Grep / Glob
+    "pattern",   // Grep / Glob (search pattern)
+    "query",     // WebSearch / ToolSearch
+    "prompt",    // Agent / CronCreate
+];
+
 fn matches_input_pattern(
     pattern: &str,
     input: &serde_json::Value,
@@ -472,14 +487,37 @@ fn matches_input_pattern(
         return glob_match(pattern, command);
     }
 
-    // Match against common input fields: file_path, pattern.
-    let input_str = input
-        .get("file_path")
-        .or_else(|| input.get("pattern"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // A pure-wildcard pattern has no specificity to protect: it means
+    // "this tool, any input". Matching it against individual fields
+    // would only fail tools that happen to omit every known key.
+    if !pattern.is_empty() && pattern.chars().all(|c| c == '*') {
+        return true;
+    }
 
-    glob_match(pattern, input_str)
+    // Match against every known subject field that is present. Any hit
+    // counts: a deny on `url` must not be defeated by a missing
+    // `file_path`, and a Grep rule may target either `path` or the
+    // search `pattern`.
+    let mut saw_comparable = false;
+    for key in PATTERN_INPUT_FIELDS {
+        if let Some(value) = input.get(*key).and_then(|v| v.as_str()) {
+            saw_comparable = true;
+            if glob_match(pattern, value) {
+                return true;
+            }
+        }
+    }
+    if saw_comparable {
+        return false;
+    }
+
+    // No comparable field at all. The old code fell through to
+    // `glob_match(pattern, "")`, which can never match a pattern with a
+    // literal character — so a deny rule on `url` (or any other key we
+    // had not listed) loaded, evaluated, and silently did nothing.
+    // Fail closed instead: widening must not grant, restricting must
+    // not miss.
+    !widening
 }
 
 /// Match `pattern` against a shell command, asymmetrically by action.
@@ -1571,6 +1609,115 @@ mod tests {
             assert!(
                 !matches_input_pattern("FIXME", &input, widening, "Grep"),
                 "widening={widening}"
+            );
+        }
+    }
+
+    /// WebFetch's subject is `url`. Matching only `file_path`/`pattern`
+    /// made every URL-targeted rule fall through to `glob_match(_, "")`,
+    /// which never matches a literal — so a deny rule silently failed open.
+    #[test]
+    fn a_deny_rule_on_url_blocks_matching_webfetch() {
+        let c = checker(vec![rule(
+            "WebFetch",
+            "*internal.example.com*",
+            PermissionMode::Deny,
+        )]);
+        assert!(
+            matches!(
+                c.check(
+                    "WebFetch",
+                    &serde_json::json!({"url": "https://api.internal.example.com/v1"})
+                ),
+                PermissionDecision::Deny(_)
+            ),
+            "deny rule targeting url must block a matching fetch"
+        );
+        // Non-matching URL falls through to the default (Ask here).
+        assert!(
+            matches!(
+                c.check(
+                    "WebFetch",
+                    &serde_json::json!({"url": "https://example.com"})
+                ),
+                PermissionDecision::Ask(_)
+            ),
+            "a non-matching url must not be caught by the deny"
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_on_url_grants_matching_webfetch() {
+        let c = PermissionChecker::from_config(&PermissionsConfig {
+            default_mode: PermissionMode::Deny,
+            rules: vec![rule(
+                "WebFetch",
+                "https://docs.example.com/*",
+                PermissionMode::Allow,
+            )],
+            ..Default::default()
+        });
+        assert!(matches!(
+            c.check(
+                "WebFetch",
+                &serde_json::json!({"url": "https://docs.example.com/guide"})
+            ),
+            PermissionDecision::Allow
+        ));
+        assert!(
+            matches!(
+                c.check(
+                    "WebFetch",
+                    &serde_json::json!({"url": "https://evil.example.com/"})
+                ),
+                PermissionDecision::Deny(_)
+            ),
+            "allow must not grant a url the pattern does not describe"
+        );
+    }
+
+    /// When the input has none of the known subject fields, a pattern
+    /// must not be compared to `""`. Restricting rules apply (fail
+    /// closed); widening rules do not grant.
+    #[test]
+    fn no_comparable_field_fails_closed() {
+        let input = serde_json::json!({"patch": "*** Begin Patch\n*** End Patch\n"});
+        for widening in BOTH_DIRECTIONS {
+            let matched = matches_input_pattern("*.rs", &input, widening, "ApplyPatch");
+            assert_eq!(
+                matched, !widening,
+                "widening={widening}: no comparable field must fail closed"
+            );
+        }
+    }
+
+    /// Grep carries both `path` and `pattern`; a rule may target either.
+    #[test]
+    fn grep_matches_path_or_search_pattern() {
+        let input = serde_json::json!({"path": "src/secrets", "pattern": "TODO"});
+        for widening in BOTH_DIRECTIONS {
+            assert!(
+                matches_input_pattern("src/*", &input, widening, "Grep"),
+                "widening={widening}: path must be matchable"
+            );
+            assert!(
+                matches_input_pattern("TODO", &input, widening, "Grep"),
+                "widening={widening}: search pattern must be matchable"
+            );
+            assert!(
+                !matches_input_pattern("FIXME", &input, widening, "Grep"),
+                "widening={widening}: unrelated pattern must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_universal_pattern_matches_without_subject_fields() {
+        let input = serde_json::json!({"patch": "x"});
+        for widening in BOTH_DIRECTIONS {
+            assert!(
+                matches_input_pattern("*", &input, widening, "ApplyPatch"),
+                "widening={widening}: pure * must still mean any input"
             );
         }
     }
