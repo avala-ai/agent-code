@@ -395,10 +395,7 @@ mod tests {
                 "linux should advertise a PRIMARY reader"
             );
         } else {
-            assert!(
-                primary_candidates().is_empty(),
-                "PRIMARY is Linux-only"
-            );
+            assert!(primary_candidates().is_empty(), "PRIMARY is Linux-only");
         }
     }
 
