@@ -3622,37 +3622,33 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             app.scroll_down(3);
             app.dirty = true;
         }
-        // Jump pill: bottom transcript row → Follow.
-        MouseEventKind::Down(MouseButton::Left)
-            if !app.scroll.is_following()
-                && app.transcript_bottom_row != 0
-                && m.row == app.transcript_bottom_row =>
-        {
-            app.scroll_to_bottom();
-            app.clear_selection();
-        }
         MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
-            // Launch recent row: click resumes (same path as Enter).
-            if let Some(super::hit_rect::HitTarget::LaunchRecent { index }) =
-                app.hit_registry.hit_test(m.column, m.row).cloned()
-                && app.launch.should_draw(app)
-                && index < app.launch.recent.len()
-            {
-                app.launch.selected = index;
-                app.launch_accept();
-                app.dirty = true;
-                return;
-            }
-            // Markdown hyperlink: open in the platform browser.
-            if let Some(super::hit_rect::HitTarget::Hyperlink { url }) =
-                app.hit_registry.hit_test(m.column, m.row).cloned()
-            {
-                match open_hyperlink(&url) {
-                    Ok(()) => app.push_toast(format!("opened {url}")),
-                    Err(e) => app.push_toast(format!("open failed: {e}")),
+            // Hit-registry targets first: a bottom-row link must win over the
+            // jump-to-tail shortcut, which used to swallow the whole row.
+            match app.hit_registry.hit_test(m.column, m.row).cloned() {
+                Some(super::hit_rect::HitTarget::LaunchRecent { index })
+                    if app.launch.should_draw(app) && index < app.launch.recent.len() =>
+                {
+                    app.launch.selected = index;
+                    app.launch_accept();
+                    app.dirty = true;
+                    return;
                 }
-                app.dirty = true;
-                return;
+                Some(super::hit_rect::HitTarget::Hyperlink { url }) => {
+                    match open_hyperlink(&url) {
+                        Ok(()) => app.push_toast(format!("opened {url}")),
+                        Err(e) => app.push_toast(format!("open failed: {e}")),
+                    }
+                    app.dirty = true;
+                    return;
+                }
+                Some(super::hit_rect::HitTarget::Control { id }) if id == "jump_pill" => {
+                    app.scroll_to_bottom();
+                    app.clear_selection();
+                    app.dirty = true;
+                    return;
+                }
+                _ => {}
             }
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 app.selection = Some(super::app::TextSelection {
@@ -3707,37 +3703,74 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Open a transcript hyperlink with the platform browser opener.
+/// Validate and normalize a transcript hyperlink URL.
 ///
-/// Only `http`/`https` (and `mailto:`) are accepted so a crafted markdown
-/// link cannot spawn an arbitrary local process.
-fn open_hyperlink(url: &str) -> Result<(), String> {
+/// Only `http`/`https`/`mailto` are accepted so a crafted markdown link
+/// cannot spawn an arbitrary local process. Rejects ASCII control bytes
+/// (including CR/LF) that could break out of an opener command line.
+fn validate_hyperlink_url(url: &str) -> Result<&str, String> {
     let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("empty url".into());
+    }
+    if trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("url contains control characters".into());
+    }
     let ok = trimmed.starts_with("https://")
         || trimmed.starts_with("http://")
         || trimmed.starts_with("mailto:");
     if !ok {
         return Err("only http(s) and mailto links can be opened".into());
     }
-    // Prefer the same openers the OAuth browser path uses on each OS.
-    #[cfg(target_os = "macos")]
-    let cmd = ("open", vec![trimmed.to_string()]);
-    #[cfg(target_os = "windows")]
-    let cmd = (
-        "cmd",
-        vec!["/C".into(), "start".into(), "".into(), trimmed.to_string()],
-    );
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let cmd = ("xdg-open", vec![trimmed.to_string()]);
+    Ok(trimmed)
+}
 
-    std::process::Command::new(cmd.0)
-        .args(&cmd.1)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", cmd.0))?;
-    Ok(())
+/// Open a transcript hyperlink with the platform browser opener.
+fn open_hyperlink(url: &str) -> Result<(), String> {
+    let trimmed = validate_hyperlink_url(url)?;
+    platform_open_url(trimmed)
+}
+
+/// Platform-specific URL open. Kept separate so tests exercise validation
+/// without spawning a browser (AGENTS.md: hermetic default `cargo test`).
+fn platform_open_url(url: &str) -> Result<(), String> {
+    // Never route the model-authored URL through `cmd.exe /C` — metacharacters
+    // such as `&` would start a second command. Use direct openers instead.
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `rundll32 url.dll,FileProtocolHandler` takes the URL as a single
+        // argument without re-parsing it through cmd's command separators.
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("rundll32: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+        Ok(())
+    }
 }
 
 /// Map a screen row to an absolute layout line in the transcript viewport.
@@ -5264,30 +5297,24 @@ mod tests {
     }
 
     #[test]
-    fn open_hyperlink_rejects_non_http_schemes() {
-        assert!(open_hyperlink("file:///etc/passwd").is_err());
-        assert!(open_hyperlink("javascript:alert(1)").is_err());
-        assert!(open_hyperlink("/local/path").is_err());
+    fn validate_hyperlink_rejects_non_http_schemes() {
+        assert!(validate_hyperlink_url("file:///etc/passwd").is_err());
+        assert!(validate_hyperlink_url("javascript:alert(1)").is_err());
+        assert!(validate_hyperlink_url("/local/path").is_err());
+        // cmd.exe metacharacters must not be a reason to open shell-style.
+        assert!(validate_hyperlink_url("https://example.test/\n&calc.exe").is_err());
     }
 
     #[test]
-    fn open_hyperlink_accepts_http_and_mailto_prefix() {
-        // Do not actually spawn a browser in unit tests — only the scheme
-        // gate is asserted. Spawn success depends on the host opener.
+    fn validate_hyperlink_accepts_http_and_mailto_prefix() {
+        // Hermetic: never spawn a browser from unit tests.
         for url in [
             "https://example.com/x",
             "http://example.com",
             "mailto:dev@example.com",
+            "https://example.test/?a=1&b=2",
         ] {
-            // The function either spawns or fails on missing opener; both
-            // prove the scheme was accepted (not the "only http" error).
-            match open_hyperlink(url) {
-                Ok(()) => {}
-                Err(e) => assert!(
-                    !e.contains("only http"),
-                    "scheme rejected unexpectedly: {e}"
-                ),
-            }
+            assert_eq!(validate_hyperlink_url(url).unwrap(), url);
         }
     }
 

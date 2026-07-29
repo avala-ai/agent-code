@@ -25,6 +25,8 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use unicode_width::UnicodeWidthStr;
+
 use super::colors::palette;
 
 /// A clickable link discovered while rendering (line index + column range +
@@ -172,11 +174,16 @@ impl Builder {
         if self.cur.is_empty() && self.cur_cols == 0 {
             let prefix = self.line_prefix();
             for sp in prefix {
-                self.cur_cols += sp.content.chars().count() as u16;
+                // Display columns, not char counts — must match wrap_one.
+                self.cur_cols = self
+                    .cur_cols
+                    .saturating_add(UnicodeWidthStr::width(sp.content.as_ref()) as u16);
                 self.cur.push(sp);
             }
         }
-        self.cur_cols += text.chars().count() as u16;
+        self.cur_cols = self
+            .cur_cols
+            .saturating_add(UnicodeWidthStr::width(text) as u16);
         self.cur.push(Span::styled(text.to_string(), style));
         self.spans_emitted += 1;
     }

@@ -1445,7 +1445,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Jump-to-bottom pill when reading above the live tail (plan §M2).
     let below = app.scroll.lines_below(total, height);
     if below > 0 {
-        draw_jump_pill(frame, inner, below);
+        draw_jump_pill(frame, inner, below, app);
     }
 }
 
@@ -1519,7 +1519,7 @@ fn draw_empty_conversation_guidance(frame: &mut Frame<'_>, area: Rect) {
 }
 
 /// Floating "↓ N new" pill anchored bottom-right of the transcript area.
-fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
+fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize, app: &mut App) {
     let label = if n > 99 {
         " ↓ 99+ new ".to_string()
     } else {
@@ -1535,6 +1535,14 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize) {
         width: w,
         height: 1,
     };
+    // Register the pill's actual footprint so bottom-row links remain
+    // clickable outside this rectangle.
+    app.hit_registry.register(
+        rect,
+        super::hit_rect::HitTarget::Control {
+            id: "jump_pill".into(),
+        },
+    );
     let accent = palette().accent;
     frame.render_widget(Clear, rect);
     frame.render_widget(

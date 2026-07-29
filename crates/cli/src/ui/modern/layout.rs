@@ -360,8 +360,8 @@ fn scrub_item(item: &TranscriptItem) -> Option<TranscriptItem> {
 /// Map pre-wrap [`LinkSpan`]s onto post-wrap display rows.
 ///
 /// Each logical line becomes one or more display rows (`cont` marks
-/// soft-wrap continuations). A link lands on the first display row of its
-/// logical line; column range is clamped to `width`.
+/// soft-wrap continuations). A link that spans multiple wrap rows emits
+/// one [`LinkSpan`] per display row with local column ranges.
 fn remap_links_through_wrap(links: &[LinkSpan], cont: &[bool], width: u16) -> Vec<LinkSpan> {
     if links.is_empty() || cont.is_empty() {
         return Vec::new();
@@ -373,20 +373,40 @@ fn remap_links_through_wrap(links: &[LinkSpan], cont: &[bool], width: u16) -> Ve
             logical_starts.push(i);
         }
     }
-    let w = width.max(1);
-    links
-        .iter()
-        .filter_map(|l| {
-            let display = *logical_starts.get(l.line)?;
-            let start = l.cols.start.min(w.saturating_sub(1));
-            let end = l.cols.end.clamp(start.saturating_add(1), w);
-            Some(LinkSpan {
-                line: display,
-                cols: start..end,
+    let w = width.max(1) as usize;
+    let mut out = Vec::new();
+    for l in links {
+        let Some(&base) = logical_starts.get(l.line) else {
+            continue;
+        };
+        // How many display rows this logical line occupies.
+        let mut rows = 1usize;
+        let mut i = base + 1;
+        while i < cont.len() && cont[i] {
+            rows += 1;
+            i += 1;
+        }
+        let start = l.cols.start as usize;
+        let end = (l.cols.end as usize).max(start.saturating_add(1));
+        let mut col = start;
+        while col < end {
+            let row_off = col / w;
+            if row_off >= rows {
+                break;
+            }
+            let local_start = col % w;
+            // Exclusive end column on this wrap row (global display col).
+            let row_end_global = ((row_off + 1) * w).min(end);
+            let local_end = row_end_global - row_off * w;
+            out.push(LinkSpan {
+                line: base + row_off,
+                cols: (local_start as u16)..(local_end as u16),
                 url: l.url.clone(),
-            })
-        })
-        .collect()
+            });
+            col = row_end_global;
+        }
+    }
+    out
 }
 
 /// Render one transcript block to logical (pre-wrap) lines.
@@ -983,6 +1003,27 @@ mod tests {
             links.iter().any(|l| l.url == "https://example.com/a"),
             "expected assistant link in layout cache, got {links:?}"
         );
+    }
+
+    #[test]
+    fn remap_links_splits_across_wrap_rows() {
+        // Logical line index 0, link covering cols 5..25 at width 10 →
+        // three display rows: 5..10, 0..10, 0..5.
+        let cont = vec![false, true, true]; // one logical line, three rows
+        let links = vec![LinkSpan {
+            line: 0,
+            cols: 5..25,
+            url: "https://example.com".into(),
+        }];
+        let mapped = remap_links_through_wrap(&links, &cont, 10);
+        assert_eq!(mapped.len(), 3, "{mapped:?}");
+        assert_eq!(mapped[0].line, 0);
+        assert_eq!(mapped[0].cols, 5..10);
+        assert_eq!(mapped[1].line, 1);
+        assert_eq!(mapped[1].cols, 0..10);
+        assert_eq!(mapped[2].line, 2);
+        assert_eq!(mapped[2].cols, 0..5);
+        assert!(mapped.iter().all(|l| l.url == "https://example.com"));
     }
 
     #[test]
