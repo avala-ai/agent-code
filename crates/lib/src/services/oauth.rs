@@ -2064,12 +2064,25 @@ mod tests {
         // *immediately*, not let the user wait through
         // a 5-minute LoopbackTimeout.
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("opener");
-        std::fs::write(&bin, "#!/bin/sh\nexit 7\n").unwrap();
+        // Unique name avoids ETXTBSY when parallel tests reuse a
+        // path while a sibling still has the old binary open.
+        let bin = tmp.path().join(format!(
+            "opener-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Write via temp+rename so the final path is never partially
+        // open for write when we spawn.
+        let tmp_bin = bin.with_extension("tmp");
+        std::fs::write(&tmp_bin, "#!/bin/sh\nexit 7\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        let mut perms = std::fs::metadata(&tmp_bin).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
+        std::fs::set_permissions(&tmp_bin, perms).unwrap();
+        std::fs::rename(&tmp_bin, &bin).unwrap();
 
         let url = "https://example.com/auth";
         let mut child = std::process::Command::new(&bin)
