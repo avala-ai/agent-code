@@ -3648,8 +3648,13 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     app.dirty = true;
                     return;
                 }
+                Some(super::hit_rect::HitTarget::Scrollbar { kind }) => {
+                    handle_scrollbar_press(app, m.row, kind);
+                    return;
+                }
                 _ => {}
             }
+            app.scrollbar_drag = None;
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 app.selection = Some(super::app::TextSelection {
                     start_line: abs,
@@ -3659,6 +3664,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.scrollbar_drag.is_some() {
+                handle_scrollbar_drag(app, m.row);
+                return;
+            }
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 if let Some(sel) = app.selection.as_mut() {
                     sel.end_line = abs;
@@ -3672,6 +3681,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if app.scrollbar_drag.take().is_some() {
+                app.dirty = true;
+                return;
+            }
             // Keep selection for y / Ctrl+Shift+C; toast if non-empty.
             if let Some(sel) = app.selection
                 && sel.start_line != sel.end_line
@@ -3700,6 +3713,68 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         _ => {}
+    }
+}
+
+/// Begin a scrollbar interaction: thumb drag, or track click-to-jump.
+fn handle_scrollbar_press(app: &mut App, row: u16, kind: super::hit_rect::ScrollbarKind) {
+    let Some(geom) = app.scrollbar_geom else {
+        return;
+    };
+    let total = app.layout.total_lines();
+    let height = app.viewport_h;
+    app.clear_selection();
+    match kind {
+        super::hit_rect::ScrollbarKind::Thumb => {
+            let grab = row.saturating_sub(geom.thumb.y);
+            app.scrollbar_drag = Some(grab.min(geom.thumb.height.saturating_sub(1)));
+        }
+        super::hit_rect::ScrollbarKind::Track => {
+            // Jump so the thumb top lands under the click, then start a drag
+            // so a press-and-move continues smoothly.
+            let new_top = super::scroll::top_from_track_row(row, geom, total, height, 0);
+            app.scroll_to_top_line(new_top);
+            // Grab relative to where the thumb will sit after the jump.
+            let top2 = app.scroll.top(total, height);
+            let area = ratatui::layout::Rect {
+                x: 0,
+                y: geom.track.y,
+                width: geom.track.x.saturating_add(1),
+                height: geom.track.height,
+            };
+            if let Some(g2) = super::scroll::scrollbar_geom(area, total, height, top2) {
+                app.scrollbar_geom = Some(g2);
+                app.scrollbar_drag = Some(row.saturating_sub(g2.thumb.y));
+            } else {
+                app.scrollbar_drag = Some(0);
+            }
+        }
+    }
+    app.dirty = true;
+}
+
+fn handle_scrollbar_drag(app: &mut App, row: u16) {
+    let Some(grab) = app.scrollbar_drag else {
+        return;
+    };
+    let Some(geom) = app.scrollbar_geom else {
+        app.scrollbar_drag = None;
+        return;
+    };
+    let total = app.layout.total_lines();
+    let height = app.viewport_h;
+    let new_top = super::scroll::top_from_track_row(row, geom, total, height, grab);
+    app.scroll_to_top_line(new_top);
+    // Keep geom in sync so the next drag event uses the updated thumb.
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: geom.track.y,
+        width: geom.track.x.saturating_add(1),
+        height: geom.track.height,
+    };
+    let top2 = app.scroll.top(total, height);
+    if let Some(g2) = super::scroll::scrollbar_geom(area, total, height, top2) {
+        app.scrollbar_geom = Some(g2);
     }
 }
 
@@ -5306,6 +5381,87 @@ mod tests {
             mouse_at(MouseEventKind::Down(MouseButton::Left), 65, 22),
         );
         assert!(app.scroll.is_following(), "click on jump pill follows");
+    }
+
+    #[test]
+    fn scrollbar_track_click_jumps_and_thumb_drag_scrolls() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..100 {
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::System(format!(
+                    "l {i}"
+                )));
+        }
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        app.viewport_h = 20;
+        let total = app.layout.total_lines();
+        assert!(total > 20, "need overflow for a scrollbar");
+
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 20,
+        };
+        let geom = super::super::scroll::scrollbar_geom(area, total, 20, 0).expect("bar");
+        app.scrollbar_geom = Some(geom);
+        app.hit_registry.register(
+            geom.track,
+            super::super::hit_rect::HitTarget::Scrollbar {
+                kind: super::super::hit_rect::ScrollbarKind::Track,
+            },
+        );
+        app.hit_registry.register(
+            geom.thumb,
+            super::super::hit_rect::HitTarget::Scrollbar {
+                kind: super::super::hit_rect::ScrollbarKind::Thumb,
+            },
+        );
+
+        // Click near the bottom of the track → near the live tail.
+        let click_row = geom.track.y + geom.track.height - 1;
+        handle_mouse(
+            &mut app,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                geom.track.x,
+                click_row,
+            ),
+        );
+        assert!(
+            app.scroll.is_following() || app.scroll.top(total, 20) > total / 2,
+            "track click near bottom should jump down, got {:?}",
+            app.scroll
+        );
+        assert!(app.scrollbar_drag.is_some(), "track press starts a drag");
+
+        // Drag to the top of the track → near line 0.
+        handle_mouse(
+            &mut app,
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                geom.track.x,
+                geom.track.y,
+            ),
+        );
+        assert_eq!(
+            app.scroll.top(total, 20),
+            0,
+            "drag to top should land at line 0"
+        );
+        handle_mouse(
+            &mut app,
+            mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                geom.track.x,
+                geom.track.y,
+            ),
+        );
+        assert!(app.scrollbar_drag.is_none());
     }
 
     // Assert a command's ANSI byte sequence via `Command::write_ansi`, which

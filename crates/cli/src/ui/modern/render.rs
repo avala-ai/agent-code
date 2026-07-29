@@ -1396,6 +1396,8 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // or resumes (#557 Phase 2). Paint chrome only, clear the body so
     // the system welcome line does not ghost under the brand.
     if app.launch.should_draw(app) {
+        app.scrollbar_geom = None;
+        app.scrollbar_drag = None;
         frame.render_widget(
             Paragraph::new(Vec::<ratatui::text::Line<'_>>::new()).block(title_block),
             area,
@@ -1442,11 +1444,82 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         draw_empty_conversation_guidance(frame, inner);
     }
 
+    // Overlay scrollbar on the right edge when content overflows (#558 D5-21).
+    // Drawn before the jump pill so the pill (registered later) wins on the
+    // bottom-right cell when both claim it — actually the pill sits one
+    // column left of the track when the bar is present.
+    draw_transcript_scrollbar(frame, inner, app, total, height, top);
+
     // Jump-to-bottom pill when reading above the live tail (plan §M2).
     let below = app.scroll.lines_below(total, height);
     if below > 0 {
         draw_jump_pill(frame, inner, below, app);
     }
+}
+
+/// 1-column scrollbar: track + thumb, with hit rects for click/drag.
+fn draw_transcript_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    total: usize,
+    height: usize,
+    top: usize,
+) {
+    let Some(geom) = super::scroll::scrollbar_geom(area, total, height, top) else {
+        app.scrollbar_geom = None;
+        return;
+    };
+    app.scrollbar_geom = Some(geom);
+    let p = palette();
+    let hover = matches!(
+        app.hit_registry.hover,
+        Some(super::hit_rect::HitTarget::Scrollbar { .. })
+    ) || app.scrollbar_drag.is_some();
+    let track_style = Style::default().fg(p.muted).add_modifier(Modifier::DIM);
+    let thumb_style = if hover {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.inactive)
+    };
+    // Paint track, then thumb on top.
+    for row in 0..geom.track.height {
+        let cell = Rect {
+            x: geom.track.x,
+            y: geom.track.y.saturating_add(row),
+            width: 1,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("│", track_style))),
+            cell,
+        );
+    }
+    for row in 0..geom.thumb.height {
+        let cell = Rect {
+            x: geom.thumb.x,
+            y: geom.thumb.y.saturating_add(row),
+            width: 1,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("█", thumb_style))),
+            cell,
+        );
+    }
+    // Track first, then thumb so thumb is topmost under hit_test.
+    app.hit_registry.register(
+        geom.track,
+        super::hit_rect::HitTarget::Scrollbar {
+            kind: super::hit_rect::ScrollbarKind::Track,
+        },
+    );
+    app.hit_registry.register(
+        geom.thumb,
+        super::hit_rect::HitTarget::Scrollbar {
+            kind: super::hit_rect::ScrollbarKind::Thumb,
+        },
+    );
 }
 
 /// True when the transcript is empty or only holds the initial chrome
@@ -1526,11 +1599,14 @@ fn draw_jump_pill(frame: &mut Frame<'_>, area: Rect, n: usize, app: &mut App) {
         format!(" ↓ {n} new ")
     };
     let w = label.chars().count() as u16;
-    if area.width < w + 1 || area.height < 1 {
+    // Leave the rightmost column free when a scrollbar is (or would be)
+    // painted so the pill never covers the track (#558 D5-21).
+    let bar_reserve: u16 = 1;
+    if area.width < w + bar_reserve + 1 || area.height < 1 {
         return;
     }
     let rect = Rect {
-        x: area.x + area.width - w - 1,
+        x: area.x + area.width - w - bar_reserve - 1,
         y: area.y + area.height.saturating_sub(1),
         width: w,
         height: 1,

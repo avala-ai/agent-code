@@ -381,6 +381,12 @@ pub struct App {
     /// Transcript viewport height in rows, recorded on the last draw so
     /// scroll-key handlers (which run before the next draw) have metrics.
     pub viewport_h: usize,
+    /// Active scrollbar thumb drag: pointer offset within the thumb (rows
+    /// from thumb top). `None` when not dragging (#558 D5-21).
+    pub scrollbar_drag: Option<u16>,
+    /// Last-drawn scrollbar geometry (track + thumb), for mouse handlers
+    /// that run between frames.
+    pub scrollbar_geom: Option<super::scroll::ScrollbarGeom>,
 
     pub input: String,
     /// Byte index into `input` (must land on a char boundary).
@@ -701,6 +707,8 @@ impl App {
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
             viewport_h: 0,
+            scrollbar_drag: None,
+            scrollbar_geom: None,
             input: String::new(),
             cursor: 0,
             multiline_mode: false,
@@ -2366,6 +2374,14 @@ impl App {
     /// Jump to the bottom and resume following the live tail.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll.go_bottom();
+        self.dirty = true;
+    }
+
+    /// Jump the viewport so `top` is the first visible display line.
+    /// Re-enters Follow when the jump lands on the live tail.
+    pub fn scroll_to_top_line(&mut self, top: usize) {
+        self.scroll
+            .set_top(top, self.layout.total_lines(), self.viewport_h);
         self.dirty = true;
     }
 

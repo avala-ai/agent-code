@@ -5,6 +5,12 @@
 //! absolute top line — so new content appended below **never moves the
 //! viewport** while the user is reading. A jump-to-bottom pill (rendered
 //! elsewhere) counts the lines that arrived below the viewport.
+//!
+//! A 1-column scrollbar (#558 D5-21) is overlaid on the right edge when
+//! content exceeds the viewport; geometry helpers live here so hit-testing
+//! and paint share one definition of thumb size / position.
+
+use ratatui::layout::Rect;
 
 /// Where the transcript viewport is anchored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +55,18 @@ impl ScrollState {
         };
     }
 
+    /// Jump to an absolute top line. Re-enters `Follow` at the bottom.
+    pub fn set_top(&mut self, top: usize, total: usize, height: usize) {
+        let max_top = total.saturating_sub(height);
+        *self = if top >= max_top {
+            ScrollState::Follow
+        } else {
+            ScrollState::Free {
+                top_line: top.min(max_top),
+            }
+        };
+    }
+
     /// Jump to the top (enters `Free` at line 0).
     pub fn go_top(&mut self) {
         *self = ScrollState::Free { top_line: 0 };
@@ -74,6 +92,80 @@ impl ScrollState {
             }
         }
     }
+}
+
+/// Geometry of the 1-column transcript scrollbar (track + thumb).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarGeom {
+    pub track: Rect,
+    pub thumb: Rect,
+}
+
+/// Overlay scrollbar on the right edge of `area` when `total > height`.
+///
+/// Returns `None` when there is nothing to scroll or the area is empty.
+pub fn scrollbar_geom(
+    area: Rect,
+    total: usize,
+    height: usize,
+    top: usize,
+) -> Option<ScrollbarGeom> {
+    if area.width == 0 || area.height == 0 || height == 0 || total <= height {
+        return None;
+    }
+    let track_h = area.height as usize;
+    // Visible fraction of the document, at least one row, at most the track.
+    let thumb_h = ((height.saturating_mul(track_h)) / total.max(1))
+        .max(1)
+        .min(track_h);
+    let max_top = total - height;
+    let travel = track_h.saturating_sub(thumb_h);
+    let thumb_off = if max_top == 0 || travel == 0 {
+        0
+    } else {
+        // Round to nearest so the thumb reaches both ends of the track.
+        (top.saturating_mul(travel) + max_top / 2) / max_top
+    };
+    let x = area.x.saturating_add(area.width.saturating_sub(1));
+    let thumb_y = area.y.saturating_add(thumb_off as u16);
+    Some(ScrollbarGeom {
+        track: Rect {
+            x,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        },
+        thumb: Rect {
+            x,
+            y: thumb_y,
+            width: 1,
+            height: thumb_h as u16,
+        },
+    })
+}
+
+/// Map an absolute screen row on the track to a `top_line`, placing the
+/// thumb so its top sits at the clamped click (drag with offset 0).
+pub fn top_from_track_row(
+    mouse_row: u16,
+    geom: ScrollbarGeom,
+    total: usize,
+    height: usize,
+    grab_offset: u16,
+) -> usize {
+    let max_top = total.saturating_sub(height);
+    if max_top == 0 {
+        return 0;
+    }
+    let travel = geom.track.height.saturating_sub(geom.thumb.height) as usize;
+    if travel == 0 {
+        return 0;
+    }
+    let raw = mouse_row
+        .saturating_sub(geom.track.y)
+        .saturating_sub(grab_offset);
+    let thumb_top = (raw as usize).min(travel);
+    (thumb_top.saturating_mul(max_top) + travel / 2) / travel
 }
 
 #[cfg(test)]
@@ -127,5 +219,64 @@ mod tests {
         // Anchor past the end (content shrank) clamps to the last page.
         let s = ScrollState::Free { top_line: 9999 };
         assert_eq!(s.top(100, 20), 80);
+    }
+
+    #[test]
+    fn set_top_enters_follow_at_bottom() {
+        let mut s = ScrollState::Free { top_line: 10 };
+        s.set_top(80, 100, 20);
+        assert!(s.is_following());
+        s.set_top(40, 100, 20);
+        assert_eq!(s, ScrollState::Free { top_line: 40 });
+    }
+
+    #[test]
+    fn scrollbar_hidden_when_content_fits() {
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 20,
+        };
+        assert!(scrollbar_geom(area, 10, 20, 0).is_none());
+    }
+
+    #[test]
+    fn scrollbar_thumb_scales_and_moves() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // 100 lines, 10 visible → thumb ≈ 1 row; at top → y=0; at bottom → y=9.
+        let top = scrollbar_geom(area, 100, 10, 0).expect("overflow");
+        assert_eq!(top.track.x, 39);
+        assert_eq!(top.track.height, 10);
+        assert_eq!(top.thumb.y, 0);
+        assert_eq!(top.thumb.height, 1);
+
+        let bot = scrollbar_geom(area, 100, 10, 90).expect("overflow");
+        assert_eq!(bot.thumb.y, 9);
+
+        // Mid: top=45 of max 90 → half travel (rounded).
+        let mid = scrollbar_geom(area, 100, 10, 45).expect("overflow");
+        assert_eq!(mid.thumb.y, 5);
+    }
+
+    #[test]
+    fn track_row_maps_back_to_top() {
+        let area = Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
+        let geom = scrollbar_geom(area, 100, 10, 0).unwrap();
+        // Click bottom of track (thumb height 1) → near max top.
+        let top = top_from_track_row(area.y + 9, geom, 100, 10, 0);
+        assert_eq!(top, 90);
+        let top0 = top_from_track_row(area.y, geom, 100, 10, 0);
+        assert_eq!(top0, 0);
     }
 }
