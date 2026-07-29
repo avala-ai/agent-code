@@ -362,8 +362,10 @@ fn finish_provider_setup(choice: &str) -> Option<SetupResult> {
         "codex_subscription" => finish_codex_oauth(),
         "xai_subscription" => finish_xai_oauth(),
         "ollama" => {
+            // Local placeholder so `has_key` / config load treat Ollama as
+            // ready without a real secret (Ollama ignores Authorization).
             let result = SetupResult {
-                api_key: String::new(),
+                api_key: "ollama".into(),
                 auth_mode: "api_key".into(),
                 provider: "ollama".into(),
                 base_url: Some("http://127.0.0.1:11434/v1".into()),
@@ -394,10 +396,6 @@ fn finish_provider_setup(choice: &str) -> Option<SetupResult> {
                 provider
             );
             println!("    {}", format!("export {env_var}=…").white().bold());
-            println!(
-                "  {}",
-                "(Or paste a key into config.toml under [api] — env is preferred.)".dark_grey()
-            );
             println!();
             print_ready_tips(&result);
             // Return Some so the caller reloads config; the next has_key
@@ -631,10 +629,10 @@ fn render_config_toml(result: &SetupResult) -> String {
     if result.auth_mode != "api_key" && !result.auth_mode.is_empty() {
         api.insert("auth_mode".into(), result.auth_mode.clone().into());
     }
-    // Include the API key only when it's a real, persistable secret.
-    // Ollama needs no key, and an empty key must not be written.
-    // Subscription (codex_chatgpt) auth has no API key field.
-    if result.auth_mode == "api_key" && !result.api_key.is_empty() && result.api_key != "ollama" {
+    // Persist a non-empty api_key under api_key auth — including the
+    // local "ollama" placeholder so has_key passes on next launch.
+    // Empty keys and subscription modes omit the field.
+    if result.auth_mode == "api_key" && !result.api_key.is_empty() {
         api.insert("api_key".into(), result.api_key.clone().into());
     }
 
@@ -924,12 +922,25 @@ mod tests {
     }
 
     #[test]
-    fn ollama_sentinel_key_is_omitted() {
-        let result = result_with_key("ollama");
+    fn ollama_placeholder_key_is_persisted() {
+        let result = SetupResult {
+            api_key: "ollama".into(),
+            auth_mode: "api_key".into(),
+            provider: "ollama".into(),
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            model: Some("llama3.2".into()),
+            theme: "auto".into(),
+            permission_mode: "accept_edits".into(),
+        };
         let doc: toml::Value = toml::from_str(&render_config_toml(&result)).unwrap();
-        assert!(
-            doc["api"].get("api_key").is_none(),
-            "the ollama sentinel must not be persisted as a key"
+        assert_eq!(
+            doc["api"]["api_key"].as_str(),
+            Some("ollama"),
+            "ollama placeholder must be written so has_key passes"
+        );
+        assert_eq!(
+            doc["api"]["base_url"].as_str(),
+            Some("http://127.0.0.1:11434/v1")
         );
     }
 }
