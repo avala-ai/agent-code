@@ -3745,7 +3745,8 @@ fn handle_scrollbar_press(app: &mut App, row: u16, kind: super::hit_rect::Scroll
             };
             if let Some(g2) = super::scroll::scrollbar_geom(area, total, height, top2) {
                 app.scrollbar_geom = Some(g2);
-                app.scrollbar_drag = Some(row.saturating_sub(g2.thumb.y));
+                let grab = row.saturating_sub(g2.thumb.y);
+                app.scrollbar_drag = Some(grab.min(g2.thumb.height.saturating_sub(1)));
             } else {
                 app.scrollbar_drag = Some(0);
             }
@@ -3755,13 +3756,20 @@ fn handle_scrollbar_press(app: &mut App, row: u16, kind: super::hit_rect::Scroll
 }
 
 fn handle_scrollbar_drag(app: &mut App, row: u16) {
-    let Some(grab) = app.scrollbar_drag else {
+    let Some(mut grab) = app.scrollbar_drag else {
         return;
     };
     let Some(geom) = app.scrollbar_geom else {
         app.scrollbar_drag = None;
         return;
     };
+    // Content growth / resize can shrink the thumb while the mouse is
+    // held; clamp the grab so a stale offset cannot yank the viewport.
+    let max_grab = geom.thumb.height.saturating_sub(1);
+    if grab > max_grab {
+        grab = max_grab;
+        app.scrollbar_drag = Some(grab);
+    }
     let total = app.layout.total_lines();
     let height = app.viewport_h;
     let new_top = super::scroll::top_from_track_row(row, geom, total, height, grab);
@@ -3776,6 +3784,10 @@ fn handle_scrollbar_drag(app: &mut App, row: u16) {
     let top2 = app.scroll.top(total, height);
     if let Some(g2) = super::scroll::scrollbar_geom(area, total, height, top2) {
         app.scrollbar_geom = Some(g2);
+        let max_grab = g2.thumb.height.saturating_sub(1);
+        if grab > max_grab {
+            app.scrollbar_drag = Some(max_grab);
+        }
     }
 }
 
