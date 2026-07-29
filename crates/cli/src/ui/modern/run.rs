@@ -53,6 +53,11 @@ type LoadedSession = (
     agent_code_lib::services::session::SessionData,
     Vec<super::app::TranscriptItem>,
     Option<Result<agent_code_lib::config::Config, String>>,
+    // Destination project root when the session's cwd differs from here.
+    // Resolved in the same blocking task as the config — never on the
+    // event-loop future, where `git rev-parse` / a marker walk would
+    // freeze redraw and Ctrl+C.
+    Option<std::path::PathBuf>,
 );
 
 use agent_code_lib::config::PermissionMode;
@@ -176,6 +181,25 @@ fn policy_root_from_config(dir: &std::path::Path) -> Option<std::path::PathBuf> 
     let settings = agent_code_lib::config::find_project_config_from(dir)?;
     let agent_dir = settings.parent()?;
     agent_dir.parent().map(std::path::Path::to_path_buf)
+}
+
+/// Resolve the project root that owns `dir` for a resume.
+///
+/// Prefer the settings file the config loader would read; otherwise the
+/// single shared detector (`project_root_for` → git / markers). Called
+/// only from the resume **blocking** preflight — never from the event
+/// loop — so a slow mount cannot freeze redraw.
+fn resolve_resume_project_root(dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(root) = policy_root_from_config(dir) {
+        return root;
+    }
+    // Same implementation the rest of the process uses. We are on a
+    // blocking-pool thread; `block_on` runs the async detector without
+    // inventing a second, sync copy of the walk.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(agent_code_lib::services::session_env::project_root_for(dir)),
+        Err(_) => dir.to_path_buf(),
+    }
 }
 
 /// Drive `work` to completion while the TUI keeps painting.
@@ -520,13 +544,19 @@ fn check_session_cwd(
 /// Finish moving into a directory the process has already entered:
 /// engine state, prompt cache (the cwd is baked into it), persistent
 /// grants (per-project, so approvals from the old one must stop
-/// applying) and the UI, then `CwdChanged` so watchers retune.
-async fn finish_cwd_adoption(
+/// applying) and the UI.
+///
+/// `project_root` is resolved **before** this is called — in the resume
+/// blocking preflight — so this function does no filesystem or `git`
+/// work. Awaiting detection here used to park the sole event-loop
+/// future for the whole walk.
+fn finish_cwd_adoption(
     app: &mut App,
     eng: &mut agent_code_lib::query::QueryEngine,
     notifier: &mut NotifierService,
     dir: &std::path::Path,
     cfg: agent_code_lib::config::Config,
+    project_root: std::path::PathBuf,
 ) {
     let cwd = dir.display().to_string();
     eng.state_mut().cwd = cwd.clone();
@@ -540,10 +570,6 @@ async fn finish_cwd_adoption(
     // and scoping grants and the canonical team-memory check to the
     // subdirectory leaves `/repo/.agent/team-memory` outside the root —
     // unprotected exactly where a resume crossed into it.
-    let project_root = match policy_root_from_config(dir) {
-        Some(root) => root,
-        None => agent_code_lib::services::session_env::project_root_for(dir).await,
-    };
     // Keep the connected servers only when the destination asks for the
     // *same* ones. The project root is the wrong question: config
     // discovery walks up from the session directory and takes the nearest
@@ -966,7 +992,7 @@ pub(super) async fn event_loop(
         if turn.is_none()
             && let Some(loaded) = pending_restore.take()
         {
-            let (generation, id, data, items, loaded_cfg) = *loaded;
+            let (generation, id, data, items, loaded_cfg, loaded_project_root) = *loaded;
             // Superseded by a newer selection made while this one was
             // still loading: drop it, the load arm fetches the new one.
             if app.resume.is_awaiting(generation) {
@@ -1377,7 +1403,15 @@ pub(super) async fn event_loop(
                         if let Some(dir) = entered.as_deref()
                             && let Some(cfg) = destination_cfg.clone()
                         {
-                            finish_cwd_adoption(app, &mut eng, notifier, dir, cfg).await;
+                            // Root was resolved in the blocking preflight.
+                            // Fall back to the session directory only if
+                            // the load path somehow omitted it — never
+                            // re-detect here, where a hung git freezes
+                            // the loop.
+                            let project_root = loaded_project_root
+                                .clone()
+                                .unwrap_or_else(|| dir.to_path_buf());
+                            finish_cwd_adoption(app, &mut eng, notifier, dir, cfg, project_root);
                             // Fired here rather than inside, so the loop
                             // can keep painting through a slow watcher
                             // hook. A cancel during it is noted and
@@ -1435,7 +1469,14 @@ pub(super) async fn event_loop(
                     // A turn holds the mutex; retry next iteration rather
                     // than half-applying the resume.
                     Err(_) => {
-                        pending_restore = Some(Box::new((generation, id, data, items, loaded_cfg)))
+                        pending_restore = Some(Box::new((
+                            generation,
+                            id,
+                            data,
+                            items,
+                            loaded_cfg,
+                            loaded_project_root,
+                        )))
                     }
                 }
             }
@@ -2073,14 +2114,27 @@ pub(super) async fn event_loop(
                                     show_thinking,
                                 );
                                 // Same task, same thread: the destination's
-                                // policy is filesystem work too, and the
-                                // loop must not wait on it either.
-                                let cfg = if data.cwd.is_empty() || data.cwd == here {
-                                    None
-                                } else {
-                                    Some(load_project_config(&data.cwd, &cli_for_cfg))
-                                };
-                                Box::new((generation, id.clone(), data, items, cfg))
+                                // policy *and* project-root detection are
+                                // filesystem/git work, and the loop must
+                                // not wait on either.
+                                let (cfg, project_root) =
+                                    if data.cwd.is_empty() || data.cwd == here {
+                                        (None, None)
+                                    } else {
+                                        let dir = std::path::Path::new(&data.cwd);
+                                        (
+                                            Some(load_project_config(&data.cwd, &cli_for_cfg)),
+                                            Some(resolve_resume_project_root(dir)),
+                                        )
+                                    };
+                                Box::new((
+                                    generation,
+                                    id.clone(),
+                                    data,
+                                    items,
+                                    cfg,
+                                    project_root,
+                                ))
                             });
                         let _ = tx.send((generation, id, loaded));
                     });
@@ -5576,6 +5630,86 @@ mod tests {
         assert!(
             policy_root_from_config(std::path::Path::new("/")).is_none(),
             "no governing settings should fall back, not invent a root"
+        );
+    }
+
+    /// Resume project-root resolution must prefer the governing settings
+    /// file and fall back to a marker walk — without inventing a second
+    /// detector. A deep tree with a marker at the top is the slow case
+    /// that used to hang the event loop; here we only assert correctness
+    /// of the shared detector path.
+    #[test]
+    fn resolve_resume_project_root_finds_a_marker_above_a_deep_tree() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
+        let mut deep = root.path().join("a");
+        for name in ["b", "c", "d", "e", "f", "g", "h"] {
+            deep = deep.join(name);
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // No tokio runtime in this unit test: without a handle the
+        // fallback is the dir itself. Drive the async detector directly
+        // so the marker path is what we assert.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let found = rt.block_on(agent_code_lib::services::session_env::project_root_for(
+            &deep,
+        ));
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            root.path().canonicalize().unwrap(),
+            "marker walk must climb to the Cargo.toml root"
+        );
+
+        // Settings still win over markers when both exist.
+        std::fs::create_dir_all(root.path().join(".agent")).unwrap();
+        std::fs::write(
+            root.path().join(".agent").join("settings.toml"),
+            "[permissions]\ndefault_mode = \"ask\"\n",
+        )
+        .unwrap();
+        let via_settings = resolve_resume_project_root(&deep);
+        assert_eq!(
+            via_settings.canonicalize().unwrap(),
+            root.path().canonicalize().unwrap(),
+        );
+    }
+
+    /// `finish_cwd_adoption` must not re-detect the project root. That
+    /// detection is filesystem/git work and belongs on the resume
+    /// blocking preflight; doing it on the event-loop future freezes
+    /// redraw for the walk's duration.
+    #[test]
+    fn finish_cwd_adoption_does_not_detect_project_root() {
+        let src = include_str!("run.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker");
+        // Isolate the finish_cwd_adoption function body.
+        let start = production
+            .find("fn finish_cwd_adoption(")
+            .expect("finish_cwd_adoption missing");
+        let body = &production[start..];
+        let end = body
+            .find("\nfn probe_caps(")
+            .or_else(|| body.find("\nfn "))
+            .unwrap_or(body.len().min(start + 4000));
+        let finish_fn = &body[..end];
+        assert!(
+            !finish_fn.contains("project_root_for"),
+            "finish_cwd_adoption must not call project_root_for — that parks the event loop"
+        );
+        assert!(
+            !finish_fn.contains("resolve_resume_project_root"),
+            "finish_cwd_adoption must take a precomputed root, not resolve one"
+        );
+        assert!(
+            production.contains("resolve_resume_project_root(dir)"),
+            "resume preflight must resolve the project root off the event loop"
         );
     }
 }
