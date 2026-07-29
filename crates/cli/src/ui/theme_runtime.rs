@@ -238,6 +238,11 @@ fn auto_detection_applies(name: &str, user_owns_auto: impl FnOnce() -> bool) -> 
 }
 
 /// Resolve a config theme name, handling "auto".
+///
+/// Unknown ids are kept as-is for `Theme::from_name` (which falls back
+/// to `one-dark`), but we emit a one-shot warning so a typo in config
+/// is not silent — `/color` already rejects unknown names, while the
+/// file path previously did not.
 pub fn resolve_theme(configured: &str) -> String {
     // Same rule as `Theme::from_name`: a user `auto.toml` owns the id.
     if auto_detection_applies(configured, || legacy::user_palette_exists("auto")) {
@@ -247,8 +252,35 @@ pub fn resolve_theme(configured: &str) -> String {
             "one-dark".to_string()
         }
     } else {
+        warn_if_unknown_theme(configured);
         configured.to_string()
     }
+}
+
+/// Known aliases that are not palette file stems but `from_name` accepts.
+const THEME_ALIASES: &[&str] = &["auto", "dark", "light"];
+
+fn warn_if_unknown_theme(id: &str) {
+    if id.is_empty() || THEME_ALIASES.contains(&id) {
+        return;
+    }
+    if legacy::user_palette_exists(id) {
+        return;
+    }
+    // Built-in catalog only — do not scan user dir again.
+    let known = legacy::catalog_ids(Vec::new());
+    if known.iter().any(|k| k == id) {
+        return;
+    }
+    tracing::warn!(
+        theme = %id,
+        "unknown theme '{id}'; using one-dark. Run /color to list available themes"
+    );
+    // Surface via the warnings registry so `/doctor` and the startup
+    // banner show it without requiring a tracing subscriber.
+    agent_code_lib::services::warnings::warn(format!(
+        "unknown theme '{id}'; using one-dark. Run /color to list"
+    ));
 }
 
 /// Options recorded alongside the active theme so we can replay the
@@ -512,6 +544,29 @@ mod tests {
         let theme = adapt_for_emit_with(Theme::from_name("one-dark"), EmitMode::Ansi256);
         assert_ne!(theme.accent, Color::Reset);
         assert_ne!(theme.error, theme.success);
+    }
+
+    #[test]
+    fn unknown_theme_id_is_flagged_but_still_resolves() {
+        // resolve_theme must not panic or rewrite the id — from_name falls
+        // back to one-dark — but warn_if_unknown_theme must fire.
+        agent_code_lib::services::warnings::clear();
+        let resolved = resolve_theme("this-theme-does-not-exist-xyz");
+        assert_eq!(resolved, "this-theme-does-not-exist-xyz");
+        let after = agent_code_lib::services::warnings::snapshot();
+        assert!(
+            after
+                .iter()
+                .any(|w| { w.message.contains("unknown theme") && w.message.contains("one-dark") }),
+            "expected an unknown-theme warning, got {after:?}"
+        );
+        // Known ids stay quiet.
+        agent_code_lib::services::warnings::clear();
+        let _ = resolve_theme("one-dark");
+        assert!(
+            agent_code_lib::services::warnings::snapshot().is_empty(),
+            "known theme emitted a warning"
+        );
     }
 
     #[test]
