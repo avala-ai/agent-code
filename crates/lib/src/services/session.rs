@@ -204,6 +204,18 @@ pub fn save_session_full(
     })
 }
 
+/// Whether this session already has a file on disk.
+///
+/// Distinguishes a never-used new session from one that was persisted
+/// and has since been emptied: the first should leave nothing behind,
+/// the second must have its file updated or the old conversation comes
+/// back on the next resume.
+pub fn session_exists(session_id: &str) -> bool {
+    sessions_dir()
+        .map(|d| d.join(format!("{session_id}.json")).exists())
+        .unwrap_or(false)
+}
+
 /// Load a session from disk by ID.
 pub fn load_session(session_id: &str) -> Result<SessionData, String> {
     // Readers do not take the write lock: an atomic rename means they
@@ -1559,6 +1571,22 @@ mod tests {
         assert!(
             production.contains("lock_exclusive"),
             "session writers must take an exclusive per-session lock"
+        );
+    }
+
+    #[test]
+    fn session_exists_tracks_the_file_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
+        let id = "exists-check";
+        assert!(
+            !session_exists(id),
+            "no file yet — must report absent so empty new sessions stay unwritten"
+        );
+        save_session(id, &[], "/tmp", "m", 0).expect("save");
+        assert!(
+            session_exists(id),
+            "after a write the id must report present so /clear can overwrite it"
         );
     }
 }
