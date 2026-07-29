@@ -28,7 +28,8 @@ use syntect::util::LinesWithEndings;
 use super::colors::palette;
 
 /// A clickable link discovered while rendering (line index + column range +
-/// destination). Consumed by mouse/OSC-8 handling in a later milestone.
+/// destination). Line is the logical (pre-wrap) index within the rendered
+/// block; layout remaps it onto display rows and registers a hit target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSpan {
     pub line: usize,

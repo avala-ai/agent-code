@@ -2886,6 +2886,10 @@ impl App {
         report.push_str(&format!("  synchronized output : {}\n", yn(c.sync_output)));
         report.push_str(&format!("  truecolor           : {}\n", yn(c.truecolor)));
         report.push_str(&format!(
+            "  OSC 8 hyperlinks    : {}\n",
+            yn(c.osc8_hyperlinks)
+        ));
+        report.push_str(&format!(
             "  kitty keyboard      : {}\n",
             yn(c.kitty_keyboard)
         ));
@@ -5249,6 +5253,7 @@ mod tests {
             kitty_keyboard: false,
             kitty_keyboard_safe: false,
             tmux: true,
+            osc8_hyperlinks: false,
         };
         app.emit_terminal_setup();
         let last = match app.transcript.last() {

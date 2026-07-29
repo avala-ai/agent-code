@@ -20,6 +20,8 @@ pub enum HitTarget {
     QueueRow { index: usize },
     /// Launch-surface recent session row (#557 Phase 3).
     LaunchRecent { index: usize },
+    /// Markdown hyperlink in the transcript (OSC-8 / click-to-open).
+    Hyperlink { url: String },
     /// Status-bar chip (future: model, mode, cwd).
     StatusChip { id: &'static str },
     /// Composer input area.

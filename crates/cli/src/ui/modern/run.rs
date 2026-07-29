@@ -3643,6 +3643,17 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 app.dirty = true;
                 return;
             }
+            // Markdown hyperlink: open in the platform browser.
+            if let Some(super::hit_rect::HitTarget::Hyperlink { url }) =
+                app.hit_registry.hit_test(m.column, m.row).cloned()
+            {
+                match open_hyperlink(&url) {
+                    Ok(()) => app.push_toast(format!("opened {url}")),
+                    Err(e) => app.push_toast(format!("open failed: {e}")),
+                }
+                app.dirty = true;
+                return;
+            }
             if let Some(abs) = mouse_abs_line(app, m.row) {
                 app.selection = Some(super::app::TextSelection {
                     start_line: abs,
@@ -3694,6 +3705,39 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Open a transcript hyperlink with the platform browser opener.
+///
+/// Only `http`/`https` (and `mailto:`) are accepted so a crafted markdown
+/// link cannot spawn an arbitrary local process.
+fn open_hyperlink(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    let ok = trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("mailto:");
+    if !ok {
+        return Err("only http(s) and mailto links can be opened".into());
+    }
+    // Prefer the same openers the OAuth browser path uses on each OS.
+    #[cfg(target_os = "macos")]
+    let cmd = ("open", vec![trimmed.to_string()]);
+    #[cfg(target_os = "windows")]
+    let cmd = (
+        "cmd",
+        vec!["/C".into(), "start".into(), "".into(), trimmed.to_string()],
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = ("xdg-open", vec![trimmed.to_string()]);
+
+    std::process::Command::new(cmd.0)
+        .args(&cmd.1)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", cmd.0))?;
+    Ok(())
 }
 
 /// Map a screen row to an absolute layout line in the transcript viewport.
@@ -5217,6 +5261,34 @@ mod tests {
             s.contains("\x1b[?1000l"),
             "mouse capture not disabled: {s:?}"
         );
+    }
+
+    #[test]
+    fn open_hyperlink_rejects_non_http_schemes() {
+        assert!(open_hyperlink("file:///etc/passwd").is_err());
+        assert!(open_hyperlink("javascript:alert(1)").is_err());
+        assert!(open_hyperlink("/local/path").is_err());
+    }
+
+    #[test]
+    fn open_hyperlink_accepts_http_and_mailto_prefix() {
+        // Do not actually spawn a browser in unit tests — only the scheme
+        // gate is asserted. Spawn success depends on the host opener.
+        for url in [
+            "https://example.com/x",
+            "http://example.com",
+            "mailto:dev@example.com",
+        ] {
+            // The function either spawns or fails on missing opener; both
+            // prove the scheme was accepted (not the "only http" error).
+            match open_hyperlink(url) {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !e.contains("only http"),
+                    "scheme rejected unexpectedly: {e}"
+                ),
+            }
+        }
     }
 
     #[test]

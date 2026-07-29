@@ -20,6 +20,10 @@ pub struct TerminalCaps {
     pub kitty_keyboard_safe: bool,
     /// Running inside tmux (passthrough needed for OSC 52 / queries).
     pub tmux: bool,
+    /// Terminal is known to honour OSC 8 hyperlinks (clickable URLs).
+    /// When false, links still render underlined and open on click via
+    /// the hit-rect registry, but we do not emit OSC 8 sequences.
+    pub osc8_hyperlinks: bool,
 }
 
 /// `TERM_PROGRAM` markers for hosts that answer the keyboard-enhancement
@@ -70,12 +74,22 @@ impl TerminalCaps {
             .any(|t| term_program.contains(t) || term.contains(t) || get("WEZTERM_PANE").is_some())
             || get("KITTY_WINDOW_ID").is_some();
 
+        // OSC 8 is well supported on the same modern hosts that do
+        // synchronized output; leave off for unknown / bare `screen`.
+        let osc8_hyperlinks = sync_output
+            || term_program.contains("kitty")
+            || term_program.contains("wezterm")
+            || term_program.contains("ghostty")
+            || term_program.contains("iterm")
+            || term.contains("xterm-kitty");
+
         TerminalCaps {
             sync_output,
             truecolor,
             kitty_keyboard: enhancement,
             kitty_keyboard_safe: keyboard_enhancement_allowed(enhancement, &term_program),
             tmux,
+            osc8_hyperlinks,
         }
     }
 
@@ -100,6 +114,13 @@ impl TerminalCaps {
         }
         if !self.truecolor {
             out.push("Set COLORTERM=truecolor for 24-bit color.".into());
+        }
+        if !self.osc8_hyperlinks {
+            out.push(
+                "OSC 8 hyperlinks are off on this host — click a link in the transcript to open it, \
+                 or use a terminal that supports OSC 8 (kitty, WezTerm, Ghostty, iTerm2)."
+                    .into(),
+            );
         }
         out
     }
@@ -134,12 +155,14 @@ mod tests {
         let caps = TerminalCaps::detect(env(&[("KITTY_WINDOW_ID", "1")]), true);
         assert!(caps.sync_output);
         assert!(caps.kitty_keyboard);
+        assert!(caps.osc8_hyperlinks, "kitty should advertise OSC 8");
     }
 
     #[test]
     fn unknown_terminal_defaults_sync_off() {
         let caps = TerminalCaps::detect(env(&[("TERM", "xterm")]), false);
         assert!(!caps.sync_output);
+        assert!(!caps.osc8_hyperlinks);
     }
 
     #[test]

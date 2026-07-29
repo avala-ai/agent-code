@@ -1408,6 +1408,33 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Lines are pre-wrapped by the layout cache; no widget wrapping.
     frame.render_widget(Paragraph::new(view).block(title_block), area);
 
+    // Markdown hyperlinks: register hit rects so a click opens the URL
+    // (#558 D3-10). Columns are relative to the transcript body.
+    for link in app.layout.links_in_range(top, height) {
+        let row_in_view = link.line.saturating_sub(top);
+        if row_in_view >= height {
+            continue;
+        }
+        let x = inner.x.saturating_add(link.cols.start);
+        let w = link
+            .cols
+            .end
+            .saturating_sub(link.cols.start)
+            .min(inner.width.saturating_sub(link.cols.start))
+            .max(1);
+        app.hit_registry.register(
+            Rect {
+                x,
+                y: inner.y.saturating_add(row_in_view as u16),
+                width: w,
+                height: 1,
+            },
+            super::hit_rect::HitTarget::Hyperlink {
+                url: link.url.clone(),
+            },
+        );
+    }
+
     // Empty / near-empty conversation: show three concrete next steps
     // instead of a blank pane (#557 Phase 4). Only when idle — never
     // over a live stream or permission modal.
