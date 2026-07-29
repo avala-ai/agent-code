@@ -544,6 +544,10 @@ pub(crate) fn prune_older_than_in(
             // Best-effort: a failed delete shouldn't abort the sweep.
             if std::fs::remove_file(&path).is_ok() {
                 stats.removed += 1;
+                // Drop the advisory lock sidecar so prune cannot leave
+                // an unbounded set of `<id>.json.lock` files behind.
+                let lock = path.with_extension("json.lock");
+                let _ = std::fs::remove_file(&lock);
             } else {
                 stats.kept += 1;
             }
@@ -1316,6 +1320,26 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&data).unwrap();
         std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn prune_also_removes_lock_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(60)).to_rfc3339();
+        let id = "old-with-lock";
+        let path = tmp.path().join(format!("{id}.json"));
+        let lock = tmp.path().join(format!("{id}.json.lock"));
+        write_session(tmp.path(), id, &old);
+        std::fs::write(&lock, "").unwrap();
+        assert!(lock.exists());
+        let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
+        assert_eq!(stats.removed, 1);
+        assert!(!path.exists());
+        assert!(
+            !lock.exists(),
+            "lock sidecar must be removed with the session"
+        );
     }
 
     #[test]
