@@ -1412,7 +1412,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // (#558 D3-10). Columns are relative to the transcript body. Hover
     // paints a filled accent bar over the active link (#558 D5-22).
     let hover_url = match &app.hit_registry.hover {
-        Some(super::hit_rect::HitTarget::Hyperlink { url }) => Some(url.as_str()),
+        Some(super::hit_rect::HitTarget::Hyperlink { url }) => Some(url.clone()),
         _ => None,
     };
     let accent = palette().accent;
@@ -1438,7 +1438,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             width: w,
             height: 1,
         };
-        if hover_url == Some(link.url.as_str()) {
+        if hover_url.as_deref() == Some(link.url.as_str()) {
             // Re-paint the label so hover is visible even without OSC 8.
             let label: String = app
                 .layout
