@@ -3,13 +3,20 @@
 //! Saves and restores conversation state across sessions. Each session
 //! gets a unique ID and is stored as a JSON file in the sessions
 //! directory (`~/.config/agent-code/sessions/`).
+//!
+//! Every write goes through an exclusive per-session lock (cross-process
+//! via `fs2` / `flock`) and an atomic temp+rename, so concurrent writers
+//! — interactive exit, `/fork`, `/rename`/`/tag`, and the scheduled-run
+//! process — cannot leave a half-written file or silently drop each
+//! other's changes mid-read-modify-write.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::config::atomic::atomic_write_secret;
 use crate::llm::message::Message;
 use crate::services::secret_masker;
 
@@ -62,6 +69,56 @@ fn sessions_dir() -> Option<PathBuf> {
     crate::config::agent_config_dir().map(|d| d.join("sessions"))
 }
 
+/// Path of the session JSON and of its sibling advisory lock file.
+fn session_paths(session_id: &str) -> Result<(PathBuf, PathBuf), String> {
+    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create sessions dir: {e}"))?;
+    let path = dir.join(format!("{session_id}.json"));
+    let lock = dir.join(format!("{session_id}.json.lock"));
+    Ok((path, lock))
+}
+
+/// RAII exclusive lock for one session file.
+///
+/// Serializes every in-process and cross-process writer of the same
+/// session id (interactive save, `/rename`, `/tag`, `/fork`, cron).
+/// The kernel releases the lock if the holder dies, so there is no
+/// stale-lock cleanup path.
+struct SessionLockGuard {
+    _file: std::fs::File,
+}
+
+impl SessionLockGuard {
+    fn acquire(lock_path: &Path) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|e| format!("Failed to open session lock {}: {e}", lock_path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|e| format!("Failed to lock session {}: {e}", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
+/// Run `f` while holding the exclusive lock for `session_id`.
+fn with_session_lock<T>(
+    session_id: &str,
+    f: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let (path, lock_path) = session_paths(session_id)?;
+    let _guard = SessionLockGuard::acquire(&lock_path)?;
+    f(&path)
+}
+
 /// Serialize session data to pretty JSON and apply the secret masker.
 ///
 /// Extracted so wire-up tests can verify the persistence boundary
@@ -70,6 +127,23 @@ pub(crate) fn serialize_masked(data: &SessionData) -> Result<String, String> {
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| format!("Failed to serialize session: {e}"))?;
     Ok(secret_masker::mask(&json))
+}
+
+/// Atomically write masked JSON to `path` (temp file + rename).
+fn write_session_file_atomic(path: &Path, data: &SessionData) -> Result<(), String> {
+    let json = serialize_masked(data)?;
+    atomic_write_secret(path, json.as_bytes())
+        .map_err(|e| format!("Failed to write session file {}: {e}", path.display()))
+}
+
+/// Load and parse a session JSON at `path` (caller holds the lock).
+fn load_session_at(path: &Path) -> Result<SessionData, String> {
+    if !path.exists() {
+        return Err(format!("Session file '{}' not found", path.display()));
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read session: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse session: {e}"))
 }
 
 /// Save the current session to disk.
@@ -98,67 +172,48 @@ pub fn save_session_full(
     total_output_tokens: u64,
     plan_mode: bool,
 ) -> Result<PathBuf, String> {
-    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create sessions dir: {e}"))?;
+    with_session_lock(session_id, |path| {
+        // Preserve original created_at, label, and tags if file exists.
+        // Re-read under the lock so a concurrent `/rename` or `/tag` is
+        // either fully before or fully after this save — never discarded
+        // because we sampled metadata mid-write.
+        let (created_at, label, tags) = match load_session_at(path) {
+            Ok(d) => (d.created_at, d.label, d.tags),
+            Err(_) => (chrono::Utc::now().to_rfc3339(), None, Vec::new()),
+        };
 
-    let path = dir.join(format!("{session_id}.json"));
+        let data = SessionData {
+            id: session_id.to_string(),
+            created_at,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            cwd: cwd.to_string(),
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            turn_count,
+            total_cost_usd,
+            total_input_tokens,
+            total_output_tokens,
+            plan_mode,
+            label,
+            tags,
+        };
 
-    // Preserve original created_at, label, and tags if file exists.
-    // All are orthogonal to the per-turn save path, so re-read rather
-    // than thread them through every call site.
-    let (created_at, label, tags) = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<SessionData>(&c).ok())
-            .map(|d| (d.created_at, d.label, d.tags))
-            .unwrap_or_else(|| (chrono::Utc::now().to_rfc3339(), None, Vec::new()))
-    } else {
-        (chrono::Utc::now().to_rfc3339(), None, Vec::new())
-    };
-
-    let data = SessionData {
-        id: session_id.to_string(),
-        created_at,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-        cwd: cwd.to_string(),
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        turn_count,
-        total_cost_usd,
-        total_input_tokens,
-        total_output_tokens,
-        plan_mode,
-        label,
-        tags,
-    };
-
-    // Mask secrets at the persistence boundary. Applied to the fully
-    // serialized JSON so the same regex set covers every text-bearing
-    // field (tool results, user messages, metadata). Escaped JSON
-    // strings still match the same patterns at the byte level.
-    let json = serialize_masked(&data)?;
-
-    std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {e}"))?;
-
-    debug!("Session saved: {}", path.display());
-    Ok(path)
+        write_session_file_atomic(path, &data)?;
+        debug!("Session saved: {}", path.display());
+        Ok(path.to_path_buf())
+    })
 }
 
 /// Load a session from disk by ID.
 pub fn load_session(session_id: &str) -> Result<SessionData, String> {
-    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
-    let path = dir.join(format!("{session_id}.json"));
-
+    // Readers do not take the write lock: an atomic rename means they
+    // always see a complete previous or next revision. Taking it would
+    // stall `/resume` behind a long serialize of a large transcript.
+    let (path, _) = session_paths(session_id)?;
     if !path.exists() {
         return Err(format!("Session '{session_id}' not found"));
     }
-
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read session: {e}"))?;
-
-    let data: SessionData =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse session: {e}"))?;
-
+    let data = load_session_at(&path)?;
     info!(
         "Session loaded: {} ({} messages)",
         session_id,
@@ -529,18 +584,17 @@ pub struct SessionSummary {
 /// Set (or clear) the human-readable label on a session. Pass `None`
 /// to clear. Returns the path of the written file.
 ///
-/// Implemented as load-modify-save so callers don't need to thread the
-/// label through the per-turn persistence path.
+/// Implemented as load-modify-save under the per-session lock so a
+/// concurrent transcript save re-reads the new label instead of
+/// overwriting it with a pre-rename snapshot.
 pub fn set_session_label(session_id: &str, label: Option<String>) -> Result<PathBuf, String> {
-    let mut data = load_session(session_id)?;
-    data.label = label;
-    data.updated_at = chrono::Utc::now().to_rfc3339();
-
-    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
-    let path = dir.join(format!("{session_id}.json"));
-    let json = serialize_masked(&data)?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {e}"))?;
-    Ok(path)
+    with_session_lock(session_id, |path| {
+        let mut data = load_session_at(path)?;
+        data.label = label;
+        data.updated_at = chrono::Utc::now().to_rfc3339();
+        write_session_file_atomic(path, &data)?;
+        Ok(path.to_path_buf())
+    })
 }
 
 /// Normalize a user-supplied tag: trim, lowercase, reject empty /
@@ -569,38 +623,34 @@ pub fn normalize_tag(raw: &str) -> Result<String, String> {
 /// returns `Ok(false)`; on add returns `Ok(true)`.
 pub fn add_session_tag(session_id: &str, tag: &str) -> Result<bool, String> {
     let normalized = normalize_tag(tag)?;
-    let mut data = load_session(session_id)?;
-    if data.tags.iter().any(|t| t == &normalized) {
-        return Ok(false);
-    }
-    data.tags.push(normalized);
-    data.tags.sort();
-    data.updated_at = chrono::Utc::now().to_rfc3339();
-    write_back(&data)?;
-    Ok(true)
+    with_session_lock(session_id, |path| {
+        let mut data = load_session_at(path)?;
+        if data.tags.iter().any(|t| t == &normalized) {
+            return Ok(false);
+        }
+        data.tags.push(normalized);
+        data.tags.sort();
+        data.updated_at = chrono::Utc::now().to_rfc3339();
+        write_session_file_atomic(path, &data)?;
+        Ok(true)
+    })
 }
 
 /// Remove a tag from the session. Returns `Ok(false)` if the tag
 /// wasn't present, `Ok(true)` if it was removed.
 pub fn remove_session_tag(session_id: &str, tag: &str) -> Result<bool, String> {
     let normalized = normalize_tag(tag)?;
-    let mut data = load_session(session_id)?;
-    let before = data.tags.len();
-    data.tags.retain(|t| t != &normalized);
-    if data.tags.len() == before {
-        return Ok(false);
-    }
-    data.updated_at = chrono::Utc::now().to_rfc3339();
-    write_back(&data)?;
-    Ok(true)
-}
-
-/// Persist a modified SessionData back to the sessions dir.
-fn write_back(data: &SessionData) -> Result<(), String> {
-    let dir = sessions_dir().ok_or("Could not determine sessions directory")?;
-    let path = dir.join(format!("{}.json", data.id));
-    let json = serialize_masked(data)?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {e}"))
+    with_session_lock(session_id, |path| {
+        let mut data = load_session_at(path)?;
+        let before = data.tags.len();
+        data.tags.retain(|t| t != &normalized);
+        if data.tags.len() == before {
+            return Ok(false);
+        }
+        data.updated_at = chrono::Utc::now().to_rfc3339();
+        write_session_file_atomic(path, &data)?;
+        Ok(true)
+    })
 }
 
 /// Generate a new session ID.
@@ -1359,5 +1409,132 @@ mod tests {
         let stats = prune_older_than_in(tmp.path(), 30, now).unwrap();
         assert_eq!(stats.removed, 0, "file at the exact threshold must be kept");
         assert_eq!(stats.kept, 1);
+    }
+
+    /// A `/rename` that interleaves with a transcript save must not be
+    /// discarded: the save re-reads label/tags under the same lock.
+    #[test]
+    fn rename_survives_a_concurrent_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
+        let id = "rename-race";
+        let msg = user_message("hello");
+        save_session(id, std::slice::from_ref(&msg), "/work", "m", 1).expect("seed");
+
+        let id_save = id.to_string();
+        let id_rename = id.to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier;
+
+        let save = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..40 {
+                let m = user_message(format!("turn-{i}"));
+                save_session(&id_save, &[m], "/work", "m", i + 2).expect("save");
+            }
+        });
+        let rename = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..40 {
+                set_session_label(&id_rename, Some(format!("label-{i}"))).expect("rename");
+            }
+        });
+        save.join().expect("save thread");
+        rename.join().expect("rename thread");
+
+        let data = load_session(id).expect("final load must parse");
+        assert!(data.label.is_some(), "label was lost to a concurrent save");
+        assert_eq!(data.messages.len(), 1, "transcript should be present");
+        // Round-trip through serde again — file must be valid JSON.
+        let raw = std::fs::read_to_string(
+            tmp.path()
+                .join("agent-code")
+                .join("sessions")
+                .join(format!("{id}.json")),
+        )
+        .expect("read final");
+        let _: SessionData = serde_json::from_str(&raw).expect("final JSON must parse");
+    }
+
+    /// Two concurrent full saves must leave a parseable file; neither
+    /// truncate-write can produce a partial JSON document.
+    #[test]
+    fn concurrent_saves_leave_parseable_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
+        let id = "atomic-race";
+        save_session(id, &[user_message("seed")], "/work", "m", 1).expect("seed");
+
+        let id_a = id.to_string();
+        let id_b = id.to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier;
+
+        let a = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..50 {
+                // Large-ish payload so a non-atomic write would be more
+                // likely to interleave mid-document.
+                let body = "x".repeat(8_192);
+                let m = user_message(format!("a-{i}-{body}"));
+                save_session(&id_a, &[m], "/work", "m", i).expect("a");
+            }
+        });
+        let b = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..50 {
+                let body = "y".repeat(8_192);
+                let m = user_message(format!("b-{i}-{body}"));
+                save_session(&id_b, &[m], "/work", "m", i).expect("b");
+            }
+        });
+        a.join().expect("a");
+        b.join().expect("b");
+
+        let data = load_session(id).expect("must load after concurrent writes");
+        assert_eq!(data.messages.len(), 1);
+        let text = match &data.messages[0] {
+            Message::User(u) => u
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or(""),
+            _ => "",
+        };
+        assert!(
+            text.starts_with("a-") || text.starts_with("b-"),
+            "unexpected final content: {text:.40}"
+        );
+    }
+
+    #[test]
+    fn write_is_atomic_temp_then_rename() {
+        // Structural: production writers must not call std::fs::write on
+        // the session path. A partial-write regression is silent until
+        // corruption shows up in the wild.
+        let src = include_str!("session.rs");
+        // Strip the test module so fixtures that write helper files do
+        // not count.
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker");
+        assert!(
+            !production.contains("std::fs::write(&path"),
+            "session writers must use atomic_write_secret, not std::fs::write(&path"
+        );
+        assert!(
+            production.contains("atomic_write_secret"),
+            "session writers must call atomic_write_secret"
+        );
+        assert!(
+            production.contains("lock_exclusive"),
+            "session writers must take an exclusive per-session lock"
+        );
     }
 }
