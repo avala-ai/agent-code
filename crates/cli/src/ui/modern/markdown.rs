@@ -134,6 +134,14 @@ struct Builder {
     in_table: bool,
     table_row: Vec<String>,
     table_cell: String,
+    /// Display-column cursor within the current table cell (same units as
+    /// `cur_cols`). Used so links inside cells get real hit ranges instead
+    /// of `0..0` (text never goes through `push_text` while `in_table`).
+    table_cell_col: u16,
+    /// Links collected for the current cell: `(url, start_col, end_col)`.
+    table_cell_links: Vec<(String, u16, u16)>,
+    /// Per-cell link lists for the row being built.
+    table_row_links: Vec<Vec<(String, u16, u16)>>,
 
     // Fenced-code state.
     code: Option<(String, String)>, // (lang, accumulated content)
@@ -212,6 +220,9 @@ impl Builder {
                     buf.push_str(&t);
                 } else if self.in_table {
                     self.table_cell.push_str(&t);
+                    self.table_cell_col = self
+                        .table_cell_col
+                        .saturating_add(UnicodeWidthStr::width(t.as_ref()) as u16);
                 } else {
                     let style = self.inline_style();
                     self.push_text(&t, style);
@@ -252,7 +263,12 @@ impl Builder {
             Tag::Emphasis => self.italic = true,
             Tag::Strikethrough => self.strike = true,
             Tag::Link { dest_url, .. } => {
-                self.link = Some((dest_url.to_string(), self.cur_cols));
+                let start = if self.in_table {
+                    self.table_cell_col
+                } else {
+                    self.cur_cols
+                };
+                self.link = Some((dest_url.to_string(), start));
             }
             Tag::List(start) => self.lists.push(start),
             Tag::Item => {
@@ -284,13 +300,21 @@ impl Builder {
                 self.in_table = true;
                 self.table_row.clear();
                 self.table_cell.clear();
+                self.table_cell_col = 0;
+                self.table_cell_links.clear();
+                self.table_row_links.clear();
             }
             Tag::TableHead | Tag::TableRow => {
                 self.table_row.clear();
                 self.table_cell.clear();
+                self.table_cell_col = 0;
+                self.table_cell_links.clear();
+                self.table_row_links.clear();
             }
             Tag::TableCell => {
                 self.table_cell.clear();
+                self.table_cell_col = 0;
+                self.table_cell_links.clear();
             }
             _ => {}
         }
@@ -339,11 +363,42 @@ impl Builder {
                 self.blank_line();
             }
             TagEnd::TableCell => {
-                let cell = std::mem::take(&mut self.table_cell);
-                self.table_row.push(cell.trim().to_string());
+                let raw = std::mem::take(&mut self.table_cell);
+                let lead_bytes = raw.len() - raw.trim_start().len();
+                let lead_w = UnicodeWidthStr::width(&raw[..lead_bytes]) as u16;
+                let trimmed = raw.trim().to_string();
+                let trim_w = UnicodeWidthStr::width(trimmed.as_str()) as u16;
+                let mut cell_links = std::mem::take(&mut self.table_cell_links);
+                for (_, s, e) in &mut cell_links {
+                    *s = (*s).saturating_sub(lead_w).min(trim_w);
+                    *e = (*e).saturating_sub(lead_w).min(trim_w).max(*s);
+                }
+                cell_links.retain(|(_, s, e)| s < e);
+                self.table_row.push(trimmed);
+                self.table_row_links.push(cell_links);
+                self.table_cell_col = 0;
             }
             TagEnd::TableRow | TagEnd::TableHead => {
                 if !self.table_row.is_empty() {
+                    // Emit " {c0} │ {c1} │ … " and place each cell-local
+                    // link at the corresponding absolute display column.
+                    let mut col: u16 = 1; // leading space in the formatted row
+                    let line_idx = self.lines.len();
+                    for (i, cell) in self.table_row.iter().enumerate() {
+                        if i > 0 {
+                            col = col.saturating_add(3); // " │ "
+                        }
+                        if let Some(cell_links) = self.table_row_links.get(i) {
+                            for (url, s, e) in cell_links {
+                                self.links.push(LinkSpan {
+                                    line: line_idx,
+                                    cols: col.saturating_add(*s)..col.saturating_add(*e),
+                                    url: url.clone(),
+                                });
+                            }
+                        }
+                        col = col.saturating_add(UnicodeWidthStr::width(cell.as_str()) as u16);
+                    }
                     let line = self
                         .table_row
                         .iter()
@@ -355,12 +410,16 @@ impl Builder {
                         Style::default().fg(palette().inactive),
                     )));
                     self.table_row.clear();
+                    self.table_row_links.clear();
                 }
             }
             TagEnd::Table => {
                 self.in_table = false;
                 self.table_row.clear();
                 self.table_cell.clear();
+                self.table_cell_col = 0;
+                self.table_cell_links.clear();
+                self.table_row_links.clear();
                 self.blank_line();
             }
             TagEnd::Strong => self.bold = false,
@@ -368,11 +427,16 @@ impl Builder {
             TagEnd::Strikethrough => self.strike = false,
             TagEnd::Link => {
                 if let Some((url, start_col)) = self.link.take() {
-                    self.links.push(LinkSpan {
-                        line: self.lines.len(),
-                        cols: start_col..self.cur_cols,
-                        url,
-                    });
+                    if self.in_table {
+                        self.table_cell_links
+                            .push((url, start_col, self.table_cell_col));
+                    } else {
+                        self.links.push(LinkSpan {
+                            line: self.lines.len(),
+                            cols: start_col..self.cur_cols,
+                            url,
+                        });
+                    }
                 }
             }
             TagEnd::List(_) => {
@@ -858,6 +922,31 @@ mod tests {
         let md = render_markdown("see [docs](https://example.com/x) here");
         assert_eq!(md.links.len(), 1);
         assert_eq!(md.links[0].url, "https://example.com/x");
+        // "see " is 4 display cols; label "docs" is 4.
+        assert_eq!(md.links[0].cols, 4..8, "{:?}", md.links[0]);
+    }
+
+    #[test]
+    fn table_links_get_real_column_ranges() {
+        let md = render_markdown("| a | b |\n|---|---|\n| [docs](https://example.com/t) | x |\n");
+        let link = md
+            .links
+            .iter()
+            .find(|l| l.url == "https://example.com/t")
+            .unwrap_or_else(|| panic!("expected table link, got {:?}", md.links));
+        assert!(
+            link.cols.end > link.cols.start,
+            "table link must not be 0..0: {link:?}"
+        );
+        // Row is " docs │ x " — label starts after the leading space.
+        assert_eq!(link.cols.start, 1, "{link:?}");
+        assert_eq!(link.cols.end, 5, "{link:?}"); // "docs"
+        // Label text appears on that rendered line at those columns.
+        let line = &md.lines[link.line];
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let start = link.cols.start as usize;
+        let end = link.cols.end as usize;
+        assert_eq!(&text[start..end], "docs", "line={text:?}");
     }
 
     #[test]

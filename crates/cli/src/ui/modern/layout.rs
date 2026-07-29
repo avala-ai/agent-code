@@ -133,8 +133,8 @@ impl LayoutCache {
                             (render_group(items, idxs, sel), Vec::new())
                         }
                     };
-                    let (lines, cont) = wrap_lines_tagged(raw, width);
-                    let links = remap_links_through_wrap(&logical_links, &cont, width);
+                    let (lines, cont, row_cols) = wrap_lines_tagged(raw, width);
+                    let links = remap_links_through_wrap(&logical_links, &cont, &row_cols);
                     let entry = Cached {
                         hash,
                         lines,
@@ -360,9 +360,18 @@ fn scrub_item(item: &TranscriptItem) -> Option<TranscriptItem> {
 /// Map pre-wrap [`LinkSpan`]s onto post-wrap display rows.
 ///
 /// Each logical line becomes one or more display rows (`cont` marks
-/// soft-wrap continuations). A link that spans multiple wrap rows emits
-/// one [`LinkSpan`] per display row with local column ranges.
-fn remap_links_through_wrap(links: &[LinkSpan], cont: &[bool], width: u16) -> Vec<LinkSpan> {
+/// soft-wrap continuations). `row_cols[i]` is the `[start, end)` range of
+/// logical display columns covered by display row `i` — the same units as
+/// [`LinkSpan::cols`], and the actual breakpoints from [`wrap_one`] (which
+/// may underfill a row when a wide grapheme does not fit).
+///
+/// A link that spans multiple wrap rows emits one [`LinkSpan`] per display
+/// row with local column ranges.
+fn remap_links_through_wrap(
+    links: &[LinkSpan],
+    cont: &[bool],
+    row_cols: &[(u16, u16)],
+) -> Vec<LinkSpan> {
     if links.is_empty() || cont.is_empty() {
         return Vec::new();
     }
@@ -373,37 +382,31 @@ fn remap_links_through_wrap(links: &[LinkSpan], cont: &[bool], width: u16) -> Ve
             logical_starts.push(i);
         }
     }
-    let w = width.max(1) as usize;
     let mut out = Vec::new();
     for l in links {
         let Some(&base) = logical_starts.get(l.line) else {
             continue;
         };
-        // How many display rows this logical line occupies.
-        let mut rows = 1usize;
-        let mut i = base + 1;
-        while i < cont.len() && cont[i] {
-            rows += 1;
-            i += 1;
+        let mut end_row = base + 1;
+        while end_row < cont.len() && cont[end_row] {
+            end_row += 1;
         }
-        let start = l.cols.start as usize;
-        let end = (l.cols.end as usize).max(start.saturating_add(1));
-        let mut col = start;
-        while col < end {
-            let row_off = col / w;
-            if row_off >= rows {
-                break;
+        let link_start = l.cols.start;
+        let link_end = l.cols.end.max(link_start.saturating_add(1));
+        for row in base..end_row {
+            let (rs, re) = row_cols.get(row).copied().unwrap_or((0, 0));
+            if re <= rs {
+                continue;
             }
-            let local_start = col % w;
-            // Exclusive end column on this wrap row (global display col).
-            let row_end_global = ((row_off + 1) * w).min(end);
-            let local_end = row_end_global - row_off * w;
-            out.push(LinkSpan {
-                line: base + row_off,
-                cols: (local_start as u16)..(local_end as u16),
-                url: l.url.clone(),
-            });
-            col = row_end_global;
+            let o_start = link_start.max(rs);
+            let o_end = link_end.min(re);
+            if o_start < o_end {
+                out.push(LinkSpan {
+                    line: row,
+                    cols: (o_start - rs)..(o_end - rs),
+                    url: l.url.clone(),
+                });
+            }
         }
     }
     out
@@ -724,30 +727,60 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     wrap_lines_tagged(lines, width).0
 }
 
-/// [`wrap_lines`] plus a per-row continuation flag: `true` for rows that
-/// are soft-wrap overflow of the previous row (never the first row of a
-/// logical line).
-pub fn wrap_lines_tagged(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>, Vec<bool>) {
+/// [`wrap_lines`] plus:
+/// - a per-row continuation flag: `true` for rows that are soft-wrap
+///   overflow of the previous row (never the first row of a logical line)
+/// - per-row `[start, end)` ranges of logical display columns covered by
+///   each display row (for remapping link hit rects through underfilled
+///   wrap boundaries)
+pub fn wrap_lines_tagged(
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<bool>, Vec<(u16, u16)>) {
     if width == 0 {
         let cont = vec![false; lines.len()];
-        return (lines, cont);
+        let row_cols = lines
+            .iter()
+            .map(|l| {
+                let w = l
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                    .fold(0u16, u16::saturating_add);
+                (0, w)
+            })
+            .collect();
+        return (lines, cont, row_cols);
     }
     let mut out = Vec::with_capacity(lines.len());
     let mut cont = Vec::with_capacity(lines.len());
+    let mut row_cols = Vec::with_capacity(lines.len());
     for line in lines {
         let first = out.len();
-        wrap_one(line, width as usize, &mut out);
+        wrap_one(line, width as usize, &mut out, &mut row_cols);
         cont.resize(out.len(), true);
         cont[first] = false;
     }
-    (out, cont)
+    (out, cont, row_cols)
 }
 
 /// Wrap a single styled line, preserving span styles across the split.
 /// Splits on grapheme-cluster boundaries and never exceeds `width` columns.
-fn wrap_one(line: Line<'static>, width: usize, out: &mut Vec<Line<'static>>) {
+///
+/// Each emitted row appends `(logical_start, logical_end)` to `row_cols` —
+/// the display-column range within the original logical line covered by
+/// that row. Underfilled rows (wide grapheme would not fit the remainder)
+/// record a range shorter than `width`.
+fn wrap_one(
+    line: Line<'static>,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+    row_cols: &mut Vec<(u16, u16)>,
+) {
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
+    let mut row_start_col = 0u16;
+    let mut logical_col = 0u16;
     // Accumulate graphemes of the current span so runs of same style stay
     // in one Span instead of one Span per grapheme.
     let mut buf = String::new();
@@ -765,15 +798,19 @@ fn wrap_one(line: Line<'static>, width: usize, out: &mut Vec<Line<'static>>) {
             if cur_w + gw > width && cur_w > 0 {
                 flush_buf(&mut cur, &mut buf, style);
                 out.push(Line::from(std::mem::take(&mut cur)));
+                row_cols.push((row_start_col, logical_col));
+                row_start_col = logical_col;
                 cur_w = 0;
             }
             buf.push_str(g);
             cur_w += gw;
+            logical_col = logical_col.saturating_add(gw as u16);
         }
         flush_buf(&mut cur, &mut buf, style);
     }
     // Always push the final (possibly empty) line so blank lines survive.
     out.push(Line::from(cur));
+    row_cols.push((row_start_col, logical_col));
 }
 
 #[cfg(test)]
@@ -1007,15 +1044,16 @@ mod tests {
 
     #[test]
     fn remap_links_splits_across_wrap_rows() {
-        // Logical line index 0, link covering cols 5..25 at width 10 →
-        // three display rows: 5..10, 0..10, 0..5.
+        // Logical line index 0, link covering cols 5..25 with full-width
+        // rows of 10 → three display rows: 5..10, 0..10, 0..5.
         let cont = vec![false, true, true]; // one logical line, three rows
+        let row_cols = vec![(0, 10), (10, 20), (20, 25)];
         let links = vec![LinkSpan {
             line: 0,
             cols: 5..25,
             url: "https://example.com".into(),
         }];
-        let mapped = remap_links_through_wrap(&links, &cont, 10);
+        let mapped = remap_links_through_wrap(&links, &cont, &row_cols);
         assert_eq!(mapped.len(), 3, "{mapped:?}");
         assert_eq!(mapped[0].line, 0);
         assert_eq!(mapped[0].cols, 5..10);
@@ -1024,6 +1062,33 @@ mod tests {
         assert_eq!(mapped[2].line, 2);
         assert_eq!(mapped[2].cols, 0..5);
         assert!(mapped.iter().all(|l| l.url == "https://example.com"));
+    }
+
+    #[test]
+    fn remap_links_uses_underfilled_wrap_boundaries() {
+        // Width 5: "aaaa界link" wraps after the four a's (界 is 2 cells and
+        // does not fit the remainder). Link "link" sits at cols 6..10.
+        // Naive col/width would put start at row 1 col 1; the real row
+        // starts at logical col 4, so the link begins at local col 2.
+        let line = Line::from("aaaa界link");
+        let (wrapped, cont, row_cols) = wrap_lines_tagged(vec![line], 5);
+        assert!(wrapped.len() >= 2, "expected wrap: {wrapped:?}");
+        assert_eq!(row_cols[0], (0, 4), "first row underfills: {row_cols:?}");
+        let links = vec![LinkSpan {
+            line: 0,
+            cols: 6..10,
+            url: "https://example.com".into(),
+        }];
+        let mapped = remap_links_through_wrap(&links, &cont, &row_cols);
+        assert!(!mapped.is_empty(), "{mapped:?}");
+        assert_eq!(mapped[0].line, 1, "{mapped:?}");
+        assert_eq!(mapped[0].cols.start, 2, "{mapped:?}");
+        assert_eq!(mapped[0].url, "https://example.com");
+        // Continuation of the link on later rows, if any, must stay local.
+        for m in &mapped {
+            assert!(m.cols.end > m.cols.start, "{m:?}");
+            assert!(m.cols.end <= 5, "local col past width: {m:?}");
+        }
     }
 
     #[test]
