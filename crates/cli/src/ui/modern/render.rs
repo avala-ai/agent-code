@@ -1650,48 +1650,64 @@ fn apply_selection_highlight(
         if abs < lo || abs > hi {
             continue;
         }
-        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         if let Some((cs, ce)) = sel.cols.filter(|_| lo == hi) {
-            // Partial (word) selection: only paint the column range.
-            *line = paint_col_range(&plain, cs, ce, fill, line.style);
+            // Partial (word) selection: keep per-span styles outside the
+            // selected columns (Codex P3 on #588).
+            *line = paint_col_range_on_line(line, cs, ce, fill);
         } else {
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             *line = Line::from(Span::styled(plain, fill));
         }
     }
     view
 }
 
-/// Paint display columns `[start, end)` of `plain` with `fill`, leaving
-/// the rest unstyled (using `base` as the surrounding style).
-fn paint_col_range(plain: &str, start: u16, end: u16, fill: Style, base: Style) -> Line<'static> {
+/// Paint display columns `[start, end)` with `fill`, preserving original
+/// span styles (and line-level style) outside that range.
+fn paint_col_range_on_line(
+    line: &Line<'static>,
+    start: u16,
+    end: u16,
+    fill: Style,
+) -> Line<'static> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut buf_fill = false;
+    let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0u16;
-    let flush = |spans: &mut Vec<Span<'static>>, buf: &mut String, filled: bool| {
-        if buf.is_empty() {
-            return;
+    let line_style = line.style;
+    for span in &line.spans {
+        let style = line_style.patch(span.style);
+        let mut plain_buf = String::new();
+        let mut fill_buf = String::new();
+        let flush_plain = |out: &mut Vec<Span<'static>>, buf: &mut String, style: Style| {
+            if !buf.is_empty() {
+                out.push(Span::styled(std::mem::take(buf), style));
+            }
+        };
+        let flush_fill = |out: &mut Vec<Span<'static>>, buf: &mut String| {
+            if !buf.is_empty() {
+                out.push(Span::styled(std::mem::take(buf), fill));
+            }
+        };
+        for g in span.content.as_ref().graphemes(true) {
+            let w = UnicodeWidthStr::width(g).max(1) as u16;
+            let in_sel = col < end && col.saturating_add(w) > start;
+            if in_sel {
+                flush_plain(&mut out, &mut plain_buf, style);
+                fill_buf.push_str(g);
+            } else {
+                flush_fill(&mut out, &mut fill_buf);
+                plain_buf.push_str(g);
+            }
+            col = col.saturating_add(w);
         }
-        let style = if filled { fill } else { base };
-        spans.push(Span::styled(std::mem::take(buf), style));
-    };
-    for g in plain.graphemes(true) {
-        let w = UnicodeWidthStr::width(g).max(1) as u16;
-        let in_sel = col < end && col.saturating_add(w) > start;
-        if !buf.is_empty() && in_sel != buf_fill {
-            flush(&mut spans, &mut buf, buf_fill);
-        }
-        buf_fill = in_sel;
-        buf.push_str(g);
-        col = col.saturating_add(w);
+        flush_plain(&mut out, &mut plain_buf, style);
+        flush_fill(&mut out, &mut fill_buf);
     }
-    flush(&mut spans, &mut buf, buf_fill);
-    if spans.is_empty() {
-        Line::from(Span::styled(plain.to_string(), base))
+    if out.is_empty() {
+        line.clone()
     } else {
-        Line::from(spans)
+        Line::from(out)
     }
 }
 
@@ -3028,6 +3044,35 @@ mod tests {
         let painted = apply_selection_highlight(view, 0, Some(sel));
         assert_eq!(painted[0].spans[0].style.fg, Some(Color::Reset));
         assert_eq!(painted[0].spans[0].style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn word_selection_keeps_styles_outside_the_range() {
+        let muted = Style::default().fg(palette().muted);
+        let code = Style::default().fg(palette().code_fg).bg(palette().code_bg);
+        let view = vec![Line::from(vec![
+            Span::styled("see ", muted),
+            Span::styled("run()", code),
+            Span::styled(" here", muted),
+        ])];
+        // Select only "run" (cols 4..7).
+        let sel = super::super::app::TextSelection::word(0, 4, 7);
+        let painted = apply_selection_highlight(view, 0, Some(sel));
+        let spans = &painted[0].spans;
+        // At least one span outside the selection still carries the code or muted style.
+        let outside_keeps_style = spans.iter().any(|s| {
+            let t = s.content.as_ref();
+            (t.contains("see") || t.contains("here") || t.contains("()"))
+                && s.style.bg != Some(palette().accent)
+        });
+        assert!(
+            outside_keeps_style,
+            "unselected spans lost their style: {spans:?}"
+        );
+        let selected = spans
+            .iter()
+            .any(|s| s.content.as_ref().contains("run") && s.style.bg == Some(palette().accent));
+        assert!(selected, "selected word not filled: {spans:?}");
     }
 
     #[test]
