@@ -372,9 +372,7 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(
-            !display
-                .iter()
-                .any(|l| l.to_lowercase().contains("needle")),
+            !display.iter().any(|l| l.to_lowercase().contains("needle")),
             "needle fits one row; adjust the padding: {display:?}"
         );
         app.open_search();
