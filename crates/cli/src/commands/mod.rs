@@ -832,7 +832,8 @@ pub fn list_slash_for_palette(query: &str) -> Vec<(&'static str, &'static str)> 
     scored
         .into_iter()
         .map(|(_, name, desc)| (name, desc))
-        .collect()}
+        .collect()
+}
 
 #[cfg(test)]
 mod slash_lookup_tests {
