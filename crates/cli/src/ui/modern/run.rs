@@ -5219,9 +5219,13 @@ mod tests {
     }
 
     fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        mouse_at(kind, 0, row)
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
-            column: 0,
+            column,
             row,
             modifiers: KeyModifiers::NONE,
         }
@@ -5251,6 +5255,8 @@ mod tests {
 
     #[test]
     fn click_bottom_row_jumps_to_follow() {
+        use ratatui::layout::Rect;
+
         let mut app = App::new("m", "/tmp", "s");
         app.transcript.clear();
         for i in 0..100 {
@@ -5265,6 +5271,19 @@ mod tests {
         app.transcript_bottom_row = 22;
         app.scroll_up(30);
         assert!(!app.scroll.is_following());
+        // Jump pill only owns its registered rect (bottom-right), not the
+        // whole bottom row — so hyperlinks on that row stay clickable.
+        app.hit_registry.register(
+            Rect {
+                x: 60,
+                y: 22,
+                width: 15,
+                height: 1,
+            },
+            super::super::hit_rect::HitTarget::Control {
+                id: "jump_pill".into(),
+            },
+        );
         // A click anywhere BELOW the transcript (status bar, input box) must
         // NOT snap the viewport — that lost the user's reading position.
         handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 25));
@@ -5272,9 +5291,21 @@ mod tests {
             !app.scroll.is_following(),
             "click on input box must not jump"
         );
-        // Exactly the transcript's bottom row (the jump-pill target) follows.
-        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 22));
-        assert!(app.scroll.is_following(), "click at bottom follows");
+        // Bottom row outside the pill must not jump either.
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 22),
+        );
+        assert!(
+            !app.scroll.is_following(),
+            "bottom-row click outside pill must not jump"
+        );
+        // Click on the pill itself follows.
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 65, 22),
+        );
+        assert!(app.scroll.is_following(), "click on jump pill follows");
     }
 
     // Assert a command's ANSI byte sequence via `Command::write_ansi`, which
