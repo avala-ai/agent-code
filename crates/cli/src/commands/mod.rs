@@ -806,17 +806,21 @@ pub fn list_slash_for_palette(query: &str) -> Vec<(&'static str, &'static str)> 
         out.dedup_by_key(|(name, _)| *name);
         return out;
     }
-    // Score against name, best alias, and description; keep the max.
+    // Score against name, best alias, and description. Canonical-name
+    // hits get a large bonus so typing `ag` prefers `agents` over `redo`
+    // (alias `again`, which can score higher as a shorter match).
+    // Description hits stay half weight.
+    const NAME_BONUS: i64 = 1_000_000;
     let mut scored: Vec<(i64, &'static str, &'static str)> = Vec::new();
     for c in COMMANDS.iter().filter(|c| !c.hidden) {
-        let mut best = crate::ui::fuzzy::fuzzy_score(q, c.name);
+        let mut best: Option<i64> =
+            crate::ui::fuzzy::fuzzy_score(q, c.name).map(|s| s + NAME_BONUS);
         for a in c.aliases {
             if let Some(s) = crate::ui::fuzzy::fuzzy_score(q, a) {
                 best = Some(best.map_or(s, |b| b.max(s)));
             }
         }
         if let Some(s) = crate::ui::fuzzy::fuzzy_score(q, c.description) {
-            // Description hits rank below name hits.
             best = Some(best.map_or(s / 2, |b| b.max(s / 2)));
         }
         if let Some(s) = best {
@@ -958,6 +962,22 @@ mod slash_lookup_tests {
             tab.is_empty() || tab.iter().all(|n| n.starts_with("conversation")),
             "Tab must not use description match: {tab:?}"
         );
+    }
+
+    #[test]
+    fn list_slash_for_palette_prefers_canonical_name_over_alias() {
+        // `ag` is a prefix of both `agents` (canonical) and `again`
+        // (alias of `redo`). Canonical must rank first.
+        let hits = list_slash_for_palette("ag");
+        let agents = hits.iter().position(|(n, _)| *n == "agents");
+        let redo = hits.iter().position(|(n, _)| *n == "redo");
+        assert!(agents.is_some(), "agents should match query `ag`: {hits:?}");
+        if let (Some(a), Some(r)) = (agents, redo) {
+            assert!(
+                a < r,
+                "canonical `agents` must rank above alias `again`/`redo`: {hits:?}"
+            );
+        }
     }
 }
 
