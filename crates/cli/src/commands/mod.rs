@@ -1160,6 +1160,26 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             if let Some(id) = args {
                 match agent_code_lib::services::session::load_session(id) {
                     Ok(data) => {
+                        let (base_url, auth_mode) = {
+                            let st = engine.state();
+                            (st.config.api.base_url.clone(), st.config.api.auth_mode)
+                        };
+                        match agent_code_lib::services::session::check_provider_for_resume(
+                            &data, &base_url, auth_mode,
+                        ) {
+                            Ok(agent_code_lib::services::session::ProviderResume::Unknown) => {
+                                println!(
+                                    "Note: session has no provider fingerprint \
+                                     (saved before this was recorded) — \
+                                     continuing on the running provider."
+                                );
+                            }
+                            Ok(agent_code_lib::services::session::ProviderResume::Match) => {}
+                            Err(msg) => {
+                                println!("Failed to resume: {msg}");
+                                return CommandResult::Handled;
+                            }
+                        }
                         let restored_plan = data.plan_mode;
                         {
                             let state = engine.state_mut();
@@ -2064,12 +2084,22 @@ pub fn execute(input: &str, engine: &mut QueryEngine) -> CommandResult {
             let state = engine.state();
             let fork_id = agent_code_lib::services::session::new_session_id();
             let msg_count = state.messages.len();
-            match agent_code_lib::services::session::save_session(
+            match agent_code_lib::services::session::save_session_full(
                 &fork_id,
                 &state.messages,
                 &state.cwd,
                 &state.config.api.model,
                 state.turn_count,
+                state.total_cost_usd,
+                state.total_usage.input_tokens,
+                state.total_usage.output_tokens,
+                state.plan_mode,
+                Some(
+                    agent_code_lib::services::session::ProviderIdentity::from_api(
+                        &state.config.api.base_url,
+                        state.config.api.auth_mode,
+                    ),
+                ),
             ) {
                 Ok(_) => {
                     println!("Forked conversation at message {msg_count} -> session {fork_id}",);
@@ -6020,6 +6050,26 @@ fn execute_session_picker(engine: &mut QueryEngine) {
     // Resume — same path as /resume <id>.
     match agent_code_lib::services::session::load_session(&chosen) {
         Ok(data) => {
+            let (base_url, auth_mode) = {
+                let st = engine.state();
+                (st.config.api.base_url.clone(), st.config.api.auth_mode)
+            };
+            match agent_code_lib::services::session::check_provider_for_resume(
+                &data, &base_url, auth_mode,
+            ) {
+                Ok(agent_code_lib::services::session::ProviderResume::Unknown) => {
+                    println!(
+                        "Note: session has no provider fingerprint \
+                         (saved before this was recorded) — \
+                         continuing on the running provider."
+                    );
+                }
+                Ok(agent_code_lib::services::session::ProviderResume::Match) => {}
+                Err(msg) => {
+                    eprintln!("Failed to resume session: {msg}");
+                    return;
+                }
+            }
             let restored_plan = data.plan_mode;
             {
                 let state = engine.state_mut();

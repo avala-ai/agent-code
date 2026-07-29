@@ -156,6 +156,10 @@ impl ScheduleExecutor {
             state.total_usage.input_tokens,
             state.total_usage.output_tokens,
             false,
+            Some(crate::services::session::ProviderIdentity::from_api(
+                &state.config.api.base_url,
+                state.config.api.auth_mode,
+            )),
         );
 
         // Truncate summary.

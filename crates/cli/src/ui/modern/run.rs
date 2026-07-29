@@ -1080,6 +1080,46 @@ pub(super) async fn event_loop(
                                 continue;
                             }
                         };
+                        // Provider identity is stamped on save from the
+                        // *resolved* engine config and compared to the
+                        // *resolved* running config — never to the
+                        // destination project's raw file (that comparison
+                        // is unsound; see #537).
+                        {
+                            let engine_arc = session.engine();
+                            let eng = engine_arc.lock().await;
+                            let api = &eng.state().config.api;
+                            let provider_check =
+                                agent_code_lib::services::session::check_provider_for_resume(
+                                    &data,
+                                    &api.base_url,
+                                    api.auth_mode,
+                                );
+                            drop(eng);
+                            match provider_check {
+                                Ok(agent_code_lib::services::session::ProviderResume::Unknown) => {
+                                    app.transcript.push(super::app::TranscriptItem::System(
+                                        "session has no provider fingerprint \
+                                             (saved before this was recorded) — \
+                                             continuing on the running provider"
+                                            .into(),
+                                    ));
+                                }
+                                Ok(agent_code_lib::services::session::ProviderResume::Match) => {}
+                                Err(msg) => {
+                                    app.status_message.clear();
+                                    app.transcript.push(super::app::TranscriptItem::Error(
+                                        format!("could not resume {id}: {msg}"),
+                                    ));
+                                    app.cancel_deferred_resume_work(
+                                        "cancelled — held for a session whose provider does not match:",
+                                    );
+                                    app.resume.settle();
+                                    app.dirty = true;
+                                    continue;
+                                }
+                            }
+                        }
                         let entered = match check_session_cwd(&data.cwd, &previous_cwd) {
                             Ok(dir) => dir,
                             Err(e) => {
@@ -2345,6 +2385,8 @@ struct SessionSnapshot {
     tokens_in: u64,
     tokens_out: u64,
     plan_mode: bool,
+    /// Resolved provider identity of the live engine at save time.
+    provider: agent_code_lib::services::session::ProviderIdentity,
 }
 
 /// Copy the live conversation out of the engine, or `None` when there is
@@ -2371,6 +2413,10 @@ fn session_snapshot(eng: &agent_code_lib::query::QueryEngine) -> Option<SessionS
         tokens_in: st.total_usage.input_tokens,
         tokens_out: st.total_usage.output_tokens,
         plan_mode: st.plan_mode,
+        provider: agent_code_lib::services::session::ProviderIdentity::from_api(
+            &st.config.api.base_url,
+            st.config.api.auth_mode,
+        ),
     })
 }
 
@@ -2393,6 +2439,7 @@ fn write_session_snapshot(snap: &SessionSnapshot) -> Result<(), String> {
         snap.tokens_in,
         snap.tokens_out,
         snap.plan_mode,
+        Some(snap.provider.clone()),
     )
     .map(|_| ())
 }

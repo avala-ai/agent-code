@@ -17,8 +17,44 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::config::atomic::atomic_write_secret;
+use crate::config::ApiAuthMode;
 use crate::llm::message::Message;
 use crate::services::secret_masker;
+
+/// The resolved provider a session conversation was run against.
+///
+/// Stored on disk at save time from the **live** engine config (already
+/// resolved endpoints and auth modes — not the raw project file). At
+/// resume, the same shape is taken from the live engine again, so the
+/// comparison is resolved-vs-resolved and does not re-open the failed
+/// "destination file vs running config" approach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderIdentity {
+    /// Resolved API base URL (trailing slashes normalized on compare).
+    pub base_url: String,
+    /// Auth mode the conversation used.
+    pub auth_mode: ApiAuthMode,
+}
+
+impl ProviderIdentity {
+    /// Snapshot from a live (already resolved) `ApiConfig`.
+    pub fn from_api(base_url: &str, auth_mode: ApiAuthMode) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            auth_mode,
+        }
+    }
+
+    /// Whether two identities name the same service binding.
+    pub fn matches(&self, other: &Self) -> bool {
+        normalize_base_url(&self.base_url) == normalize_base_url(&other.base_url)
+            && self.auth_mode == other.auth_mode
+    }
+}
+
+fn normalize_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
 
 /// Serializable session state persisted to disk.
 ///
@@ -62,6 +98,11 @@ pub struct SessionData {
     /// tags are a set for categorization. Managed via `/tag`.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Provider the conversation was saved under. `None` for sessions
+    /// written before this field existed — resume treats that as
+    /// "unknown" rather than assuming the current process is safe.
+    #[serde(default)]
+    pub provider: Option<ProviderIdentity>,
 }
 
 /// Sessions directory path.
@@ -155,11 +196,16 @@ pub fn save_session(
     turn_count: usize,
 ) -> Result<PathBuf, String> {
     save_session_full(
-        session_id, messages, cwd, model, turn_count, 0.0, 0, 0, false,
+        session_id, messages, cwd, model, turn_count, 0.0, 0, 0, false, None,
     )
 }
 
 /// Save the full session state to disk (including cost and token tracking).
+///
+/// `provider` is the **resolved** identity of the live engine. When
+/// `Some`, it is written so a later resume can refuse to bind the
+/// conversation to a different service. When `None`, any previously
+/// stored identity is preserved (metadata-only writers like `/rename`).
 #[allow(clippy::too_many_arguments)]
 pub fn save_session_full(
     session_id: &str,
@@ -171,15 +217,17 @@ pub fn save_session_full(
     total_input_tokens: u64,
     total_output_tokens: u64,
     plan_mode: bool,
+    provider: Option<ProviderIdentity>,
 ) -> Result<PathBuf, String> {
     with_session_lock(session_id, |path| {
-        // Preserve original created_at, label, and tags if file exists.
+        // Preserve original created_at, label, tags, and (when the caller
+        // did not stamp a new one) provider if the file exists.
         // Re-read under the lock so a concurrent `/rename` or `/tag` is
         // either fully before or fully after this save — never discarded
         // because we sampled metadata mid-write.
-        let (created_at, label, tags) = match load_session_at(path) {
-            Ok(d) => (d.created_at, d.label, d.tags),
-            Err(_) => (chrono::Utc::now().to_rfc3339(), None, Vec::new()),
+        let (created_at, label, tags, prior_provider) = match load_session_at(path) {
+            Ok(d) => (d.created_at, d.label, d.tags, d.provider),
+            Err(_) => (chrono::Utc::now().to_rfc3339(), None, Vec::new(), None),
         };
 
         let data = SessionData {
@@ -196,6 +244,7 @@ pub fn save_session_full(
             plan_mode,
             label,
             tags,
+            provider: provider.or(prior_provider),
         };
 
         write_session_file_atomic(path, &data)?;
@@ -214,6 +263,50 @@ pub fn session_exists(session_id: &str) -> bool {
     sessions_dir()
         .map(|d| d.join(format!("{session_id}.json")).exists())
         .unwrap_or(false)
+}
+
+/// Whether `data` may be restored into a process whose live API config
+/// is `current`.
+///
+/// Compares the session's stored **resolved** provider to the process's
+/// **resolved** provider. Does not load destination project files — that
+/// path was tried and is unsound (running config is rewritten by
+/// provider detection; project files are not).
+///
+/// - Both sides present and equal → `Ok(Compatible::Match)`
+/// - Session has no fingerprint (pre-field save) → `Ok(Compatible::Unknown)`
+/// - Mismatch → `Err` with a message naming both sides
+pub fn check_provider_for_resume(
+    data: &SessionData,
+    current_base_url: &str,
+    current_auth_mode: ApiAuthMode,
+) -> Result<ProviderResume, String> {
+    let Some(ref stored) = data.provider else {
+        return Ok(ProviderResume::Unknown);
+    };
+    let current = ProviderIdentity::from_api(current_base_url, current_auth_mode);
+    if stored.matches(&current) {
+        return Ok(ProviderResume::Match);
+    }
+    Err(format!(
+        "this session was saved against {} ({}) but the running process \
+         is bound to {} ({}) — resume would send the conversation to a \
+         different service or account. Start a new session with the \
+         matching provider, or continue here without resuming.",
+        stored.base_url,
+        stored.auth_mode.as_str(),
+        current.base_url,
+        current.auth_mode.as_str(),
+    ))
+}
+
+/// Outcome of [`check_provider_for_resume`] when the resume is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderResume {
+    /// Stored identity matches the running process.
+    Match,
+    /// Session predates provider stamping; caller should warn.
+    Unknown,
 }
 
 /// Load a session from disk by ID.
@@ -900,6 +993,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         }
     }
 
@@ -959,6 +1053,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&data).unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
@@ -989,6 +1084,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();
@@ -1018,6 +1114,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(
@@ -1047,6 +1144,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(!out.contains("verylongprovidersecret1234567890"));
@@ -1073,6 +1171,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let out = serialize_masked(&data).unwrap();
         // Must still parse back as a SessionData.
@@ -1111,6 +1210,7 @@ mod tests {
                 plan_mode: false,
                 label: None,
                 tags: Vec::new(),
+                provider: None,
             };
             let out = serialize_masked(&data).unwrap();
             let parsed: Result<SessionData, _> = serde_json::from_str(&out);
@@ -1216,6 +1316,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let out = serialize_masked(&data).unwrap();
         assert!(!out.contains("REDACTED"));
@@ -1238,6 +1339,7 @@ mod tests {
             plan_mode: false,
             label: Some("refactor pass".into()),
             tags: Vec::new(),
+            provider: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         let back: SessionData = serde_json::from_str(&json).unwrap();
@@ -1329,6 +1431,7 @@ mod tests {
             plan_mode: false,
             label: None,
             tags: Vec::new(),
+            provider: None,
         };
         let json = serde_json::to_string_pretty(&data).unwrap();
         std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
@@ -1587,6 +1690,109 @@ mod tests {
         assert!(
             session_exists(id),
             "after a write the id must report present so /clear can overwrite it"
+        );
+    }
+    #[test]
+    fn provider_identity_ignores_trailing_slash() {
+        let a = ProviderIdentity::from_api("https://api.example.com/", ApiAuthMode::ApiKey);
+        let b = ProviderIdentity::from_api("https://api.example.com", ApiAuthMode::ApiKey);
+        assert!(a.matches(&b));
+        let c = ProviderIdentity::from_api("https://api.example.com", ApiAuthMode::XaiOauth);
+        assert!(!a.matches(&c));
+    }
+
+    #[test]
+    fn check_provider_match_mismatch_and_unknown() {
+        let mut data = make_session(vec![]);
+        // Legacy session: no fingerprint.
+        assert_eq!(
+            check_provider_for_resume(&data, "https://api.x.ai", ApiAuthMode::ApiKey).unwrap(),
+            ProviderResume::Unknown
+        );
+
+        data.provider = Some(ProviderIdentity::from_api(
+            "https://api.x.ai",
+            ApiAuthMode::ApiKey,
+        ));
+        assert_eq!(
+            check_provider_for_resume(&data, "https://api.x.ai/", ApiAuthMode::ApiKey).unwrap(),
+            ProviderResume::Match
+        );
+
+        let err =
+            check_provider_for_resume(&data, "https://api.openai.com/v1", ApiAuthMode::ApiKey)
+                .expect_err("different base_url must refuse");
+        assert!(
+            err.contains("api.x.ai") && err.contains("api.openai.com"),
+            "refusal must name both sides: {err}"
+        );
+
+        let err = check_provider_for_resume(&data, "https://api.x.ai", ApiAuthMode::XaiOauth)
+            .expect_err("different auth_mode must refuse");
+        assert!(
+            err.contains("api_key") && err.contains("xai_oauth"),
+            "refusal must name both modes: {err}"
+        );
+    }
+
+    #[test]
+    fn save_stamps_provider_and_load_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvGuard::set("XDG_CONFIG_HOME", tmp.path());
+        let id = "prov-stamp";
+        let identity = ProviderIdentity::from_api("https://api.x.ai", ApiAuthMode::ApiKey);
+        save_session_full(
+            id,
+            &[user_message("hi")],
+            "/work",
+            "grok-4",
+            1,
+            0.0,
+            0,
+            0,
+            false,
+            Some(identity.clone()),
+        )
+        .expect("save");
+        let loaded = load_session(id).expect("load");
+        assert_eq!(loaded.provider.as_ref(), Some(&identity));
+
+        // A later save without a provider stamp must keep the old one
+        // (metadata-only writers share this path).
+        save_session_full(
+            id,
+            &[user_message("hi")],
+            "/work",
+            "grok-4",
+            2,
+            0.0,
+            0,
+            0,
+            false,
+            None,
+        )
+        .expect("resave");
+        let again = load_session(id).expect("load again");
+        assert_eq!(again.provider.as_ref(), Some(&identity));
+        assert_eq!(again.turn_count, 2);
+    }
+
+    #[test]
+    fn old_session_json_without_provider_still_loads() {
+        let json = serde_json::json!({
+            "id": "legacy",
+            "created_at": "2026-04-15T00:00:00Z",
+            "updated_at": "2026-04-15T00:00:00Z",
+            "cwd": "/work",
+            "model": "m",
+            "messages": [],
+            "turn_count": 1,
+        });
+        let data: SessionData = serde_json::from_value(json).unwrap();
+        assert!(data.provider.is_none());
+        assert_eq!(
+            check_provider_for_resume(&data, "https://x", ApiAuthMode::ApiKey).unwrap(),
+            ProviderResume::Unknown
         );
     }
 }
