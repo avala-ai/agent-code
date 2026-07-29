@@ -68,6 +68,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | Click / drag scrollbar | Jump or scrub the viewport when content overflows |
 | Click composer body | Place caret (2× → end of word · 3× → end of line) |
 | Click status-bar chip | Mode cycle / token & cost detail / queue toggle / copy selection / etc. |
+| Middle-click | Paste X11/Wayland **PRIMARY** selection into the composer (needs `xclip`/`xsel`/`wl-paste`) |
 
 Mouse capture is on by default so the in-app hits above work. Toggle with `Ctrl+Alt+M` or `/mouse` for native terminal selection.
 

@@ -78,6 +78,10 @@ pub fn describe_routes() -> Vec<String> {
         native_candidate_names().join(", ")
     ));
     out.push(format!(
+        "primary candidates: {}",
+        primary_candidate_names().join(", ")
+    ));
+    out.push(format!(
         "tmux buffer       : {}",
         if in_tmux() { "yes ($TMUX)" } else { "no" }
     ));
@@ -94,6 +98,76 @@ pub fn describe_routes() -> Vec<String> {
         if is_ssh() { "yes" } else { "no" }
     ));
     out
+}
+
+/// Read the X11/Wayland **PRIMARY** selection (middle-click paste).
+///
+/// Linux only — returns `Err` on macOS/Windows where PRIMARY does not exist.
+/// Caps payload size so a huge selection cannot freeze the TUI.
+pub fn paste_primary() -> Result<(String, &'static str), String> {
+    const MAX: usize = 256 * 1024;
+    let mut last_err: Option<String> = None;
+    for (cmd, args) in primary_candidates() {
+        match std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                if text.len() > MAX {
+                    // Truncate on a char boundary.
+                    let mut end = MAX;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    text.push_str("\n…[truncated]");
+                }
+                return Ok((text, cmd));
+            }
+            Ok(out) => {
+                last_err = Some(format!("{cmd} exited with {}", out.status));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                last_err = Some(format!("{cmd}: {e}"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        if cfg!(target_os = "linux") {
+            "no PRIMARY reader on PATH (install xclip, xsel, or wl-paste)".into()
+        } else {
+            "PRIMARY selection is not available on this platform".into()
+        }
+    }))
+}
+
+fn primary_candidate_names() -> Vec<&'static str> {
+    primary_candidates().iter().map(|(n, _)| *n).collect()
+}
+
+fn primary_candidates() -> &'static [(&'static str, &'static [&'static str])] {
+    // PRIMARY is an X11/Wayland concept; skip on macOS/Windows.
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        return &[];
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        &[
+            ("wl-paste", &["--primary", "--no-newline"]),
+            ("xclip", &["-selection", "primary", "-o"]),
+            ("xsel", &["--primary", "--output"]),
+        ]
+    } else {
+        &[
+            ("xclip", &["-selection", "primary", "-o"]),
+            ("xsel", &["--primary", "--output"]),
+            ("wl-paste", &["--primary", "--no-newline"]),
+        ]
+    }
 }
 
 fn native_candidate_names() -> Vec<&'static str> {
@@ -298,6 +372,35 @@ mod tests {
         let d = describe_routes();
         assert!(d.iter().any(|l| l.contains("native")));
         assert!(d.iter().any(|l| l.contains("osc52")));
+        assert!(d.iter().any(|l| l.contains("primary")));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn paste_primary_errors_on_non_linux() {
+        let err = paste_primary().unwrap_err();
+        assert!(
+            err.contains("not available") || err.contains("PRIMARY"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paste_primary_errors_cleanly_with_empty_path() {
+        let prev = std::env::var_os("PATH");
+        // SAFETY: single-threaded test, restored before exit.
+        unsafe {
+            std::env::set_var("PATH", "");
+        }
+        let result = paste_primary();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(result.is_err(), "empty PATH must not invent a reader");
     }
 
     #[test]

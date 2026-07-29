@@ -3720,9 +3720,24 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 }
             }
         }
-        // Middle-click: no OS PRIMARY read without extra deps; hint paste path.
+        // Middle-click: paste X11/Wayland PRIMARY when a reader is on PATH
+        // (#558 D5-31). Falls back to a clipboard hint when unavailable.
         MouseEventKind::Down(MouseButton::Middle) if app.phase != super::app::Phase::Permission => {
-            app.push_toast("use Ctrl+Shift+V / terminal paste for clipboard");
+            match crate::clipboard::paste_primary() {
+                Ok((text, route)) if !text.is_empty() => {
+                    handle_paste(app, &text);
+                    let n = text.chars().count();
+                    app.push_toast(format!("pasted {n} chars from PRIMARY via {route}"));
+                }
+                Ok(_) => {
+                    app.push_toast("PRIMARY selection is empty");
+                }
+                Err(e) => {
+                    app.push_toast(format!(
+                        "{e} · use Ctrl+Shift+V / terminal paste for CLIPBOARD"
+                    ));
+                }
+            }
         }
         // Hover: resolve against the per-frame hit registry (#558).
         // Launch rows also update the keyboard highlight under the cursor.
