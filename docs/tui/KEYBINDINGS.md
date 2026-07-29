@@ -61,7 +61,15 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | `y` (block selected) | **Copy block body** (clipboard cascade) |
 | `Y` (block selected) | **Copy block metadata** (e.g. tool name · detail) |
 | Mouse wheel | Scroll |
-| Click bottom transcript row | Jump to live tail (Follow) |
+| Click **↓ N new** pill | Jump to live tail (Follow) |
+| Click transcript | 1× select display line · 2× select word · 3× select soft-wrap group |
+| Drag on transcript | Expand line selection |
+| Click hyperlink | Open http(s)/mailto in the platform browser (hover fills the label) |
+| Click / drag scrollbar | Jump or scrub the viewport when content overflows |
+| Click composer body | Place caret (2× → end of word · 3× → end of line) |
+| Click status-bar chip | Mode cycle / token & cost detail / queue toggle / copy selection / etc. |
+
+Mouse capture is on by default so the in-app hits above work. Toggle with `Ctrl+Alt+M` or `/mouse` for native terminal selection.
 
 Tool results start collapsed (`… +N more · e expand`).
 
