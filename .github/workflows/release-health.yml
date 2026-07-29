@@ -19,9 +19,25 @@ jobs:
       - name: Compare
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh needs an explicit repo when the job has no checkout;
+          # GITHUB_REPOSITORY alone is not enough for `gh issue` / some
+          # `gh api` paths in that environment.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)
+          # Prefer the newest git tag (a tag with no GitHub Release still
+          # counts — publish can fail after the tag is pushed). Fall back
+          # to releases/latest only when no v* tags exist.
+          TAG=$(gh api "repos/${GH_REPO}/git/matching-refs/tags/v" --paginate --jq '
+            map(.ref | sub("^refs/tags/"; ""))
+            | map(select(test("^v[0-9]")))
+            | sort_by(ltrimstr("v") | split(".") | map(tonumber? // 0))
+            | reverse
+            | .[0] // empty
+          ')
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)
+          fi
           WANT="${TAG#v}"
           echo "latest tag: $TAG ($WANT)"
 

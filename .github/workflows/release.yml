@@ -247,10 +247,13 @@ jobs:
           contains(needs.*.result, 'cancelled')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh needs an explicit repo when the job has no checkout;
+          # GITHUB_REPOSITORY alone is not enough for `gh issue`.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}"
           BODY=$(cat <<MD
           ## Release workflow failure for \`${TAG}\`
 
