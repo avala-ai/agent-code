@@ -3000,6 +3000,38 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
             app.toggle_queue_pane();
         }
+        // Launch surface owns ↑/↓/Enter on an empty composer while it is
+        // visible (#557 Phase 3). Tasks / queue panes take priority when
+        // they have focusable rows.
+        (m, KeyCode::Up)
+            if m.is_empty()
+                && app.input.is_empty()
+                && app.launch.should_draw(app)
+                && !app.tasks_nav_active()
+                && !app.show_queue_pane =>
+        {
+            app.launch_move(-1);
+        }
+        (m, KeyCode::Down)
+            if m.is_empty()
+                && app.input.is_empty()
+                && app.launch.should_draw(app)
+                && !app.tasks_nav_active()
+                && !app.show_queue_pane =>
+        {
+            app.launch_move(1);
+        }
+        (m, KeyCode::Enter)
+            if m.is_empty()
+                && app.input.is_empty()
+                && app.queue.is_empty()
+                && app.launch.should_draw(app)
+                && !app.tasks_nav_active()
+                && !app.show_queue_pane
+                && app.launch.highlighted_id().is_some() =>
+        {
+            app.launch_accept();
+        }
         // When the tasks pane has selectable rows (and the queue pane is
         // not open, which owns the same keys), plain arrows move the
         // selection and plain Enter opens the selected task's output.

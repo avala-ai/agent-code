@@ -1,9 +1,9 @@
 //! Launch surface — the front door before the first turn.
 //!
-//! Phase 2 of the first-run / launch epic (#557): branding, `repo:branch ·
+//! Phases 2–3 of the first-run / launch epic (#557): branding, `repo:branch ·
 //! version`, auth + permission mode, a single startup-warning slot, recent
-//! sessions, and a type-to-start prompt. Interaction (arrow/Enter into a
-//! recent session, mouse hit-testing, shimmer) is Phase 3.
+//! sessions with ↑/↓ + Enter to resume, and a type-to-start prompt.
+//! Remaining: mouse hit-testing on rows, shimmer / reduced_motion.
 
 use agent_code_lib::services::session::SessionSummary;
 use agent_code_lib::services::startup::{self, StartupWarning, WarningSeverity};
@@ -37,6 +37,8 @@ pub struct LaunchSurface {
     pub warning: Option<StartupWarning>,
     /// Recent sessions, newest first (capped at [`RECENT_LIMIT`]).
     pub recent: Vec<SessionSummary>,
+    /// Highlighted row in [`Self::recent`] (↑/↓).
+    pub selected: usize,
 }
 
 impl LaunchSurface {
@@ -57,6 +59,7 @@ impl LaunchSurface {
             mode_label: mode_label.into(),
             warning: startup::pick_banner(warnings).cloned(),
             recent,
+            selected: 0,
         }
     }
 
@@ -74,6 +77,25 @@ impl LaunchSurface {
             && !app.theme_picker_open()
             && !app.command_palette_open()
             && transcript_is_fresh(&app.transcript)
+    }
+
+    /// Move the recent-session highlight. No-op when the list is empty.
+    pub fn move_selection(&mut self, delta: i32) {
+        let n = self.recent.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.selected.min(n - 1) as i32;
+        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        self.selected = next;
+    }
+
+    /// Id of the highlighted recent session, if any.
+    pub fn highlighted_id(&self) -> Option<&str> {
+        self.recent
+            .get(self.selected.min(self.recent.len().saturating_sub(1)))
+            .map(|s| s.id.as_str())
+            .filter(|_| !self.recent.is_empty())
     }
 }
 
@@ -201,7 +223,8 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         )));
     } else {
-        for s in &launch.recent {
+        let sel = launch.selected.min(launch.recent.len() - 1);
+        for (i, s) in launch.recent.iter().enumerate() {
             let id = short_id(&s.id);
             let label = s
                 .label
@@ -213,15 +236,18 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 format!("{} turns", s.turn_count)
             };
-            let row = format!("    {id}  {turns}  {label}");
+            let marker = if i == sel { "›" } else { " " };
+            let row = format!("  {marker} {id}  {turns}  {label}");
             let row = truncate_cols(&row, area.width.saturating_sub(2) as usize);
-            lines.push(Line::from(Span::styled(
-                row,
-                Style::default().fg(p.inactive),
-            )));
+            let style = if i == sel {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.inactive)
+            };
+            lines.push(Line::from(Span::styled(row, style)));
         }
         lines.push(Line::from(Span::styled(
-            "    /resume or Ctrl+P to open a past session",
+            "    ↑/↓ select · Enter resume · or type to start",
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         )));
     }
@@ -410,5 +436,69 @@ mod tests {
             !app.launch.visible,
             "slash submit must dismiss launch so System output is visible"
         );
+    }
+
+    fn summary(id: &str, label: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            turn_count: 2,
+            message_count: 4,
+            updated_at: "t".into(),
+            label: label.map(str::to_owned),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn move_selection_wraps() {
+        let mut l = LaunchSurface::ready(
+            "r",
+            "a",
+            "n",
+            &[],
+            vec![summary("a", None), summary("b", None), summary("c", None)],
+        );
+        assert_eq!(l.highlighted_id(), Some("a"));
+        l.move_selection(1);
+        assert_eq!(l.highlighted_id(), Some("b"));
+        l.move_selection(1);
+        assert_eq!(l.highlighted_id(), Some("c"));
+        l.move_selection(1);
+        assert_eq!(l.highlighted_id(), Some("a"));
+        l.move_selection(-1);
+        assert_eq!(l.highlighted_id(), Some("c"));
+    }
+
+    #[test]
+    fn launch_accept_starts_resume_and_dismisses() {
+        let mut app = App::new("m", "/w", "current");
+        app.launch = LaunchSurface::ready(
+            "r",
+            "a",
+            "n",
+            &[],
+            vec![summary("other-sess", Some("past work"))],
+        );
+        assert!(app.launch.visible);
+        app.launch_accept();
+        assert!(!app.launch.visible);
+        assert!(
+            app.status_message.contains("resuming"),
+            "status: {}",
+            app.status_message
+        );
+        // Gate must be armed for the run loop.
+        assert!(app.resume.settle().is_some());
+    }
+
+    #[test]
+    fn launch_accept_same_session_is_noop() {
+        let mut app = App::new("m", "/w", "same-id");
+        app.launch = LaunchSurface::ready("r", "a", "n", &[], vec![summary("same-id", None)]);
+        app.launch_accept();
+        assert!(app.status_message.contains("already in this session"));
+        assert!(app.resume.settle().is_none());
     }
 }

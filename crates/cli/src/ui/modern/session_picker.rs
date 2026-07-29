@@ -696,6 +696,48 @@ impl App {
         self.dirty = true;
     }
 
+    /// Move the launch surface's recent-session highlight (↑/↓).
+    pub fn launch_move(&mut self, delta: i32) {
+        if !self.launch.should_draw(self) {
+            return;
+        }
+        self.launch.move_selection(delta);
+        self.dirty = true;
+    }
+
+    /// Resume the highlighted recent session from the launch surface.
+    ///
+    /// Same safety rules as [`Self::session_picker_accept`]: same-session
+    /// is a no-op, pending work for the conversation we leave is cancelled,
+    /// and the run loop performs the load via `resume.begin`.
+    pub fn launch_accept(&mut self) {
+        if !self.launch.should_draw(self) {
+            return;
+        }
+        let Some(id) = self.launch.highlighted_id().map(str::to_owned) else {
+            return;
+        };
+        // Hide the front door once a resume is committed.
+        self.launch.dismiss();
+        if id == self.session_id {
+            self.status_message = if self.resume.settle().is_some() {
+                self.cancel_deferred_resume_work("cancelled — held for the resume you cancelled:");
+                "already in this session — cancelled the resume in progress".to_string()
+            } else {
+                "already in this session".to_string()
+            };
+            self.dirty = true;
+            return;
+        }
+        self.cancel_pending_session_work(
+            "cancelled — issued before you resumed another session:",
+            true,
+        );
+        self.resume.begin(id.clone());
+        self.status_message = format!("resuming {}…", short_id(&id));
+        self.dirty = true;
+    }
+
     /// Adopt the restored conversation's checklist.
     ///
     /// A resume rewrites history exactly as `/rewind` and `/snip` do, so
