@@ -1358,17 +1358,13 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-/// True when the transcript has no user/assistant work — only chrome
-/// system lines (or nothing).
+/// True when the transcript is empty or only holds the initial chrome
+/// welcome line. `/help` System output, Errors, and Warnings are real
+/// content — guidance must not overlay them (#578).
 fn transcript_is_empty_guidance(items: &[super::app::TranscriptItem]) -> bool {
-    !items.iter().any(|i| {
-        matches!(
-            i,
-            super::app::TranscriptItem::User(_)
-                | super::app::TranscriptItem::Assistant(_)
-                | super::app::TranscriptItem::Thinking { .. }
-                | super::app::TranscriptItem::Tool { .. }
-        )
+    items.iter().all(|i| match i {
+        super::app::TranscriptItem::System(s) => s == super::app::WELCOME_SYSTEM_LINE,
+        _ => false,
     })
 }
 
@@ -3534,17 +3530,32 @@ mod tests {
         assert!(!s2.contains("↓"), "no pill while following; buffer:\n{s2}");
     }
     #[test]
-    fn empty_guidance_when_only_system_lines() {
-        use super::super::app::TranscriptItem;
+    fn empty_guidance_when_only_chrome_or_empty() {
+        use super::super::app::{TranscriptItem, WELCOME_SYSTEM_LINE};
         assert!(transcript_is_empty_guidance(&[]));
         assert!(transcript_is_empty_guidance(&[TranscriptItem::System(
-            "welcome".into()
+            WELCOME_SYSTEM_LINE.into()
+        )]));
+        // Subsequent System rows (e.g. /help) are real content.
+        assert!(!transcript_is_empty_guidance(&[TranscriptItem::System(
+            "Keys: Enter send · …".into()
+        )]));
+        assert!(!transcript_is_empty_guidance(&[
+            TranscriptItem::System(WELCOME_SYSTEM_LINE.into()),
+            TranscriptItem::System("Keys: Enter send · …".into()),
+        ]));
+        // Error / Warning must not be treated as empty chrome.
+        assert!(!transcript_is_empty_guidance(&[TranscriptItem::Error(
+            "boom".into()
+        )]));
+        assert!(!transcript_is_empty_guidance(&[TranscriptItem::Warning(
+            "careful".into()
         )]));
         assert!(!transcript_is_empty_guidance(&[TranscriptItem::User(
             "hi".into()
         )]));
         assert!(!transcript_is_empty_guidance(&[
-            TranscriptItem::System("x".into()),
+            TranscriptItem::System(WELCOME_SYSTEM_LINE.into()),
             TranscriptItem::Assistant("y".into()),
         ]));
     }

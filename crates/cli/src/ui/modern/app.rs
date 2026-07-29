@@ -244,6 +244,10 @@ pub enum ComposerMode {
     Normal,
 }
 
+/// Initial chrome system line shown on a fresh session. Empty-state
+/// guidance treats this (and only this) System row as non-content.
+pub const WELCOME_SYSTEM_LINE: &str = "Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels";
+
 #[derive(Debug, Clone, Hash)]
 pub enum TranscriptItem {
     User(String),
@@ -669,9 +673,7 @@ impl App {
             show_thinking_blocks: true,
             effort: None,
             modals: std::collections::VecDeque::new(),
-            transcript: vec![TranscriptItem::System(
-                "Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels".into(),
-            )],
+            transcript: vec![TranscriptItem::System(WELCOME_SYSTEM_LINE.into())],
             scroll: ScrollState::Follow,
             layout: LayoutCache::default(),
             viewport_h: 0,
@@ -718,9 +720,7 @@ impl App {
             vi_mode: false,
             composer_mode: ComposerMode::Insert,
             vi_pending_d: false,
-            keybindings: std::sync::Arc::new(
-                crate::ui::keybindings::KeybindingRegistry::defaults(),
-            ),
+            keybindings: std::sync::Arc::new(crate::ui::keybindings::KeybindingRegistry::defaults()),
             search: None,
             theme_picker: None,
             theme_name: "auto".to_string(),
