@@ -570,6 +570,9 @@ pub struct App {
     pub inherit_fg: bool,
     /// Theme id the run loop should mirror into config and persist.
     pub pending_theme: Option<String>,
+    /// Desired mouse-capture state. The run loop applies
+    /// `Enable`/`DisableMouseCapture` when this flips. Default true.
+    pub mouse_capture: bool,
     /// When true, runtime should cancel the active turn.
     pub cancel_requested: bool,
     /// Ctrl+C on an empty idle prompt arms quit; a second press within
@@ -750,6 +753,7 @@ impl App {
             theme_name: "auto".to_string(),
             inherit_fg: false,
             pending_theme: None,
+            mouse_capture: true,
             cancel_requested: false,
             quit_armed: false,
             tasks: Vec::new(),
@@ -1460,9 +1464,30 @@ impl App {
             self.transcript.push(TranscriptItem::System(
                 "Keys: Enter send · Alt+Enter newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels · \
                  Ctrl+T tasks · Ctrl+; queue · y/Y copy block · e expand · \
-                 /model /copy /cost /status /plan /theme /queue /terminal-setup /stats /exit · skills: /commit …"
+                 /model /copy /cost /status /plan /theme /mouse /queue /terminal-setup /stats /exit · skills: /commit …"
                     .into(),
             ));
+            self.input.clear();
+            self.cursor = 0;
+            return;
+        }
+        if text == "/mouse" || text == "/mouse on" || text == "/mouse off" {
+            // Toggle mouse capture so the terminal's native selection can
+            // take over when the user wants it. The run loop applies the
+            // Enable/Disable against the backend.
+            let want = match text.as_str() {
+                "/mouse on" => true,
+                "/mouse off" => false,
+                _ => !self.mouse_capture,
+            };
+            self.mouse_capture = want;
+            self.status_message = if want {
+                "mouse capture on — line selection active · /mouse off for native copy".into()
+            } else {
+                "mouse capture off — terminal native selection · /mouse on to restore".into()
+            };
+            self.transcript
+                .push(TranscriptItem::System(self.status_message.clone()));
             self.input.clear();
             self.cursor = 0;
             return;
@@ -3395,6 +3420,21 @@ mod tests {
             )),
             "old-epoch task output must not land"
         );
+    }
+
+    #[test]
+    fn toggle_mouse_capture_via_slash() {
+        let mut app = app_with_lines(10, 20);
+        assert!(app.mouse_capture, "default is capture on");
+        app.input = "/mouse".into();
+        app.submit();
+        assert!(!app.mouse_capture, "/mouse should toggle off");
+        app.input = "/mouse on".into();
+        app.submit();
+        assert!(app.mouse_capture);
+        app.input = "/mouse off".into();
+        app.submit();
+        assert!(!app.mouse_capture);
     }
 
     #[test]

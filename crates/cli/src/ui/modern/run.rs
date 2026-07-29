@@ -679,6 +679,10 @@ static KEYBOARD_ENHANCEMENT_WANTED: AtomicBool = AtomicBool::new(false);
 /// consults this so we pop exactly as many times as we pushed. A leaked
 /// keyboard mode makes the user's shell unusable.
 static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+/// Whether the user wants mouse capture on. Default true so line selection
+/// works; `/mouse` turns it off for native terminal click-drag copy.
+/// Shared with `with_main_screen` so re-entry respects the choice.
+static MOUSE_CAPTURE_WANTED: AtomicBool = AtomicBool::new(true);
 
 fn push_keyboard_enhancement(out: &mut impl Write) {
     if !KEYBOARD_ENHANCEMENT_WANTED.load(Ordering::Relaxed)
@@ -703,13 +707,23 @@ fn pop_keyboard_enhancement(out: &mut impl Write) {
     let _ = execute!(out, PopKeyboardEnhancementFlags);
 }
 
+fn apply_mouse_capture(out: &mut impl Write, want: bool) {
+    MOUSE_CAPTURE_WANTED.store(want, Ordering::Relaxed);
+    if want {
+        let _ = execute!(out, EnableMouseCapture);
+    } else {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+}
+
 fn setup_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
     // Enter alt screen and enable focus + bracketed paste + mouse capture.
     // All are consumed by the loop and disabled on exit so no `^[[I`/`^[[O`
     // (focus), paste brackets, or mouse tracking leak into the shell
-    // (plan §M7/§M9).
+    // (plan §M7/§M9). Mouse capture starts on; the user can drop it with
+    // `/mouse` for native terminal selection.
     if let Err(e) = execute!(
         out,
         EnterAlternateScreen,
@@ -720,6 +734,7 @@ fn setup_terminal() -> anyhow::Result<Term> {
         let _ = disable_raw_mode();
         return Err(e.into());
     }
+    MOUSE_CAPTURE_WANTED.store(true, Ordering::Relaxed);
     // Pushed last, so it is popped first on every restore path.
     push_keyboard_enhancement(&mut out);
     let backend = CrosstermBackend::new(out);
@@ -772,14 +787,17 @@ fn with_main_screen<R>(f: impl FnOnce() -> R) -> R {
     // Best-effort re-enter; draw path will recover on the next frame.
     let _ = enable_raw_mode();
     let mut out = stdout();
+    let want_mouse = MOUSE_CAPTURE_WANTED.load(Ordering::Relaxed);
     let _ = execute!(
         out,
         EnterAlternateScreen,
         EnableFocusChange,
         EnableBracketedPaste,
-        EnableMouseCapture,
         crossterm::cursor::Hide,
     );
+    if want_mouse {
+        let _ = execute!(out, EnableMouseCapture);
+    }
     // `restore_stdout_modes` popped the flags for the interactive command;
     // put them back last so the teardown order stays the same.
     push_keyboard_enhancement(&mut out);
@@ -1015,6 +1033,18 @@ pub(super) async fn event_loop(
                     }
                 }
                 Err(_) => app.pending_theme = Some(theme_id),
+            }
+        }
+
+        // Apply a `/mouse` toggle: Enable/Disable must hit the live
+        // backend. The event loop has no terminal handle — write the
+        // mode switch to stdout, which is the same stream crossterm
+        // already owns for the alt screen.
+        {
+            let want = app.mouse_capture;
+            if want != MOUSE_CAPTURE_WANTED.load(Ordering::Relaxed) {
+                apply_mouse_capture(&mut stdout(), want);
+                app.dirty = true;
             }
         }
 
@@ -3086,6 +3116,19 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
             if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
         {
             app.copy_selection_or_last();
+        }
+        // Toggle mouse capture (Ctrl+Shift+M) so native terminal
+        // selection is available without typing /mouse.
+        (m, KeyCode::Char('m') | KeyCode::Char('M'))
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            app.input = if app.mouse_capture {
+                "/mouse off".into()
+            } else {
+                "/mouse on".into()
+            };
+            app.cursor = app.input.len();
+            app.submit();
         }
         // Queue pane toggle (Ctrl+; / Ctrl+').
         (m, KeyCode::Char(';') | KeyCode::Char('\'')) if m.contains(KeyModifiers::CONTROL) => {
