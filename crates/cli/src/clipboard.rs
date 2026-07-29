@@ -386,21 +386,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn paste_primary_errors_cleanly_with_empty_path() {
-        let prev = std::env::var_os("PATH");
-        // SAFETY: single-threaded test, restored before exit.
-        unsafe {
-            std::env::set_var("PATH", "");
+    fn primary_candidates_match_platform() {
+        // Do not clear PATH here — env mutation races with parallel tests
+        // (e.g. which_in_path). Inspect the static candidate table instead.
+        if cfg!(target_os = "linux") {
+            assert!(
+                !primary_candidates().is_empty(),
+                "linux should advertise a PRIMARY reader"
+            );
+        } else {
+            assert!(
+                primary_candidates().is_empty(),
+                "PRIMARY is Linux-only"
+            );
         }
-        let result = paste_primary();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-        assert!(result.is_err(), "empty PATH must not invent a reader");
     }
 
     #[test]
