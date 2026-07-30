@@ -64,7 +64,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | Click **↓ N new** pill | Jump to live tail (Follow) |
 | Click transcript | 1× select display line · 2× select word · 3× select soft-wrap group |
 | Drag on transcript | Expand line selection |
-| Click hyperlink | Open http(s)/mailto in the platform browser (hover fills the label; OSC 22 pointer shape on supported hosts) |
+| Click hyperlink | Open http(s)/mailto in the platform browser (hover fills the label; OSC 8 + OSC 22 pointer on capable hosts) |
 | Click / drag scrollbar | Jump or scrub the viewport when content overflows |
 | Timeline rail (left) | Markers for turns/errors; hover previews, click jumps |
 | Click composer body | Place caret (2× → end of word · 3× → end of line) |

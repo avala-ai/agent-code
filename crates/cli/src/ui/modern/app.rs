@@ -603,6 +603,9 @@ pub struct App {
     pub show_tasks: bool,
     /// Detected terminal capabilities, set once at loop start (plan §M7).
     pub caps: TerminalCaps,
+    /// Visible hyperlinks queued this frame for OSC 8 stamping after draw
+    /// (#558 D3-10). Cleared at the start of each frame with the hit registry.
+    pub osc8_spans: Vec<super::osc8::Osc8Span>,
     /// Visual skin (plan §M10); toggled with /minimal · /fullscreen.
     pub skin: Skin,
     /// Frames actually drawn — instrumentation for /stats and the idle
@@ -962,6 +965,7 @@ impl App {
             tasks: Vec::new(),
             show_tasks: true,
             caps: TerminalCaps::default(),
+            osc8_spans: Vec::new(),
             skin: Skin::Fullscreen,
             frame_count: 0,
             tick: 0,

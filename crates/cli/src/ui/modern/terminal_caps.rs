@@ -21,8 +21,9 @@ pub struct TerminalCaps {
     /// Running inside tmux (passthrough needed for OSC 52 / queries).
     pub tmux: bool,
     /// Terminal is known to honour OSC 8 hyperlinks (clickable URLs).
-    /// When false, links still render underlined and open on click via
-    /// the hit-rect registry, but we do not emit OSC 8 sequences.
+    /// When true, visible links are re-stamped with OSC 8 after each frame
+    /// (`osc8` module). When false, links still render underlined and open
+    /// on click via the hit-rect registry.
     pub osc8_hyperlinks: bool,
     /// Terminal is believed to honour OSC 22 pointer-shape changes
     /// (pointer over hyperlinks — #558 D10-18).

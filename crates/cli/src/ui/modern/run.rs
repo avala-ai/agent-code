@@ -833,6 +833,13 @@ fn draw_frame(terminal: &mut Term, app: &mut App, caps: TerminalCaps) -> anyhow:
     // Map away the returned CompletedFrame so it doesn't hold a borrow of
     // `terminal` across the End-sync `execute!` below.
     let res = terminal.draw(|f| render::draw(f, app)).map(|_| ());
+    // Stamp OSC 8 over visible hyperlinks while still inside the sync
+    // region so the re-print does not flicker (#558 D3-10 / D10-12).
+    if caps.osc8_hyperlinks && !app.osc8_spans.is_empty() {
+        super::osc8::emit_osc8_spans(terminal.backend_mut(), &mut app.osc8_spans);
+    } else {
+        app.osc8_spans.clear();
+    }
     if caps.sync_output {
         let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
     }

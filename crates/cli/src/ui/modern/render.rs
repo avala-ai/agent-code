@@ -22,6 +22,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Fresh hit map every frame — rects from the previous layout must
     // not survive a resize or a widget that disappeared (#558).
     app.hit_registry.clear();
+    app.osc8_spans.clear();
     let area = frame.area();
     // Minimal skin (plan §M10) drops the header and the framed prompt for a
     // compact look — same block model, render config only.
@@ -1438,27 +1439,42 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             width: w,
             height: 1,
         };
+        let label: String = app
+            .layout
+            .viewport(link.line, 1)
+            .into_iter()
+            .next()
+            .map(|l| {
+                let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                super::app::slice_display_cols(&plain, link.cols.start, link.cols.end)
+            })
+            .unwrap_or_default();
         if hover_url.as_deref() == Some(link.url.as_str()) {
             // Re-paint the label so hover is visible even without OSC 8.
-            let label: String = app
-                .layout
-                .viewport(link.line, 1)
-                .into_iter()
-                .next()
-                .map(|l| {
-                    let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                    super::app::slice_display_cols(&plain, link.cols.start, link.cols.end)
-                })
-                .unwrap_or_default();
             let text = if label.is_empty() {
                 " ".repeat(w as usize)
             } else {
-                label
+                label.clone()
             };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(text, hover_style))),
                 rect,
             );
+        }
+        // Queue OSC 8 stamping for capable terminals (#558 D3-10 / D10-12).
+        // Written after ratatui flushes the frame (see `draw_frame`).
+        if app.caps.osc8_hyperlinks {
+            let text = if label.is_empty() {
+                " ".repeat(w as usize)
+            } else {
+                label
+            };
+            app.osc8_spans.push(super::osc8::Osc8Span {
+                x: rect.x,
+                y: rect.y,
+                url: link.url.clone(),
+                label: text,
+            });
         }
         app.hit_registry.register(
             rect,

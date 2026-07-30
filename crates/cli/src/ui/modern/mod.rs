@@ -17,6 +17,7 @@ mod mentions;
 mod modal;
 mod mode;
 mod model_picker;
+mod osc8;
 mod palette;
 mod render;
 pub mod resume_state;
