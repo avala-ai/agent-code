@@ -24,6 +24,9 @@ pub struct TerminalCaps {
     /// When false, links still render underlined and open on click via
     /// the hit-rect registry, but we do not emit OSC 8 sequences.
     pub osc8_hyperlinks: bool,
+    /// Terminal is believed to honour OSC 22 pointer-shape changes
+    /// (pointer over hyperlinks — #558 D10-18).
+    pub osc22_pointer: bool,
 }
 
 /// `TERM_PROGRAM` markers for hosts that answer the keyboard-enhancement
@@ -83,6 +86,13 @@ impl TerminalCaps {
             || term_program.contains("iterm")
             || term.contains("xterm-kitty");
 
+        // OSC 22 pointer shapes: kitty / wezterm / ghostty today.
+        let osc22_pointer = term_program.contains("kitty")
+            || term_program.contains("wezterm")
+            || term_program.contains("ghostty")
+            || get("KITTY_WINDOW_ID").is_some()
+            || get("WEZTERM_PANE").is_some();
+
         TerminalCaps {
             sync_output,
             truecolor,
@@ -90,6 +100,7 @@ impl TerminalCaps {
             kitty_keyboard_safe: keyboard_enhancement_allowed(enhancement, &term_program),
             tmux,
             osc8_hyperlinks,
+            osc22_pointer,
         }
     }
 
@@ -122,8 +133,27 @@ impl TerminalCaps {
                     .into(),
             );
         }
+        if !self.osc22_pointer {
+            out.push(
+                "OSC 22 pointer shapes are off — link hover will not change the mouse cursor."
+                    .into(),
+            );
+        }
         out
     }
+}
+
+/// Emit OSC 22 pointer shape (`pointer` for links, empty/`default` to reset).
+///
+/// Best-effort write to stdout; failures are ignored (tests / redirected
+/// stdout). Shape names follow the common kitty/wezterm set.
+pub fn set_pointer_shape(shape: &str) {
+    use std::io::Write;
+    // OSC 22 ; <shape> ST  — empty shape restores the default.
+    let seq = format!("\x1b]22;{shape}\x1b\\");
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 #[cfg(test)]
@@ -156,6 +186,7 @@ mod tests {
         assert!(caps.sync_output);
         assert!(caps.kitty_keyboard);
         assert!(caps.osc8_hyperlinks, "kitty should advertise OSC 8");
+        assert!(caps.osc22_pointer, "kitty should advertise OSC 22");
     }
 
     #[test]
@@ -163,6 +194,7 @@ mod tests {
         let caps = TerminalCaps::detect(env(&[("TERM", "xterm")]), false);
         assert!(!caps.sync_output);
         assert!(!caps.osc8_hyperlinks);
+        assert!(!caps.osc22_pointer);
     }
 
     #[test]

@@ -3779,6 +3779,20 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             let (enter, leave) = app.hit_registry.set_hover(target);
             if enter.is_some() || leave.is_some() {
                 app.dirty = true;
+                // OSC 22 pointer shape over hyperlinks (#558 D10-18).
+                if app.caps.osc22_pointer {
+                    let over_link = matches!(
+                        &app.hit_registry.hover,
+                        Some(super::hit_rect::HitTarget::Hyperlink { .. })
+                    );
+                    let was_link =
+                        matches!(&leave, Some(super::hit_rect::HitTarget::Hyperlink { .. }));
+                    if over_link {
+                        super::terminal_caps::set_pointer_shape("pointer");
+                    } else if was_link {
+                        super::terminal_caps::set_pointer_shape("");
+                    }
+                }
             }
         }
         _ => {}

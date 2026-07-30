@@ -3175,6 +3175,10 @@ impl App {
             yn(c.osc8_hyperlinks)
         ));
         report.push_str(&format!(
+            "  OSC 22 pointer      : {}\n",
+            yn(c.osc22_pointer)
+        ));
+        report.push_str(&format!(
             "  kitty keyboard      : {}\n",
             yn(c.kitty_keyboard)
         ));
@@ -5585,6 +5589,7 @@ mod tests {
             kitty_keyboard_safe: false,
             tmux: true,
             osc8_hyperlinks: false,
+            osc22_pointer: false,
         };
         app.emit_terminal_setup();
         let last = match app.transcript.last() {
