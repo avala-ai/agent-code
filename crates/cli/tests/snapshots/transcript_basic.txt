@@ -3,21 +3,21 @@ agent-code x.y.z   test-model   NORMAL   /w
 
 ────────────────────────────────────────────────────────────────────────────────
  transcript
-  · Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Ent
-er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
- ❯ add a null check
-
- Done. Added the guard.
-
-
- ✓ ✏ edit · src/auth.rs
-   ↳ 1 edit applied
-
-
-
-
-
-
+│ · Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Ent
+│r newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
+│❯ add a null check
+●
+│Done. Added the guard.
+│
+│
+○✓ ✏ edit · src/auth.rs
+│  ↳ 1 edit applied
+│
+│
+│
+◆
+│
+│
  turn 0 │ 0 tok │ $0.0000 │  │ /w │ sid sess1234
 ╭ composer ────────────────────────────────────────────────────────────────────╮
 │❯                                                                             │
@@ -29,26 +29,26 @@ aaaaaaaaaabccccccbbddddddddddbbeeeeeeeebbccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 ccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
-bffgggggggggggggggggbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bhheeeeeeeccdddddddddddbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-cccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+fccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
+fgghhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jkkeeeeeeeccdddddddddddbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fccccccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+lbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 ccccccccbcccccccbcccccccccbddbccccbccccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-iaaaaaaaaaaiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
-iaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbi
-icccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccci
-iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+maaaaaaaaaammmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm
+maabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbm
+mccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccm
+mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm
 
 == legend ==
 a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
@@ -56,7 +56,11 @@ b fg=Reset bg=Reset mods=NONE
 c fg=Rgb(92, 99, 112) bg=Reset mods=NONE
 d fg=Rgb(124, 131, 144) bg=Reset mods=NONE
 e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
-f fg=Rgb(97, 175, 239) bg=Rgb(47, 60, 74) mods=BOLD
-g fg=Rgb(171, 178, 191) bg=Rgb(47, 60, 74) mods=NONE
-h fg=Rgb(152, 195, 121) bg=Reset mods=NONE
-i fg=Rgb(97, 175, 239) bg=Reset mods=NONE
+f fg=Rgb(124, 131, 144) bg=Rgb(40, 44, 52) mods=DIM
+g fg=Rgb(97, 175, 239) bg=Rgb(47, 60, 74) mods=BOLD
+h fg=Rgb(171, 178, 191) bg=Rgb(47, 60, 74) mods=NONE
+i fg=Rgb(97, 175, 239) bg=Rgb(40, 44, 52) mods=BOLD | DIM
+j fg=Rgb(124, 131, 144) bg=Rgb(40, 44, 52) mods=BOLD | DIM
+k fg=Rgb(152, 195, 121) bg=Reset mods=NONE
+l fg=Rgb(86, 182, 194) bg=Rgb(40, 44, 52) mods=BOLD | DIM
+m fg=Rgb(97, 175, 239) bg=Reset mods=NONE
