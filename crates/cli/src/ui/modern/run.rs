@@ -3648,6 +3648,17 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     app.dirty = true;
                     return;
                 }
+                Some(super::hit_rect::HitTarget::Timeline { item }) => {
+                    // Jump the viewport so this transcript item is near the top
+                    // (#558 D5-19).
+                    if item < app.transcript.len() {
+                        app.selected_item = Some(item);
+                        app.scroll_to_item(item);
+                        app.clear_selection();
+                        app.dirty = true;
+                    }
+                    return;
+                }
                 Some(super::hit_rect::HitTarget::Control { id }) if id == "guide_focus" => {
                     // Step 1: just focus the composer (toast a nudge).
                     app.push_toast("type a task in the composer below");
@@ -5513,6 +5524,62 @@ mod tests {
             mouse_at(MouseEventKind::Down(MouseButton::Left), 65, 22),
         );
         assert!(app.scroll.is_following(), "click on jump pill follows");
+    }
+
+    #[test]
+    fn timeline_marker_click_jumps_to_item() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..20 {
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::User(format!(
+                    "turn {i} with enough text to make blocks"
+                )));
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::Assistant(
+                    "ok".into(),
+                ));
+        }
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        app.viewport_h = 8;
+        // Start at the bottom (Follow), then jump to an early item.
+        assert!(app.scroll.is_following());
+        let target = 2usize; // second user turn
+        app.hit_registry.register(
+            Rect {
+                x: 0,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
+            super::super::hit_rect::HitTarget::Timeline { item: target },
+        );
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 5),
+        );
+        assert_eq!(app.selected_item, Some(target));
+        assert!(
+            !app.scroll.is_following(),
+            "timeline click should leave Follow"
+        );
+        let top = app.scroll.top(app.layout.total_lines(), app.viewport_h);
+        let expected = app.layout.block_start_line(
+            super::super::toolcard::plan_display(&app.transcript)
+                .iter()
+                .position(|d| match d {
+                    super::super::toolcard::Display::Single(i) => *i == target,
+                    super::super::toolcard::Display::Group(idxs) => idxs.contains(&target),
+                })
+                .unwrap_or(0),
+        );
+        assert_eq!(
+            top,
+            expected.min(app.layout.total_lines().saturating_sub(8))
+        );
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub enum HitTarget {
     Composer,
     /// Scrollbar thumb / track.
     Scrollbar { kind: ScrollbarKind },
+    /// Timeline rail marker — click jumps to a transcript item (#558 D5-19).
+    Timeline { item: usize },
     /// Generic named control for one-off widgets.
     Control { id: String },
 }

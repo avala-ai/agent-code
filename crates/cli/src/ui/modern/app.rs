@@ -2530,7 +2530,7 @@ impl App {
     }
 
     /// Scroll so `item` is near the top of the Free viewport.
-    fn scroll_to_item(&mut self, item: usize) {
+    pub(crate) fn scroll_to_item(&mut self, item: usize) {
         // Layout may be stale; best-effort using last sync's block map.
         let display = super::toolcard::plan_display(&self.transcript);
         let Some(d_idx) = display.iter().position(|d| match d {

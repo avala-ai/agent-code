@@ -33,6 +33,7 @@ mod stream_buffer;
 mod tasks;
 mod terminal_caps;
 pub mod theme_picker;
+mod timeline;
 mod toolcard;
 mod vi;
 

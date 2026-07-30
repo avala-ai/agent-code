@@ -66,6 +66,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | Drag on transcript | Expand line selection |
 | Click hyperlink | Open http(s)/mailto in the platform browser (hover fills the label) |
 | Click / drag scrollbar | Jump or scrub the viewport when content overflows |
+| Timeline rail (left) | Markers for turns/errors; hover previews, click jumps |
 | Click composer body | Place caret (2× → end of word · 3× → end of line) |
 | Click status-bar chip | Mode cycle / token & cost detail / queue toggle / copy selection / etc. |
 | Middle-click | Paste X11/Wayland **PRIMARY** selection into the composer (needs `xclip`/`xsel`/`wl-paste`) |

@@ -1475,6 +1475,22 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         draw_empty_conversation_guidance(frame, inner, app);
     }
 
+    // Timeline rail on the left: turn markers + hover preview + click jump
+    // (#558 D5-19). Overlay like the right-edge scrollbar so wrap width
+    // stays stable.
+    {
+        let markers = super::timeline::build_markers(&app.transcript, &app.layout, height);
+        if super::timeline::should_draw(total, height, markers.len()) {
+            let rail = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            super::timeline::draw(frame, rail, app, &markers, total, top, height);
+        }
+    }
+
     // Overlay scrollbar on the right edge when content overflows (#558 D5-21).
     // Drawn before the jump pill so the pill (registered later) wins on the
     // bottom-right cell when both claim it — actually the pill sits one
