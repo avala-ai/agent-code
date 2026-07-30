@@ -121,7 +121,8 @@ fn classify(item: &TranscriptItem) -> Option<(MarkerKind, String)> {
             } else {
                 MarkerKind::Tool
             };
-            Some((kind, preview(&format!("{name} {detail}"), 48)))
+            // Bound work to a short prefix of name+detail (not the full body).
+            Some((kind, preview_parts(&[name.as_str(), detail.as_str()], 48)))
         }
         TranscriptItem::Error(t) => Some((MarkerKind::Error, preview(t, 48))),
         TranscriptItem::Warning(t) => Some((MarkerKind::Warning, preview(t, 48))),
@@ -130,17 +131,40 @@ fn classify(item: &TranscriptItem) -> Option<(MarkerKind, String)> {
     }
 }
 
-fn preview(s: &str, max: usize) -> String {
-    let one: String = s
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let trimmed = one.trim();
-    if trimmed.chars().count() <= max {
-        return trimmed.to_string();
+/// Build a short label from one or more string parts without scanning
+/// multi-megabyte transcript bodies on every paint.
+fn preview_parts(parts: &[&str], max: usize) -> String {
+    let mut out = String::with_capacity(max.saturating_add(8));
+    let mut count = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if count >= max {
+            break;
+        }
+        if i > 0 && count + 1 < max {
+            out.push(' ');
+            count += 1;
+        }
+        for c in part.chars() {
+            if count >= max {
+                break;
+            }
+            let ch = if c == '\n' || c == '\r' { ' ' } else { c };
+            out.push(ch);
+            count += 1;
+        }
     }
-    let head: String = trimmed.chars().take(max.saturating_sub(1)).collect();
-    format!("{head}…")
+    let trimmed = out.trim();
+    let scrubbed = crate::ui::text_safety::escape_deceptive(trimmed);
+    if scrubbed.chars().count() <= max {
+        scrubbed.into_owned()
+    } else {
+        let head: String = scrubbed.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+fn preview(s: &str, max: usize) -> String {
+    preview_parts(&[s], max)
 }
 
 /// Whether the rail is worth drawing (enough content + height).
@@ -348,5 +372,24 @@ mod tests {
         assert!(!should_draw(100, 20, 1));
         assert!(should_draw(100, 20, 3));
         assert!(!should_draw(5, 20, 5)); // short transcript
+    }
+
+    #[test]
+    fn preview_does_not_scan_past_max_chars() {
+        // A multi-megabyte body must not be fully walked just to label a marker.
+        let huge = "a".repeat(2_000_000);
+        let label = preview(&huge, 48);
+        assert!(label.chars().count() <= 48);
+        assert!(label.starts_with('a'));
+    }
+
+    #[test]
+    fn preview_scrubs_bidi_overrides() {
+        let attack = "rm -rf /tmp \u{202e}# hctap";
+        let label = preview(attack, 64);
+        assert!(
+            !label.contains('\u{202e}'),
+            "bidi override must not reach the hover popup: {label:?}"
+        );
     }
 }
