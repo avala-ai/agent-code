@@ -1,0 +1,63 @@
+== glyphs ==
+agent-code x.y.z   test-model   NORMAL   /w
+
+────────────────────────────────────────────────────────────────────────────────
+ transcript
+  · Modern TUI · Enter send · Ctrl+P commands · Ctrl+M model/multiline · Alt+Ent
+er newline · Shift+Tab mode · Ctrl+C cancel · Esc never cancels
+ ❯ select this line
+
+ and this reply
+
+
+
+
+
+
+
+
+
+
+ turn 0 │ 0 tok │ $0.0000 │  │ sel · Ctrl+Shift+C copy │ /w │ sid sess1234
+╭ composer ────────────────────────────────────────────────────────────────────╮
+│❯                                                                             │
+│Enter send · Alt/Shift+Enter newline · Ctrl+Enter interject · Shift+Tab mode …│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+== styles ==
+aaaaaaaaaabccccccbbddddddddddbbeeeeeeeebbccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+ccccccccccccbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbbbbbbbbbbbbbbbbb
+bgghhhhhhhhhhhhhhhhhbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ccccccccbcccccccbcccccccccbddbiiiiiiiiiiiiiiiiiiiiiiiiibccccbccccccccccccccbbbbb
+jaaaaaaaaaajjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+jaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbj
+jccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccj
+jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+
+== legend ==
+a fg=Rgb(97, 175, 239) bg=Reset mods=BOLD
+b fg=Reset bg=Reset mods=NONE
+c fg=Rgb(92, 99, 112) bg=Reset mods=NONE
+d fg=Rgb(124, 131, 144) bg=Reset mods=NONE
+e fg=Rgb(152, 195, 121) bg=Reset mods=BOLD
+f fg=Rgb(40, 44, 52) bg=Rgb(97, 175, 239) mods=BOLD
+g fg=Rgb(97, 175, 239) bg=Rgb(47, 60, 74) mods=BOLD
+h fg=Rgb(171, 178, 191) bg=Rgb(47, 60, 74) mods=NONE
+i fg=Rgb(97, 175, 239) bg=Reset mods=DIM
+j fg=Rgb(97, 175, 239) bg=Reset mods=NONE

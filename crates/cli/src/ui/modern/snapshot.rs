@@ -225,7 +225,9 @@ mod tests {
 #[cfg(test)]
 mod frames {
     use super::*;
-    use crate::ui::modern::app::{App, Modal, PendingPermission, Phase, TranscriptItem};
+    use crate::ui::modern::app::{
+        App, Modal, PendingPermission, Phase, TextSelection, TranscriptItem,
+    };
     use crate::ui::modern::render::draw;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -274,6 +276,28 @@ mod frames {
             });
         });
         assert_snapshot("transcript_basic", &snap);
+    }
+
+    /// M9 acceptance: selection overlay paints a filled accent bar so a
+    /// style regression cannot silently drop the highlight.
+    #[test]
+    fn selection_overlay() {
+        let snap = render("one-dark", |app| {
+            app.transcript
+                .push(TranscriptItem::User("select this line".into()));
+            app.transcript
+                .push(TranscriptItem::Assistant("and this reply".into()));
+            // Layout must exist before line indices are meaningful.
+            app.layout
+                .sync(&app.transcript, 76, &std::collections::HashSet::new(), None);
+            app.selection = Some(TextSelection::lines(0, 0));
+        });
+        assert_snapshot("selection_overlay", &snap);
+        // Style legend must include the accent selection fill (not glyphs alone).
+        assert!(
+            snap.contains("== styles ==") && snap.contains("== legend =="),
+            "selection snapshot must record styles"
+        );
     }
 
     #[test]

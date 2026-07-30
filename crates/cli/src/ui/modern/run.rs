@@ -5790,6 +5790,42 @@ mod tests {
     }
 
     #[test]
+    fn drag_extends_selection_end_line() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        for i in 0..8 {
+            app.transcript
+                .push(crate::ui::modern::app::TranscriptItem::System(format!(
+                    "row {i}"
+                )));
+        }
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        app.viewport_h = 10;
+        app.transcript_bottom_row = 10;
+        app.transcript_left_x = 0;
+        let top_row = app
+            .transcript_bottom_row
+            .saturating_sub(app.viewport_h as u16 - 1);
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 2, top_row),
+        );
+        let start = app.selection.expect("start").start_line;
+        handle_mouse(
+            &mut app,
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 2, top_row + 3),
+        );
+        let sel = app.selection.expect("drag");
+        assert_eq!(sel.start_line, start);
+        assert!(
+            sel.end_line > sel.start_line,
+            "drag should extend end_line: {sel:?}"
+        );
+        assert!(sel.cols.is_none(), "drag drops word cols: {sel:?}");
+    }
+
+    #[test]
     fn validate_hyperlink_rejects_non_http_schemes() {
         assert!(validate_hyperlink_url("file:///etc/passwd").is_err());
         assert!(validate_hyperlink_url("javascript:alert(1)").is_err());

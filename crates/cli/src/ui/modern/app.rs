@@ -3948,6 +3948,71 @@ mod tests {
         assert!(app.needs_anim_tick());
     }
 
+    /// M9: yank of a word/line selection is the exact plain text under the
+    /// highlight (not a truncated toast-only path).
+    #[test]
+    fn selection_plain_text_yanks_exact_word_and_lines() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        app.transcript
+            .push(TranscriptItem::System("alpha beta gamma".into()));
+        app.transcript
+            .push(TranscriptItem::System("second line".into()));
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        let plain0 = app.layout.plain_range(0, 0).expect("line0");
+        // Display columns (not byte indices — · is multi-byte).
+        let (start, end) = word_range_at(&plain0, {
+            // Land on a column inside "beta".
+            use unicode_segmentation::UnicodeSegmentation;
+            use unicode_width::UnicodeWidthStr;
+            let mut col = 0u16;
+            for g in plain0.graphemes(true) {
+                if g == "b" {
+                    // peek "beta"
+                    break;
+                }
+                col = col.saturating_add(UnicodeWidthStr::width(g).max(1) as u16);
+            }
+            col
+        })
+        .expect("word at beta");
+        let word = TextSelection::word(0, start, end);
+        assert_eq!(
+            app.selection_plain_text(word).as_deref(),
+            Some("beta"),
+            "word yank must be exact (plain={plain0:?})"
+        );
+        let lines = TextSelection::lines(0, 1);
+        let yanked = app.selection_plain_text(lines).expect("lines");
+        assert!(
+            yanked.contains("alpha") && yanked.contains("second"),
+            "multi-line yank: {yanked:?}"
+        );
+    }
+
+    #[test]
+    fn copy_selection_reports_exact_payload_length() {
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        app.transcript
+            .push(TranscriptItem::System("copy-me-exactly".into()));
+        app.layout
+            .sync(&app.transcript, 80, &std::collections::HashSet::new(), None);
+        app.selection = Some(TextSelection::lines(0, 0));
+        let expected = app
+            .selection_plain_text(app.selection.unwrap())
+            .expect("plain");
+        assert!(expected.contains("copy-me-exactly"), "setup: {expected:?}");
+        app.copy_selection_or_last();
+        let toast = app.toast.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        assert!(
+            toast.contains("copied selection")
+                && toast.contains(&format!("({} bytes)", expected.len())),
+            "expected exact byte count in toast, got {toast:?}"
+        );
+    }
+
     #[test]
     fn push_toast_does_not_clobber_status_message() {
         let mut app = App::new("m", "/tmp", "s");

@@ -2416,6 +2416,39 @@ mod tests {
         assert!(hover.contains('k') || hover.contains("41"), "{hover}");
     }
 
+    /// M9 / D10-12: OSC 8 spans are queued only when the capability is on.
+    #[test]
+    fn osc8_spans_only_when_capability_enabled() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("m", "/tmp", "s");
+        app.transcript.clear();
+        app.transcript.push(TranscriptItem::Assistant(
+            "see [docs](https://example.com/a) please".into(),
+        ));
+        app.caps.osc8_hyperlinks = false;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            app.osc8_spans.is_empty(),
+            "cap off must not queue OSC 8: {:?}",
+            app.osc8_spans
+        );
+
+        app.caps.osc8_hyperlinks = true;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !app.osc8_spans.is_empty(),
+            "cap on must queue OSC 8 for markdown links"
+        );
+        assert!(
+            app.osc8_spans
+                .iter()
+                .any(|s| s.url == "https://example.com/a"),
+            "queued urls: {:?}",
+            app.osc8_spans
+        );
+    }
+
     #[test]
     fn idle_frame_contains_branding_and_mode() {
         let backend = TestBackend::new(80, 24);
