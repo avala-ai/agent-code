@@ -1883,6 +1883,18 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     ));
     chips.push((Span::raw("│"), None));
 
+    // Todo checklist badge (#558 D4-18) — click toggles the tasks pane.
+    if !app.todos.is_empty() {
+        let (done, total) = super::tasks::todo_progress(&app.todos);
+        let p = palette();
+        let color = if done == total { p.success } else { p.accent };
+        chips.push((
+            Span::styled(format!(" ✓ {done}/{total} "), Style::default().fg(color)),
+            Some("todos"),
+        ));
+        chips.push((Span::raw("│"), None));
+    }
+
     // Context meter: yellow ≥70%, red ≥90% (plan §M1/§6).
     // Hover swaps to used/max at the same display width (#558 D6-20).
     if let Some((used, max)) = app.ctx_meter

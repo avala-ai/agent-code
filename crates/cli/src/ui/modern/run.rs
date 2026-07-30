@@ -3832,6 +3832,16 @@ fn handle_status_chip_click(app: &mut App, id: &str) {
                 app.push_toast("context meter unavailable");
             }
         }
+        "todos" => {
+            // D4-18: open / focus the tasks pane so the checklist is visible.
+            if !app.show_tasks {
+                app.show_tasks = true;
+            }
+            app.push_toast({
+                let (done, total) = super::tasks::todo_progress(&app.todos);
+                format!("todos {done}/{total} · tasks pane open")
+            });
+        }
         "queue" => {
             app.show_queue_pane = !app.show_queue_pane;
             app.dirty = true;

@@ -70,6 +70,7 @@ Rounded bordered field with `❯` prefix. Height grows with content.
 | Click composer body | Place caret (2× → end of word · 3× → end of line) |
 | Click status-bar chip | Mode cycle / token & cost detail / queue toggle / copy selection / etc. |
 | Hover **ctx N%** chip | Same-width swap to `used/max` token counts |
+| Click **✓ done/total** chip | Open the tasks pane (todo checklist progress) |
 | Middle-click | Paste X11/Wayland **PRIMARY** selection into the composer (needs `xclip`/`xsel`/`wl-paste`) |
 
 Mouse capture is on by default so the in-app hits above work. Toggle with `Ctrl+Alt+M` or `/mouse` for native terminal selection.
