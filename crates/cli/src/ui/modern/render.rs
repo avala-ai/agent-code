@@ -1884,6 +1884,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     chips.push((Span::raw("│"), None));
 
     // Context meter: yellow ≥70%, red ≥90% (plan §M1/§6).
+    // Hover swaps to used/max at the same display width (#558 D6-20).
     if let Some((used, max)) = app.ctx_meter
         && max > 0
     {
@@ -1896,10 +1897,20 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         } else {
             palette().muted
         };
-        chips.push((
-            Span::styled(format!(" ctx {pct}% "), Style::default().fg(color)),
-            Some("ctx"),
-        ));
+        let idle = format!(" ctx {pct}% ");
+        let hover_ctx = matches!(
+            app.hit_registry.hover,
+            Some(super::hit_rect::HitTarget::StatusChip { id: "ctx" })
+        );
+        let label = if hover_ctx {
+            pad_to_width(
+                &format_ctx_counts(used, max),
+                UnicodeWidthStr::width(idle.as_str()),
+            )
+        } else {
+            idle
+        };
+        chips.push((Span::styled(label, Style::default().fg(color)), Some("ctx")));
         chips.push((Span::raw("│"), None));
     }
 
@@ -2260,6 +2271,57 @@ fn mode_style(mode: SessionMode) -> Style {
     Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
 
+/// Compact `used/max` for the ctx chip hover face (#558 D6-20).
+fn format_ctx_counts(used: u64, max: u64) -> String {
+    format!(" {}/{} ", fmt_k(used), fmt_k(max))
+}
+
+fn fmt_k(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", n / 1_000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Pad or trim `s` to exactly `width` display columns (spaces on both ends
+/// when possible) so a status chip does not shift its neighbors on hover.
+fn pad_to_width(s: &str, width: usize) -> String {
+    let cur = UnicodeWidthStr::width(s);
+    if cur == width {
+        return s.to_string();
+    }
+    if cur > width {
+        // Prefer left content; drop trailing spaces first.
+        let mut out = s.to_string();
+        while UnicodeWidthStr::width(out.as_str()) > width && out.ends_with(' ') {
+            out.pop();
+        }
+        if UnicodeWidthStr::width(out.as_str()) > width {
+            let mut acc = String::new();
+            let mut w = 0usize;
+            for g in out.chars() {
+                let gw = UnicodeWidthStr::width(g.to_string().as_str()).max(1);
+                if w + gw > width {
+                    break;
+                }
+                acc.push(g);
+                w += gw;
+            }
+            return acc;
+        }
+        return out;
+    }
+    let pad = width - cur;
+    let left = pad / 2;
+    let right = pad - left;
+    format!("{}{}{}", " ".repeat(left), s.trim(), " ".repeat(right))
+}
+
 fn truncate_path(path: &str, max: usize) -> String {
     // Char-based, not byte-based: byte slicing panics on multibyte cwds.
     let count = path.chars().count();
@@ -2310,6 +2372,21 @@ mod tests {
     use crate::ui::modern::app::TranscriptItem;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn ctx_hover_label_matches_idle_width() {
+        let idle = " ctx 41% ";
+        let hover = pad_to_width(
+            &format_ctx_counts(41_000, 100_000),
+            UnicodeWidthStr::width(idle),
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(hover.as_str()),
+            UnicodeWidthStr::width(idle),
+            "idle={idle:?} hover={hover:?}"
+        );
+        assert!(hover.contains('k') || hover.contains("41"), "{hover}");
+    }
 
     #[test]
     fn idle_frame_contains_branding_and_mode() {
