@@ -62,13 +62,25 @@ class _AppShellState extends State<AppShell> {
               // Collapsed, the sidebar narrows to a rail that stays in the
               // layout rather than floating, so the transcript can never render
               // underneath the control that reopens it.
+              //
+              // The contents are laid out at their settled width throughout,
+              // and the shrinking box clips them. Letting them reflow to the
+              // animating width instead would re-wrap the header on every
+              // frame and overflow it while the box is still narrow.
               AnimatedContainer(
                 duration: const Duration(milliseconds: 180),
                 curve: Curves.easeOut,
                 width: _sidebarOpen ? tokens.sidebarWidth : tokens.railWidth,
-                child: _sidebarOpen
-                    ? Sidebar(onCollapse: _toggleSidebar)
-                    : _SidebarRail(onExpand: _toggleSidebar),
+                child: ClipRect(
+                  child: OverflowBox(
+                    alignment: Alignment.centerLeft,
+                    minWidth: _sidebarOpen ? tokens.sidebarWidth : tokens.railWidth,
+                    maxWidth: _sidebarOpen ? tokens.sidebarWidth : tokens.railWidth,
+                    child: _sidebarOpen
+                        ? Sidebar(onCollapse: _toggleSidebar)
+                        : _SidebarRail(onExpand: _toggleSidebar),
+                  ),
+                ),
               ),
               const VerticalDivider(width: 1),
               Expanded(
