@@ -97,8 +97,7 @@ void main() {
       'handles tool_result notification',
       build: () => ChatBloc(wsClient: mockWs),
       seed: () {
-        final msg = ChatMessage.assistant();
-        msg.toolCalls.add(ToolCall(name: 'Bash'));
+        final msg = ChatMessage.assistant().addToolCall(ToolCall(name: 'Bash'));
         return ChatState(messages: [msg], streaming: true);
       },
       act: (bloc) => bloc.add(NotificationReceived(
@@ -117,8 +116,7 @@ void main() {
       'handles tool_result with error',
       build: () => ChatBloc(wsClient: mockWs),
       seed: () {
-        final msg = ChatMessage.assistant();
-        msg.toolCalls.add(ToolCall(name: 'Bash'));
+        final msg = ChatMessage.assistant().addToolCall(ToolCall(name: 'Bash'));
         return ChatState(messages: [msg], streaming: true);
       },
       act: (bloc) => bloc.add(NotificationReceived(

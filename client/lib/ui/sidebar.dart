@@ -22,7 +22,11 @@ Color activityColor(ThemeData theme, SessionActivity activity) {
 }
 
 class Sidebar extends StatelessWidget {
-  const Sidebar({super.key});
+  /// Collapses the sidebar to its rail. Omitted where the sidebar cannot be
+  /// collapsed, in which case no control is shown.
+  final VoidCallback? onCollapse;
+
+  const Sidebar({super.key, this.onCollapse});
 
   @override
   Widget build(BuildContext context) {
@@ -48,6 +52,13 @@ class Sidebar extends StatelessWidget {
                     ),
                     const Spacer(),
                     _NewSessionButton(),
+                    if (onCollapse != null)
+                      IconButton(
+                        onPressed: onCollapse,
+                        tooltip: 'Hide sessions',
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.view_sidebar_outlined, size: 18),
+                      ),
                   ],
                 ),
               ),

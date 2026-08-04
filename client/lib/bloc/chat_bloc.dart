@@ -17,6 +17,7 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
     on<PermissionRequestReceived>(_onPermissionRequest);
     on<PermissionResponded>(_onPermissionResponded);
     on<ConnectionLost>(_onConnectionLost);
+    on<StatusRefreshed>(_onStatusRefreshed);
 
     // Subscribe to WebSocket streams.
     _notificationSub = wsClient.notifications.listen(
@@ -31,26 +32,23 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
     SendMessageRequested event,
     Emitter<ChatState> emit,
   ) async {
-    // Add user message.
     final userMsg = ChatMessage.user(event.content);
-    final messages = [...state.messages, userMsg];
-
-    // Start assistant message placeholder.
     final assistantMsg = ChatMessage.assistant();
     emit(state.copyWith(
-      messages: [...messages, assistantMsg],
+      messages: [...state.messages, userMsg, assistantMsg],
       streaming: true,
       clearError: true,
+      bumpRevision: true,
     ));
 
     try {
-      // POST message. Events arrive via notification stream.
+      // POST message. Events arrive via the notification stream.
       final response = await wsClient.sendMessage(event.content);
       if (response.error != null) {
-        _appendToCurrentMessage('\n\n**Error:** ${response.error!.message}');
+        _appendToLastAssistant(emit, '\n\n**Error:** ${response.error!.message}');
       }
     } catch (e) {
-      _appendToCurrentMessage('\n\n**Error:** $e');
+      _appendToLastAssistant(emit, '\n\n**Error:** $e');
     }
   }
 
@@ -63,50 +61,63 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
 
     switch (method) {
       case 'events/text_delta':
-        _ensureAssistantMessage(emit);
-        final text = params['text'] as String? ?? '';
-        _appendToCurrentMessage(text);
-        emit(state.copyWith(messages: List.of(state.messages)));
+        _updateLastAssistant(
+          emit,
+          (m) => m.appendContent(params['text'] as String? ?? ''),
+        );
         break;
 
       case 'events/thinking':
-        _ensureAssistantMessage(emit);
-        final current = state.messages.last;
-        current.thinking = (current.thinking ?? '') + (params['text'] as String? ?? '');
-        emit(state.copyWith(messages: List.of(state.messages)));
+        _updateLastAssistant(
+          emit,
+          (m) => m.appendThinking(params['text'] as String? ?? ''),
+        );
         break;
 
       case 'events/tool_start':
-        _ensureAssistantMessage(emit);
-        final name = params['name'] as String? ?? 'unknown';
-        state.messages.last.toolCalls.add(ToolCall(name: name));
-        emit(state.copyWith(messages: List.of(state.messages)));
+        final input = params['input'];
+        _updateLastAssistant(
+          emit,
+          (m) => m.addToolCall(ToolCall(
+            name: params['name'] as String? ?? 'unknown',
+            input: input is Map ? Map<String, dynamic>.from(input) : null,
+          )),
+        );
         break;
 
       case 'events/tool_result':
         final name = params['name'] as String? ?? '';
         final isError = params['is_error'] as bool? ?? false;
-        final tools = state.messages.last.toolCalls;
-        for (var i = tools.length - 1; i >= 0; i--) {
-          if (tools[i].name == name && tools[i].status == ToolCallStatus.running) {
-            tools[i].status = isError ? ToolCallStatus.error : ToolCallStatus.done;
-            break;
+        final content = params['content'] as String?;
+        _updateLastAssistant(emit, (m) {
+          // Resolve the most recent still-running call with this name. The
+          // server sends no call id, so identity is name plus running state.
+          for (var i = m.toolCalls.length - 1; i >= 0; i--) {
+            final call = m.toolCalls[i];
+            if (call.name == name && call.isRunning) {
+              return m.replaceToolCall(
+                i,
+                call.copyWith(
+                  status: isError ? ToolCallStatus.error : ToolCallStatus.done,
+                  result: content,
+                ),
+              );
+            }
           }
-        }
-        emit(state.copyWith(messages: List.of(state.messages)));
+          return m;
+        });
         break;
 
       case 'events/done':
         emit(state.copyWith(streaming: false));
-        // Refresh status.
-        _refreshStatus();
+        unawaited(_refreshStatus());
         break;
 
       case 'events/error':
-        _ensureAssistantMessage(emit);
-        final message = params['message'] as String? ?? 'Unknown error';
-        _appendToCurrentMessage('\n\n**Error:** $message');
-        emit(state.copyWith(messages: List.of(state.messages)));
+        _appendToLastAssistant(
+          emit,
+          '\n\n**Error:** ${params['message'] as String? ?? 'Unknown error'}',
+        );
         break;
 
       case 'events/usage':
@@ -150,27 +161,42 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
     ));
   }
 
-  void _ensureAssistantMessage(Emitter<ChatState> emit) {
-    if (state.messages.isEmpty || state.messages.last.role != 'assistant') {
-      final msg = ChatMessage.assistant();
-      emit(state.copyWith(
-        messages: [...state.messages, msg],
-        streaming: true,
-      ));
-    }
+  void _onStatusRefreshed(
+    StatusRefreshed event,
+    Emitter<ChatState> emit,
+  ) {
+    emit(state.copyWith(status: event.status));
   }
 
-  void _appendToCurrentMessage(String text) {
-    if (state.messages.isNotEmpty && state.messages.last.role == 'assistant') {
-      state.messages.last.content += text;
-    }
+  /// Applies [update] to the trailing assistant message, creating one first if
+  /// the transcript does not currently end with one, and emits the result.
+  void _updateLastAssistant(
+    Emitter<ChatState> emit,
+    ChatMessage Function(ChatMessage) update,
+  ) {
+    final messages = List<ChatMessage>.of(state.messages);
+    final grew = messages.isEmpty || !messages.last.isAssistant;
+    if (grew) messages.add(ChatMessage.assistant());
+
+    final last = messages.last;
+    final updated = update(last);
+    if (!grew && identical(updated, last)) return;
+
+    messages[messages.length - 1] = updated;
+    emit(state.copyWith(
+      messages: messages,
+      streaming: grew ? true : null,
+      bumpRevision: true,
+    ));
   }
+
+  void _appendToLastAssistant(Emitter<ChatState> emit, String text) =>
+      _updateLastAssistant(emit, (m) => m.appendContent(text));
 
   Future<void> _refreshStatus() async {
     try {
       final status = await wsClient.getStatus();
-      // ignore: invalid_use_of_visible_for_testing_member
-      emit(state.copyWith(status: status));
+      if (!isClosed) add(StatusRefreshed(status));
     } catch (_) {
       // Best-effort.
     }

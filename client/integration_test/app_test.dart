@@ -15,6 +15,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
 import 'package:agent_code_client_app/main.dart' as app;
+import 'package:agent_code_client_app/ui/app_theme.dart';
+import 'package:agent_code_client_app/ui/sidebar.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -49,12 +51,38 @@ void main() {
       expect(find.byType(VerticalDivider), findsOneWidget);
     });
 
-    testWidgets('sidebar has fixed width of 240', (tester) async {
+    testWidgets('sidebar is laid out at the token width', (tester) async {
       app.main();
       await tester.pumpAndSettle();
 
-      final sizedBox = tester.widgetList<SizedBox>(find.byType(SizedBox)).where((sb) => sb.width == 240);
-      expect(sizedBox, isNotEmpty);
+      final tokens = AppTokens.of(tester.element(find.byType(Sidebar)));
+      final width = tester.getSize(find.byType(Sidebar)).width;
+      expect(width, tokens.sidebarWidth);
+    });
+
+    testWidgets('sidebar collapses to a rail and back', (tester) async {
+      app.main();
+      await tester.pumpAndSettle();
+
+      final tokens = AppTokens.of(tester.element(find.byType(Sidebar)));
+      expect(find.text('SESSIONS'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Hide sessions'));
+      await tester.pumpAndSettle();
+
+      // The rail stays in the layout rather than floating over the main area,
+      // so the reopen control is always reachable.
+      expect(find.text('SESSIONS'), findsNothing);
+      final rail = find.byTooltip('Show sessions');
+      expect(rail, findsOneWidget);
+      expect(
+        tester.getSize(find.ancestor(of: rail, matching: find.byType(Column)).first).width,
+        lessThanOrEqualTo(tokens.railWidth),
+      );
+
+      await tester.tap(rail);
+      await tester.pumpAndSettle();
+      expect(find.text('SESSIONS'), findsOneWidget);
     });
   });
 
@@ -133,7 +161,7 @@ void main() {
       app.main();
       await tester.pumpAndSettle();
 
-      // The AppShell has a Row with SizedBox(240) + VerticalDivider + Expanded.
+      // The AppShell has a Row with the sidebar + VerticalDivider + Expanded.
       expect(find.byType(Row), findsWidgets);
       expect(find.byType(Expanded), findsWidgets);
     });
