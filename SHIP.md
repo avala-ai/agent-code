@@ -112,7 +112,12 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 # After PR merge or abandon — gate deletion on state:
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
-  git worktree remove --force ../agent-code-wt-lib
+  # Never --force-remove a dirty worktree (loses uncommitted/untracked work).
+  if [ -n "$(git -C ../agent-code-wt-lib status --porcelain 2>/dev/null)" ]; then
+    echo "Worktree ../agent-code-wt-lib is dirty — refuse remove. Commit/stash/discard first."
+    exit 1
+  fi
+  git worktree remove ../agent-code-wt-lib
   git branch -D fix/lib-<slug>
 else
   echo "PR still $state — not deleting branch"
