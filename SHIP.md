@@ -104,13 +104,15 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 # Agent A cwd: ../agent-code-wt-lib     (writes crates/lib/ only)
 # Agent B cwd: ../agent-code-wt-client  (writes client/ only)
 
-# First publish:
-#   git push -u origin HEAD
+# First publish — writable PR-head remote (fork or origin). Do not assume origin always exists:
+#   PUSH_REMOTE=$(git remote | head -1)
+#   git remote get-url "$PUSH_REMOTE" >/dev/null
+#   git push -u "$PUSH_REMOTE" HEAD
 
 # After PR merge or abandon — gate deletion on state:
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
-  git worktree remove ../agent-code-wt-lib
+  git worktree remove --force ../agent-code-wt-lib
   git branch -D fix/lib-<slug>
 else
   echo "PR still $state — not deleting branch"
@@ -210,7 +212,8 @@ Do not hide large refactors inside feature PRs.
 3. Commit **atomically** in-lane (own worktree).  
 4. Verify with **scoped** cargo/dart commands; full gate before open PR.  
 5. Self-check **security rules** (AGENTS.md §3 / SECURITY.md).  
-6. Encode learnings into AGENTS.md — not only chat.
+6. Propose durable learnings to the **lead / docs owner** — do **not** have every lane edit
+   root `AGENTS.md` in parallel. Lead lands one follow-up commit/PR for shared docs.
 
 ---
 
