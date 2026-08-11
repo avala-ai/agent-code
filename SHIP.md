@@ -110,8 +110,9 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 #   git remote get-url "$PR_HEAD_REMOTE" >/dev/null
 #   git push -u "$PR_HEAD_REMOTE" HEAD
 
-# Cleanup — run from the PRIMARY clone (not inside the worktree cwd):
-# cd "$(git rev-parse --show-toplevel)"   # primary
+# Cleanup — ALWAYS cd to primary first (show-toplevel of a linked worktree is itself):
+PRIMARY=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+cd "$PRIMARY"
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
   if [ -n "$(git -C ../agent-code-wt-lib status --porcelain 2>/dev/null)" ]; then
