@@ -110,9 +110,18 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 #   git remote get-url "$PR_HEAD_REMOTE" >/dev/null
 #   git push -u "$PR_HEAD_REMOTE" HEAD
 
-# Cleanup — ALWAYS cd to primary first (show-toplevel of a linked worktree is itself):
-PRIMARY=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)
-cd "$PRIMARY"
+# Cleanup — ALWAYS cd to primary first (show-toplevel of a linked worktree is itself).
+# Use -z (NUL-delimited) so paths with spaces/newlines parse intact; abort if cd fails.
+PRIMARY=""
+while IFS= read -r -d '' line; do
+  case "$line" in
+    worktree\ *) PRIMARY="${line#worktree }"; break ;;
+  esac
+done < <(git worktree list --porcelain -z)
+if [ -z "$PRIMARY" ] || ! cd "$PRIMARY"; then
+  echo "Could not cd to primary worktree (got: ${PRIMARY:-empty}). Abort cleanup."
+  exit 1
+fi
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
   if [ -n "$(git -C ../agent-code-wt-lib status --porcelain 2>/dev/null)" ]; then
