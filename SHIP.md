@@ -1,4 +1,4 @@
-# SPEED.md — Throughput without quality debt
+# SHIP.md — Throughput without quality debt
 
 **Audience:** humans and coding agents shipping in this repository.
 
