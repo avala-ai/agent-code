@@ -54,9 +54,9 @@ Throughput comes from **non-overlapping writers**, not from more tokens on the s
 
 | Lane | Conflict scope (write exclusive) | Notes |
 |------|----------------------------------|-------|
-| **lib** | `crates/lib/` | Engine: providers, tools, query loop, permissions, agent tools |
-| **cli** | `crates/cli/` | Binary, TUI, slash commands — depends on lib |
-| **eval** | `crates/eval/`, `evals/` | Harness + fixtures; keep default tests hermetic |
+| **lib** | `crates/lib/` (+ root `Cargo.lock` when the lane changes deps) | Engine: providers, tools, query loop, permissions, agent tools |
+| **cli** | `crates/cli/` (+ root `Cargo.lock` when the lane changes deps) | Binary, TUI, slash commands — depends on lib |
+| **eval** | `crates/eval/`, `evals/` (+ root `Cargo.lock` when needed) | Harness + fixtures; keep default tests hermetic |
 | **client** | `client/` | Flutter desktop/web UI for `agent --serve` |
 | **dart-client** | `packages/` | **Dart** client package (`agent_code_client` via pub) — not TypeScript |
 | **npm / install** | `npm/`, `install.sh` | Release/install path — serialize with care |
@@ -74,8 +74,11 @@ Hard rules:
 
 1. **Two writers never share a file.** Split by directory first; if a shared file is
    unavoidable, **serialize** edits through one owner.
-2. **Contract changes stack, they do not race.** `agent-code-lib` API → CLI / client consumers
-   is a **stack** (lib lands first), not parallel PRs against `main` that both edit the surface.
+2. **Contract changes must keep workspace CI green.** Incompatible `agent-code-lib` API breaks
+   used by `crates/cli` / `crates/eval` cannot land as “lib PR first” if workspace
+   `cargo test --all-targets` fails on that PR. Prefer: (a) land lib + in-workspace consumers
+   **atomically in one PR**, or (b) ship a compatibility shim in lib first, then a follow-up
+   that removes the shim and updates consumers. Parallel PRs racing the same surface are still wrong.
 3. **One `git worktree` per concurrent lane (required).** Do not run two writing agents in
    the same working tree.
 4. **Lead owns integration.** When multiple lanes land, one person/agent rebases the stack,
@@ -88,7 +91,10 @@ fork, that is often `upstream`, not `origin`.
 
 ```bash
 UPSTREAM=$(git remote -v | awk '/avala-ai\/agent-code/ {print $1; exit}')
-UPSTREAM=${UPSTREAM:-origin}
+if [ -z "$UPSTREAM" ]; then
+  echo "No remote for avala-ai/agent-code. Add e.g.: git remote add upstream git@github.com:avala-ai/agent-code.git"
+  exit 1
+fi
 git fetch "$UPSTREAM" main
 
 # --no-track so feature branches do not track main (plain `git push` stays sane)
@@ -101,10 +107,14 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 # First publish:
 #   git push -u origin HEAD
 
-# After PR merge or abandon — squash-safe cleanup:
-git worktree remove ../agent-code-wt-lib
-gh pr view <n> --json state --jq .state   # MERGED, or confirm abandon
-git branch -D fix/lib-<slug>              # -d often fails after squash merge
+# After PR merge or abandon — gate deletion on state:
+state=$(gh pr view <n> --json state --jq .state)
+if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
+  git worktree remove ../agent-code-wt-lib
+  git branch -D fix/lib-<slug>
+else
+  echo "PR still $state — not deleting branch"
+fi
 ```
 
 Rules of use:
@@ -136,11 +146,12 @@ Agents **should** commit as they go **inside their own worktree**.
 
 1. **Atomic commits** — one concern per commit. Prefer Conventional Commit subjects when
    natural: `fix(lib): …`, `test(cli): …`, `docs: …`.
-2. **Only stage your lane’s files.**
+2. **Only stage your lane’s files.** Exception: root **`Cargo.lock`** when your Rust lane
+   changes dependencies (required for `--locked` builds). Do not stage unrelated lock churn.
 3. **History rewrites:** no casual amend/force-push.
    - Allowed: recovery on **feature** branches when the human explicitly asked or stack recovery requires it.
-   - **Never** force-push `main` (or the default branch), even if a human casually asks —
-     protected-branch rules win; require an explicit exceptional override naming the branch.
+   - **Never** force-push `main` (or the default branch). **No agent exception** — not even with
+     a human “override” in chat. Humans use their own credentials/process if recovery truly needs it.
 4. **Batch review-bot findings** into one follow-up commit when possible.
 5. **Tests with the fix.** Keep default `cargo test` hermetic (no network/API keys) — AGENTS.md §2.
 
