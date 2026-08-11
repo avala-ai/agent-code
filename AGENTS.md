@@ -4,7 +4,7 @@ Instructions for AI coding agents working in this repository. Read this file in 
 
 This repo is **agent-code** (Avala AI): a Rust terminal coding agent, shipped as both a CLI and an embeddable library. Because this project *is itself* an agent, changes here affect the safety posture of every user who runs it. Move carefully.
 
-**Throughput (parallel agents / multi-crate work):** read **[SHIP.md](SHIP.md)** — blast radius, non-overlapping lanes, **one `git worktree` per concurrent writer**, atomic commits. Does not lower the security or CI bar below.
+**Throughput (parallel agents / multi-crate work):** read **[SHIP.md](SHIP.md)** — blast radius, non-overlapping lanes, **one `git worktree` per concurrent writer**, atomic commits. Opt-in for multi-agent, multi-crate, or bloating PRs — **not** tiny single-crate edits. Does not lower the security or CI bar.
 
 ---
 
