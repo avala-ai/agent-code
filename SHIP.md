@@ -104,15 +104,26 @@ git worktree add --no-track -b fix/client-<slug> ../agent-code-wt-client "$UPSTR
 # Agent A cwd: ../agent-code-wt-lib     (writes crates/lib/ only)
 # Agent B cwd: ../agent-code-wt-client  (writes client/ only)
 
-# First publish — writable PR-head remote (fork or origin). Do not assume origin always exists:
-#   PUSH_REMOTE=$(git remote | head -1)
-#   git remote get-url "$PUSH_REMOTE" >/dev/null
-#   git push -u "$PUSH_REMOTE" HEAD
+# Publish — set PR_HEAD_REMOTE explicitly (your fork on a fork clone; often origin on a direct clone).
+# Do NOT use `git remote | head -1` (may pick read-only upstream).
+#   : "${PR_HEAD_REMOTE:?set PR_HEAD_REMOTE to the writable remote for the PR head}"
+#   git remote get-url "$PR_HEAD_REMOTE" >/dev/null
+#   git push -u "$PR_HEAD_REMOTE" HEAD
 
-# After PR merge or abandon — gate deletion on state:
+# Cleanup — ALWAYS cd to primary first (show-toplevel of a linked worktree is itself).
+# Use -z (NUL-delimited) so paths with spaces/newlines parse intact; abort if cd fails.
+PRIMARY=""
+while IFS= read -r -d '' line; do
+  case "$line" in
+    worktree\ *) PRIMARY="${line#worktree }"; break ;;
+  esac
+done < <(git worktree list --porcelain -z)
+if [ -z "$PRIMARY" ] || ! cd "$PRIMARY"; then
+  echo "Could not cd to primary worktree (got: ${PRIMARY:-empty}). Abort cleanup."
+  exit 1
+fi
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
-  # Never --force-remove a dirty worktree (loses uncommitted/untracked work).
   if [ -n "$(git -C ../agent-code-wt-lib status --porcelain 2>/dev/null)" ]; then
     echo "Worktree ../agent-code-wt-lib is dirty — refuse remove. Commit/stash/discard first."
     exit 1
