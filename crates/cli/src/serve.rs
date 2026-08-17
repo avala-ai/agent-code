@@ -668,6 +668,28 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<ServerState>) {
     out_task.abort();
 }
 
+/// Build the `skills` response payload: the user-invocable skills, as name,
+/// description, and argument hint.
+///
+/// Skills the user cannot invoke are omitted — the client uses this to populate
+/// a slash-command picker, and offering `/name` for something that does not
+/// answer to it is worse than offering nothing. Bodies are excluded on purpose:
+/// they are prompt text the agent expands server-side, and the client has no
+/// use for them.
+fn skill_summaries(registry: &agent_code_lib::skills::SkillRegistry) -> Vec<serde_json::Value> {
+    registry
+        .user_invocable()
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.metadata.description,
+                "argument_hint": s.metadata.argument_hint,
+            })
+        })
+        .collect()
+}
+
 /// Handle a JSON-RPC request from the WebSocket client.
 async fn handle_ws_request(
     state: &Arc<ServerState>,
@@ -769,6 +791,15 @@ async fn handle_ws_request(
             engine.cancel();
             serde_json::json!({"cancelled": true})
         }
+        "skills" => {
+            let cwd = {
+                let engine = state.engine.lock().await;
+                engine.state().cwd.clone()
+            };
+            let registry =
+                agent_code_lib::skills::SkillRegistry::load_all(Some(std::path::Path::new(&cwd)));
+            serde_json::json!({ "skills": skill_summaries(&registry) })
+        }
         _ => {
             serde_json::json!({"error": format!("Unknown method: {method}")})
         }
@@ -841,6 +872,75 @@ mod tests {
             result["content"].as_str().unwrap().contains("@@"),
             "diff content must survive serialization"
         );
+    }
+
+    fn skill(
+        name: &str,
+        description: Option<&str>,
+        user_invocable: bool,
+    ) -> agent_code_lib::skills::Skill {
+        agent_code_lib::skills::Skill {
+            name: name.to_string(),
+            metadata: agent_code_lib::skills::SkillMetadata {
+                description: description.map(str::to_string),
+                user_invocable,
+                ..Default::default()
+            },
+            body: "prompt body the client must never see".to_string(),
+            source: std::path::PathBuf::from(format!("/skills/{name}.md")),
+        }
+    }
+
+    #[test]
+    fn skills_payload_lists_only_user_invocable_skills() {
+        let registry = agent_code_lib::skills::SkillRegistry::from_skills(vec![
+            skill("commit", Some("Write a commit"), true),
+            skill("internal-helper", Some("Model-only"), false),
+            skill("review", Some("Review the diff"), true),
+        ]);
+
+        let summaries = skill_summaries(&registry);
+        let names: Vec<&str> = summaries
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(names, vec!["commit", "review"]);
+        assert_eq!(summaries[0]["description"], "Write a commit");
+    }
+
+    #[test]
+    fn skills_payload_never_leaks_skill_bodies() {
+        let registry = agent_code_lib::skills::SkillRegistry::from_skills(vec![skill(
+            "commit",
+            Some("Write a commit"),
+            true,
+        )]);
+
+        let json = serde_json::to_string(&skill_summaries(&registry)).unwrap();
+        assert!(
+            !json.contains("prompt body"),
+            "skill bodies are server-side prompt text and must not reach the client: {json}"
+        );
+    }
+
+    #[test]
+    fn skills_payload_is_empty_when_nothing_is_invocable() {
+        let registry = agent_code_lib::skills::SkillRegistry::from_skills(vec![skill(
+            "internal-helper",
+            None,
+            false,
+        )]);
+        assert!(skill_summaries(&registry).is_empty());
+    }
+
+    #[test]
+    fn skills_payload_tolerates_a_missing_description() {
+        let registry =
+            agent_code_lib::skills::SkillRegistry::from_skills(vec![skill("bare", None, true)]);
+        let summaries = skill_summaries(&registry);
+        assert_eq!(summaries[0]["name"], "bare");
+        assert!(summaries[0]["description"].is_null());
     }
 
     #[test]

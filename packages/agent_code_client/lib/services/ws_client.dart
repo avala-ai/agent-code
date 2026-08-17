@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/json_rpc.dart';
+import '../models/skill_summary.dart';
 import '../models/status_response.dart';
 
 /// Heartbeat interval. The client sends a ping notification every 5 seconds
@@ -118,6 +119,23 @@ class WsClient {
   /// Cancel the currently running turn.
   Future<void> cancel() async {
     await _sendRequest('cancel');
+  }
+
+  /// List the user-invocable skills, for the composer's slash picker.
+  ///
+  /// Names and descriptions only — skill bodies are prompt text the agent runs
+  /// and never reach the client.
+  Future<List<SkillSummary>> getSkills() async {
+    final resp = await _sendRequest('skills');
+    if (resp.error != null) {
+      throw WsClientException('Skills error: ${resp.error!.message}');
+    }
+    final raw = resp.result?['skills'];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(SkillSummary.fromJson)
+        .toList();
   }
 
   /// Respond to a permission request from the agent.

@@ -13,6 +13,7 @@ library agent_code_client;
 export 'models/agent_instance.dart';
 export 'models/chat_message.dart';
 export 'models/json_rpc.dart';
+export 'models/skill_summary.dart';
 export 'models/status_response.dart';
 
 // Services (platform-independent)
