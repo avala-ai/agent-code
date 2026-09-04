@@ -24,7 +24,7 @@ jobs:
       - name: Build agent binary
         run: cargo build --release
 
-      - uses: dart-lang/setup-dart@v1.8.0
+      - uses: dart-lang/setup-dart@v1.8.1
         with:
           sdk: stable
 
