@@ -51,7 +51,7 @@ regex = "1"
 sha2 = "0.11"
 similar = "3"
 crossterm = "0.29"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-bash = "0.25"
 # Source-language grammars for AMR AST selectors. Same 0.25 grammar line
 # as tree-sitter-bash, which is ABI-compatible with the 0.26 runtime.
