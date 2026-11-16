@@ -9,8 +9,6 @@ the CI gate.
 **Not a goal:** commit count, token spend, or “vibe” volume. Those are lagging noise.
 Optimize for **green PRs merged per week** and **time from idea → first green CI**.
 
-Companion to the Avala monorepo’s `SHIP.md` (same discipline, this repo’s lanes).
-
 ---
 
 ## 1. Relationship to the other root docs

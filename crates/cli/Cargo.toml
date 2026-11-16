@@ -9,7 +9,7 @@ homepage = "https://github.com/avala-ai/agent-code"
 readme = "../../README.md"
 keywords = ["ai", "agent", "coding", "cli", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
-authors = ["Avala AI <emal@avala.ai>"]
+authors = ["Avala AI"]
 
 [[bin]]
 name = "agent"

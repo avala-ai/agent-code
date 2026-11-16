@@ -41,7 +41,9 @@ jobs:
           WANT="${TAG#v}"
           echo "latest tag: $TAG ($WANT)"
 
-          CRATES=$(curl -fsSL "https://crates.io/api/v1/crates/agent-code" | jq -r .crate.max_version)
+          # crates.io rejects requests without an identifying User-Agent (HTTP 403).
+          CRATES=$(curl -fsSL -A "agent-code-release-health (+https://github.com/${GH_REPO})" \
+            "https://crates.io/api/v1/crates/agent-code" | jq -r .crate.max_version)
           NPM=$(curl -fsSL "https://registry.npmjs.org/@avala-ai/agent-code/latest" | jq -r .version)
           # Homebrew formula from the tap (raw main).
           FORMULA=$(curl -fsSL "https://raw.githubusercontent.com/avala-ai/homebrew-tap/main/Formula/agent-code.rb" \
