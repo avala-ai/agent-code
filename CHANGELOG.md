@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *No changes yet.*
 
+## [0.31.0] - 2026-11-16
+
+### Added
+
+- **Clickable transcript links** — markdown hyperlinks open on click through the hit registry (#584), highlight on hover (#591), switch the pointer shape via OSC 22 (#601), and are emitted as OSC 8 hyperlinks when the terminal supports them, with a scheme allowlist and control characters stripped (#603).
+- **Mouse-driven scrolling and navigation** — the scrollbar track is clickable and the thumb draggable (#586). A timeline rail on the left edge of long transcripts marks user turns, tool activity, and errors, shows a preview on hover, and jumps on click (#598).
+- **Mouse selection and composer editing** — multi-click selects words and lines in the transcript (#588) and in the composer (#594), a click places the composer caret (#589), and middle-click pastes the X11/Wayland PRIMARY selection (#596).
+- **Interactive status bar** — chips fill on hover (#592); the working-directory chip (#595) and todo progress chip (#602) are clickable; the context chip swaps to used/max token counts on hover without shifting its neighbors (#600).
+- **Clickable empty-conversation guidance** (#597) — the suggested next steps start on click.
+- **Desktop client chat surface** (#608) — streamed markdown renders in settled segments, tool activity collapses into a timeline, and the composer stays live during a turn so a running agent can be steered. `serve` gains a `skills` JSON-RPC method (names and descriptions only) for the composer's `/` picker.
+
+### Fixed
+
+- **Desktop client streaming** (#608) — the transcript no longer freezes for the length of a streaming turn, status refreshes after a turn, switching sessions keeps the transcript, and tool input/output are no longer discarded.
+- **Hyperlink hit testing follows real wrap breakpoints** (#585).
+- **Scrollbar drag clamps when the thumb shrinks mid-drag** (#587).
+- **Span styles outside a word selection are preserved** (#590).
+- **Timeline marker previews are bounded and scrubbed** (#599).
+- **Eval harness launches the agent with flags that exist** (#652) — the rig passed `--print` and `--permission-mode auto-approve`, so every eval attempt exited with a usage error.
+- **Release health check reaches crates.io** (#652) — the version lookup now sends a User-Agent instead of failing with HTTP 403.
+- **Clippy-clean on Rust 1.100** (#654) — `base64_encode` iterates with `as_chunks`, which the release E2E suite's newer Clippy requires; the client Playwright job is pinned to an image its Playwright release supports.
+
+### Changed
+
+- **tree-sitter 0.26 → 0.27.1** (#618, #623, #626, #638), with the now-redundant index casts removed (#652); **dirs 6 → 7** (#631).
+- Routine dependency updates: tokio 1.54.1, tokio-util 0.7.20, rustls 0.23.46, serde_json 1.0.154, toml 1.1.8, uuid 1.29.0, clap 4.6.7, similar 3.2.1, pulldown-cmark 0.13.5, sha2 0.11.1, libc 0.2.191, termimad 0.35.5, thiserror 2.0.21, futures 0.3.34, ignore 0.4.33, async-trait 0.1.92, tokio-test 0.4.6.
+- **Docs** — the TUI guide covers multi-click, the scrollbar, links, and status chips (#593); `SHIP.md` describes how to split work into parallel, reviewable changes (#609, #610).
+- The CLI crate's `authors` metadata no longer includes an email address (#652).
+
 ## [0.30.0] - 2026-07-29
 
 ### Added
@@ -662,7 +691,8 @@ Initial public release.
 - **Cross-platform support**: Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon)
 - **Installation methods**: cargo install, Homebrew tap, curl script, prebuilt binaries
 
-[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/avala-ai/agent-code/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/avala-ai/agent-code/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/avala-ai/agent-code/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/avala-ai/agent-code/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/avala-ai/agent-code/compare/v0.27.0...v0.28.0
