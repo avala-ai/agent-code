@@ -358,15 +358,15 @@ pub fn image_block_from_bytes(path: &std::path::Path, data: &[u8]) -> ContentBlo
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for c in &mut chunks {
-        let (b0, b1, b2) = (c[0] as usize, c[1] as usize, c[2] as usize);
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
+        let (b0, b1, b2) = (b0 as usize, b1 as usize, b2 as usize);
         out.push(CHARS[b0 >> 2] as char);
         out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
         out.push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
         out.push(CHARS[b2 & 0x3f] as char);
     }
-    match *chunks.remainder() {
+    match *remainder {
         [b0] => {
             let b0 = b0 as usize;
             out.push(CHARS[b0 >> 2] as char);
