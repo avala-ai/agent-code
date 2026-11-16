@@ -4,6 +4,13 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Wall-clock budget for one agent run.
+///
+/// An eval is a handful of model turns over a tiny fixture and finishes in
+/// seconds. Without a budget, one agent that never exits holds the whole suite
+/// until the CI job's own timeout cancels it, and nothing is reported.
+const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A captured tool call from the agent's execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturedToolCall {
@@ -135,17 +142,24 @@ impl TestRig {
             .arg(&self.workspace)
             .arg("-p")
             .arg(prompt)
+            // Never let the agent, or a command it runs, wait on the runner's
+            // stdin, and make sure a timed-out attempt does not leave it behind.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         for (key, val) in env {
             cmd.env(key, val);
         }
 
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to execute agent binary")?;
+        let output = match tokio::time::timeout(ATTEMPT_TIMEOUT, cmd.output()).await {
+            Ok(result) => result.context("Failed to execute agent binary")?,
+            Err(_) => anyhow::bail!(
+                "agent did not exit within {}s; the attempt was killed",
+                ATTEMPT_TIMEOUT.as_secs()
+            ),
+        };
 
         self.stdout = String::from_utf8_lossy(&output.stdout).to_string();
         self.stderr = String::from_utf8_lossy(&output.stderr).to_string();

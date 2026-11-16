@@ -57,11 +57,8 @@ impl Tool for GlobTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("'pattern' is required".into()))?;
 
-        let base_path = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| ctx.cwd.clone());
+        let base_path =
+            super::resolve_search_root(input.get("path").and_then(|v| v.as_str()), &ctx.cwd);
 
         // Resolve the glob pattern relative to the base path.
         let full_pattern = if pattern.starts_with('/') {
@@ -192,5 +189,48 @@ mod tests {
             !confined.contains(".git/config") && !confined.contains(".git\\config"),
             "a confined worker must not enumerate .git internals"
         );
+    }
+
+    /// A model that has no path to give often sends `"path": ""`. That used to
+    /// build the pattern `/**/...` and walk the whole filesystem, which looked
+    /// like a hang. It must mean the working directory.
+    #[tokio::test]
+    async fn empty_path_searches_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let mut ctx = ctx_with_scope(None);
+        ctx.cwd = dir.path().to_path_buf();
+
+        for path in ["", "   "] {
+            let out = GlobTool
+                .call(json!({ "pattern": "**/src/main.rs", "path": path }), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                out.content.starts_with("Found 1 files:"),
+                "path {path:?} must search only the working directory, got: {}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("top.rs"), "").unwrap();
+
+        let mut ctx = ctx_with_scope(None);
+        ctx.cwd = dir.path().to_path_buf();
+
+        let out = GlobTool
+            .call(json!({ "pattern": "*.rs", "path": "src" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("lib.rs"), "got: {}", out.content);
+        assert!(!out.content.contains("top.rs"), "got: {}", out.content);
     }
 }

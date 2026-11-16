@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-*No changes yet.*
+### Fixed
+
+- **`Glob` with an empty `path` no longer walks the whole filesystem** — an empty or blank `path` was joined with the pattern as `/<pattern>`, so a project search became a walk from `/` that looked like a hang. Empty now means the working directory, and relative paths in `Glob` and `Grep` resolve against the session's working directory.
+- **Eval harness gives each agent run a time limit** — a run that never exits now fails that attempt after 5 minutes instead of holding the suite until the CI job is cancelled; the agent's stdin is closed.
 
 ## [0.31.0] - 2026-11-16
 
