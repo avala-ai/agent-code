@@ -81,7 +81,7 @@ fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
             } else {
                 // Fallback: first word child.
                 for i in 0..node.child_count() {
-                    let child = node.child(i as u32).unwrap();
+                    let child = node.child(i).unwrap();
                     if child.kind() == "word" || child.kind() == "command_name" {
                         parsed.commands.push(node_text(child, source));
                         break;
@@ -116,7 +116,7 @@ fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
             parsed.has_pipes = true;
             // Extract each command in the pipeline.
             for i in 0..node.child_count() {
-                let child = node.child(i as u32).unwrap();
+                let child = node.child(i).unwrap();
                 if child.kind() == "command" || child.kind() == "pipeline" {
                     let text = node_text(child, source);
                     parsed.pipeline_segments.push(text);
@@ -126,7 +126,7 @@ fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
         "list" => {
             // && and || chains.
             for i in 0..node.child_count() {
-                let child = node.child(i as u32).unwrap();
+                let child = node.child(i).unwrap();
                 let kind = child.kind();
                 if kind == "&&" || kind == "||" {
                     parsed.has_chains = true;
@@ -145,7 +145,7 @@ fn extract_from_node(node: Node, source: &[u8], parsed: &mut ParsedCommand) {
 
     // Recurse into children.
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
+        if let Some(child) = node.child(i) {
             extract_from_node(child, source, parsed);
         }
     }
@@ -162,7 +162,7 @@ fn node_text(node: Node, source: &[u8]) -> String {
 fn command_argv(node: Node, source: &[u8]) -> Vec<String> {
     let mut argv = Vec::new();
     for i in 0..node.child_count() {
-        let Some(child) = node.child(i as u32) else {
+        let Some(child) = node.child(i) else {
             continue;
         };
         match child.kind() {

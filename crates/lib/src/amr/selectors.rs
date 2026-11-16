@@ -199,7 +199,7 @@ impl Selector {
             }
             let count = node.child_count();
             for i in 0..count {
-                if let Some(child) = node.child(i as u32) {
+                if let Some(child) = node.child(i) {
                     stack.push(child);
                 }
             }

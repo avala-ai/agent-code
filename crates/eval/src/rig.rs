@@ -116,8 +116,9 @@ impl TestRig {
 
     /// Run the agent binary against this workspace with the given prompt.
     ///
-    /// Uses `agent --print --max-turns N --permission-mode auto-approve`
-    /// to execute non-interactively and capture output.
+    /// Uses `agent --max-turns N --permission-mode allow -p <prompt>`:
+    /// `-p` selects one-shot (non-interactive) mode, and `allow` lets the
+    /// agent act inside the throwaway workspace without prompting.
     pub async fn run_agent(
         &mut self,
         agent_binary: &str,
@@ -126,11 +127,10 @@ impl TestRig {
         env: &[(&str, &str)],
     ) -> Result<()> {
         let mut cmd = tokio::process::Command::new(agent_binary);
-        cmd.arg("--print")
-            .arg("--max-turns")
+        cmd.arg("--max-turns")
             .arg(max_turns.to_string())
             .arg("--permission-mode")
-            .arg("auto-approve")
+            .arg("allow")
             .arg("-C")
             .arg(&self.workspace)
             .arg("-p")
