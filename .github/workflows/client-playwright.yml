@@ -17,7 +17,9 @@ permissions:
 jobs:
   playwright:
     name: Playwright web tests
-    runs-on: ubuntu-latest
+    # Pinned: the Playwright release in client/e2e cannot install Chromium on
+    # the Ubuntu 26.04 image that `ubuntu-latest` now resolves to.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
