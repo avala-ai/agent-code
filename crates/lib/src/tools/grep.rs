@@ -6,7 +6,6 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -114,11 +113,8 @@ impl Tool for GrepTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("'pattern' is required".into()))?;
 
-        let search_path = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| ctx.cwd.clone());
+        let search_path =
+            super::resolve_search_root(input.get("path").and_then(|v| v.as_str()), &ctx.cwd);
 
         let glob_filter = input.get("glob").and_then(|v| v.as_str());
         let type_filter = input.get("type").and_then(|v| v.as_str());
@@ -367,6 +363,7 @@ mod tests {
     use super::*;
     use crate::permissions::PermissionChecker;
     use crate::tools::ToolContext;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 

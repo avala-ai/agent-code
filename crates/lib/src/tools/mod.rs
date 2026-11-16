@@ -528,6 +528,28 @@ impl<T: Tool + ?Sized> From<&T> for ToolSchema {
     }
 }
 
+/// Resolve the optional `path` argument of a search tool to a directory.
+///
+/// Models routinely send `"path": ""` for "no path". Treating that as a real
+/// path is not harmless: joined with a pattern it yields `/<pattern>`, which
+/// turns a project search into a walk of the whole filesystem. An absent,
+/// empty or whitespace-only value therefore means the session's working
+/// directory, and a relative value is resolved against it rather than against
+/// whatever directory the process happens to be in.
+pub(crate) fn resolve_search_root(raw: Option<&str>, cwd: &std::path::Path) -> std::path::PathBuf {
+    match raw.map(str::trim).filter(|p| !p.is_empty()) {
+        None => cwd.to_path_buf(),
+        Some(p) => {
+            let p = std::path::Path::new(p);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod default_check_tests {
     use super::*;
@@ -585,5 +607,44 @@ mod default_check_tests {
             .check_permissions(&serde_json::json!({"file_path": "src/lib.rs"}), &checker)
             .await;
         assert!(matches!(allowed, PermissionDecision::Allow));
+    }
+}
+
+#[cfg(test)]
+mod search_root_tests {
+    use super::resolve_search_root;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn absent_empty_and_blank_paths_mean_the_working_directory() {
+        let cwd = Path::new("/work/project");
+        for raw in [None, Some(""), Some("   "), Some("\t")] {
+            assert_eq!(
+                resolve_search_root(raw, cwd),
+                PathBuf::from("/work/project")
+            );
+        }
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_working_directory() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            resolve_search_root(Some("src"), cwd),
+            PathBuf::from("/work/project/src")
+        );
+        assert_eq!(
+            resolve_search_root(Some(" src/bin "), cwd),
+            PathBuf::from("/work/project/src/bin")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_kept() {
+        let abs = std::env::temp_dir();
+        assert_eq!(
+            resolve_search_root(Some(&abs.to_string_lossy()), Path::new("/work/project")),
+            abs
+        );
     }
 }
