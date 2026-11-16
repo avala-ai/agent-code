@@ -5,11 +5,13 @@ on:
     paths:
       - 'client/**'
       - 'packages/agent_code_client/**'
+      - '.github/workflows/client-playwright.yml'
   push:
     branches: [main]
     paths:
       - 'client/**'
       - 'packages/agent_code_client/**'
+      - '.github/workflows/client-playwright.yml'
 
 permissions:
   contents: read
